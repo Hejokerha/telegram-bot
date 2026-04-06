@@ -738,7 +738,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 import asyncio
 
-async def main():
+def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN غير موجود داخل ملف .env")
 
@@ -748,8 +748,12 @@ async def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("Bot is running...")
-    await app.run_polling()
+
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    app.run_polling(close_loop=False)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
