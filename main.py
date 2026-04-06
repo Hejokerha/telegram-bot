@@ -515,7 +515,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == "❌ لا، لست مشتركًا":
             await update.message.reply_text(
-                🟢للتسجيل والاشتراك تابع الخطوات:👇🏻
+                📌للتسجيل والاشتراك تابع الخطوات:👇🏻
 
 1-انشئ حساب جديد على منصة Quotex من هذا الرابط : 🔽
 
