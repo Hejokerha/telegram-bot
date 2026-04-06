@@ -736,7 +736,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("اختر خيارًا من القائمة.", reply_markup=build_main_menu_for_user(user.id))
 
 
-def main():
+import asyncio
+
+async def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN غير موجود داخل ملف .env")
 
@@ -746,8 +748,8 @@ def main():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("Bot is running...")
-    app.run_polling()
+    await app.run_polling()
 
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
