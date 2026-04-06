@@ -1,5 +1,7 @@
 import os
+import json
 import hashlib
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 import firebase_admin
@@ -22,20 +24,34 @@ DATABASE_URL = "https://telegram-bot-f0229-default-rtdb.firebaseio.com"
 
 PAIRS = [
     "USD/BRL (OTC)",
+    "USD/ARS (OTC)",
+    "USD/BDT (OTC)",
+    "USD/NGN (OTC)",
+    "USD/PKR (OTC)",
+    "USD/DZD (OTC)",
+    "USD/MXN (OTC)",
+    "USD/INR (OTC)",
+    "USD/IDR (OTC)",
+    "USD/EGP (OTC)",
+    "USD/TRY (OTC)",
+    "USD/COP (OTC)",
+    "EUR/JPY (OTC)",
     "EUR/USD (OTC)",
-    "GBP/USD (OTC)",
-    "USD/JPY (OTC)",
+    "CAD/CHF (OTC)",
+    "CAD/JPY (OTC)",
+    "AUD/CHF (OTC)",
+    "AUD/CAD (OTC)",
 ]
 
-TRADE_COUNTS = [3, 5, 10]
+TRADE_COUNTS = [3, 5, 10, 15, 20]
 INTERVALS = [1, 3, 5]
 
 ONLINE_MINUTES_WINDOW = 15
 
+# ===== Firebase init =====
 firebase_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
 
 if firebase_json:
-    import json
     cred_dict = json.loads(firebase_json)
     cred = credentials.Certificate(cred_dict)
 else:
@@ -45,6 +61,7 @@ firebase_admin.initialize_app(cred, {
     "databaseURL": DATABASE_URL
 })
 
+# ===== Keyboards =====
 main_keyboard = ReplyKeyboardMarkup(
     [
         ["📊 توليد إشارات", "👤 حسابي"],
@@ -72,8 +89,15 @@ welcome_keyboard = ReplyKeyboardMarkup(
 
 pairs_keyboard = ReplyKeyboardMarkup(
     [
-        [PAIRS[0], PAIRS[1]],
-        [PAIRS[2], PAIRS[3]],
+        ["USD/BRL (OTC)", "USD/ARS (OTC)"],
+        ["USD/BDT (OTC)", "USD/NGN (OTC)"],
+        ["USD/PKR (OTC)", "USD/DZD (OTC)"],
+        ["USD/MXN (OTC)", "USD/INR (OTC)"],
+        ["USD/IDR (OTC)", "USD/EGP (OTC)"],
+        ["USD/TRY (OTC)", "USD/COP (OTC)"],
+        ["EUR/JPY (OTC)", "EUR/USD (OTC)"],
+        ["CAD/CHF (OTC)", "CAD/JPY (OTC)"],
+        ["AUD/CHF (OTC)", "AUD/CAD (OTC)"],
         ["🔙 رجوع"],
     ],
     resize_keyboard=True
@@ -81,7 +105,8 @@ pairs_keyboard = ReplyKeyboardMarkup(
 
 count_keyboard = ReplyKeyboardMarkup(
     [
-        [str(TRADE_COUNTS[0]), str(TRADE_COUNTS[1]), str(TRADE_COUNTS[2])],
+        ["3", "5", "10"],
+        ["15", "20"],
         ["🔙 رجوع"],
     ],
     resize_keyboard=True
@@ -105,6 +130,7 @@ admin_duration_keyboard = ReplyKeyboardMarkup(
 )
 
 
+# ===== Firebase refs =====
 def users_ref():
     return db.reference("users")
 
@@ -121,6 +147,7 @@ def system_ref():
     return db.reference("system")
 
 
+# ===== Helpers =====
 def now_utc():
     return datetime.now(timezone.utc)
 
@@ -326,6 +353,37 @@ def generate_signals(pair: str, count: int, interval_minutes: int, start_dt: dat
     return signals
 
 
+def build_signals_message(pair: str, count: int, interval_minutes: int, signals: list[str]) -> str:
+    header = (
+        "╔══════════════╗\n"
+        "   📊 Quotex Signals\n"
+        "╚══════════════╝\n\n"
+        "⏰ توقيت المنصة\n"
+        "UTC / GMT +3.00\n\n"
+        f"💱 الزوج: {pair}\n"
+        f"📈 عدد الصفقات: {count}\n"
+        f"⏳ الفاصل: {interval_minutes} دقيقة\n\n"
+        "⚠️ ملاحظات مهمة:\n"
+        "• مدة كل صفقة: 1M\n"
+        "• تجنب صفقة عكس مومنتم\n"
+        "• تجنب دخول الصفقة بعد شمعة دوجي\n"
+        "• تجنب صفقة عكس تريند قوي\n"
+        "• استخدم مضاعفة واحدة عند الخسارة\n\n"
+        "📍 الإشارات:\n"
+    )
+
+    formatted_signals = []
+    for index, signal in enumerate(signals, start=1):
+        parts = signal.split(" — ")
+        if len(parts) == 3:
+            _, signal_time, direction = parts
+            formatted_signals.append(f"{index}) {signal_time} → {direction}")
+        else:
+            formatted_signals.append(f"{index}) {signal}")
+
+    return header + "\n".join(formatted_signals)
+
+
 def reset_signal_state(context: ContextTypes.DEFAULT_TYPE):
     context.user_data["step"] = None
     context.user_data["pair"] = None
@@ -336,7 +394,7 @@ def reset_signal_state(context: ContextTypes.DEFAULT_TYPE):
 
 async def send_welcome_flow(update: Update):
     await update.message.reply_text(
-        "أهلًا بك في بوت TRADING TIME 👋\n\n"
+        "👋 أهلًا بك في بوت TRADING TIME\n\n"
         "هل أنت منضم لفريق TRADING TIME؟",
         reply_markup=welcome_keyboard
     )
@@ -357,7 +415,7 @@ def build_main_menu_for_user(user_id: int):
 async def send_user_details(update: Update, target_id: int, show_admin_actions: bool = False):
     data = get_user_record(target_id)
     if not data:
-        await update.message.reply_text("هذا المستخدم غير موجود.")
+        await update.message.reply_text("❌ هذا المستخدم غير موجود.")
         return
 
     username = f"@{data.get('username')}" if data.get("username") else "بدون username"
@@ -369,14 +427,14 @@ async def send_user_details(update: Update, target_id: int, show_admin_actions: 
         expires_at = format_dt_ar(expires_at) if expires_at != "غير محدد" else expires_at
 
     msg = (
-        f"🔍 تفاصيل المستخدم\n\n"
-        f"الاسم: {data.get('name', 'غير معروف')}\n"
-        f"اليوزر: {username}\n"
-        f"Telegram ID: {target_id}\n"
-        f"Quotex ID: {quotex_id}\n"
-        f"الحالة: {status}\n"
-        f"آخر نشاط: {format_dt_ar(data.get('last_seen', ''))}\n"
-        f"انتهاء الصلاحية: {expires_at}"
+        "👤 تفاصيل المستخدم\n\n"
+        f"• الاسم: {data.get('name', 'غير معروف')}\n"
+        f"• اليوزر: {username}\n"
+        f"• Telegram ID: {target_id}\n"
+        f"• Quotex ID: {quotex_id}\n"
+        f"• الحالة: {status}\n"
+        f"• آخر نشاط: {format_dt_ar(data.get('last_seen', ''))}\n"
+        f"• انتهاء الصلاحية: {expires_at}"
     )
 
     if show_admin_actions:
@@ -387,11 +445,14 @@ async def send_user_details(update: Update, target_id: int, show_admin_actions: 
 
 async def send_maintenance_message(update: Update):
     await update.message.reply_text(
-        "البوت متوقف مؤقتًا لأعمال التحديث والصيانة 🛠\n"
-        "يرجى المحاولة لاحقًا."
+        "🛠 البوت تحت الصيانة حاليًا\n\n"
+        "نقوم حاليًا ببعض التحديثات والتحسينات.\n"
+        "يرجى المحاولة لاحقًا.\n\n"
+        "شكرًا لتفهمك 🤍"
     )
 
 
+# ===== Main Handlers =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     reset_signal_state(context)
@@ -405,7 +466,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_admin(user.id):
         await update.message.reply_text(
-            f"أهلًا {user.first_name} 👋\nمرحبًا بك يا أدمن.",
+            f"👋 أهلًا {user.first_name}\n"
+            "مرحبًا بك في وضع الأدمن.",
             reply_markup=build_main_menu_for_user(user.id)
         )
         return
@@ -416,7 +478,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_approved(user.id):
         await update.message.reply_text(
-            f"أهلًا {user.first_name} 👋\nمرحبًا بك من جديد.",
+            f"✅ أهلًا {user.first_name}\n"
+            "مرحبًا بك من جديد في بوت TRADING TIME.",
             reply_markup=build_main_menu_for_user(user.id)
         )
     else:
@@ -435,22 +498,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "last_seen": now_iso(),
     })
 
+    # ===== Maintenance mode =====
     if not is_admin(user.id) and not get_bot_enabled():
         await send_maintenance_message(update)
         return
 
+    # ===== Non-approved users =====
     if not is_admin(user.id) and not is_approved(user.id):
         if text == "✅ نعم، أنا منضم":
             context.user_data["step"] = "waiting_quotex_id"
             await update.message.reply_text(
-                "أرسل ID الخاص بحسابك على QUOTEX ليتم فحص حسابك.\n"
+                "📩 أرسل ID الخاص بحسابك على QUOTEX ليتم فحص حسابك.\n"
                 "بعد التأكد سيتم إتاحة البوت لك بشكل مجاني."
             )
             return
 
         if text == "❌ لا، لست مشتركًا":
             await update.message.reply_text(
-                f"تواصل مع الأدمن للاشتراك:\n{ADMIN_USERNAME}"
+                f"📞 للتسجيل والاشتراك تواصل مع الأدمن:\n{ADMIN_USERNAME}"
             )
             return
 
@@ -473,17 +538,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             })
 
             await update.message.reply_text(
-                "تم استلام ID الخاص بك ✅\n"
-                "سيتم مراجعته، وبعد التأكد سيتم تفعيل البوت لك."
+                "📩 تم استلام طلبك بنجاح\n\n"
+                "تم حفظ Quotex ID الخاص بك وإرساله للإدارة للمراجعة.\n"
+                "بعد التأكد، سيتم تفعيل البوت لك مجانًا.\n\n"
+                "يرجى انتظار موافقة الأدمن ✅"
             )
 
             username_text = f"@{user.username}" if user.username else "بدون username"
             admin_message = (
                 "📥 طلب تفعيل جديد\n\n"
-                f"الاسم: {user.full_name}\n"
-                f"اليوزر: {username_text}\n"
-                f"Telegram ID: {user.id}\n"
-                f"Quotex ID: {quotex_id}"
+                f"👤 الاسم: {user.full_name}\n"
+                f"🔗 اليوزر: {username_text}\n"
+                f"🆔 Telegram ID: {user.id}\n"
+                f"💱 Quotex ID: {quotex_id}\n\n"
+                "──────────────"
             )
             try:
                 await context.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=admin_message)
@@ -496,90 +564,102 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_welcome_flow(update)
         return
 
+    # ===== Common buttons =====
     if text == "🔙 رجوع":
         if step == "choose_count":
             context.user_data["step"] = "choose_pair"
-            await update.message.reply_text("اختر الزوج 👇", reply_markup=pairs_keyboard)
+            await update.message.reply_text("💱 اختر الزوج 👇", reply_markup=pairs_keyboard)
             return
 
         if step == "choose_interval":
             context.user_data["step"] = "choose_count"
-            await update.message.reply_text("اختر عدد الصفقات 👇", reply_markup=count_keyboard)
+            await update.message.reply_text("📈 اختر عدد الصفقات 👇", reply_markup=count_keyboard)
             return
 
         reset_signal_state(context)
-        await update.message.reply_text("رجعت للقائمة الرئيسية", reply_markup=build_main_menu_for_user(user.id))
+        await update.message.reply_text(
+            "↩️ رجعت للقائمة الرئيسية",
+            reply_markup=build_main_menu_for_user(user.id)
+        )
         return
 
     if text == "⬅️ رجوع":
         reset_signal_state(context)
-        await update.message.reply_text("رجعت للقائمة الرئيسية", reply_markup=build_main_menu_for_user(user.id))
+        await update.message.reply_text(
+            "↩️ رجعت للقائمة الرئيسية",
+            reply_markup=build_main_menu_for_user(user.id)
+        )
         return
 
     if text == "📊 توليد إشارات":
         reset_signal_state(context)
         context.user_data["step"] = "choose_pair"
-        await update.message.reply_text("اختر الزوج 👇", reply_markup=pairs_keyboard)
+        await update.message.reply_text("💱 اختر الزوج 👇", reply_markup=pairs_keyboard)
         return
 
     if text == "👤 حسابي":
         username = f"@{user.username}" if user.username else "ما عنده username"
         await update.message.reply_text(
-            f"معلومات حسابك:\n"
-            f"الاسم: {user.full_name}\n"
-            f"اليوزر: {username}\n"
-            f"الآيدي: {user.id}",
+            "👤 معلومات حسابك\n\n"
+            f"• الاسم: {user.full_name}\n"
+            f"• اليوزر: {username}\n"
+            f"• الآيدي: {user.id}",
             reply_markup=build_main_menu_for_user(user.id)
         )
         return
 
     if text == "📞 تواصل مع المسؤول":
         await update.message.reply_text(
-            f"راسل المسؤول من هنا: {ADMIN_USERNAME}",
+            f"📞 راسل المسؤول من هنا:\n{ADMIN_USERNAME}",
             reply_markup=build_main_menu_for_user(user.id)
         )
         return
 
+    # ===== Admin panel =====
     if is_admin(user.id):
         if text == "🛠 لوحة الأدمن":
             reset_signal_state(context)
-            await update.message.reply_text("مرحبًا بك في لوحة الأدمن", reply_markup=admin_main_keyboard)
+            await update.message.reply_text(
+                "🛠 مرحبًا بك في لوحة الأدمن",
+                reply_markup=admin_main_keyboard
+            )
             return
 
         if text == "🟢 تشغيل البوت":
             set_bot_enabled(True)
-            await update.message.reply_text("تم تشغيل البوت للعامة ✅", reply_markup=admin_main_keyboard)
+            await update.message.reply_text("✅ تم تشغيل البوت للعامة", reply_markup=admin_main_keyboard)
             return
 
         if text == "🔴 إيقاف البوت":
             set_bot_enabled(False)
-            await update.message.reply_text("تم إيقاف البوت للعامة 🛠", reply_markup=admin_main_keyboard)
+            await update.message.reply_text("🛠 تم إيقاف البوت للعامة", reply_markup=admin_main_keyboard)
             return
 
         if text == "📥 الطلبات المعلقة":
             data = get_all_pending_users()
             if not data:
-                await update.message.reply_text("لا يوجد طلبات معلقة حاليًا.", reply_markup=admin_main_keyboard)
+                await update.message.reply_text("📭 لا يوجد طلبات معلقة حاليًا.", reply_markup=admin_main_keyboard)
                 return
 
             lines = []
             for _, item in data.items():
                 username = f"@{item.get('username')}" if item.get("username") else "بدون username"
                 lines.append(
-                    f"الاسم: {item.get('name')}\n"
-                    f"اليوزر: {username}\n"
-                    f"Telegram ID: {item.get('telegram_id')}\n"
-                    f"Quotex ID: {item.get('quotex_id')}\n"
-                    f"----------------"
+                    "📥 طلب تفعيل\n\n"
+                    f"👤 الاسم: {item.get('name')}\n"
+                    f"🔗 اليوزر: {username}\n"
+                    f"🆔 Telegram ID: {item.get('telegram_id')}\n"
+                    f"💱 Quotex ID: {item.get('quotex_id')}\n\n"
+                    "──────────────"
                 )
 
-            await update.message.reply_text("\n".join(lines), reply_markup=admin_main_keyboard)
+            await update.message.reply_text("\n\n".join(lines), reply_markup=admin_main_keyboard)
             return
 
         if text == "📋 كافة المستخدمين":
             users = get_all_users()
             if not users:
-                await update.message.reply_text("لا يوجد مستخدمون.", reply_markup=admin_main_keyboard)
+                await update.message.reply_text("📭 لا يوجد مستخدمون.", reply_markup=admin_main_keyboard)
                 return
 
             lines = []
@@ -588,9 +668,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name = data.get("name", "غير معروف")
                 username = f"@{data.get('username')}" if data.get("username") else "بدون username"
                 lines.append(
-                    f"{name} | {username}\n"
-                    f"ID: {user_id} | الحالة: {status}\n"
-                    f"----------------"
+                    f"👤 {name} | {username}\n"
+                    f"🆔 ID: {user_id}\n"
+                    f"📌 الحالة: {status}\n"
+                    "──────────────"
                 )
 
             msg = "\n".join(lines[:50])
@@ -600,7 +681,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "🟢 المستخدمون النشطون":
             active_users = get_recent_active_users()
             if not active_users:
-                await update.message.reply_text("لا يوجد مستخدمون نشطون خلال آخر 15 دقيقة.", reply_markup=admin_main_keyboard)
+                await update.message.reply_text(
+                    "🕒 لا يوجد مستخدمون نشطون خلال آخر 15 دقيقة.",
+                    reply_markup=admin_main_keyboard
+                )
                 return
 
             lines = []
@@ -608,10 +692,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name = data.get("name", "غير معروف")
                 username = f"@{data.get('username')}" if data.get("username") else "بدون username"
                 lines.append(
-                    f"{name} | {username}\n"
-                    f"ID: {user_id}\n"
-                    f"آخر نشاط: {format_dt_ar(data.get('last_seen', ''))}\n"
-                    f"----------------"
+                    f"🟢 {name} | {username}\n"
+                    f"🆔 ID: {user_id}\n"
+                    f"⏰ آخر نشاط: {format_dt_ar(data.get('last_seen', ''))}\n"
+                    "──────────────"
                 )
 
             await update.message.reply_text("\n".join(lines[:50]), reply_markup=admin_main_keyboard)
@@ -620,7 +704,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "🔍 تفاصيل مستخدم":
             context.user_data["step"] = "admin_waiting_user_id"
             await update.message.reply_text(
-                "أرسل Telegram ID الخاص بالمستخدم لعرض تفاصيله.",
+                "🔍 أرسل Telegram ID الخاص بالمستخدم لعرض تفاصيله.",
                 reply_markup=admin_main_keyboard
             )
             return
@@ -629,7 +713,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 target_id = int(text.strip())
             except ValueError:
-                await update.message.reply_text("أرسل Telegram ID صحيحًا.")
+                await update.message.reply_text("❌ أرسل Telegram ID صحيحًا.")
                 return
 
             context.user_data["admin_target_id"] = target_id
@@ -640,15 +724,18 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if step == "admin_user_actions":
             target_id = context.user_data.get("admin_target_id")
             if not target_id:
-                await update.message.reply_text("لا يوجد مستخدم محدد.", reply_markup=admin_main_keyboard)
+                await update.message.reply_text("❌ لا يوجد مستخدم محدد.", reply_markup=admin_main_keyboard)
                 context.user_data["step"] = None
                 return
 
             if text == "🗓 أسبوع":
                 set_user_expiry(target_id, "week")
-                await update.message.reply_text("تم تفعيل المستخدم لمدة أسبوع ✅", reply_markup=admin_main_keyboard)
+                await update.message.reply_text("✅ تم تفعيل المستخدم لمدة أسبوع", reply_markup=admin_main_keyboard)
                 try:
-                    await context.bot.send_message(chat_id=target_id, text="تم تفعيل حسابك لمدة أسبوع ✅")
+                    await context.bot.send_message(
+                        chat_id=target_id,
+                        text="✅ تم تفعيل حسابك بنجاح لمدة أسبوع\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
+                    )
                 except Exception:
                     pass
                 context.user_data["step"] = None
@@ -656,9 +743,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if text == "🗓 شهر":
                 set_user_expiry(target_id, "month")
-                await update.message.reply_text("تم تفعيل المستخدم لمدة شهر ✅", reply_markup=admin_main_keyboard)
+                await update.message.reply_text("✅ تم تفعيل المستخدم لمدة شهر", reply_markup=admin_main_keyboard)
                 try:
-                    await context.bot.send_message(chat_id=target_id, text="تم تفعيل حسابك لمدة شهر ✅")
+                    await context.bot.send_message(
+                        chat_id=target_id,
+                        text="✅ تم تفعيل حسابك بنجاح لمدة شهر\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
+                    )
                 except Exception:
                     pass
                 context.user_data["step"] = None
@@ -666,9 +756,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if text == "♾ دائم":
                 set_user_expiry(target_id, "forever")
-                await update.message.reply_text("تم تفعيل المستخدم بشكل دائم ✅", reply_markup=admin_main_keyboard)
+                await update.message.reply_text("✅ تم تفعيل المستخدم بشكل دائم", reply_markup=admin_main_keyboard)
                 try:
-                    await context.bot.send_message(chat_id=target_id, text="تم تفعيل حسابك بشكل دائم ✅")
+                    await context.bot.send_message(
+                        chat_id=target_id,
+                        text="✅ تم تفعيل حسابك بنجاح بشكل دائم\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
+                    )
                 except Exception:
                     pass
                 context.user_data["step"] = None
@@ -676,32 +769,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             if text == "⛔ إلغاء التفعيل":
                 block_user(target_id)
-                await update.message.reply_text("تم إلغاء تفعيل المستخدم ⛔", reply_markup=admin_main_keyboard)
+                await update.message.reply_text("⛔ تم إلغاء تفعيل المستخدم", reply_markup=admin_main_keyboard)
                 try:
-                    await context.bot.send_message(chat_id=target_id, text="تم إلغاء تفعيل حسابك ⛔")
+                    await context.bot.send_message(
+                        chat_id=target_id,
+                        text="⛔ تم إلغاء تفعيل حسابك\n\nإذا كنت ترى أن هذا بالخطأ، تواصل مع الأدمن."
+                    )
                 except Exception:
                     pass
                 context.user_data["step"] = None
                 return
 
+    # ===== Signal flow =====
     if step == "choose_pair":
         if text not in PAIRS:
-            await update.message.reply_text("اختر زوجًا من الأزرار 👇", reply_markup=pairs_keyboard)
+            await update.message.reply_text("💱 اختر زوجًا من الأزرار 👇", reply_markup=pairs_keyboard)
             return
 
         context.user_data["pair"] = text
         context.user_data["step"] = "choose_count"
-        await update.message.reply_text("اختر عدد الصفقات 👇", reply_markup=count_keyboard)
+        await update.message.reply_text("📈 اختر عدد الصفقات 👇", reply_markup=count_keyboard)
         return
 
     if step == "choose_count":
         if text not in [str(x) for x in TRADE_COUNTS]:
-            await update.message.reply_text("اختر عدد الصفقات من الأزرار 👇", reply_markup=count_keyboard)
+            await update.message.reply_text("📈 اختر عدد الصفقات من الأزرار 👇", reply_markup=count_keyboard)
             return
 
         context.user_data["count"] = int(text)
         context.user_data["step"] = "choose_interval"
-        await update.message.reply_text("اختر الفاصل الزمني 👇", reply_markup=interval_keyboard)
+        await update.message.reply_text("⏳ اختر الفاصل الزمني 👇", reply_markup=interval_keyboard)
         return
 
     if step == "choose_interval":
@@ -712,7 +809,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         }
 
         if text not in interval_map:
-            await update.message.reply_text("اختر الفاصل من الأزرار 👇", reply_markup=interval_keyboard)
+            await update.message.reply_text("⏳ اختر الفاصل من الأزرار 👇", reply_markup=interval_keyboard)
             return
 
         context.user_data["interval"] = interval_map[text]
@@ -723,21 +820,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         start_dt = now_utc()
 
         signals = generate_signals(pair, count, interval_minutes, start_dt)
-        result = "\n".join(signals)
+        message_text = build_signals_message(pair, count, interval_minutes, signals)
 
         await update.message.reply_text(
-            f"📊 الإشارات:\n\n{result}",
+            message_text,
             reply_markup=build_main_menu_for_user(user.id)
         )
 
         reset_signal_state(context)
         return
 
-    await update.message.reply_text("اختر خيارًا من القائمة.", reply_markup=build_main_menu_for_user(user.id))
+    await update.message.reply_text(
+        "📌 اختر خيارًا من القائمة.",
+        reply_markup=build_main_menu_for_user(user.id)
+    )
 
 
-import asyncio
-
+# ===== App Runner =====
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN غير موجود داخل ملف .env")
