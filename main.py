@@ -8,8 +8,20 @@ import firebase_admin
 from firebase_admin import credentials, db
 
 from dotenv import load_dotenv
-from telegram import Update, ReplyKeyboardMarkup
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram import (
+    Update,
+    ReplyKeyboardMarkup,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    ContextTypes,
+    MessageHandler,
+    CallbackQueryHandler,
+    filters,
+)
 
 load_dotenv()
 
@@ -229,6 +241,10 @@ def get_all_users():
     return users_ref().get() or {}
 
 
+def get_all_approved_users():
+    return approved_ref().get() or {}
+
+
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_TELEGRAM_ID
 
@@ -329,17 +345,32 @@ def block_user(user_id: int):
     save_user_record(user_id, {
         "status": "blocked",
     })
+    remove_pending_user(user_id)
 
 
-def get_recent_active_users(minutes: int = ONLINE_MINUTES_WINDOW):
-    users = get_all_users()
+def get_recent_active_approved_users(minutes: int = ONLINE_MINUTES_WINDOW):
+    approved_users = get_all_approved_users()
+    all_users = get_all_users()
+
     result = []
     cutoff = now_utc() - timedelta(minutes=minutes)
 
-    for user_id, data in users.items():
-        last_seen = parse_iso(data.get("last_seen", ""))
+    for user_id_str in approved_users.keys():
+        try:
+            user_id = int(user_id_str)
+        except ValueError:
+            continue
+
+        if not is_approved(user_id):
+            continue
+
+        user_data = all_users.get(user_id_str)
+        if not user_data:
+            continue
+
+        last_seen = parse_iso(user_data.get("last_seen", ""))
         if last_seen and last_seen >= cutoff:
-            result.append((user_id, data))
+            result.append((user_id_str, user_data))
 
     result.sort(key=lambda x: x[1].get("last_seen", ""), reverse=True)
     return result
@@ -419,6 +450,21 @@ def reset_signal_state(context: ContextTypes.DEFAULT_TYPE):
     context.user_data["admin_target_id"] = None
 
 
+def build_pending_request_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("🗓 أسبوع", callback_data=f"approve_week:{user_id}"),
+            InlineKeyboardButton("🗓 شهر", callback_data=f"approve_month:{user_id}"),
+        ],
+        [
+            InlineKeyboardButton("♾ دائم", callback_data=f"approve_forever:{user_id}")
+        ],
+        [
+            InlineKeyboardButton("❌ رفض", callback_data=f"reject:{user_id}")
+        ]
+    ])
+
+
 async def send_welcome_flow(update: Update):
     await update.message.reply_text(
         "👋 أهلًا بك في بوت TRADING TIME\n\n"
@@ -457,17 +503,17 @@ async def send_user_details(update: Update, target_id: int, show_admin_actions: 
         "👤 تفاصيل المستخدم\n\n"
         f"• الاسم: {data.get('name', 'غير معروف')}\n"
         f"• اليوزر: {username}\n"
-        f"• Telegram ID: {target_id}\n"
-        f"• Quotex ID: {quotex_id}\n"
+        f"• Telegram ID: <code>{target_id}</code>\n"
+        f"• Quotex ID: <code>{quotex_id}</code>\n"
         f"• الحالة: {status}\n"
         f"• آخر نشاط: {format_dt_ar(data.get('last_seen', ''))}\n"
         f"• انتهاء الصلاحية: {expires_at}"
     )
 
     if show_admin_actions:
-        await update.message.reply_text(msg, reply_markup=admin_duration_keyboard)
+        await update.message.reply_text(msg, parse_mode="HTML", reply_markup=admin_duration_keyboard)
     else:
-        await update.message.reply_text(msg)
+        await update.message.reply_text(msg, parse_mode="HTML")
 
 
 async def send_maintenance_message(update: Update):
@@ -477,6 +523,92 @@ async def send_maintenance_message(update: Update):
         "يرجى المحاولة لاحقًا.\n\n"
         "شكرًا لتفهمك 🤍"
     )
+
+
+async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    user = query.from_user
+
+    if not is_admin(user.id):
+        await query.answer("هذا الزر للأدمن فقط", show_alert=True)
+        return
+
+    data = query.data or ""
+    await query.answer()
+
+    try:
+        action, target_id_str = data.split(":")
+        target_id = int(target_id_str)
+    except Exception:
+        await query.answer("بيانات غير صالحة", show_alert=True)
+        return
+
+    user_data = get_user_record(target_id)
+    target_name = user_data.get("name", "المستخدم") if user_data else "المستخدم"
+
+    if action == "approve_week":
+        set_user_expiry(target_id, "week")
+        await query.edit_message_text(
+            f"✅ تم تفعيل {target_name} لمدة أسبوع\n"
+            f"🆔 Telegram ID: <code>{target_id}</code>",
+            parse_mode="HTML"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text="✅ تم تفعيل حسابك بنجاح لمدة أسبوع\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "approve_month":
+        set_user_expiry(target_id, "month")
+        await query.edit_message_text(
+            f"✅ تم تفعيل {target_name} لمدة شهر\n"
+            f"🆔 Telegram ID: <code>{target_id}</code>",
+            parse_mode="HTML"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text="✅ تم تفعيل حسابك بنجاح لمدة شهر\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "approve_forever":
+        set_user_expiry(target_id, "forever")
+        await query.edit_message_text(
+            f"✅ تم تفعيل {target_name} بشكل دائم\n"
+            f"🆔 Telegram ID: <code>{target_id}</code>",
+            parse_mode="HTML"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text="✅ تم تفعيل حسابك بنجاح بشكل دائم\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
+            )
+        except Exception:
+            pass
+        return
+
+    if action == "reject":
+        block_user(target_id)
+        await query.edit_message_text(
+            f"❌ تم رفض/حظر {target_name}\n"
+            f"🆔 Telegram ID: <code>{target_id}</code>",
+            parse_mode="HTML"
+        )
+        try:
+            await context.bot.send_message(
+                chat_id=target_id,
+                text="❌ تم رفض طلبك أو إيقافه\n\nإذا كنت ترى أن هذا بالخطأ، تواصل مع الأدمن."
+            )
+        except Exception:
+            pass
+        return
 
 
 # ===== Main Handlers =====
@@ -574,12 +706,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "📥 طلب تفعيل جديد\n\n"
                 f"👤 الاسم: {user.full_name}\n"
                 f"🔗 اليوزر: {username_text}\n"
-                f"🆔 Telegram ID: {user.id}\n"
-                f"💱 Quotex ID: {quotex_id}\n\n"
+                f"🆔 Telegram ID: <code>{user.id}</code>\n"
+                f"💱 Quotex ID: <code>{quotex_id}</code>\n\n"
                 "──────────────"
             )
             try:
-                await context.bot.send_message(chat_id=ADMIN_TELEGRAM_ID, text=admin_message)
+                await context.bot.send_message(
+                    chat_id=ADMIN_TELEGRAM_ID,
+                    text=admin_message,
+                    parse_mode="HTML",
+                    reply_markup=build_pending_request_keyboard(user.id)
+                )
             except Exception:
                 pass
 
@@ -628,7 +765,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "👤 معلومات حسابك\n\n"
             f"• الاسم: {user.full_name}\n"
             f"• اليوزر: {username}\n"
-            f"• الآيدي: {user.id}",
+            f"• الآيدي: <code>{user.id}</code>",
+            parse_mode="HTML",
             reply_markup=build_main_menu_for_user(user.id)
         )
         return
@@ -673,57 +811,86 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "📥 طلب تفعيل\n\n"
                     f"👤 الاسم: {item.get('name')}\n"
                     f"🔗 اليوزر: {username}\n"
-                    f"🆔 Telegram ID: {item.get('telegram_id')}\n"
-                    f"💱 Quotex ID: {item.get('quotex_id')}\n\n"
+                    f"🆔 Telegram ID: <code>{item.get('telegram_id')}</code>\n"
+                    f"💱 Quotex ID: <code>{item.get('quotex_id')}</code>\n\n"
                     "──────────────"
                 )
 
-            await update.message.reply_text("\n\n".join(lines), reply_markup=admin_main_keyboard)
+            await update.message.reply_text(
+                "\n\n".join(lines),
+                parse_mode="HTML",
+                reply_markup=admin_main_keyboard
+            )
             return
 
         if text == "📋 كافة المستخدمين":
-            users = get_all_users()
-            if not users:
-                await update.message.reply_text("📭 لا يوجد مستخدمون.", reply_markup=admin_main_keyboard)
+            approved_users = get_all_approved_users()
+            all_users = get_all_users()
+
+            approved_active_list = []
+            for user_id_str in approved_users.keys():
+                try:
+                    user_id = int(user_id_str)
+                except ValueError:
+                    continue
+
+                if not is_approved(user_id):
+                    continue
+
+                user_data = all_users.get(user_id_str)
+                if not user_data:
+                    continue
+
+                approved_active_list.append((user_id_str, user_data))
+
+            if not approved_active_list:
+                await update.message.reply_text("📭 لا يوجد مستخدمون مفعّلون حاليًا.", reply_markup=admin_main_keyboard)
                 return
 
             lines = []
-            for user_id, data in users.items():
-                status = get_user_status(int(user_id))
+            for user_id_str, data in approved_active_list:
                 name = data.get("name", "غير معروف")
                 username = f"@{data.get('username')}" if data.get("username") else "بدون username"
                 lines.append(
                     f"👤 {name} | {username}\n"
-                    f"🆔 ID: {user_id}\n"
-                    f"📌 الحالة: {status}\n"
+                    f"🆔 ID: <code>{user_id_str}</code>\n"
+                    f"📌 الحالة: approved\n"
                     "──────────────"
                 )
 
             msg = "\n".join(lines[:50])
-            await update.message.reply_text(msg, reply_markup=admin_main_keyboard)
+            await update.message.reply_text(
+                msg,
+                parse_mode="HTML",
+                reply_markup=admin_main_keyboard
+            )
             return
 
         if text == "🟢 المستخدمون النشطون":
-            active_users = get_recent_active_users()
+            active_users = get_recent_active_approved_users()
             if not active_users:
                 await update.message.reply_text(
-                    "🕒 لا يوجد مستخدمون نشطون خلال آخر 15 دقيقة.",
+                    "🕒 لا يوجد مستخدمون نشطون من المفعّلين خلال آخر 15 دقيقة.",
                     reply_markup=admin_main_keyboard
                 )
                 return
 
             lines = []
-            for user_id, data in active_users:
+            for user_id_str, data in active_users:
                 name = data.get("name", "غير معروف")
                 username = f"@{data.get('username')}" if data.get("username") else "بدون username"
                 lines.append(
                     f"🟢 {name} | {username}\n"
-                    f"🆔 ID: {user_id}\n"
+                    f"🆔 ID: <code>{user_id_str}</code>\n"
                     f"⏰ آخر نشاط: {format_dt_ar(data.get('last_seen', ''))}\n"
                     "──────────────"
                 )
 
-            await update.message.reply_text("\n".join(lines[:50]), reply_markup=admin_main_keyboard)
+            await update.message.reply_text(
+                "\n".join(lines[:50]),
+                parse_mode="HTML",
+                reply_markup=admin_main_keyboard
+            )
             return
 
         if text == "🔍 تفاصيل مستخدم":
@@ -869,6 +1036,7 @@ def main():
     app = Application.builder().token(BOT_TOKEN).build()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_admin_buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
 
     print("Bot is running...")
