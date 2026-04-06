@@ -22,6 +22,33 @@ ADMIN_TELEGRAM_ID = 1582593617
 
 DATABASE_URL = "https://telegram-bot-f0229-default-rtdb.firebaseio.com"
 
+WELCOME_MESSAGE = """
+📌 طريقة التسجيل والاشتراك في بوت TRADING TIME 👇
+
+1️⃣ إنشاء حساب جديد على منصة Quotex عبر الرابط التالي:
+🔗 Broker-qx.pro/?lid=569153
+
+2️⃣ بعد إنشاء الحساب (قبل التوثيق أو الإيداع)
+📩 أرسل ID حسابك إلى الأدمن:
+👉 @MOHAMMED_trading
+
+3️⃣ بعد المراجعة من قبل الأدمن
+✔ قم بتوثيق حسابك (البريد الإلكتروني + الهوية)
+
+4️⃣ 💰 قم بالإيداع بمبلغ لا يقل عن 50$ لبدء التداول بشكل صحيح
+
+5️⃣ بعد إتمام جميع الخطوات
+🤖 أرسل ID حسابك للبوت هنا ليتم:
+✔ فحص الحساب
+✔ تفعيلك داخل البوت
+
+━━━━━━━━━━━━━━━
+🚀 بعدها ستحصل على إشارات التداول مجانًا
+مع فريق TRADING TIME
+
+بالتوفيق للجميع 💚
+"""
+
 PAIRS = [
     "USD/BRL (OTC)",
     "USD/ARS (OTC)",
@@ -514,33 +541,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if text == "❌ لا، لست مشتركًا":
-            await update.message.reply_text(WELCOME_MESSAGE = """
-📌 طريقة التسجيل والاشتراك في بوت TRADING TIME 👇
-
-1️⃣ إنشاء حساب جديد على منصة Quotex عبر الرابط التالي:
-🔗 Broker-qx.pro/?lid=569153
-
-2️⃣ بعد إنشاء الحساب (قبل التوثيق أو الإيداع)
-📩 أرسل ID حسابك إلى الأدمن:
-👉 @MOHAMMED_trading
-
-3️⃣ بعد المراجعة من قبل الأدمن
-✔ قم بتوثيق حسابك (البريد الإلكتروني + الهوية)
-
-4️⃣ 💰 قم بالإيداع بمبلغ لا يقل عن 50$ لبدء التداول بشكل صحيح
-
-5️⃣ بعد إتمام جميع الخطوات
-🤖 أرسل ID حسابك للبوت هنا ليتم:
-✔ فحص الحساب
-✔ تفعيلك داخل البوت
-
-━━━━━━━━━━━━━━━
-🚀 بعدها ستحصل على إشارات التداول مجانًا
-مع فريق TRADING TIME
-
-بالتوفيق للجميع 💚
-"""
-            )
+            await update.message.reply_text(WELCOME_MESSAGE)
             return
 
         if step == "waiting_quotex_id":
@@ -875,7 +876,7 @@ def main():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    app.run_polling(close_loop=False)
+    app.run_polling(drop_pending_updates=True, close_loop=False)
 
 
 if __name__ == "__main__":
