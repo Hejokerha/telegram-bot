@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import asyncio
+import requests
 from datetime import datetime, timedelta, timezone
 
 import firebase_admin
@@ -27,6 +28,7 @@ load_dotenv()
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 
+UTC = timezone.utc
 UTC_PLUS_3 = timezone(timedelta(hours=3))
 
 ADMIN_USERNAME = "@coach_WAEL_trading"
@@ -61,7 +63,7 @@ WELCOME_MESSAGE = """
 بالتوفيق للجميع 💚
 """
 
-PAIRS = [
+OTC_PAIRS = [
     "USD/BRL (OTC)",
     "USD/ARS (OTC)",
     "USD/BDT (OTC)",
@@ -82,9 +84,18 @@ PAIRS = [
     "AUD/CAD (OTC)",
 ]
 
+REAL_PAIRS = [
+    "EUR/USD",
+    "GBP/USD",
+    "USD/JPY",
+    "USD/CHF",
+    "USD/CAD",
+    "AUD/USD",
+    "NZD/USD",
+]
+
 TRADE_COUNTS = [3, 5, 10, 15, 20]
 INTERVALS = [1, 3, 5]
-
 ONLINE_MINUTES_WINDOW = 15
 
 # ===== Firebase init =====
@@ -96,9 +107,10 @@ if firebase_json:
 else:
     cred = credentials.Certificate("serviceAccountKey.json")
 
-firebase_admin.initialize_app(cred, {
-    "databaseURL": DATABASE_URL
-})
+if not firebase_admin._apps:
+    firebase_admin.initialize_app(cred, {
+        "databaseURL": DATABASE_URL
+    })
 
 # ===== Keyboards =====
 main_keyboard = ReplyKeyboardMarkup(
@@ -126,7 +138,15 @@ welcome_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-pairs_keyboard = ReplyKeyboardMarkup(
+market_mode_keyboard = ReplyKeyboardMarkup(
+    [
+        ["⚡ OTC", "🌍 سوق عالمي"],
+        ["🔙 رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+otc_pairs_keyboard = ReplyKeyboardMarkup(
     [
         ["USD/BRL (OTC)", "USD/ARS (OTC)"],
         ["USD/BDT (OTC)", "USD/NGN (OTC)"],
@@ -137,6 +157,17 @@ pairs_keyboard = ReplyKeyboardMarkup(
         ["EUR/JPY (OTC)", "EUR/USD (OTC)"],
         ["CAD/CHF (OTC)", "CAD/JPY (OTC)"],
         ["AUD/CHF (OTC)", "AUD/CAD (OTC)"],
+        ["🔙 رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+real_pairs_keyboard = ReplyKeyboardMarkup(
+    [
+        ["EUR/USD", "GBP/USD"],
+        ["USD/JPY", "USD/CHF"],
+        ["USD/CAD", "AUD/USD"],
+        ["NZD/USD"],
         ["🔙 رجوع"],
     ],
     resize_keyboard=True
@@ -168,7 +199,6 @@ admin_duration_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-
 # ===== Firebase refs =====
 def users_ref():
     return db.reference("users")
@@ -188,7 +218,7 @@ def system_ref():
 
 # ===== Helpers =====
 def now_utc():
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 def now_iso():
@@ -276,7 +306,6 @@ def is_approved(user_id: int) -> bool:
     expires_at = data.get("expires_at")
     if not expires_at:
         return True
-
     if expires_at == "forever":
         return True
 
@@ -377,10 +406,10 @@ def get_recent_active_approved_users(minutes: int = ONLINE_MINUTES_WINDOW):
 
 
 def format_utc_plus_3(dt: datetime) -> str:
-    dt_plus_3 = dt.astimezone(UTC_PLUS_3)
-    return dt_plus_3.strftime("%H:%M")
+    return dt.astimezone(UTC_PLUS_3).strftime("%H:%M")
 
 
+# ===== OTC ENGINE =====
 def get_stable_direction(pair: str, dt: datetime) -> str:
     dt_plus_3 = dt.astimezone(UTC_PLUS_3)
 
@@ -414,7 +443,7 @@ def generate_signals(pair: str, count: int, interval_minutes: int, start_dt: dat
 def build_signals_message(pair: str, count: int, interval_minutes: int, signals: list[str]) -> str:
     header = (
         "╔══════════════╗\n"
-        "   📊 Quotex Signals\n"
+        "   📊 Quotex Signals - OTC\n"
         "╚══════════════╝\n\n"
         "⏰ توقيت المنصة\n"
         "UTC / GMT +3.00\n\n"
@@ -442,8 +471,287 @@ def build_signals_message(pair: str, count: int, interval_minutes: int, signals:
     return header + "\n".join(formatted_signals)
 
 
+# ===== REAL MARKET ENGINE =====
+def is_real_pair_available(pair: str, check_dt: datetime | None = None) -> bool:
+    if pair not in REAL_PAIRS:
+        return False
+
+    dt = check_dt or now_utc()
+    weekday = dt.weekday()  # Mon=0 ... Sun=6
+
+    if weekday == 5:
+        return False
+    if weekday == 6 and dt.hour < 21:
+        return False
+    if weekday == 4 and dt.hour >= 21:
+        return False
+
+    return True
+
+
+def get_session_name(check_dt: datetime | None = None) -> str:
+    dt = (check_dt or now_utc()).astimezone(UTC_PLUS_3)
+    hour = dt.hour
+
+    if 0 <= hour < 8:
+        return "الآسيوية"
+    if 8 <= hour < 16:
+        return "الأوروبية"
+    return "الأمريكية"
+
+
+def get_candles(pair: str, limit: int = 120):
+    symbol_map = {
+        "EUR/USD": "EURUSDT",
+        "GBP/USD": "GBPUSDT",
+        "USD/JPY": "JPYUSDT",
+        "USD/CHF": "CHFUSDT",
+        "USD/CAD": "CADUSDT",
+        "AUD/USD": "AUDUSDT",
+        "NZD/USD": "NZDUSDT",
+    }
+
+    symbol = symbol_map.get(pair)
+    if not symbol:
+        return None
+
+    url = "https://api.binance.com/api/v3/klines"
+
+    try:
+        res = requests.get(url, params={
+            "symbol": symbol,
+            "interval": "1m",
+            "limit": limit,
+        }, timeout=8)
+        res.raise_for_status()
+        data = res.json()
+
+        candles = []
+        for c in data:
+            candles.append({
+                "open_time": int(c[0]),
+                "open": float(c[1]),
+                "high": float(c[2]),
+                "low": float(c[3]),
+                "close": float(c[4]),
+                "close_time": int(c[6]),
+            })
+        return candles
+    except Exception:
+        return None
+
+
+def calculate_ema(candles, period: int):
+    closes = [c["close"] for c in candles]
+    ema = []
+    k = 2 / (period + 1)
+
+    for i, price in enumerate(closes):
+        if i == 0:
+            ema.append(price)
+        else:
+            ema.append(price * k + ema[i - 1] * (1 - k))
+
+    return ema
+
+
+def analyze_candle(candle: dict):
+    body = abs(candle["close"] - candle["open"])
+    full = candle["high"] - candle["low"]
+
+    if full <= 0:
+        return {
+            "doji": True,
+            "strong": False,
+            "body_ratio": 0.0,
+            "bullish": False,
+            "bearish": False,
+        }
+
+    body_ratio = body / full
+    return {
+        "doji": body_ratio < 0.18,
+        "strong": body_ratio > 0.55,
+        "body_ratio": body_ratio,
+        "bullish": candle["close"] > candle["open"],
+        "bearish": candle["close"] < candle["open"],
+    }
+
+
+def is_rejection_candle(candle: dict):
+    body = abs(candle["close"] - candle["open"])
+    upper = candle["high"] - max(candle["close"], candle["open"])
+    lower = min(candle["close"], candle["open"]) - candle["low"]
+
+    min_body = max(body, 1e-9)
+
+    if lower >= min_body * 2 and upper <= min_body * 1.2:
+        return "bullish"
+    if upper >= min_body * 2 and lower <= min_body * 1.2:
+        return "bearish"
+    return None
+
+
+def find_levels(candles, lookback: int = 30):
+    recent = candles[-lookback:]
+    highs = [c["high"] for c in recent]
+    lows = [c["low"] for c in recent]
+    return min(lows), max(highs)
+
+
+def classify_distance(price: float, level: float):
+    dist = abs(price - level)
+
+    if dist < 0.0005:
+        return "touch"
+    elif dist < 0.0015:
+        return "near"
+    elif dist < 0.003:
+        return "approaching"
+    return "far"
+
+
+def round_number(price: float):
+    return round(price * 100) / 100
+
+
+def analyze_real_market(pair: str, interval_minutes: int):
+    if not is_real_pair_available(pair):
+        return {
+            "ok": False,
+            "message": f"❌ الزوج {pair} غير متاح حاليًا\n\n⏰ السوق العالمي مغلق الآن"
+        }
+
+    candles = get_candles(pair)
+    if not candles or len(candles) < 30:
+        return {
+            "ok": False,
+            "message": "❌ فشل جلب بيانات السوق"
+        }
+
+    ema9 = calculate_ema(candles, 9)
+    ema21 = calculate_ema(candles, 21)
+
+    last = candles[-1]
+    prev = candles[-2]
+    candle = analyze_candle(last)
+    rejection = is_rejection_candle(last)
+
+    support, resistance = find_levels(candles)
+    price = last["close"]
+
+    sup_dist = classify_distance(price, support)
+    res_dist = classify_distance(price, resistance)
+
+    round_lvl = round_number(price)
+    round_dist = classify_distance(price, round_lvl)
+
+    score_call = 0
+    score_put = 0
+    notes = []
+
+    # Trend
+    if ema9[-1] > ema21[-1]:
+        score_call += 3
+        notes.append("📈 الترند العام صاعد")
+    else:
+        score_put += 3
+        notes.append("📉 الترند العام هابط")
+
+    # Momentum
+    if last["close"] > prev["close"]:
+        score_call += 2
+    else:
+        score_put += 2
+
+    # Strong candle
+    if candle["strong"]:
+        if candle["bullish"]:
+            score_call += 2
+        elif candle["bearish"]:
+            score_put += 2
+
+    # Doji filter
+    if candle["doji"]:
+        return {
+            "ok": False,
+            "message": (
+                "🌍 السوق العالمي\n\n"
+                f"💱 الزوج: {pair}\n"
+                "❌ لا توجد فرصة واضحة الآن\n\n"
+                "السبب: السوق غير واضح (دوجي)"
+            )
+        }
+
+    # Support / Resistance reactions
+    if sup_dist == "touch" and rejection == "bullish":
+        score_call += 5
+        notes.append(f"🔥 ارتداد من دعم {round(support, 5)}")
+    elif sup_dist == "approaching":
+        notes.append(f"📍 دعم قريب عند {round(support, 5)} — راقب CALL عند الملامسة")
+
+    if res_dist == "touch" and rejection == "bearish":
+        score_put += 5
+        notes.append(f"🔥 ارتداد من مقاومة {round(resistance, 5)}")
+    elif res_dist == "approaching":
+        notes.append(f"📍 مقاومة قريبة عند {round(resistance, 5)} — راقب PUT عند الملامسة")
+
+    if round_dist == "touch":
+        notes.append(f"📍 Round Number: {round_lvl}")
+
+    direction = None
+    confidence = 0
+
+    if score_call >= 7 and score_call > score_put:
+        direction = "CALL 📈"
+        confidence = min(score_call * 10, 95)
+    elif score_put >= 7 and score_put > score_call:
+        direction = "PUT 📉"
+        confidence = min(score_put * 10, 95)
+
+    entry_time = now_utc() + timedelta(minutes=interval_minutes)
+    session_name = get_session_name()
+
+    if direction:
+        return {
+            "ok": True,
+            "message": (
+                "🌍 السوق العالمي\n\n"
+                f"💱 الزوج: {pair}\n"
+                f"🕒 الجلسة: {session_name}\n"
+                f"📊 الثقة: {confidence}%\n\n"
+                f"📌 الإشارة: {direction}\n"
+                f"⏰ وقت الدخول: {format_utc_plus_3(entry_time)}\n\n"
+                + "\n".join(notes)
+            )
+        }
+
+    setup_lines = [n for n in notes if "قريب" in n or "راقب" in n]
+    if setup_lines:
+        return {
+            "ok": False,
+            "message": (
+                "🌍 السوق العالمي\n\n"
+                f"💱 الزوج: {pair}\n"
+                "❌ لا توجد صفقة مباشرة الآن\n\n"
+                "⚠️ لكن يوجد Setup قريب:\n"
+                + "\n".join(setup_lines)
+            )
+        }
+
+    return {
+        "ok": False,
+        "message": (
+            "🌍 السوق العالمي\n\n"
+            f"💱 الزوج: {pair}\n"
+            "❌ لا توجد فرصة واضحة الآن"
+        )
+    }
+
+
 def reset_signal_state(context: ContextTypes.DEFAULT_TYPE):
     context.user_data["step"] = None
+    context.user_data["mode"] = None
     context.user_data["pair"] = None
     context.user_data["count"] = None
     context.user_data["interval"] = None
@@ -730,12 +1038,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if text == "🔙 رجوع":
         if step == "choose_count":
             context.user_data["step"] = "choose_pair"
-            await update.message.reply_text("💱 اختر الزوج 👇", reply_markup=pairs_keyboard)
+            await update.message.reply_text("💱 اختر الزوج 👇", reply_markup=otc_pairs_keyboard)
             return
 
-        if step == "choose_interval":
+        if step == "choose_interval" and context.user_data.get("mode") == "otc":
             context.user_data["step"] = "choose_count"
             await update.message.reply_text("📈 اختر عدد الصفقات 👇", reply_markup=count_keyboard)
+            return
+
+        if step in {"choose_market_mode", "choose_real_pair", "choose_interval_real", "choose_pair"}:
+            reset_signal_state(context)
+            await update.message.reply_text(
+                "↩️ رجعت للقائمة الرئيسية",
+                reply_markup=build_main_menu_for_user(user.id)
+            )
             return
 
         reset_signal_state(context)
@@ -755,8 +1071,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == "📊 توليد إشارات":
         reset_signal_state(context)
-        context.user_data["step"] = "choose_pair"
-        await update.message.reply_text("💱 اختر الزوج 👇", reply_markup=pairs_keyboard)
+        context.user_data["step"] = "choose_market_mode"
+        await update.message.reply_text("📊 اختر نوع السوق 👇", reply_markup=market_mode_keyboard)
         return
 
     if text == "👤 حسابي":
@@ -972,10 +1288,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["step"] = None
                 return
 
-    # ===== Signal flow =====
-    if step == "choose_pair":
-        if text not in PAIRS:
-            await update.message.reply_text("💱 اختر زوجًا من الأزرار 👇", reply_markup=pairs_keyboard)
+    # ===== Market mode flow =====
+    if step == "choose_market_mode":
+        if text == "⚡ OTC":
+            context.user_data["mode"] = "otc"
+            context.user_data["step"] = "choose_pair"
+            await update.message.reply_text("💱 اختر زوج OTC 👇", reply_markup=otc_pairs_keyboard)
+            return
+
+        if text == "🌍 سوق عالمي":
+            context.user_data["mode"] = "real"
+            context.user_data["step"] = "choose_real_pair"
+            await update.message.reply_text("🌍 اختر الزوج العالمي 👇", reply_markup=real_pairs_keyboard)
+            return
+
+        await update.message.reply_text("📌 اختر نوع السوق من الأزرار 👇", reply_markup=market_mode_keyboard)
+        return
+
+    # ===== OTC flow =====
+    if step == "choose_pair" and context.user_data.get("mode") == "otc":
+        if text not in OTC_PAIRS:
+            await update.message.reply_text("💱 اختر زوجًا من الأزرار 👇", reply_markup=otc_pairs_keyboard)
             return
 
         context.user_data["pair"] = text
@@ -983,7 +1316,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📈 اختر عدد الصفقات 👇", reply_markup=count_keyboard)
         return
 
-    if step == "choose_count":
+    if step == "choose_count" and context.user_data.get("mode") == "otc":
         if text not in [str(x) for x in TRADE_COUNTS]:
             await update.message.reply_text("📈 اختر عدد الصفقات من الأزرار 👇", reply_markup=count_keyboard)
             return
@@ -993,7 +1326,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⏳ اختر الفاصل الزمني 👇", reply_markup=interval_keyboard)
         return
 
-    if step == "choose_interval":
+    if step == "choose_interval" and context.user_data.get("mode") == "otc":
         interval_map = {
             "1 دقيقة": 1,
             "3 دقائق": 3,
@@ -1016,6 +1349,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             message_text,
+            reply_markup=build_main_menu_for_user(user.id)
+        )
+
+        reset_signal_state(context)
+        return
+
+    # ===== Real market flow =====
+    if step == "choose_real_pair":
+        if text not in REAL_PAIRS:
+            await update.message.reply_text("🌍 اختر زوجًا من الأزرار 👇", reply_markup=real_pairs_keyboard)
+            return
+
+        context.user_data["pair"] = text
+        context.user_data["step"] = "choose_interval_real"
+        await update.message.reply_text("⏳ اختر الفاصل الزمني 👇", reply_markup=interval_keyboard)
+        return
+
+    if step == "choose_interval_real":
+        interval_map = {
+            "1 دقيقة": 1,
+            "3 دقائق": 3,
+            "5 دقائق": 5,
+        }
+
+        if text not in interval_map:
+            await update.message.reply_text("⏳ اختر الفاصل من الأزرار 👇", reply_markup=interval_keyboard)
+            return
+
+        pair = context.user_data["pair"]
+        interval_minutes = interval_map[text]
+        result = analyze_real_market(pair, interval_minutes)
+
+        await update.message.reply_text(
+            result["message"],
             reply_markup=build_main_menu_for_user(user.id)
         )
 
