@@ -500,7 +500,7 @@ def get_session_name(check_dt: datetime | None = None) -> str:
     return "الأمريكية"
 
 
-def get_candles(pair: str, limit: int = 120):
+def get_candles(pair: str, limit=100):
     symbol_map = {
         "EUR/USD": "EURUSDT",
         "GBP/USD": "GBPUSDT",
@@ -513,32 +513,47 @@ def get_candles(pair: str, limit: int = 120):
 
     symbol = symbol_map.get(pair)
     if not symbol:
-        return None
+        return None, f"الزوج {pair} غير مربوط برمز API"
 
     url = "https://api.binance.com/api/v3/klines"
 
     try:
-        res = requests.get(url, params={
-            "symbol": symbol,
-            "interval": "1m",
-            "limit": limit,
-        }, timeout=8)
-        res.raise_for_status()
+        res = requests.get(
+            url,
+            params={
+                "symbol": symbol,
+                "interval": "1m",
+                "limit": limit,
+            },
+            timeout=8,
+        )
+
+        if res.status_code != 200:
+            return None, f"API status={res.status_code}"
+
         data = res.json()
+
+        # لو Binance رجعت خطأ بدل قائمة
+        if not isinstance(data, list):
+            msg = data.get("msg", "رد غير متوقع من API") if isinstance(data, dict) else "رد غير متوقع من API"
+            return None, msg
+
+        if len(data) == 0:
+            return None, "لم يتم إرجاع أي شموع"
 
         candles = []
         for c in data:
             candles.append({
-                "open_time": int(c[0]),
                 "open": float(c[1]),
                 "high": float(c[2]),
                 "low": float(c[3]),
                 "close": float(c[4]),
-                "close_time": int(c[6]),
             })
-        return candles
-    except Exception:
-        return None
+
+        return candles, None
+
+    except Exception as e:
+        return None, str(e)
 
 
 def calculate_ema(candles, period: int):
@@ -616,17 +631,19 @@ def round_number(price: float):
 
 
 def analyze_real_market(pair: str, interval_minutes: int):
+
     if not is_real_pair_available(pair):
         return {
             "ok": False,
-            "message": f"❌ الزوج {pair} غير متاح حاليًا\n\n⏰ السوق العالمي مغلق الآن"
+            "message": f"❌ الزوج {pair} غير متاح الآن\n⏰ السوق مغلق"
         }
 
-    candles = get_candles(pair)
+    candles, error_msg = get_candles(pair)
+
     if not candles or len(candles) < 30:
         return {
             "ok": False,
-            "message": "❌ فشل جلب بيانات السوق"
+            "message": f"❌ فشل جلب بيانات السوق\n\nالسبب: {error_msg}"
         }
 
     ema9 = calculate_ema(candles, 9)
