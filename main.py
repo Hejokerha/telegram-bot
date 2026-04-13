@@ -1659,7 +1659,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== OTC flow =====
    if step == "choose_count" and context.user_data.get("mode") == "otc":
-    if text not in [str(x) for x in TRADE_COUNTS]:
+   if text not in [str(x) for x in TRADE_COUNTS]:
         await update.message.reply_text(
             "📈 اختر عدد الصفقات من الأزرار 👇",
             reply_markup=count_keyboard
