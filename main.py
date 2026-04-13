@@ -1674,26 +1674,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         context.user_data["count"] = int(text)
-        context.user_data["step"] = "choose_interval"
-        await update.message.reply_text("⏳ اختر الفاصل الزمني / نوع الفرصة 👇", reply_markup=real_interval_keyboard)
-        return
 
-    if step == "choose_interval" and context.user_data.get("mode") == "otc":
-        interval_map = {
-            "1 دقيقة": 1,
-            "3 دقائق": 3,
-            "5 دقائق": 5,
-        }
-
-        if text not in interval_map:
-            await update.message.reply_text("⏳ اختر الفاصل من الأزرار 👇", reply_markup=interval_keyboard)
-            return
-
-        context.user_data["interval"] = interval_map[text]
+        # تم تثبيت الفاصل بين الصفقات على 3 دقائق في OTC حسب الطلب.
+        interval_minutes = 3
 
         pair = context.user_data["pair"]
         count = context.user_data["count"]
-        interval_minutes = context.user_data["interval"]
         start_dt = now_utc()
 
         signals = generate_signals(pair, count, interval_minutes, start_dt)
