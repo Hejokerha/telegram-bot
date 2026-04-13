@@ -1535,7 +1535,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("💱 اختر زوج OTC 👇", reply_markup=otc_pairs_keyboard)
             return
 
-        if text == "🌍 سوق عالمي":
+        if "سوق عالمي" in text:
             context.user_data["mode"] = "real"
             context.user_data["step"] = "choose_real_pair"
             await update.message.reply_text("🌍 اختر الزوج العالمي 👇", reply_markup=real_pairs_keyboard)
