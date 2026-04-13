@@ -1658,45 +1658,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ===== OTC flow =====
-    if step == "choose_pair" and context.user_data.get("mode") == "otc":
-        if text not in OTC_PAIRS:
-            await update.message.reply_text("💱 اختر زوجًا من الأزرار 👇", reply_markup=otc_pairs_keyboard)
-            return
-
-        context.user_data["pair"] = text
-        context.user_data["step"] = "choose_count"
-        await update.message.reply_text("📈 اختر عدد الصفقات 👇", reply_markup=count_keyboard)
+   if step == "choose_count" and context.user_data.get("mode") == "otc":
+    if text not in [str(x) for x in TRADE_COUNTS]:
+        await update.message.reply_text(
+            "📈 اختر عدد الصفقات من الأزرار 👇",
+            reply_markup=count_keyboard
+        )
         return
 
-    if step == "choose_count" and context.user_data.get("mode") == "otc":
-        if text not in [str(x) for x in TRADE_COUNTS]:
-            await update.message.reply_text("📈 اختر عدد الصفقات من الأزرار 👇", reply_markup=count_keyboard)
-            return
+    context.user_data["count"] = int(text)
 
-        context.user_data["count"] = int(text)
-        # خلي الفاصل ثابت 3 دقائق بدون سؤال المستخدم
-interval_minutes = 3
+    # خلي الفاصل ثابت 3 دقائق بدون سؤال المستخدم
+    interval_minutes = 3
 
-pair = context.user_data["pair"]
-count = context.user_data["count"]
-start_dt = now_utc()
+    pair = context.user_data["pair"]
+    count = context.user_data["count"]
+    start_dt = now_utc()
 
-signals = generate_signals(pair, count, interval_minutes, start_dt)
-message_text = build_signals_message(pair, count, interval_minutes, signals)
+    signals = generate_signals(pair, count, interval_minutes, start_dt)
+    message_text = build_signals_message(pair, count, interval_minutes, signals)
 
-await update.message.reply_text(
-    message_text,
-    reply_markup=build_main_menu_for_user(user.id)
-)
+    await update.message.reply_text(
+        message_text,
+        reply_markup=build_main_menu_for_user(user.id)
+    )
 
-reset_signal_state(context)
-return
-
-
-
-
-
-
+    reset_signal_state(context)
+    return
     # ===== Real market flow =====
     if step == "choose_real_pair":
         if text not in REAL_PAIRS:
