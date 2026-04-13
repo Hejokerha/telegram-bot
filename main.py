@@ -1674,38 +1674,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         context.user_data["count"] = int(text)
-        context.user_data["step"] = "choose_interval"
-        await update.message.reply_text("⏳ اختر الفاصل الزمني / نوع الفرصة 👇", reply_markup=real_interval_keyboard)
-        return
+        # خلي الفاصل ثابت 3 دقائق بدون سؤال المستخدم
+interval_minutes = 3
 
-    if step == "choose_interval" and context.user_data.get("mode") == "otc":
-        interval_map = {
-            "1 دقيقة": 1,
-            "3 دقائق": 3,
-            "5 دقائق": 5,
-        }
+pair = context.user_data["pair"]
+count = context.user_data["count"]
+start_dt = now_utc()
 
-        if text not in interval_map:
-            await update.message.reply_text("⏳ اختر الفاصل من الأزرار 👇", reply_markup=interval_keyboard)
-            return
+signals = generate_signals(pair, count, interval_minutes, start_dt)
+message_text = build_signals_message(pair, count, interval_minutes, signals)
 
-        context.user_data["interval"] = interval_map[text]
+await update.message.reply_text(
+    message_text,
+    reply_markup=build_main_menu_for_user(user.id)
+)
 
-        pair = context.user_data["pair"]
-        count = context.user_data["count"]
-        interval_minutes = context.user_data["interval"]
-        start_dt = now_utc()
+reset_signal_state(context)
+return
 
-        signals = generate_signals(pair, count, interval_minutes, start_dt)
-        message_text = build_signals_message(pair, count, interval_minutes, signals)
-
-        await update.message.reply_text(
-            message_text,
-            reply_markup=build_main_menu_for_user(user.id)
-        )
-
-        reset_signal_state(context)
-        return
 
     # ===== Real market flow =====
     if step == "choose_real_pair":
