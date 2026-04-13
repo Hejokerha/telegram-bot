@@ -119,6 +119,7 @@ PAIR_CONTEXT = {
 
 TRADE_COUNTS = [3, 5, 10, 15, 20]
 INTERVALS = [1, 3, 5]
+REAL_INTERVALS = [1, 5, 10]
 ONLINE_MINUTES_WINDOW = 15
 
 # ===== Firebase init =====
@@ -208,6 +209,15 @@ count_keyboard = ReplyKeyboardMarkup(
 interval_keyboard = ReplyKeyboardMarkup(
     [
         [f"{INTERVALS[0]} دقيقة", f"{INTERVALS[1]} دقائق", f"{INTERVALS[2]} دقائق"],
+        ["🔙 رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+real_interval_keyboard = ReplyKeyboardMarkup(
+    [
+        ["1 دقيقة", "5 دقائق"],
+        ["10 دقائق", "🔥 أفضل فرصة"],
         ["🔙 رجوع"],
     ],
     resize_keyboard=True
@@ -539,20 +549,62 @@ def get_pair_context(pair: str) -> dict:
     return PAIR_CONTEXT.get(pair, {"round_step": 0.0010, "near_factor": 0.18, "touch_factor": 0.07})
 
 
-def get_candles(pair: str, limit=180):
+def aggregate_candles(candles, timeframe_minutes: int):
+    if timeframe_minutes <= 1:
+        return candles
+
+    aggregated = []
+    bucket = []
+    bucket_start = None
+
+    for candle in candles:
+        candle_time = candle["time"]
+        floored_minute = candle_time.minute - (candle_time.minute % timeframe_minutes)
+        current_bucket_start = candle_time.replace(minute=floored_minute, second=0, microsecond=0)
+
+        if bucket_start is None:
+            bucket_start = current_bucket_start
+
+        if current_bucket_start != bucket_start:
+            if bucket:
+                aggregated.append({
+                    "time": bucket_start,
+                    "open": bucket[0]["open"],
+                    "high": max(x["high"] for x in bucket),
+                    "low": min(x["low"] for x in bucket),
+                    "close": bucket[-1]["close"],
+                })
+            bucket = []
+            bucket_start = current_bucket_start
+
+        bucket.append(candle)
+
+    if bucket:
+        aggregated.append({
+            "time": bucket_start,
+            "open": bucket[0]["open"],
+            "high": max(x["high"] for x in bucket),
+            "low": min(x["low"] for x in bucket),
+            "close": bucket[-1]["close"],
+        })
+
+    return aggregated
+
+
+def get_candles(pair: str, timeframe_minutes: int = 1, limit: int = 180):
     symbol = REAL_PAIR_TO_YAHOO_SYMBOL.get(pair)
     if not symbol:
         return None, f"الزوج {pair} غير مربوط برمز بيانات"
 
-    # استخدمنا Yahoo Finance بدل الربط الخاطئ السابق مع رموز كريبتو على Binance.
-    # هذا تصحيح مباشر لنفس الملف بدون إعادة بناء النظام من الصفر.
+    # نجلب 1m دائمًا ثم نعيد تجميعها إلى 5m/10m.
+    # السبب: حتى خيار الفاصل في السوق العالمي يصبح فريم تحليل حقيقي، وليس مجرد وقت دخول شكلي.
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
     try:
         res = requests.get(
             url,
             params={
-                "range": "2d",
+                "range": "5d",
                 "interval": "1m",
                 "includePrePost": "false",
                 "events": "div,splits",
@@ -582,11 +634,11 @@ def get_candles(pair: str, limit=180):
         lows = quote.get("low") or []
         closes = quote.get("close") or []
 
-        candles = []
+        candles_1m = []
         for ts, o, h, l, c in zip(timestamps, opens, highs, lows, closes):
             if None in (ts, o, h, l, c):
                 continue
-            candles.append({
+            candles_1m.append({
                 "time": datetime.fromtimestamp(ts, tz=UTC),
                 "open": float(o),
                 "high": float(h),
@@ -594,8 +646,12 @@ def get_candles(pair: str, limit=180):
                 "close": float(c),
             })
 
-        if len(candles) < 30:
-            return None, "عدد الشموع غير كافٍ"
+        if len(candles_1m) < 60:
+            return None, "عدد شموع 1m غير كافٍ"
+
+        candles = aggregate_candles(candles_1m, timeframe_minutes)
+        if len(candles) < 35:
+            return None, f"عدد الشموع غير كافٍ بعد تجميع فريم {timeframe_minutes}m"
 
         return candles[-limit:], None
 
@@ -793,17 +849,21 @@ def build_nearby_setup_lines(pair: str, price: float, atr: float, support: float
     return uniq
 
 
-def analyze_real_market(pair: str, interval_minutes: int):
+def analyze_real_market(pair: str, timeframe_minutes: int):
     if not is_real_pair_available(pair):
         return {
             "ok": False,
+            "quality": 0,
+            "timeframe": timeframe_minutes,
             "message": f"❌ الزوج {pair} غير متاح الآن\n⏰ السوق مغلق"
         }
 
-    candles, error_msg = get_candles(pair)
-    if not candles or len(candles) < 60:
+    candles, error_msg = get_candles(pair, timeframe_minutes=timeframe_minutes, limit=220)
+    if not candles or len(candles) < 35:
         return {
             "ok": False,
+            "quality": 0,
+            "timeframe": timeframe_minutes,
             "message": f"❌ فشل جلب بيانات السوق\n\nالسبب: {error_msg}"
         }
 
@@ -811,7 +871,7 @@ def analyze_real_market(pair: str, interval_minutes: int):
     ema21 = calculate_ema(candles, 21)
     atr = calculate_atr(candles, 14)
 
-    # نستخدم آخر شمعة مغلقة وليس الشمعة الحالية المفتوحة حتى لا تتغير الإشارة كل ثانية.
+    # دائمًا نقرأ آخر شمعة مغلقة بعد تجميع الفريم المطلوب، وليس الشمعة الجارية.
     last_closed = candles[-2]
     prev_closed = candles[-3]
 
@@ -848,41 +908,40 @@ def analyze_real_market(pair: str, interval_minutes: int):
         trend_bias = "bearish"
         notes.append("📉 الترند العام هابط (EMA 9 تحت EMA 21)")
 
-    # Momentum on closed candles
+    # Momentum: نعطيه وزنًا أعلى لأنه مهم في الصفقات السريعة.
     if last_closed["close"] > prev_closed["close"]:
-        score_call += 2
+        score_call += 3
         notes.append("⚡ الزخم الأخير لصالح الصعود")
     elif last_closed["close"] < prev_closed["close"]:
-        score_put += 2
+        score_put += 3
         notes.append("⚡ الزخم الأخير لصالح الهبوط")
 
     # Strong candle / candle quality
     if candle["strong"]:
         if candle["bullish"]:
-            score_call += 2
+            score_call += 3
             notes.append("🟢 آخر شمعة مغلقة قوية صاعدة")
         elif candle["bearish"]:
-            score_put += 2
+            score_put += 3
             notes.append("🔴 آخر شمعة مغلقة قوية هابطة")
 
-    # Doji filter
+    # إذا كانت الشمعة الحالية دوجي لا نلغي الصفقة مباشرة، بل نخفض الجودة فقط.
+    # السبب: الإلغاء الكامل جعل البوت يرفض السوق كثيرًا حتى في حالات الزخم الواضح.
     if candle["doji"]:
-        nearby_lines = build_nearby_setup_lines(pair, price, atr, support, resistance, trend_bias)
-        return {
-            "ok": False,
-            "message": (
-                "🌍 السوق العالمي\n\n"
-                f"💱 الزوج: {pair}\n"
-                "❌ لا توجد فرصة مباشرة الآن\n\n"
-                "السبب: آخر شمعة مغلقة دوجي / حياد واضح\n\n"
-                + ("⚠️ فرص قريبة للمراقبة:\n" + "\n".join(nearby_lines) if nearby_lines else "راقب حتى تتكوّن شمعة تأكيد واضحة")
-            )
-        }
+        warnings.append("⚠️ آخر شمعة مغلقة قريبة من الدوجي — يلزم تأكيد إضافي")
+        score_call -= 1
+        score_put -= 1
+
+    if prev_candle["strong"]:
+        if prev_candle["bullish"] and trend_bias == "bullish":
+            score_call += 1
+        elif prev_candle["bearish"] and trend_bias == "bearish":
+            score_put += 1
 
     # Rejection + support/resistance
     if support is not None:
         if sup_state == "touch" and rejection == "bullish":
-            score_call += 5
+            score_call += 4
             notes.append(f"🔥 ارتداد واضح من دعم {format_price(pair, support)}")
         elif sup_state == "near" and candle["bullish"]:
             score_call += 2
@@ -892,7 +951,7 @@ def analyze_real_market(pair: str, interval_minutes: int):
 
     if resistance is not None:
         if res_state == "touch" and rejection == "bearish":
-            score_put += 5
+            score_put += 4
             notes.append(f"🔥 ارتداد واضح من مقاومة {format_price(pair, resistance)}")
         elif res_state == "near" and candle["bearish"]:
             score_put += 2
@@ -913,45 +972,76 @@ def analyze_real_market(pair: str, interval_minutes: int):
     elif round_state == "near":
         warnings.append(f"🔢 Round Number قريب عند {format_price(pair, nearest_round)}")
 
-    # فلترة التناقض: إذا ظهرت شمعة رفض عكس الاتجاه لكن الترند قوي جدًا، خفف النتيجة ولا تعطِ دخولًا متسرعًا
-    if rejection == "bearish" and trend_bias == "bullish":
-        score_put += 1
-        warnings.append("⚠️ يوجد رفض هابط لكن الترند ما زال صاعدًا")
-    if rejection == "bullish" and trend_bias == "bearish":
+    if rejection == "bullish":
         score_call += 1
-        warnings.append("⚠️ يوجد رفض صاعد لكن الترند ما زال هابطًا")
+    elif rejection == "bearish":
+        score_put += 1
+
+    # فلترة التناقض بدون قتل الإشارة بالكامل
+    if rejection == "bearish" and trend_bias == "bullish":
+        score_call -= 1
+        warnings.append("⚠️ يوجد رفض هابط مقابل الترند الصاعد")
+    if rejection == "bullish" and trend_bias == "bearish":
+        score_put -= 1
+        warnings.append("⚠️ يوجد رفض صاعد مقابل الترند الهابط")
+
+    score_call = max(score_call, 0)
+    score_put = max(score_put, 0)
 
     confidence = 0
     direction = None
+    best_score = max(score_call, score_put)
+    score_gap = abs(score_call - score_put)
 
-    if score_call >= 8 and score_call >= score_put + 2:
+    # القوة هنا تعني توافق عدة إشارات جيدة، وليس مجرد تقليل الصفقات لأي ثمن.
+    if score_call >= 7 and score_call >= score_put + 2:
         direction = "CALL 📈"
-        confidence = min(55 + score_call * 4, 95)
-    elif score_put >= 8 and score_put >= score_call + 2:
+        confidence = min(58 + score_call * 4 + min(score_gap, 3) * 3, 95)
+    elif score_put >= 7 and score_put >= score_call + 2:
         direction = "PUT 📉"
-        confidence = min(55 + score_put * 4, 95)
+        confidence = min(58 + score_put * 4 + min(score_gap, 3) * 3, 95)
+    elif best_score >= 6 and score_gap >= 3:
+        if score_call > score_put:
+            direction = "CALL 📈"
+            confidence = min(54 + score_call * 4, 88)
+        else:
+            direction = "PUT 📉"
+            confidence = min(54 + score_put * 4, 88)
 
-    entry_time = now_utc() + timedelta(minutes=interval_minutes)
+    entry_time = now_utc() + timedelta(minutes=timeframe_minutes)
     session_name = get_session_name()
 
-    # التنبيه المبكر للفرص القريبة
     nearby_lines = build_nearby_setup_lines(pair, price, atr, support, resistance, trend_bias)
     for line in warnings:
         if line not in nearby_lines:
             nearby_lines.append(line)
 
+    quality = max(best_score * 10 + min(score_gap, 3) * 5, 0)
+    if direction:
+        quality += 15
+
+    header = (
+        "🌍 السوق العالمي\n\n"
+        f"💱 الزوج: {pair}\n"
+        f"🕒 الجلسة: {session_name}\n"
+        f"🧭 الفريم: {timeframe_minutes}M\n"
+    )
+
     if direction:
         return {
             "ok": True,
+            "quality": quality,
+            "timeframe": timeframe_minutes,
+            "direction": direction,
+            "confidence": confidence,
             "message": (
-                "🌍 السوق العالمي\n\n"
-                f"💱 الزوج: {pair}\n"
-                f"🕒 الجلسة: {session_name}\n"
-                f"📊 الثقة: {confidence}%\n\n"
-                f"📌 الإشارة: {direction}\n"
-                f"⏰ وقت الدخول: {format_utc_plus_3(entry_time)}\n"
-                f"💵 السعر الحالي: {format_price(pair, price)}\n\n"
-                + "\n".join(notes)
+                header
+                + f"📊 الثقة: {confidence}%\n\n"
+                + f"📌 الإشارة: {direction}\n"
+                + f"⏰ وقت الدخول: {format_utc_plus_3(entry_time)}\n"
+                + f"💵 السعر الحالي: {format_price(pair, price)}\n"
+                + f"⏳ مدة الصفقة المقترحة: {timeframe_minutes}M\n\n"
+                + "\n".join(notes[:6])
                 + (
                     "\n\n⚠️ تنبيهات إضافية:\n" + "\n".join(nearby_lines[:3])
                     if nearby_lines else ""
@@ -962,24 +1052,47 @@ def analyze_real_market(pair: str, interval_minutes: int):
     if nearby_lines:
         return {
             "ok": False,
+            "quality": quality,
+            "timeframe": timeframe_minutes,
             "message": (
-                "🌍 السوق العالمي\n\n"
-                f"💱 الزوج: {pair}\n"
-                "❌ لا توجد صفقة مباشرة الآن\n\n"
-                "⚠️ لكن توجد فرص قريبة للمراقبة:\n"
+                header
+                + "❌ لا توجد صفقة مباشرة الآن\n\n"
+                + "⚠️ لكن توجد فرص قريبة للمراقبة:\n"
                 + "\n".join(nearby_lines[:4])
             )
         }
 
+    reason = "السبب: شروط الدخول غير مكتملة بعد"
+    if candle["doji"]:
+        reason = "السبب: آخر شمعة مغلقة حيادية وتحتاج تأكيد"
+
     return {
         "ok": False,
+        "quality": quality,
+        "timeframe": timeframe_minutes,
         "message": (
-            "🌍 السوق العالمي\n\n"
-            f"💱 الزوج: {pair}\n"
-            "❌ لا توجد فرصة واضحة الآن\n\n"
-            "السبب: شروط الدخول غير مكتملة بعد"
+            header
+            + "❌ لا توجد فرصة واضحة الآن\n\n"
+            + reason
         )
     }
+
+
+def analyze_real_market_best(pair: str):
+    results = [analyze_real_market(pair, tf) for tf in REAL_INTERVALS]
+    successful = [r for r in results if r.get("ok")]
+
+    if successful:
+        best = max(successful, key=lambda x: (x.get("quality", 0), x.get("confidence", 0)))
+        best["message"] += "\n\n🔥 تم اختيار هذه الصفقة لأنها الأقوى بين 1M / 5M / 10M"
+        return best
+
+    best_watch = max(results, key=lambda x: x.get("quality", 0))
+    frames_summary = "\n".join(
+        [f"• {r.get('timeframe')}M: {'جاهزة' if r.get('ok') else 'لا'}" for r in results]
+    )
+    best_watch["message"] += "\n\n📋 ملخص الفريمات المفحوصة:\n" + frames_summary
+    return best_watch
 
 
 def reset_signal_state(context: ContextTypes.DEFAULT_TYPE):
@@ -1535,7 +1648,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("💱 اختر زوج OTC 👇", reply_markup=otc_pairs_keyboard)
             return
 
-        if "سوق عالمي" in text:
+        if text == "🌍 سوق عالمي":
             context.user_data["mode"] = "real"
             context.user_data["step"] = "choose_real_pair"
             await update.message.reply_text("🌍 اختر الزوج العالمي 👇", reply_markup=real_pairs_keyboard)
@@ -1562,7 +1675,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data["count"] = int(text)
         context.user_data["step"] = "choose_interval"
-        await update.message.reply_text("⏳ اختر الفاصل الزمني 👇", reply_markup=interval_keyboard)
+        await update.message.reply_text("⏳ اختر الفاصل الزمني / نوع الفرصة 👇", reply_markup=real_interval_keyboard)
         return
 
     if step == "choose_interval" and context.user_data.get("mode") == "otc":
@@ -1602,23 +1715,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data["pair"] = text
         context.user_data["step"] = "choose_interval_real"
-        await update.message.reply_text("⏳ اختر الفاصل الزمني 👇", reply_markup=interval_keyboard)
+        await update.message.reply_text("⏳ اختر الفريم أو دع البوت يحدد أفضل فرصة 👇", reply_markup=real_interval_keyboard)
         return
 
     if step == "choose_interval_real":
         interval_map = {
             "1 دقيقة": 1,
-            "3 دقائق": 3,
             "5 دقائق": 5,
+            "10 دقائق": 10,
         }
 
-        if text not in interval_map:
-            await update.message.reply_text("⏳ اختر الفاصل من الأزرار 👇", reply_markup=interval_keyboard)
+        if text not in interval_map and text != "🔥 أفضل فرصة":
+            await update.message.reply_text("⏳ اختر الفريم من الأزرار 👇", reply_markup=real_interval_keyboard)
             return
 
         pair = context.user_data["pair"]
-        interval_minutes = interval_map[text]
-        result = analyze_real_market(pair, interval_minutes)
+
+        if text == "🔥 أفضل فرصة":
+            result = analyze_real_market_best(pair)
+        else:
+            interval_minutes = interval_map[text]
+            result = analyze_real_market(pair, interval_minutes)
 
         await update.message.reply_text(
             result["message"],
