@@ -1693,6 +1693,10 @@ reset_signal_state(context)
 return
 
 
+
+
+
+
     # ===== Real market flow =====
     if step == "choose_real_pair":
         if text not in REAL_PAIRS:
