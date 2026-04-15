@@ -1,4 +1,3 @@
-python-telegram-bot==22.0
+python-telegram-bot[job-queue]==22.0
 python-dotenv==1.0.1
-python-telegram-bot[job-queue]
 firebase-admin==6.5.0

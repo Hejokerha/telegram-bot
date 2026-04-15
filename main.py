@@ -3,7 +3,7 @@ import json
 import hashlib
 import asyncio
 import requests
-import datetime
+from datetime import time
 from datetime import datetime, timedelta, timezone
 from statistics import median
 
@@ -1775,13 +1775,13 @@ def main():
    # 🕛 12 الظهر
     job_queue.run_daily(
         publish_otc_list,
-        time=datetime.time(hour=12, minute=0, tzinfo=UTC_PLUS_3)
+        time=time(hour=12, minute=0, tzinfo=UTC_PLUS_3)
 )
 
    # 🕕 6 المسا
     job_queue.run_daily(
         publish_otc_list,
-        time=datetime.time(hour=18, minute=0, tzinfo=UTC_PLUS_3)
+        time=time(hour=18, minute=0, tzinfo=UTC_PLUS_3)
 )
 
     app.add_handler(CommandHandler("start", start))
