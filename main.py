@@ -1771,8 +1771,6 @@ def main():
 
     job_queue = app.job_queue
 
-    job_queue.run_once(publish_otc_list, when=10)
-
 
    # 🕛 12 الظهر
     job_queue.run_daily(
