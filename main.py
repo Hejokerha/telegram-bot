@@ -1767,11 +1767,10 @@ def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN غير موجود داخل ملف .env")
 
-    app = Application.builder().token(BOT_TOKEN).build()
+    app = Application.builder().token(BOT_TOKEN).job_queue(True).build()
 
     job_queue = app.job_queue
 
-    job_queue.run_once(publish_otc_list, when=10)
 
    # 🕛 12 الظهر
     job_queue.run_daily(
