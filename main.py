@@ -3,6 +3,7 @@ import json
 import hashlib
 import asyncio
 import requests
+import datetime
 from datetime import datetime, timedelta, timezone
 from statistics import median
 
@@ -32,6 +33,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 UTC = timezone.utc
 UTC_PLUS_3 = timezone(timedelta(hours=3))
 
+CHANNEL_ID = "@quotexsignals_tt"
 ADMIN_USERNAME = "@coach_WAEL_trading"
 ADMIN_TELEGRAM_ID = 1582593617
 
@@ -459,6 +461,29 @@ def get_stable_direction(pair: str, dt: datetime) -> str:
     value = int(digest[:8], 16)
 
     return "CALL 📈" if value % 2 == 0 else "PUT 📉"
+
+
+async def publish_otc_list(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        pair = "USD/BRL (OTC)"
+        count = 20
+        interval_minutes = 3
+        start_dt = now_utc()
+
+        signals = generate_signals(pair, count, interval_minutes, start_dt)
+
+        message_text = build_signals_message(pair, count, interval_minutes, signals)
+
+        # حذف سطر الفاصل من الرسالة
+        message_text = message_text.replace(f"⏳ الفاصل: {interval_minutes} دقيقة\n\n", "")
+
+        await context.bot.send_message(
+            chat_id=CHANNEL_ID,
+            text=message_text
+        )
+
+    except Exception as e:
+        print("Publish OTC Error:", e)
 
 
 def generate_signals(pair: str, count: int, interval_minutes: int, start_dt: datetime):
@@ -1743,6 +1768,22 @@ def main():
         raise ValueError("BOT_TOKEN غير موجود داخل ملف .env")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    job_queue = app.job_queue
+
+    job_queue.run_once(publish_otc_list, when=10)
+
+   # 🕛 12 الظهر
+    job_queue.run_daily(
+        publish_otc_list,
+        time=datetime.time(hour=12, minute=0, tzinfo=UTC_PLUS_3)
+)
+
+   # 🕕 6 المسا
+    job_queue.run_daily(
+        publish_otc_list,
+        time=datetime.time(hour=18, minute=0, tzinfo=UTC_PLUS_3)
+)
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_admin_buttons))
