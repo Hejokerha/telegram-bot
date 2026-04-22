@@ -507,42 +507,36 @@ def generate_signals(pair: str, count: int, interval_minutes: int, start_dt: dat
 
 
 def build_signals_message(pair: str, count: int, interval_minutes: int, signals: list[str]) -> str:
+    
     header = (
         "╔══════════════╗\n"
         "   📊 Quotex Signals - OTC\n"
         "╚══════════════╝\n\n"
+
         "⏰ توقيت المنصة\n"
         "UTC / GMT +3.00\n\n"
-        f"💱 الزوج: {pair}\n"
-        f"📈 عدد الصفقات: {count}\n"
-        f"⏳ الفاصل: {interval_minutes} دقيقة\n\n"
+
         "⚠️ ملاحظات مهمة:\n"
         "• مدة كل صفقة: 1M\n"
         "• تجنب صفقة عكس مومنتم\n"
         "• تجنب دخول الصفقة بعد شمعة دوجي\n"
         "• تجنب صفقة عكس تريند قوي\n"
         "• استخدم مضاعفة واحدة عند الخسارة\n\n"
-        "📍 الإشارات:\n"
+
+        "📍 الإشارات:\n\n"
     )
 
     formatted_signals = []
-    for index, signal in enumerate(signals, start=1):
+
+    for signal in signals:
+        # signal شكله: "USD/BRL-OTC — 21:06 — CALL"
         parts = signal.split(" — ")
+
         if len(parts) == 3:
-            _, signal_time, direction = parts
-
-            direction_clean = direction.replace("📈", "").replace("📉", "").strip()
-
-            if "CALL" in direction_clean:
-                direction_fixed = "CALL "
-            elif "PUT" in direction_clean:
-                direction_fixed = "PUT  "
-            else:
-                direction_fixed = direction_clean.ljust(5)
-
-            formatted_signals.append(f"{index:02d}) {signal_time} | {direction_fixed} |")
+            pair_name, signal_time, direction = parts
+            formatted_signals.append(f"M1 {pair_name} {signal_time} {direction}")
         else:
-            formatted_signals.append(f"{index:02d}) {signal}")
+            formatted_signals.append(signal)
 
     return header + "\n".join(formatted_signals)
 
