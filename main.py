@@ -1032,17 +1032,17 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
 
     # القوة هنا تعني توافق عدة إشارات جيدة، وليس مجرد تقليل الصفقات لأي ثمن.
     if score_call >= 7 and score_call >= score_put + 2:
-        direction = "CALL 📈"
+        direction = "CALL"
         confidence = min(58 + score_call * 4 + min(score_gap, 3) * 3, 95)
     elif score_put >= 7 and score_put >= score_call + 2:
-        direction = "PUT 📉"
+        direction = "PUT"
         confidence = min(58 + score_put * 4 + min(score_gap, 3) * 3, 95)
     elif best_score >= 6 and score_gap >= 3:
         if score_call > score_put:
-            direction = "CALL 📈"
+            direction = "CALL"
             confidence = min(54 + score_call * 4, 88)
         else:
-            direction = "PUT 📉"
+            direction = "PUT"
             confidence = min(54 + score_put * 4, 88)
 
     entry_time = now_utc() + timedelta(minutes=timeframe_minutes)
