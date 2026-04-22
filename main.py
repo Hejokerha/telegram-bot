@@ -544,7 +544,7 @@ def build_signals_message(pair: str, count: int, interval_minutes: int, signals:
         else:
             formatted_signals.append(f"{index:02d}) {signal}")
 
-    return header + "```\n" + "\n".join(formatted_signals) + "\n```"
+    return header + "\n".join(formatted_signals)
 
 
 # ===== REAL MARKET ENGINE =====
