@@ -444,6 +444,12 @@ def format_utc_plus_3(dt: datetime) -> str:
     return dt.astimezone(UTC_PLUS_3).strftime("%H:%M")
 
 
+def next_full_minute(dt: datetime) -> datetime:
+    dt = dt.astimezone(UTC_PLUS_3)
+    dt = dt.replace(second=0, microsecond=0)
+    return (dt + timedelta(minutes=1)).astimezone(UTC)
+
+
 # ===== OTC ENGINE =====
 def get_stable_direction(pair: str, dt: datetime) -> str:
     dt_plus_3 = dt.astimezone(UTC_PLUS_3)
@@ -468,18 +474,20 @@ async def publish_otc_list(context: ContextTypes.DEFAULT_TYPE):
         pair = "USD/BRL (OTC)"
         count = 20
         interval_minutes = 3
-        start_dt = now_utc()
+
+        # في النشر التلقائي نبدأ من أول دقيقة كاملة قادمة لتجنب البدء من منتصف الدقيقة.
+        start_dt = next_full_minute(now_utc())
 
         signals = generate_signals(pair, count, interval_minutes, start_dt)
-
         message_text = build_signals_message(pair, count, interval_minutes, signals)
 
-        # حذف سطر الفاصل من الرسالة
+        # حذف سطر الفاصل من الرسالة في القناة فقط حسب الطلب.
         message_text = message_text.replace(f"⏳ الفاصل: {interval_minutes} دقيقة\n\n", "")
 
         await context.bot.send_message(
             chat_id=CHANNEL_ID,
-            text=message_text
+            text=message_text,
+            parse_mode="Markdown"
         )
 
     except Exception as e:
@@ -522,11 +530,21 @@ def build_signals_message(pair: str, count: int, interval_minutes: int, signals:
         parts = signal.split(" — ")
         if len(parts) == 3:
             _, signal_time, direction = parts
-            formatted_signals.append(f"{index}) {signal_time} → {direction}")
-        else:
-            formatted_signals.append(f"{index}) {signal}")
 
-    return header + "\n".join(formatted_signals)
+            direction_clean = direction.replace("📈", "").replace("📉", "").strip()
+
+            if "CALL" in direction_clean:
+                direction_fixed = "CALL "
+            elif "PUT" in direction_clean:
+                direction_fixed = "PUT  "
+            else:
+                direction_fixed = direction_clean.ljust(5)
+
+            formatted_signals.append(f"{index:02d}) {signal_time} | {direction_fixed} |")
+        else:
+            formatted_signals.append(f"{index:02d}) {signal}")
+
+    return header + "```\n" + "\n".join(formatted_signals) + "\n```"
 
 
 # ===== REAL MARKET ENGINE =====
@@ -1325,6 +1343,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.message or not update.message.text:
+        return
+
     user = update.effective_user
     text = update.message.text
     step = context.user_data.get("step")
@@ -1705,14 +1726,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         pair = context.user_data["pair"]
         count = context.user_data["count"]
-        start_dt = now_utc()
+
+        # أول صفقة تبدأ من الدقيقة القادمة وليس من اللحظة الحالية.
+        start_dt = next_full_minute(now_utc())
 
         signals = generate_signals(pair, count, interval_minutes, start_dt)
         message_text = build_signals_message(pair, count, interval_minutes, signals)
 
         await update.message.reply_text(
             message_text,
-            reply_markup=build_main_menu_for_user(user.id)
+            reply_markup=build_main_menu_for_user(user.id),
+            parse_mode="Markdown"
         )
 
         reset_signal_state(context)
@@ -1771,18 +1795,12 @@ def main():
 
     job_queue = app.job_queue
 
-
-   # 🕛 12 الظهر
-    job_queue.run_daily(
-        publish_otc_list,
-        time=time(hour=12, minute=0, tzinfo=UTC_PLUS_3)
-)
-
-   # 🕕 6 المسا
-    job_queue.run_daily(
-        publish_otc_list,
-        time=time(hour=18, minute=0, tzinfo=UTC_PLUS_3)
-)
+    # نشر تلقائي كل 6 ساعات بتوقيت سوريا: 00:00 - 06:00 - 12:00 - 18:00
+    for hour in (0, 6, 12, 18):
+        job_queue.run_daily(
+            publish_otc_list,
+            time=time(hour=hour, minute=0, tzinfo=UTC_PLUS_3)
+        )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_admin_buttons))
