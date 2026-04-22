@@ -466,7 +466,7 @@ def get_stable_direction(pair: str, dt: datetime) -> str:
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
     value = int(digest[:8], 16)
 
-    return "CALL 📈" if value % 2 == 0 else "PUT 📉"
+    return "CALL" if value % 2 == 0 else "PUT"
 
 
 async def publish_otc_list(context: ContextTypes.DEFAULT_TYPE):
