@@ -878,20 +878,24 @@ def build_nearby_setup_lines(pair: str, price: float, atr: float, support: float
     support_state, _ = classify_distance(price, support, atr, pair)
     resistance_state, _ = classify_distance(price, resistance, atr, pair)
 
-    if support is not None and support_state in {"near", "approaching"} and trend_bias != "bearish":
-        lines.append(f"📍 دعم قريب عند {format_price(pair, support)} — انتظر تأكيد ارتداد ثم CALL")
+    if support is not None and support_state in {"touch", "near", "approaching"}:
+        if support_state == "touch":
+            lines.append(f"📍 السعر يلامس دعم {format_price(pair, support)} — لا تبيع مباشرة، راقب ارتداد CALL أو كسرًا واضحًا ثم PUT")
+        else:
+            lines.append(f"📍 دعم قريب عند {format_price(pair, support)} — راقب CALL عند ظهور رفض سعري أو PUT فقط بعد كسر واضح")
 
-    if resistance is not None and resistance_state in {"near", "approaching"} and trend_bias != "bullish":
-        lines.append(f"📍 مقاومة قريبة عند {format_price(pair, resistance)} — انتظر رفض سعري ثم PUT")
+    if resistance is not None and resistance_state in {"touch", "near", "approaching"}:
+        if resistance_state == "touch":
+            lines.append(f"📍 السعر يلامس مقاومة {format_price(pair, resistance)} — لا تشتري مباشرة، راقب رفضًا هابطًا ثم PUT أو كسرًا واضحًا ثم CALL")
+        else:
+            lines.append(f"📍 مقاومة قريبة عند {format_price(pair, resistance)} — راقب PUT عند ظهور رفض سعري أو CALL فقط بعد كسر واضح")
 
     for lvl in get_round_levels(price, pair):
         state, _ = classify_distance(price, lvl, atr, pair)
         if state in {"touch", "near"}:
-            direction_hint = "CALL" if lvl <= price and trend_bias != "bearish" else "PUT"
-            lines.append(f"🔢 Round Number قريب عند {format_price(pair, lvl)} — راقب {direction_hint}")
+            lines.append(f"🔢 Round Number قريب عند {format_price(pair, lvl)} — انتظر رد فعل واضح قبل الدخول")
             break
 
-    # إزالة التكرار لو اجتمع نفس المستوى أكثر من مرة
     uniq = []
     for line in lines:
         if line not in uniq:
@@ -921,7 +925,6 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
     ema21 = calculate_ema(candles, 21)
     atr = calculate_atr(candles, 14)
 
-    # دائمًا نقرأ آخر شمعة مغلقة بعد تجميع الفريم المطلوب، وليس الشمعة الجارية.
     last_closed = candles[-2]
     prev_closed = candles[-3]
 
@@ -948,7 +951,6 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
 
     trend_bias = "neutral"
 
-    # Trend
     if ema9[-2] > ema21[-2]:
         score_call += 3
         trend_bias = "bullish"
@@ -958,7 +960,6 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
         trend_bias = "bearish"
         notes.append("📉 الترند العام هابط (EMA 9 تحت EMA 21)")
 
-    # Momentum: نعطيه وزنًا أعلى لأنه مهم في الصفقات السريعة.
     if last_closed["close"] > prev_closed["close"]:
         score_call += 3
         notes.append("⚡ الزخم الأخير لصالح الصعود")
@@ -966,7 +967,6 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
         score_put += 3
         notes.append("⚡ الزخم الأخير لصالح الهبوط")
 
-    # Strong candle / candle quality
     if candle["strong"]:
         if candle["bullish"]:
             score_call += 3
@@ -975,8 +975,6 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
             score_put += 3
             notes.append("🔴 آخر شمعة مغلقة قوية هابطة")
 
-    # إذا كانت الشمعة الحالية دوجي لا نلغي الصفقة مباشرة، بل نخفض الجودة فقط.
-    # السبب: الإلغاء الكامل جعل البوت يرفض السوق كثيرًا حتى في حالات الزخم الواضح.
     if candle["doji"]:
         warnings.append("⚠️ آخر شمعة مغلقة قريبة من الدوجي — يلزم تأكيد إضافي")
         score_call -= 1
@@ -988,7 +986,6 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
         elif prev_candle["bearish"] and trend_bias == "bearish":
             score_put += 1
 
-    # Rejection + support/resistance
     if support is not None:
         if sup_state == "touch" and rejection == "bullish":
             score_call += 4
@@ -996,7 +993,7 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
         elif sup_state == "near" and candle["bullish"]:
             score_call += 2
             notes.append(f"📍 السعر قريب من دعم {format_price(pair, support)}")
-        elif sup_state in {"approaching", "near"}:
+        elif sup_state in {"approaching", "near", "touch"}:
             warnings.append(f"📍 دعم قريب عند {format_price(pair, support)} — راقب CALL عند ظهور رفض سعري")
 
     if resistance is not None:
@@ -1006,10 +1003,9 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
         elif res_state == "near" and candle["bearish"]:
             score_put += 2
             notes.append(f"📍 السعر قريب من مقاومة {format_price(pair, resistance)}")
-        elif res_state in {"approaching", "near"}:
+        elif res_state in {"approaching", "near", "touch"}:
             warnings.append(f"📍 مقاومة قريبة عند {format_price(pair, resistance)} — راقب PUT عند ظهور رفض سعري")
 
-    # Round number logic
     if round_state == "touch":
         if candle["bullish"] and trend_bias != "bearish":
             score_call += 2
@@ -1027,7 +1023,6 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
     elif rejection == "bearish":
         score_put += 1
 
-    # فلترة التناقض بدون قتل الإشارة بالكامل
     if rejection == "bearish" and trend_bias == "bullish":
         score_call -= 1
         warnings.append("⚠️ يوجد رفض هابط مقابل الترند الصاعد")
@@ -1043,7 +1038,6 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
     best_score = max(score_call, score_put)
     score_gap = abs(score_call - score_put)
 
-    # القوة هنا تعني توافق عدة إشارات جيدة، وليس مجرد تقليل الصفقات لأي ثمن.
     if score_call >= 7 and score_call >= score_put + 2:
         direction = "CALL"
         confidence = min(58 + score_call * 4 + min(score_gap, 3) * 3, 95)
@@ -1058,8 +1052,6 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
             direction = "PUT"
             confidence = min(54 + score_put * 4, 88)
 
-    # وقت الدخول الاحترافي = بداية الشمعة القادمة للفريم المختار، وليس الآن + مدة الفريم.
-    # مثال: 19:47 على فريم 10M → 19:50 / 20:00 حسب أقرب حد زمني.
     entry_time = next_timeframe_boundary(now_utc(), timeframe_minutes)
     session_name = get_session_name()
 
@@ -1078,6 +1070,49 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
         f"🕒 الجلسة: {session_name}\n"
         f"🧭 الفريم: {timeframe_minutes}M\n"
     )
+
+    zone_block_reason = None
+    zone_plan_lines = []
+
+    if direction == "PUT" and support is not None and sup_state in {"touch", "near"}:
+        zone_block_reason = f"السعر قريب جدًا من دعم {format_price(pair, support)}"
+        zone_plan_lines = [
+            f"• إذا كسر الدعم بإغلاق واضح → خذ PUT",
+            f"• إذا ظهر رفض صاعد من الدعم → خذ CALL",
+        ]
+        if resistance is not None and res_state in {"near", "approaching"}:
+            zone_plan_lines.append(f"• المقاومة الأقرب عند {format_price(pair, resistance)}")
+        quality = max(quality - 10, 0)
+
+    elif direction == "CALL" and resistance is not None and res_state in {"touch", "near"}:
+        zone_block_reason = f"السعر قريب جدًا من مقاومة {format_price(pair, resistance)}"
+        zone_plan_lines = [
+            f"• إذا كسر المقاومة بإغلاق واضح → خذ CALL",
+            f"• إذا ظهر رفض هابط من المقاومة → خذ PUT",
+        ]
+        if support is not None and sup_state in {"near", "approaching"}:
+            zone_plan_lines.append(f"• الدعم الأقرب عند {format_price(pair, support)}")
+        quality = max(quality - 10, 0)
+
+    if zone_block_reason:
+        return {
+            "ok": False,
+            "quality": quality,
+            "timeframe": timeframe_minutes,
+            "message": (
+                header
+                + "⚠️ فرصة مشروطة — لا تدخل مباشرة الآن\n\n"
+                + f"السبب: {zone_block_reason}\n"
+                + f"💵 السعر الحالي: {format_price(pair, price)}\n"
+                + f"⏰ وقت المراقبة: {format_utc_plus_3(entry_time)}\n\n"
+                + "📋 الخطة المقترحة:\n"
+                + "\n".join(zone_plan_lines)
+                + (
+                    "\n\n📌 ملاحظات التحليل:\n" + "\n".join(notes[:4])
+                    if notes else ""
+                )
+            )
+        }
 
     if direction:
         return {
