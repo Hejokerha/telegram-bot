@@ -450,6 +450,19 @@ def next_full_minute(dt: datetime) -> datetime:
     return (dt + timedelta(minutes=1)).astimezone(UTC)
 
 
+def next_timeframe_boundary(dt: datetime, timeframe_minutes: int) -> datetime:
+    """يرجع بداية الشمعة القادمة للفريم المطلوب بدل now + timeframe.
+    مثال: لو الآن 19:47 والفريم 10M → يرجع 19:50 أو 20:00 حسب تجاوز الحد.
+    نعتمد UTC+3 لأن العرض للمستخدم وكل التوقيتات في البوت مبنية عليه.
+    """
+    dt_local = dt.astimezone(UTC_PLUS_3).replace(second=0, microsecond=0)
+    floored_minute = dt_local.minute - (dt_local.minute % timeframe_minutes)
+    current_boundary = dt_local.replace(minute=floored_minute)
+    if current_boundary <= dt_local:
+        current_boundary += timedelta(minutes=timeframe_minutes)
+    return current_boundary.astimezone(UTC)
+
+
 # ===== OTC ENGINE =====
 def get_stable_direction(pair: str, dt: datetime) -> str:
     dt_plus_3 = dt.astimezone(UTC_PLUS_3)
@@ -1045,7 +1058,9 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
             direction = "PUT"
             confidence = min(54 + score_put * 4, 88)
 
-    entry_time = now_utc() + timedelta(minutes=timeframe_minutes)
+    # وقت الدخول الاحترافي = بداية الشمعة القادمة للفريم المختار، وليس الآن + مدة الفريم.
+    # مثال: 19:47 على فريم 10M → 19:50 / 20:00 حسب أقرب حد زمني.
+    entry_time = next_timeframe_boundary(now_utc(), timeframe_minutes)
     session_name = get_session_name()
 
     nearby_lines = build_nearby_setup_lines(pair, price, atr, support, resistance, trend_bias)
