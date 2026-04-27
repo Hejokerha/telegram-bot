@@ -208,6 +208,17 @@ count_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# اختيار فريم OTC اليدوي فقط:
+# M1 = مدة الصفقة دقيقة، M15 = مدة الصفقة 15 ثانية.
+# الفاصل بين كل صفقة والتي بعدها في الليستة اليدوية ثابت 1 دقيقة حسب الطلب.
+otc_timeframe_keyboard = ReplyKeyboardMarkup(
+    [
+        ["1 دقيقة", "15 ثانية"],
+        ["🔙 رجوع"],
+    ],
+    resize_keyboard=True
+)
+
 interval_keyboard = ReplyKeyboardMarkup(
     [
         [f"{INTERVALS[0]} دقيقة", f"{INTERVALS[1]} دقائق", f"{INTERVALS[2]} دقائق"],
@@ -450,6 +461,19 @@ def next_full_minute(dt: datetime) -> datetime:
     return (dt + timedelta(minutes=1)).astimezone(UTC)
 
 
+def next_15_seconds_boundary(dt: datetime) -> datetime:
+    """يرجع أقرب حد 15 ثانية قادم لتوقيت الدخول في فريم M15.
+    مثال: 12:00:07 → 12:00:15، و 12:00:45 → 12:01:00.
+    """
+    dt_local = dt.astimezone(UTC_PLUS_3).replace(microsecond=0)
+    next_second = ((dt_local.second // 15) + 1) * 15
+    if next_second >= 60:
+        dt_local = dt_local.replace(second=0) + timedelta(minutes=1)
+    else:
+        dt_local = dt_local.replace(second=next_second)
+    return dt_local.astimezone(UTC)
+
+
 def next_timeframe_boundary(dt: datetime, timeframe_minutes: int) -> datetime:
     """يرجع بداية الشمعة القادمة للفريم المطلوب بدل now + timeframe.
     مثال: لو الآن 19:47 والفريم 10M → يرجع 19:50 أو 20:00 حسب تجاوز الحد.
@@ -474,6 +498,29 @@ def get_stable_direction(pair: str, dt: datetime) -> str:
         f"{dt_plus_3.day:02d}|"
         f"H{dt_plus_3.hour:02d}|"
         f"M{dt_plus_3.minute:02d}"
+    )
+
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+    value = int(digest[:8], 16)
+
+    return "CALL" if value % 2 == 0 else "PUT"
+
+
+def get_stable_direction_15s(pair: str, dt: datetime) -> str:
+    """نفس منطق OTC الحالي لكن مخصص لفريم 15 ثانية.
+    أضفنا بلوك الثواني حتى لا يكون M15 نسخة مطابقة تمامًا من M1.
+    """
+    dt_plus_3 = dt.astimezone(UTC_PLUS_3)
+    second_block = dt_plus_3.second // 15
+
+    key = (
+        f"{pair}|"
+        f"{dt_plus_3.year}-"
+        f"{dt_plus_3.month:02d}-"
+        f"{dt_plus_3.day:02d}|"
+        f"H{dt_plus_3.hour:02d}|"
+        f"M{dt_plus_3.minute:02d}|"
+        f"S15B{second_block}"
     )
 
     digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
@@ -519,7 +566,23 @@ def generate_signals(pair: str, count: int, interval_minutes: int, start_dt: dat
     return signals
 
 
-def build_signals_message(pair: str, count: int, interval_minutes: int, signals: list[str]) -> str:
+def generate_otc_15s_signals(pair: str, count: int, start_dt: datetime):
+    """توليد إشارات OTC لفريم 15 ثانية.
+    مهم: الفاصل بين كل صفقة والتي بعدها ثابت 1 دقيقة حسب الطلب،
+    لكن مدة الصفقة نفسها تظهر M15.
+    """
+    signals = []
+
+    for i in range(count):
+        entry_time = start_dt + timedelta(minutes=i)
+        direction = get_stable_direction_15s(pair, entry_time)
+        formatted_time = entry_time.astimezone(UTC_PLUS_3).strftime("%H:%M:%S")
+        signals.append(f"{pair} — {formatted_time} — {direction}")
+
+    return signals
+
+
+def build_signals_message(pair: str, count: int, interval_minutes: int, signals: list[str], timeframe_label: str = "M1") -> str:
     
     header = (
         "╔══════════════╗\n"
@@ -547,7 +610,7 @@ def build_signals_message(pair: str, count: int, interval_minutes: int, signals:
 
         if len(parts) == 3:
             pair_name, signal_time, direction = parts
-            formatted_signals.append(f"M1 {pair_name} {signal_time} {direction}")
+            formatted_signals.append(f"{timeframe_label} {pair_name} {signal_time} {direction}")
         else:
             formatted_signals.append(signal)
 
@@ -1625,6 +1688,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("💱 اختر الزوج 👇", reply_markup=otc_pairs_keyboard)
             return
 
+        if step == "choose_timeframe" and context.user_data.get("mode") == "otc":
+            context.user_data["step"] = "choose_count"
+            await update.message.reply_text("📈 اختر عدد الصفقات 👇", reply_markup=count_keyboard)
+            return
+
         if step == "choose_interval" and context.user_data.get("mode") == "otc":
             context.user_data["step"] = "choose_count"
             await update.message.reply_text("📈 اختر عدد الصفقات 👇", reply_markup=count_keyboard)
@@ -1912,18 +1980,36 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         context.user_data["count"] = int(text)
+        context.user_data["step"] = "choose_timeframe"
 
-        # تم تثبيت الفاصل بين الصفقات على 3 دقائق في OTC حسب الطلب.
-        interval_minutes = 3
+        await update.message.reply_text(
+            "⏱ اختر الفريم 👇",
+            reply_markup=otc_timeframe_keyboard
+        )
+        return
 
+    if step == "choose_timeframe" and context.user_data.get("mode") == "otc":
         pair = context.user_data["pair"]
         count = context.user_data["count"]
 
-        # أول صفقة تبدأ من الدقيقة القادمة وليس من اللحظة الحالية.
-        start_dt = next_full_minute(now_utc())
+        # في التوليد اليدوي للـ OTC صار الفاصل بين الصفقة والتي بعدها 1 دقيقة.
+        # M1: مدة الصفقة 1 دقيقة.
+        # M15: مدة الصفقة 15 ثانية، لكن توقيت الصفقات في الليستة يبقى كل 1 دقيقة.
+        if text == "1 دقيقة":
+            interval_minutes = 1
+            start_dt = next_full_minute(now_utc())
+            signals = generate_signals(pair, count, interval_minutes, start_dt)
+            message_text = build_signals_message(pair, count, interval_minutes, signals, timeframe_label="M1")
 
-        signals = generate_signals(pair, count, interval_minutes, start_dt)
-        message_text = build_signals_message(pair, count, interval_minutes, signals)
+        elif text == "15 ثانية":
+            interval_minutes = 1
+            start_dt = next_15_seconds_boundary(now_utc())
+            signals = generate_otc_15s_signals(pair, count, start_dt)
+            message_text = build_signals_message(pair, count, interval_minutes, signals, timeframe_label="M15")
+
+        else:
+            await update.message.reply_text("⏱ اختر الفريم من الأزرار 👇", reply_markup=otc_timeframe_keyboard)
+            return
 
         await update.message.reply_text(
             message_text,
