@@ -903,19 +903,132 @@ def build_nearby_setup_lines(pair: str, price: float, atr: float, support: float
     return uniq
 
 
+def detect_market_structure(candles, lookback: int = 18) -> str:
+    """تصنيف بسيط لبنية السوق: صاعد / هابط / رينج.
+    السبب: الاعتماد على EMA والزخم فقط كان يعطي صفقات عند مناطق سيئة.
+    """
+    recent = candles[-lookback:] if len(candles) >= lookback else candles
+    if len(recent) < 6:
+        return "range"
+
+    half = len(recent) // 2
+    first_high = max(c["high"] for c in recent[:half])
+    first_low = min(c["low"] for c in recent[:half])
+    last_high = max(c["high"] for c in recent[half:])
+    last_low = min(c["low"] for c in recent[half:])
+
+    if last_high > first_high and last_low > first_low:
+        return "uptrend"
+    if last_high < first_high and last_low < first_low:
+        return "downtrend"
+    return "range"
+
+
+def candle_body_ratio(candle: dict) -> float:
+    full = candle["high"] - candle["low"]
+    if full <= 0:
+        return 0.0
+    return abs(candle["close"] - candle["open"]) / full
+
+
+def is_strong_breakout(candle: dict, level: float | None, direction: str, atr: float = 0.0) -> bool:
+    """كسر حقيقي: إغلاق خارج المستوى + جسم شمعة واضح."""
+    if level is None:
+        return False
+
+    full = candle["high"] - candle["low"]
+    body = abs(candle["close"] - candle["open"])
+    if full <= 0:
+        return False
+
+    body_ok = body / full >= 0.48
+    buffer = max(atr * 0.03, 1e-9)
+
+    if direction == "down":
+        return candle["close"] < (level - buffer) and body_ok and candle["close"] < candle["open"]
+    if direction == "up":
+        return candle["close"] > (level + buffer) and body_ok and candle["close"] > candle["open"]
+    return False
+
+
+def is_strong_rejection_from_level(candle: dict, level: float | None, side: str, atr: float = 0.0):
+    """رفض سعري من مستوى دعم/مقاومة."""
+    if level is None:
+        return None
+
+    full = candle["high"] - candle["low"]
+    if full <= 0:
+        return None
+
+    body = max(abs(candle["close"] - candle["open"]), 1e-9)
+    upper = candle["high"] - max(candle["close"], candle["open"])
+    lower = min(candle["close"], candle["open"]) - candle["low"]
+    buffer = max(atr * 0.08, full * 0.08, 1e-9)
+
+    if side == "support":
+        touched = candle["low"] <= level + buffer
+        closed_above = candle["close"] > level
+        if touched and closed_above and lower >= body * 1.6:
+            return "bullish"
+
+    if side == "resistance":
+        touched = candle["high"] >= level - buffer
+        closed_below = candle["close"] < level
+        if touched and closed_below and upper >= body * 1.6:
+            return "bearish"
+
+    return None
+
+
+def is_exhausted_move(candles, direction: str, atr: float) -> bool:
+    """يمنع الدخول المتأخر بعد حركة مستهلكة قرب مستوى."""
+    if len(candles) < 5 or atr <= 0:
+        return False
+
+    recent = candles[-4:-1]
+    if direction == "down":
+        bearish_count = sum(1 for c in recent if c["close"] < c["open"])
+        move_size = recent[0]["open"] - recent[-1]["close"]
+        return bearish_count >= 3 and move_size >= atr * 1.15
+
+    if direction == "up":
+        bullish_count = sum(1 for c in recent if c["close"] > c["open"])
+        move_size = recent[-1]["close"] - recent[0]["open"]
+        return bullish_count >= 3 and move_size >= atr * 1.15
+
+    return False
+
+
+def build_conditional_message(header: str, reason: str, price_text: str, watch_time: str, plan_lines: list[str], notes: list[str] | None = None):
+    msg = (
+        header
+        + "⚠️ فرصة مشروطة — لا تدخل مباشرة الآن\n\n"
+        + f"السبب: {reason}\n"
+        + f"💵 السعر الحالي: {price_text}\n"
+        + f"⏰ وقت المراقبة: {watch_time}\n\n"
+        + "📋 الخطة المقترحة:\n"
+        + "\n".join(plan_lines)
+    )
+    if notes:
+        msg += "\n\n📌 ملاحظات التحليل:\n" + "\n".join(notes[:5])
+    return msg
+
+
 def analyze_real_market(pair: str, timeframe_minutes: int):
     if not is_real_pair_available(pair):
         return {
             "ok": False,
+            "setup_type": "closed",
             "quality": 0,
             "timeframe": timeframe_minutes,
             "message": f"❌ الزوج {pair} غير متاح الآن\n⏰ السوق مغلق"
         }
 
     candles, error_msg = get_candles(pair, timeframe_minutes=timeframe_minutes, limit=220)
-    if not candles or len(candles) < 35:
+    if not candles or len(candles) < 40:
         return {
             "ok": False,
+            "setup_type": "error",
             "quality": 0,
             "timeframe": timeframe_minutes,
             "message": f"❌ فشل جلب بيانات السوق\n\nالسبب: {error_msg}"
@@ -929,8 +1042,7 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
     prev_closed = candles[-3]
 
     candle = analyze_candle(last_closed)
-    prev_candle = analyze_candle(prev_closed)
-    rejection = is_rejection_candle(last_closed)
+    structure = detect_market_structure(candles)
 
     supports, resistances = find_levels(candles[:-1], atr)
     price = last_closed["close"]
@@ -944,6 +1056,11 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
     nearest_round = min(get_round_levels(price, pair), key=lambda lvl: abs(lvl - price))
     round_state, _ = classify_distance(price, nearest_round, atr, pair)
 
+    reject_support = is_strong_rejection_from_level(last_closed, support, "support", atr)
+    reject_resistance = is_strong_rejection_from_level(last_closed, resistance, "resistance", atr)
+    break_support = is_strong_breakout(last_closed, support, "down", atr)
+    break_resistance = is_strong_breakout(last_closed, resistance, "up", atr)
+
     score_call = 0
     score_put = 0
     notes = []
@@ -951,28 +1068,41 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
 
     trend_bias = "neutral"
 
+    # 1) الاتجاه العام EMA
     if ema9[-2] > ema21[-2]:
-        score_call += 3
+        score_call += 2
         trend_bias = "bullish"
         notes.append("📈 الترند العام صاعد (EMA 9 فوق EMA 21)")
     elif ema9[-2] < ema21[-2]:
-        score_put += 3
+        score_put += 2
         trend_bias = "bearish"
         notes.append("📉 الترند العام هابط (EMA 9 تحت EMA 21)")
 
-    if last_closed["close"] > prev_closed["close"]:
+    # 2) بنية السوق Market Structure
+    if structure == "uptrend":
         score_call += 3
+        notes.append("🏗 بنية السوق صاعدة (قمم وقيعان أعلى)")
+    elif structure == "downtrend":
+        score_put += 3
+        notes.append("🏗 بنية السوق هابطة (قمم وقيعان أدنى)")
+    else:
+        warnings.append("⚠️ بنية السوق متذبذبة — لا نعتمد على الترند وحده")
+
+    # 3) الزخم آخر شمعة
+    if last_closed["close"] > prev_closed["close"]:
+        score_call += 2
         notes.append("⚡ الزخم الأخير لصالح الصعود")
     elif last_closed["close"] < prev_closed["close"]:
-        score_put += 3
+        score_put += 2
         notes.append("⚡ الزخم الأخير لصالح الهبوط")
 
+    # 4) جودة الشمعة الأخيرة
     if candle["strong"]:
         if candle["bullish"]:
-            score_call += 3
+            score_call += 2
             notes.append("🟢 آخر شمعة مغلقة قوية صاعدة")
         elif candle["bearish"]:
-            score_put += 3
+            score_put += 2
             notes.append("🔴 آخر شمعة مغلقة قوية هابطة")
 
     if candle["doji"]:
@@ -980,71 +1110,59 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
         score_call -= 1
         score_put -= 1
 
-    if prev_candle["strong"]:
-        if prev_candle["bullish"] and trend_bias == "bullish":
-            score_call += 1
-        elif prev_candle["bearish"] and trend_bias == "bearish":
-            score_put += 1
-
+    # 5) دعم ومقاومة: كسر / رفض / قرب
     if support is not None:
-        if sup_state == "touch" and rejection == "bullish":
+        if reject_support == "bullish":
             score_call += 4
-            notes.append(f"🔥 ارتداد واضح من دعم {format_price(pair, support)}")
-        elif sup_state == "near" and candle["bullish"]:
-            score_call += 2
-            notes.append(f"📍 السعر قريب من دعم {format_price(pair, support)}")
-        elif sup_state in {"approaching", "near", "touch"}:
-            warnings.append(f"📍 دعم قريب عند {format_price(pair, support)} — راقب CALL عند ظهور رفض سعري")
+            notes.append(f"🔥 رفض صاعد واضح من دعم {format_price(pair, support)}")
+        elif break_support:
+            score_put += 4
+            notes.append(f"💥 كسر دعم بإغلاق واضح عند {format_price(pair, support)}")
+        elif sup_state in {"touch", "near"}:
+            warnings.append(f"📍 السعر قريب من دعم {format_price(pair, support)} — لا تطارد PUT بدون كسر واضح")
 
     if resistance is not None:
-        if res_state == "touch" and rejection == "bearish":
+        if reject_resistance == "bearish":
             score_put += 4
-            notes.append(f"🔥 ارتداد واضح من مقاومة {format_price(pair, resistance)}")
-        elif res_state == "near" and candle["bearish"]:
-            score_put += 2
-            notes.append(f"📍 السعر قريب من مقاومة {format_price(pair, resistance)}")
-        elif res_state in {"approaching", "near", "touch"}:
-            warnings.append(f"📍 مقاومة قريبة عند {format_price(pair, resistance)} — راقب PUT عند ظهور رفض سعري")
+            notes.append(f"🔥 رفض هابط واضح من مقاومة {format_price(pair, resistance)}")
+        elif break_resistance:
+            score_call += 4
+            notes.append(f"💥 كسر مقاومة بإغلاق واضح عند {format_price(pair, resistance)}")
+        elif res_state in {"touch", "near"}:
+            warnings.append(f"📍 السعر قريب من مقاومة {format_price(pair, resistance)} — لا تطارد CALL بدون كسر واضح")
 
+    # 6) Round Number
     if round_state == "touch":
-        if candle["bullish"] and trend_bias != "bearish":
-            score_call += 2
-            notes.append(f"🔢 ارتكاز على Round Number {format_price(pair, nearest_round)}")
-        elif candle["bearish"] and trend_bias != "bullish":
-            score_put += 2
-            notes.append(f"🔢 رفض من Round Number {format_price(pair, nearest_round)}")
-        else:
-            warnings.append(f"🔢 السعر يلامس Round Number {format_price(pair, nearest_round)} — انتظر تأكيد")
+        warnings.append(f"🔢 السعر يلامس Round Number {format_price(pair, nearest_round)} — انتظر تأكيد")
     elif round_state == "near":
         warnings.append(f"🔢 Round Number قريب عند {format_price(pair, nearest_round)}")
 
-    if rejection == "bullish":
-        score_call += 1
-    elif rejection == "bearish":
-        score_put += 1
-
-    if rejection == "bearish" and trend_bias == "bullish":
-        score_call -= 1
-        warnings.append("⚠️ يوجد رفض هابط مقابل الترند الصاعد")
-    if rejection == "bullish" and trend_bias == "bearish":
-        score_put -= 1
-        warnings.append("⚠️ يوجد رفض صاعد مقابل الترند الهابط")
+    # 7) منع مطاردة حركة مستهلكة عند منطقة
+    exhausted_down = is_exhausted_move(candles, "down", atr)
+    exhausted_up = is_exhausted_move(candles, "up", atr)
+    if exhausted_down and support is not None and sup_state in {"touch", "near", "approaching"}:
+        warnings.append("⚠️ هبوط مستهلك قرب دعم — البيع المتأخر خطر")
+        score_put -= 2
+    if exhausted_up and resistance is not None and res_state in {"touch", "near", "approaching"}:
+        warnings.append("⚠️ صعود مستهلك قرب مقاومة — الشراء المتأخر خطر")
+        score_call -= 2
 
     score_call = max(score_call, 0)
     score_put = max(score_put, 0)
 
-    confidence = 0
-    direction = None
     best_score = max(score_call, score_put)
     score_gap = abs(score_call - score_put)
+    direction = None
+    confidence = 0
 
-    if score_call >= 7 and score_call >= score_put + 2:
+    # القرار النهائي: لا نعطي صفقة مباشرة إلا عند توافق واضح.
+    if score_call >= 8 and score_call >= score_put + 2:
         direction = "CALL"
         confidence = min(58 + score_call * 4 + min(score_gap, 3) * 3, 95)
-    elif score_put >= 7 and score_put >= score_call + 2:
+    elif score_put >= 8 and score_put >= score_call + 2:
         direction = "PUT"
         confidence = min(58 + score_put * 4 + min(score_gap, 3) * 3, 95)
-    elif best_score >= 6 and score_gap >= 3:
+    elif best_score >= 7 and score_gap >= 3 and structure != "range":
         if score_call > score_put:
             direction = "CALL"
             confidence = min(54 + score_call * 4, 88)
@@ -1071,52 +1189,72 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
         f"🧭 الفريم: {timeframe_minutes}M\n"
     )
 
-    zone_block_reason = None
-    zone_plan_lines = []
-
-    if direction == "PUT" and support is not None and sup_state in {"touch", "near"}:
-        zone_block_reason = f"السعر قريب جدًا من دعم {format_price(pair, support)}"
-        zone_plan_lines = [
-            f"• إذا كسر الدعم بإغلاق واضح → خذ PUT",
-            f"• إذا ظهر رفض صاعد من الدعم → خذ CALL",
-        ]
-        if resistance is not None and res_state in {"near", "approaching"}:
-            zone_plan_lines.append(f"• المقاومة الأقرب عند {format_price(pair, resistance)}")
-        quality = max(quality - 10, 0)
-
-    elif direction == "CALL" and resistance is not None and res_state in {"touch", "near"}:
-        zone_block_reason = f"السعر قريب جدًا من مقاومة {format_price(pair, resistance)}"
-        zone_plan_lines = [
-            f"• إذا كسر المقاومة بإغلاق واضح → خذ CALL",
-            f"• إذا ظهر رفض هابط من المقاومة → خذ PUT",
-        ]
-        if support is not None and sup_state in {"near", "approaching"}:
-            zone_plan_lines.append(f"• الدعم الأقرب عند {format_price(pair, support)}")
-        quality = max(quality - 10, 0)
-
-    if zone_block_reason:
+    # فلتر المناطق الذكي: يمنع الدخول المباشر لكنه يعطي سيناريو بديل.
+    if direction == "PUT" and support is not None and sup_state in {"touch", "near", "approaching"} and not break_support:
+        reason = f"السعر قريب من دعم {format_price(pair, support)}"
+        if reject_support == "bullish":
+            reason = f"ظهر رفض صاعد من دعم {format_price(pair, support)}"
         return {
             "ok": False,
-            "quality": quality,
+            "setup_type": "conditional",
+            "quality": max(quality, 65),
+            "timeframe": timeframe_minutes,
+            "message": build_conditional_message(
+                header,
+                reason,
+                format_price(pair, price),
+                format_utc_plus_3(entry_time),
+                [
+                    "• إذا كسر الدعم بإغلاق واضح → خذ PUT",
+                    "• إذا ظهر رفض صاعد من الدعم → خذ CALL",
+                    "• لا تدخل PUT مباشرة قبل تأكيد الكسر",
+                ],
+                notes,
+            )
+        }
+
+    if direction == "CALL" and resistance is not None and res_state in {"touch", "near", "approaching"} and not break_resistance:
+        reason = f"السعر قريب من مقاومة {format_price(pair, resistance)}"
+        if reject_resistance == "bearish":
+            reason = f"ظهر رفض هابط من مقاومة {format_price(pair, resistance)}"
+        return {
+            "ok": False,
+            "setup_type": "conditional",
+            "quality": max(quality, 65),
+            "timeframe": timeframe_minutes,
+            "message": build_conditional_message(
+                header,
+                reason,
+                format_price(pair, price),
+                format_utc_plus_3(entry_time),
+                [
+                    "• إذا كسر المقاومة بإغلاق واضح → خذ CALL",
+                    "• إذا ظهر رفض هابط من المقاومة → خذ PUT",
+                    "• لا تدخل CALL مباشرة قبل تأكيد الكسر",
+                ],
+                notes,
+            )
+        }
+
+    # إذا السوق رينج وفيه منطقة واضحة، نعطي مراقبة بدل رفض صامت.
+    if direction is None and structure == "range" and nearby_lines:
+        return {
+            "ok": False,
+            "setup_type": "conditional",
+            "quality": max(quality, 55),
             "timeframe": timeframe_minutes,
             "message": (
                 header
-                + "⚠️ فرصة مشروطة — لا تدخل مباشرة الآن\n\n"
-                + f"السبب: {zone_block_reason}\n"
-                + f"💵 السعر الحالي: {format_price(pair, price)}\n"
-                + f"⏰ وقت المراقبة: {format_utc_plus_3(entry_time)}\n\n"
-                + "📋 الخطة المقترحة:\n"
-                + "\n".join(zone_plan_lines)
-                + (
-                    "\n\n📌 ملاحظات التحليل:\n" + "\n".join(notes[:4])
-                    if notes else ""
-                )
+                + "⚠️ السوق متذبذب — الأفضل انتظار رد فعل من المنطقة\n\n"
+                + "📋 سيناريوهات المراقبة:\n"
+                + "\n".join(nearby_lines[:4])
             )
         }
 
     if direction:
         return {
             "ok": True,
+            "setup_type": "direct",
             "quality": quality,
             "timeframe": timeframe_minutes,
             "direction": direction,
@@ -1128,7 +1266,7 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
                 + f"⏰ وقت الدخول: {format_utc_plus_3(entry_time)}\n"
                 + f"💵 السعر الحالي: {format_price(pair, price)}\n"
                 + f"⏳ مدة الصفقة المقترحة: {timeframe_minutes}M\n\n"
-                + "\n".join(notes[:6])
+                + "\n".join(notes[:7])
                 + (
                     "\n\n⚠️ تنبيهات إضافية:\n" + "\n".join(nearby_lines[:3])
                     if nearby_lines else ""
@@ -1139,6 +1277,7 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
     if nearby_lines:
         return {
             "ok": False,
+            "setup_type": "watch",
             "quality": quality,
             "timeframe": timeframe_minutes,
             "message": (
@@ -1152,9 +1291,12 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
     reason = "السبب: شروط الدخول غير مكتملة بعد"
     if candle["doji"]:
         reason = "السبب: آخر شمعة مغلقة حيادية وتحتاج تأكيد"
+    elif structure == "range":
+        reason = "السبب: السوق متذبذب ولا توجد منطقة تأكيد واضحة"
 
     return {
         "ok": False,
+        "setup_type": "none",
         "quality": quality,
         "timeframe": timeframe_minutes,
         "message": (
@@ -1172,6 +1314,12 @@ def analyze_real_market_best(pair: str):
     if successful:
         best = max(successful, key=lambda x: (x.get("quality", 0), x.get("confidence", 0)))
         best["message"] += "\n\n🔥 تم اختيار هذه الصفقة لأنها الأقوى بين 1M / 5M / 10M"
+        return best
+
+    conditional = [r for r in results if r.get("setup_type") == "conditional"]
+    if conditional:
+        best = max(conditional, key=lambda x: x.get("quality", 0))
+        best["message"] += "\n\n🔥 لا توجد صفقة مباشرة قوية، لذلك تم عرض أفضل فرصة مشروطة بين 1M / 5M / 10M"
         return best
 
     best_watch = max(results, key=lambda x: x.get("quality", 0))
