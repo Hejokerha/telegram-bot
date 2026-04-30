@@ -2,6 +2,7 @@ import os
 import json
 import hashlib
 import asyncio
+import random
 import requests
 from datetime import time
 from datetime import datetime, timedelta, timezone
@@ -86,6 +87,14 @@ OTC_PAIRS = [
     "AUD/CHF (OTC)",
     "AUD/CAD (OTC)",
 ]
+
+CHANNEL_OTC_PAIRS = [
+    "USD/BRL (OTC)",
+    "USD/ARS (OTC)",
+    "USD/BDT (OTC)",
+]
+CHANNEL_DAILY_SIGNAL_COUNT = 35
+CHANNEL_SIGNAL_INTERVAL_MINUTES = 3
 
 REAL_PAIRS = [
     "EUR/USD",
@@ -484,18 +493,19 @@ def get_stable_direction(pair: str, dt: datetime) -> str:
 
 async def publish_otc_list(context: ContextTypes.DEFAULT_TYPE):
     try:
-        pair = "USD/BRL (OTC)"
-        count = 20
-        interval_minutes = 3
+        count = CHANNEL_DAILY_SIGNAL_COUNT
+        interval_minutes = CHANNEL_SIGNAL_INTERVAL_MINUTES
 
-        # في النشر التلقائي نبدأ من أول دقيقة كاملة قادمة لتجنب البدء من منتصف الدقيقة.
+        # النشر اليومي للقناة: ليستة واحدة فقط، 35 صفقة، بأزواج عشوائية من BRL/ARS/BDT.
         start_dt = next_full_minute(now_utc())
 
-        signals = generate_signals(pair, count, interval_minutes, start_dt)
-        message_text = build_signals_message(pair, count, interval_minutes, signals)
-
-        # حذف سطر الفاصل من الرسالة في القناة فقط حسب الطلب.
-        message_text = message_text.replace(f"⏳ الفاصل: {interval_minutes} دقيقة\n\n", "")
+        signals = generate_channel_signals_random_pairs(
+            CHANNEL_OTC_PAIRS,
+            count,
+            interval_minutes,
+            start_dt
+        )
+        message_text = build_signals_message("MIXED OTC", count, interval_minutes, signals)
 
         await context.bot.send_message(
             chat_id=CHANNEL_ID,
@@ -507,10 +517,54 @@ async def publish_otc_list(context: ContextTypes.DEFAULT_TYPE):
         print("Publish OTC Error:", e)
 
 
+async def schedule_random_daily_otc_list(context: ContextTypes.DEFAULT_TYPE):
+    """يحدد وقت نشر عشوائي كل يوم بين 12:00 و 20:00 بتوقيت سوريا."""
+    try:
+        now_local = now_utc().astimezone(UTC_PLUS_3)
+
+        start_window = now_local.replace(hour=12, minute=0, second=0, microsecond=0)
+        end_window = now_local.replace(hour=20, minute=0, second=0, microsecond=0)
+
+        if now_local >= end_window:
+            start_window += timedelta(days=1)
+            end_window += timedelta(days=1)
+        elif now_local > start_window:
+            start_window = now_local + timedelta(minutes=1)
+
+        window_seconds = max(60, int((end_window - start_window).total_seconds()))
+        delay_seconds = random.randint(0, window_seconds)
+
+        run_at = start_window + timedelta(seconds=delay_seconds)
+
+        context.job_queue.run_once(
+            publish_otc_list,
+            when=run_at.astimezone(UTC),
+            name=f"daily_random_otc_publish_{run_at.strftime('%Y%m%d')}"
+        )
+
+        print(f"Next random OTC channel list scheduled at {run_at.isoformat()}")
+
+    except Exception as e:
+        print("Schedule random OTC Error:", e)
+
+
 def generate_signals(pair: str, count: int, interval_minutes: int, start_dt: datetime):
     signals = []
 
     for i in range(count):
+        entry_time = start_dt + timedelta(minutes=i * interval_minutes)
+        direction = get_stable_direction(pair, entry_time)
+        formatted_time = format_utc_plus_3(entry_time)
+        signals.append(f"{pair} — {formatted_time} — {direction}")
+
+    return signals
+
+
+def generate_channel_signals_random_pairs(pairs: list[str], count: int, interval_minutes: int, start_dt: datetime):
+    signals = []
+
+    for i in range(count):
+        pair = random.choice(pairs)
         entry_time = start_dt + timedelta(minutes=i * interval_minutes)
         direction = get_stable_direction(pair, entry_time)
         formatted_time = format_utc_plus_3(entry_time)
@@ -1987,12 +2041,18 @@ def main():
 
     job_queue = app.job_queue
 
-    # نشر تلقائي كل 6 ساعات بتوقيت سوريا: 00:00 - 06:00 - 12:00 - 18:00
-    for hour in (0, 6, 12, 18):
-        job_queue.run_daily(
-            publish_otc_list,
-            time=time(hour=hour, minute=0, tzinfo=UTC_PLUS_3)
-        )
+    # نشر تلقائي مرة واحدة يوميًا:
+    # يتم اختيار وقت عشوائي للنشر بين 12:00 و 20:00 بتوقيت سوريا.
+    job_queue.run_daily(
+        schedule_random_daily_otc_list,
+        time=time(hour=0, minute=5, tzinfo=UTC_PLUS_3)
+    )
+
+    # جدولة أول ليستة عند تشغيل البوت، حتى لو تم إعادة التشغيل بعد منتصف الليل.
+    job_queue.run_once(
+        schedule_random_daily_otc_list,
+        when=5
+    )
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_admin_buttons))
