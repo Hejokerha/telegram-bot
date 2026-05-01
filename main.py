@@ -156,6 +156,20 @@ REAL_INTERVALS = [1, 5, 10]
 GLOBAL_AUTOPUBLISH_PRIMARY_TIMEFRAMES = [1]
 GLOBAL_AUTOPUBLISH_SECONDARY_TIMEFRAMES = [5, 10]
 GLOBAL_SECONDARY_TIMEFRAME_MAX_LEAD_SECONDS = 70
+
+# قناة السوق العالمي لا تتحول إلى OTC إطلاقًا.
+# حسب سلوك Quotex الذي ظهر عندك: عند توقف السوق العالمي تصبح الأزواج OTC،
+# لذلك نوقف النشر العالمي من الجمعة 17:00 UTC+3 حتى الاثنين 00:00 UTC+3.
+# إذا تغيّر وقت إغلاق/فتح Quotex لاحقًا، عدّل هذه القيم فقط.
+QUOTEX_GLOBAL_FRIDAY_CLOSE_HOUR_UTC_PLUS_3 = 17
+QUOTEX_GLOBAL_MONDAY_OPEN_HOUR_UTC_PLUS_3 = 0
+GLOBAL_MARKET_CLOSED_MESSAGE_ENABLED = True
+GLOBAL_MARKET_CLOSED_MESSAGE = (
+    "🌍 السوق العالمي مغلق الآن\n\n"
+    "تم إيقاف نشر صفقات السوق العالمي مؤقتًا لأن الأزواج على منصة Quotex تحولت إلى OTC.\n"
+    "سيعود النشر تلقائيًا عند فتح السوق العالمي من جديد."
+)
+
 ONLINE_MINUTES_WINDOW = 15
 
 # ===== Firebase init =====
@@ -676,6 +690,79 @@ def is_real_pair_available(pair: str, check_dt: datetime | None = None) -> bool:
 
     return True
 
+
+
+
+def is_quotex_global_market_open(check_dt: datetime | None = None) -> bool:
+    """
+    يتحقق من حالة السوق العالمي كما نريدها لقناة Quotex Global.
+    عند إغلاق السوق العالمي على Quotex تتحول الأزواج إلى OTC، لذلك لا ننشر في قناة العالمي.
+    التوقيت هنا مبني على UTC+3 مثل باقي البوت.
+    """
+    dt = (check_dt or now_utc()).astimezone(UTC_PLUS_3)
+    weekday = dt.weekday()  # Mon=0 ... Sun=6
+
+    # السبت والأحد: لا يوجد سوق عالمي لقناة Quotex Global.
+    if weekday in (5, 6):
+        return False
+
+    # الجمعة بعد وقت إغلاق Quotex العالمي: توقف كامل حتى لا ننشر على OTC.
+    if weekday == 4 and dt.hour >= QUOTEX_GLOBAL_FRIDAY_CLOSE_HOUR_UTC_PLUS_3:
+        return False
+
+    # الاثنين قبل وقت الفتح المحدد، إن تم رفع قيمة الفتح لاحقًا.
+    if weekday == 0 and dt.hour < QUOTEX_GLOBAL_MONDAY_OPEN_HOUR_UTC_PLUS_3:
+        return False
+
+    return True
+
+
+def global_market_channel_state_ref():
+    return system_ref().child("global_market_channel_state")
+
+
+def get_global_market_channel_state():
+    return global_market_channel_state_ref().get() or {}
+
+
+def set_global_market_channel_state(data: dict):
+    global_market_channel_state_ref().update(data)
+
+
+async def notify_global_market_closed_once(context: ContextTypes.DEFAULT_TYPE):
+    """يرسل رسالة إغلاق مرة واحدة فقط حتى لا يزعج القناة كل دقيقة."""
+    if not GLOBAL_MARKET_CLOSED_MESSAGE_ENABLED:
+        return
+
+    state = get_global_market_channel_state()
+    if state.get("status") == "closed" and state.get("closed_notified"):
+        return
+
+    try:
+        await context.bot.send_message(
+            chat_id=GLOBAL_CHANNEL_ID,
+            text=GLOBAL_MARKET_CLOSED_MESSAGE,
+            parse_mode="Markdown"
+        )
+    except Exception as e:
+        print("Global Market Closed Notify Error:", e)
+
+    set_global_market_channel_state({
+        "status": "closed",
+        "closed_notified": True,
+        "closed_at": now_iso(),
+    })
+
+
+def mark_global_market_open():
+    """يعيد تهيئة حالة الإغلاق عند فتح السوق حتى يمكن إرسال تنبيه جديد بالإغلاق القادم."""
+    state = get_global_market_channel_state()
+    if state.get("status") != "open":
+        set_global_market_channel_state({
+            "status": "open",
+            "closed_notified": False,
+            "opened_at": now_iso(),
+        })
 
 def get_session_name(check_dt: datetime | None = None) -> str:
     dt = (check_dt or now_utc()).astimezone(UTC_PLUS_3)
@@ -1754,6 +1841,14 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
         active_still_running = await resolve_global_active_trade_if_due(context)
         if active_still_running:
             return
+
+        # قناة السوق العالمي تبقى Global فقط.
+        # إذا Quotex حوّل الأزواج إلى OTC، نوقف النشر ولا نرسل أي صفقة OTC هنا.
+        if not is_quotex_global_market_open():
+            await notify_global_market_closed_once(context)
+            return
+
+        mark_global_market_open()
 
         # يعمل فقط ضمن الجلسة الأمريكية
         session = get_session_name()
