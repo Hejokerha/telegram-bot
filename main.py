@@ -1647,13 +1647,17 @@ def floor_to_minute(dt: datetime) -> datetime:
     return dt.astimezone(UTC).replace(second=0, microsecond=0)
 
 
-def find_candle_by_minute(candles: list[dict], target_dt: datetime):
+def find_candle_by_minute(candles: list[dict], target_dt: datetime, allow_nearest: bool = True):
     target = floor_to_minute(target_dt)
     exact = [c for c in candles if floor_to_minute(c["time"]) == target]
     if exact:
         return exact[0]
 
-    # fallback: أقرب شمعة ضمن دقيقتين فقط
+    # في نتائج الصفقات لا نستخدم أقرب شمعة، لأن هذا قد يحسب شمعة غير شمعة الدخول/المضاعفة.
+    # نسمح بالـ fallback فقط للأماكن القديمة التي قد تحتاجه، أما التحقق فيستدعي allow_nearest=False.
+    if not allow_nearest:
+        return None
+
     candidates = []
     for c in candles:
         diff = abs((floor_to_minute(c["time"]) - target).total_seconds())
@@ -1673,6 +1677,11 @@ def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: da
     - إذا خسرت الصفقة من أول شمعة: ننتظر الصفقة التالية بنفس الاتجاه ونفس المدة.
     - إذا ربحت المضاعفة: WIN ✅¹.
     - إذا خسرت المضاعفة: Loss.
+
+    مهم جدًا:
+    المضاعفة لا تُقارن بسعر دخول الصفقة الأصلية.
+    المضاعفة تُحسب من شمعة المضاعفة نفسها: Open شمعة المضاعفة مقابل Close نفس الشمعة.
+    مثال PUT: إذا الشمعة الأصلية خضرا ثم الشمعة التالية حمرا => WIN ✅¹.
     """
     try:
         candles, source_name, error_msg = get_result_candles(pair, limit=140)
@@ -1704,8 +1713,8 @@ def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: da
         return None, "اتجاه الصفقة غير معروف"
 
     # نتيجة الدخول الأساسي
-    entry_candle = find_candle_by_minute(candles, entry_time)
-    close_candle = find_candle_by_minute(candles, expiry_time - timedelta(minutes=1))
+    entry_candle = find_candle_by_minute(candles, entry_time, allow_nearest=False)
+    close_candle = find_candle_by_minute(candles, expiry_time - timedelta(minutes=1), allow_nearest=False)
 
     if not close_candle:
         return None, "شمعة الإغلاق الأساسية غير متاحة بعد"
@@ -1735,8 +1744,8 @@ def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: da
     martingale_entry_time = expiry_time
     martingale_expiry_time = martingale_entry_time + timedelta(minutes=duration_minutes)
 
-    martingale_entry_candle = find_candle_by_minute(candles, martingale_entry_time)
-    martingale_close_candle = find_candle_by_minute(candles, martingale_expiry_time - timedelta(minutes=1))
+    martingale_entry_candle = find_candle_by_minute(candles, martingale_entry_time, allow_nearest=False)
+    martingale_close_candle = find_candle_by_minute(candles, martingale_expiry_time - timedelta(minutes=1), allow_nearest=False)
 
     if not martingale_entry_candle:
         return None, "شمعة دخول المضاعفة غير متاحة بعد"
