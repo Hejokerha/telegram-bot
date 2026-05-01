@@ -1418,28 +1418,42 @@ def tv_send(ws, func: str, params: list):
 
 def parse_tradingview_series(raw_message: str):
     candles = []
-    pattern = re.compile(r'"s":\[(.*?)\}\]', re.DOTALL)
-    match = pattern.search(raw_message)
-    if not match:
-        return candles
 
-    chunk = match.group(1)
-    entries = re.findall(r'\{"i":\d+,"v":\[(.*?)\]\}', chunk)
-    for entry in entries:
-        try:
-            parts = json.loads("[" + entry + "]")
-            if len(parts) < 5:
+    try:
+        # TradingView messages are wrapped like ~m~LEN~m~JSON
+        messages = re.split(r"~m~\d+~m~", raw_message)
+        for msg in messages:
+            if not msg or "timescale_update" not in msg:
                 continue
-            ts = int(float(parts[0]))
-            candles.append({
-                "time": datetime.fromtimestamp(ts, tz=UTC),
-                "open": float(parts[1]),
-                "high": float(parts[2]),
-                "low": float(parts[3]),
-                "close": float(parts[4]),
-            })
-        except Exception:
-            continue
+
+            try:
+                data = json.loads(msg)
+            except Exception:
+                continue
+
+            payload = data.get("p", [])
+            if len(payload) < 2:
+                continue
+
+            series_data = payload[1]
+            for _, series_obj in series_data.items():
+                points = series_obj.get("s", [])
+                for point in points:
+                    values = point.get("v", [])
+                    if len(values) < 5:
+                        continue
+
+                    ts = int(float(values[0]))
+                    candles.append({
+                        "time": datetime.fromtimestamp(ts, tz=UTC),
+                        "open": float(values[1]),
+                        "high": float(values[2]),
+                        "low": float(values[3]),
+                        "close": float(values[4]),
+                    })
+
+    except Exception:
+        pass
 
     candles.sort(key=lambda c: c["time"])
     return candles
@@ -1544,9 +1558,20 @@ def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: da
     - سعر النتيجة: Close آخر شمعة داخل مدة الصفقة.
       مثال 5M: دخول 20:10، نحكم على Close شمعة 20:14.
     """
-    candles, source_name, error_msg = get_result_candles(pair, limit=100)
-    if not candles:
+    try:
+        candles, source_name, error_msg = get_result_candles(pair, limit=100)
+    except Exception as e:
+        return None, f"خطأ في مصدر التحقق: {e}"
+
+    if isinstance(candles, tuple):
+        candles = candles[0]
+
+    if not candles or not isinstance(candles, list):
         return None, f"تعذر جلب بيانات التحقق: {error_msg}"
+
+    candles = [c for c in candles if isinstance(c, dict) and "time" in c and "open" in c and "close" in c]
+    if not candles:
+        return None, "بيانات الشموع غير صالحة"
 
     entry_time = floor_to_minute(entry_time)
     duration_minutes = max(1, int(duration_minutes))
@@ -1624,7 +1649,8 @@ async def resolve_global_active_trade_if_due(context: ContextTypes.DEFAULT_TYPE)
         )
 
         if not result:
-            print("Global result check waiting:", error_msg)
+            if int(trade.get("result_retry_count", 0)) % 5 == 0:
+                print("Global result check waiting:", error_msg)
 
             # إذا البيانات تأخرت، لا نسجل Loss غلط؛ نعيد المحاولة بعد دقيقة.
             retry_count = int(trade.get("result_retry_count", 0)) + 1
