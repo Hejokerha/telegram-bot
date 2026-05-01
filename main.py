@@ -1385,9 +1385,79 @@ def clear_global_active_trade():
     global_active_trade_ref().delete()
 
 
+
+def floor_to_minute(dt: datetime) -> datetime:
+    return dt.astimezone(UTC).replace(second=0, microsecond=0)
+
+
+def find_candle_by_minute(candles: list[dict], target_dt: datetime):
+    target = floor_to_minute(target_dt)
+    exact = [c for c in candles if floor_to_minute(c["time"]) == target]
+    if exact:
+        return exact[0]
+
+    # fallback: أقرب شمعة ضمن دقيقتين فقط
+    candidates = []
+    for c in candles:
+        diff = abs((floor_to_minute(c["time"]) - target).total_seconds())
+        if diff <= 120:
+            candidates.append((diff, c))
+
+    if not candidates:
+        return None
+
+    candidates.sort(key=lambda x: x[0])
+    return candidates[0]
+
+
+def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: datetime, duration_minutes: int, fallback_entry_price=None):
+    """تحقق أدق للنتيجة:
+    - سعر الدخول من افتتاح شمعة وقت الدخول.
+    - سعر الإغلاق من إغلاق آخر شمعة داخل مدة الصفقة.
+      مثال 5M: دخول 20:10، الإغلاق الحقيقي عند 20:15، نستخدم close شمعة 20:14.
+    """
+    candles, error_msg = get_candles(pair, timeframe_minutes=1, limit=80)
+    if not candles:
+        return None, f"تعذر جلب بيانات التحقق: {error_msg}"
+
+    entry_time = floor_to_minute(entry_time)
+    duration_minutes = max(1, int(duration_minutes))
+    expiry_time = entry_time + timedelta(minutes=duration_minutes)
+
+    entry_candle = find_candle_by_minute(candles, entry_time)
+    close_candle = find_candle_by_minute(candles, expiry_time - timedelta(minutes=1))
+
+    if not close_candle:
+        return None, "شمعة الإغلاق غير متاحة بعد"
+
+    if entry_candle:
+        entry_price = float(entry_candle["open"])
+    elif fallback_entry_price is not None:
+        entry_price = float(fallback_entry_price)
+    else:
+        return None, "شمعة الدخول غير متاحة"
+
+    close_price = float(close_candle["close"])
+
+    if direction == "CALL":
+        is_win = close_price > entry_price
+    elif direction == "PUT":
+        is_win = close_price < entry_price
+    else:
+        return None, "اتجاه الصفقة غير معروف"
+
+    return {
+        "is_win": is_win,
+        "entry_price": entry_price,
+        "close_price": close_price,
+        "entry_time": entry_time,
+        "expiry_time": expiry_time,
+    }, None
+
+
 async def resolve_global_active_trade_if_due(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """يرجع True إذا في صفقة عالمية نشطة ولسا ما انتهت.
-    إذا انتهت، يحاول يتحقق من النتيجة وينشر WIN/Loss ثم يمسحها.
+    إذا انتهت، ينتظر توفر شمعة الإغلاق، ثم يتحقق من النتيجة بدقة أعلى.
     """
     trade = get_global_active_trade()
     if not trade:
@@ -1398,33 +1468,55 @@ async def resolve_global_active_trade_if_due(context: ContextTypes.DEFAULT_TYPE)
         clear_global_active_trade()
         return False
 
-    if expires_at > now_utc():
+    # ننتظر بعد انتهاء الصفقة حتى تتوفر شمعة الإغلاق من مصدر البيانات.
+    result_check_at = parse_iso(trade.get("result_check_at", ""))
+    if not result_check_at:
+        result_check_at = expires_at + timedelta(seconds=90)
+
+    if result_check_at > now_utc():
         return True
 
     pair = trade.get("pair")
     direction = trade.get("direction")
-    entry_price = trade.get("entry_price")
+    entry_time = parse_iso(trade.get("entry_time", ""))
+    duration_minutes = int(trade.get("duration_minutes", trade.get("timeframe", 1)))
+    fallback_entry_price = trade.get("entry_price")
 
-    if not pair or not direction or entry_price is None:
+    if not pair or not direction or not entry_time:
         clear_global_active_trade()
         return False
 
     try:
-        entry_price = float(entry_price)
-        candles, error_msg = get_candles(pair, timeframe_minutes=1, limit=10)
+        result, error_msg = get_real_trade_result_from_candles(
+            pair=pair,
+            direction=direction,
+            entry_time=entry_time,
+            duration_minutes=duration_minutes,
+            fallback_entry_price=fallback_entry_price,
+        )
 
-        if not candles:
-            print("Global result check error:", error_msg)
+        if not result:
+            print("Global result check waiting:", error_msg)
+
+            # إذا البيانات تأخرت، لا نسجل Loss غلط؛ نعيد المحاولة بعد دقيقة.
+            retry_count = int(trade.get("result_retry_count", 0)) + 1
+            trade["result_retry_count"] = retry_count
+            trade["result_check_at"] = (now_utc() + timedelta(seconds=60)).isoformat()
+            set_global_active_trade(trade)
+
+            # بعد 5 محاولات نوقف بدون حكم خاطئ.
+            if retry_count >= 5:
+                await context.bot.send_message(
+                    chat_id=GLOBAL_CHANNEL_ID,
+                    text="⚠️ Result unavailable",
+                    parse_mode="Markdown"
+                )
+                clear_global_active_trade()
+                return False
+
             return True
 
-        latest_price = candles[-1]["close"]
-
-        if direction == "CALL":
-            is_win = latest_price > entry_price
-        else:
-            is_win = latest_price < entry_price
-
-        result_text = "WIN ✅" if is_win else "💔 Loss"
+        result_text = "WIN ✅" if result["is_win"] else "💔 Loss"
 
         await context.bot.send_message(
             chat_id=GLOBAL_CHANNEL_ID,
@@ -1496,8 +1588,10 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
             "direction": best_result.get("direction"),
             "entry_price": best_result.get("entry_price"),
             "timeframe": best_result.get("timeframe"),
+            "duration_minutes": duration_minutes,
             "entry_time": entry_time.isoformat(),
             "expires_at": expires_at.isoformat(),
+            "result_check_at": (expires_at + timedelta(seconds=90)).isoformat(),
             "published_at": now_iso(),
         })
 
