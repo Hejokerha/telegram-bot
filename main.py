@@ -150,6 +150,12 @@ PAIR_CONTEXT = {
 TRADE_COUNTS = [3, 5, 10, 15, 20]
 INTERVALS = [1, 3, 5]
 REAL_INTERVALS = [1, 5, 10]
+# للنشر التلقائي في قناة السوق العالمي:
+# 1M له الأولوية دائمًا. أما 5M/10M فلا يتم نشرها إلا عندما يقترب إغلاق الشمعة الحالية،
+# حتى لا يكون التحليل قديمًا قبل وقت الدخول.
+GLOBAL_AUTOPUBLISH_PRIMARY_TIMEFRAMES = [1]
+GLOBAL_AUTOPUBLISH_SECONDARY_TIMEFRAMES = [5, 10]
+GLOBAL_SECONDARY_TIMEFRAME_MAX_LEAD_SECONDS = 70
 ONLINE_MINUTES_WINDOW = 15
 
 # ===== Firebase init =====
@@ -489,6 +495,28 @@ def next_timeframe_boundary(dt: datetime, timeframe_minutes: int) -> datetime:
     if current_boundary <= dt_local:
         current_boundary += timedelta(minutes=timeframe_minutes)
     return current_boundary.astimezone(UTC)
+
+
+def seconds_until_timeframe_boundary(dt: datetime, timeframe_minutes: int) -> float:
+    """عدد الثواني المتبقية لبداية شمعة الفريم القادمة."""
+    boundary = next_timeframe_boundary(dt, timeframe_minutes)
+    return max(0.0, (boundary - dt.astimezone(UTC)).total_seconds())
+
+
+def can_autopublish_timeframe(timeframe_minutes: int, check_dt: datetime | None = None) -> bool:
+    """
+    1M مسموح دائمًا لأنه أصلًا قريب من الدخول.
+    5M/10M مسموحة فقط قبل إغلاق الشمعة الحالية بحوالي دقيقة،
+    حتى لا يتم نشر صفقة 5M/10M مبكرًا والتحليل يتغير قبل وقت الدخول.
+    """
+    if timeframe_minutes in GLOBAL_AUTOPUBLISH_PRIMARY_TIMEFRAMES:
+        return True
+
+    if timeframe_minutes not in GLOBAL_AUTOPUBLISH_SECONDARY_TIMEFRAMES:
+        return False
+
+    remaining_seconds = seconds_until_timeframe_boundary(check_dt or now_utc(), timeframe_minutes)
+    return 0 < remaining_seconds <= GLOBAL_SECONDARY_TIMEFRAME_MAX_LEAD_SECONDS
 
 
 # ===== OTC ENGINE =====
@@ -1689,24 +1717,43 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
         if session != "الأمريكية":
             return
 
-        # يفحص الأزواج والفريمات مثل منطق السوق العالمي اليدوي
-        candidates = []
-
         shuffled_pairs = REAL_PAIRS[:]
         random.shuffle(shuffled_pairs)
 
+        # 1) الأولوية دائمًا لصفقات 1M.
+        # إذا وجدنا فرصة 1M مباشرة، ننشرها حتى لو كانت هناك فرصة 5M/10M بجودة أعلى.
+        primary_candidates = []
         for pair in shuffled_pairs:
-            for timeframe in REAL_INTERVALS:
+            for timeframe in GLOBAL_AUTOPUBLISH_PRIMARY_TIMEFRAMES:
                 result = analyze_real_market(pair, timeframe)
-
-                # للنشر التلقائي نعتمد الصفقات المباشرة فقط لأن لها وقت دخول ومدة نتيجة واضحة.
                 if result.get("ok"):
-                    candidates.append(result)
+                    primary_candidates.append(result)
+
+        if primary_candidates:
+            candidates = primary_candidates
+        else:
+            # 2) إذا لم توجد 1M، نفحص 5M/10M فقط عندما يكون وقت الدخول قريبًا جدًا
+            # قبل بداية الشمعة القادمة بحوالي دقيقة.
+            # مثال: لفريم 5M لا ننشر عند 22:35:25 لصفقة دخولها 22:40، بل ننتظر قرب 22:39.
+            allowed_secondary_timeframes = [
+                tf for tf in GLOBAL_AUTOPUBLISH_SECONDARY_TIMEFRAMES
+                if can_autopublish_timeframe(tf)
+            ]
+
+            if not allowed_secondary_timeframes:
+                return
+
+            candidates = []
+            for pair in shuffled_pairs:
+                for timeframe in allowed_secondary_timeframes:
+                    result = analyze_real_market(pair, timeframe)
+                    if result.get("ok"):
+                        candidates.append(result)
 
         if not candidates:
             return
 
-        # الأفضلية: أعلى جودة ثم أعلى ثقة
+        # الأفضلية داخل نفس مجموعة الأولوية: أعلى جودة ثم أعلى ثقة.
         best_result = max(
             candidates,
             key=lambda r: (
