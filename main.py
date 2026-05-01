@@ -1581,14 +1581,14 @@ def find_candle_by_minute(candles: list[dict], target_dt: datetime):
 
 
 def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: datetime, duration_minutes: int, fallback_entry_price=None):
-    """تحقق أقرب إلى TradingView:
-    - المصدر الأساسي TradingView 1m.
-    - سعر الدخول: Open شمعة وقت الدخول.
-    - سعر النتيجة: Close آخر شمعة داخل مدة الصفقة.
-      مثال 5M: دخول 20:10، نحكم على Close شمعة 20:14.
+    """تحقق النتيجة مع مضاعفة واحدة:
+    - إذا ربحت الصفقة من أول شمعة: WIN عادي.
+    - إذا خسرت الصفقة من أول شمعة: ننتظر الصفقة التالية بنفس الاتجاه ونفس المدة.
+    - إذا ربحت المضاعفة: WIN ✅¹.
+    - إذا خسرت المضاعفة: Loss.
     """
     try:
-        candles, source_name, error_msg = get_result_candles(pair, limit=100)
+        candles, source_name, error_msg = get_result_candles(pair, limit=140)
     except Exception as e:
         return None, f"خطأ في مصدر التحقق: {e}"
 
@@ -1606,34 +1606,72 @@ def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: da
     duration_minutes = max(1, int(duration_minutes))
     expiry_time = entry_time + timedelta(minutes=duration_minutes)
 
+    def judge_trade(open_price: float, close_price: float):
+        if direction == "CALL":
+            return close_price > open_price
+        if direction == "PUT":
+            return close_price < open_price
+        return None
+
+    if direction not in {"CALL", "PUT"}:
+        return None, "اتجاه الصفقة غير معروف"
+
+    # نتيجة الدخول الأساسي
     entry_candle = find_candle_by_minute(candles, entry_time)
     close_candle = find_candle_by_minute(candles, expiry_time - timedelta(minutes=1))
 
     if not close_candle:
-        return None, "شمعة الإغلاق غير متاحة بعد"
+        return None, "شمعة الإغلاق الأساسية غير متاحة بعد"
 
     if entry_candle:
         entry_price = float(entry_candle["open"])
     elif fallback_entry_price is not None:
         entry_price = float(fallback_entry_price)
     else:
-        return None, "شمعة الدخول غير متاحة"
+        return None, "شمعة الدخول الأساسية غير متاحة"
 
     close_price = float(close_candle["close"])
+    direct_is_win = judge_trade(entry_price, close_price)
 
-    if direction == "CALL":
-        is_win = close_price > entry_price
-    elif direction == "PUT":
-        is_win = close_price < entry_price
-    else:
-        return None, "اتجاه الصفقة غير معروف"
+    if direct_is_win is True:
+        return {
+            "is_win": True,
+            "martingale_step": 0,
+            "entry_price": entry_price,
+            "close_price": close_price,
+            "entry_time": entry_time,
+            "expiry_time": expiry_time,
+            "source": source_name,
+        }, None
+
+    # إذا خسرت مباشرة، لا ننشر Loss قبل فحص مضاعفة واحدة بعد انتهاء الصفقة الأساسية.
+    martingale_entry_time = expiry_time
+    martingale_expiry_time = martingale_entry_time + timedelta(minutes=duration_minutes)
+
+    martingale_entry_candle = find_candle_by_minute(candles, martingale_entry_time)
+    martingale_close_candle = find_candle_by_minute(candles, martingale_expiry_time - timedelta(minutes=1))
+
+    if not martingale_entry_candle:
+        return None, "شمعة دخول المضاعفة غير متاحة بعد"
+
+    if not martingale_close_candle:
+        return None, "شمعة إغلاق المضاعفة غير متاحة بعد"
+
+    martingale_entry_price = float(martingale_entry_candle["open"])
+    martingale_close_price = float(martingale_close_candle["close"])
+    martingale_is_win = judge_trade(martingale_entry_price, martingale_close_price)
 
     return {
-        "is_win": is_win,
+        "is_win": bool(martingale_is_win),
+        "martingale_step": 1,
         "entry_price": entry_price,
         "close_price": close_price,
+        "martingale_entry_price": martingale_entry_price,
+        "martingale_close_price": martingale_close_price,
         "entry_time": entry_time,
         "expiry_time": expiry_time,
+        "martingale_entry_time": martingale_entry_time,
+        "martingale_expiry_time": martingale_expiry_time,
         "source": source_name,
     }, None
 
@@ -1689,7 +1727,12 @@ async def resolve_global_active_trade_if_due(context: ContextTypes.DEFAULT_TYPE)
             set_global_active_trade(trade)
             return True
 
-        result_text = "WIN ✅" if result["is_win"] else "💔 Loss"
+        if result["is_win"] and int(result.get("martingale_step", 0)) == 1:
+            result_text = "WIN ✅¹"
+        elif result["is_win"]:
+            result_text = "WIN ✅"
+        else:
+            result_text = "💔 Loss"
 
         await context.bot.send_message(
             chat_id=GLOBAL_CHANNEL_ID,
