@@ -3,6 +3,7 @@ import json
 import hashlib
 import asyncio
 import random
+import re
 import requests
 try:
     import websocket
@@ -1548,7 +1549,7 @@ def find_candle_by_minute(candles: list[dict], target_dt: datetime):
         return None
 
     candidates.sort(key=lambda x: x[0])
-    return candidates[0]
+    return candidates[0][1]
 
 
 def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: datetime, duration_minutes: int, fallback_entry_price=None):
@@ -1652,19 +1653,12 @@ async def resolve_global_active_trade_if_due(context: ContextTypes.DEFAULT_TYPE)
             if int(trade.get("result_retry_count", 0)) % 5 == 0:
                 print("Global result check waiting:", error_msg)
 
-            # إذا البيانات تأخرت، لا نسجل Loss غلط؛ نعيد المحاولة بعد دقيقة.
+            # إذا البيانات تأخرت، لا نسجل Loss غلط؛ نعيد المحاولة لاحقًا
+            # ولا ننشر أي شيء غير WIN أو Loss.
             retry_count = int(trade.get("result_retry_count", 0)) + 1
             trade["result_retry_count"] = retry_count
-            trade["result_check_at"] = (now_utc() + timedelta(seconds=60)).isoformat()
-            set_global_active_trade(trade)
-
-            # لا ننشر أي شيء غير WIN أو Loss.
-            # إذا لم تتوفر شمعة الإغلاق بعد، ننتظر ونعيد المحاولة.
             trade["result_check_at"] = (now_utc() + timedelta(seconds=TRADINGVIEW_RESULT_RETRY_SECONDS)).isoformat()
-            trade["result_retry_count"] = int(trade.get("result_retry_count", 0)) + 1
             set_global_active_trade(trade)
-            return True
-
             return True
 
         result_text = "WIN ✅" if result["is_win"] else "💔 Loss"
