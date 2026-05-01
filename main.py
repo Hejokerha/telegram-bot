@@ -1312,8 +1312,12 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
             "setup_type": "direct",
             "quality": quality,
             "timeframe": timeframe_minutes,
+            "pair": pair,
             "direction": direction,
             "confidence": confidence,
+            "entry_price": price,
+            "entry_time": entry_time.isoformat(),
+            "duration_minutes": timeframe_minutes,
             "message": (
                 header
                 + f"📊 الثقة: {confidence}%\n\n"
@@ -1364,8 +1368,85 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
 
 
 
+
+def global_active_trade_ref():
+    return system_ref().child("global_active_trade")
+
+
+def get_global_active_trade():
+    return global_active_trade_ref().get()
+
+
+def set_global_active_trade(data: dict):
+    global_active_trade_ref().set(data)
+
+
+def clear_global_active_trade():
+    global_active_trade_ref().delete()
+
+
+async def resolve_global_active_trade_if_due(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """يرجع True إذا في صفقة عالمية نشطة ولسا ما انتهت.
+    إذا انتهت، يحاول يتحقق من النتيجة وينشر WIN/Loss ثم يمسحها.
+    """
+    trade = get_global_active_trade()
+    if not trade:
+        return False
+
+    expires_at = parse_iso(trade.get("expires_at", ""))
+    if not expires_at:
+        clear_global_active_trade()
+        return False
+
+    if expires_at > now_utc():
+        return True
+
+    pair = trade.get("pair")
+    direction = trade.get("direction")
+    entry_price = trade.get("entry_price")
+
+    if not pair or not direction or entry_price is None:
+        clear_global_active_trade()
+        return False
+
+    try:
+        entry_price = float(entry_price)
+        candles, error_msg = get_candles(pair, timeframe_minutes=1, limit=10)
+
+        if not candles:
+            print("Global result check error:", error_msg)
+            return True
+
+        latest_price = candles[-1]["close"]
+
+        if direction == "CALL":
+            is_win = latest_price > entry_price
+        else:
+            is_win = latest_price < entry_price
+
+        result_text = "WIN ✅" if is_win else "💔 Loss"
+
+        await context.bot.send_message(
+            chat_id=GLOBAL_CHANNEL_ID,
+            text=result_text,
+            parse_mode="Markdown"
+        )
+
+        clear_global_active_trade()
+        return False
+
+    except Exception as e:
+        print("Resolve Global Trade Error:", e)
+        return True
+
+
 async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
     try:
+        # أولًا: إذا في صفقة منشورة سابقًا، لا ننشر صفقة جديدة قبل انتهائها.
+        active_still_running = await resolve_global_active_trade_if_due(context)
+        if active_still_running:
+            return
+
         # يعمل فقط ضمن الجلسة الأمريكية
         session = get_session_name()
         if session != "الأمريكية":
@@ -1381,22 +1462,17 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
             for timeframe in REAL_INTERVALS:
                 result = analyze_real_market(pair, timeframe)
 
-                # صفقة مباشرة متاحة
+                # للنشر التلقائي نعتمد الصفقات المباشرة فقط لأن لها وقت دخول ومدة نتيجة واضحة.
                 if result.get("ok"):
-                    candidates.append(result)
-
-                # فرصة مشروطة متاحة
-                elif result.get("setup_type") == "conditional":
                     candidates.append(result)
 
         if not candidates:
             return
 
-        # الأفضلية: الصفقة المباشرة أولًا، ثم أعلى جودة
+        # الأفضلية: أعلى جودة ثم أعلى ثقة
         best_result = max(
             candidates,
             key=lambda r: (
-                1 if r.get("ok") else 0,
                 r.get("quality", 0),
                 r.get("confidence", 0),
             )
@@ -1407,6 +1483,23 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
             text=best_result.get("message"),
             parse_mode="Markdown"
         )
+
+        entry_time = parse_iso(best_result.get("entry_time", ""))
+        duration_minutes = int(best_result.get("duration_minutes", best_result.get("timeframe", 1)))
+        if not entry_time:
+            entry_time = now_utc()
+
+        expires_at = entry_time + timedelta(minutes=duration_minutes)
+
+        set_global_active_trade({
+            "pair": best_result.get("pair"),
+            "direction": best_result.get("direction"),
+            "entry_price": best_result.get("entry_price"),
+            "timeframe": best_result.get("timeframe"),
+            "entry_time": entry_time.isoformat(),
+            "expires_at": expires_at.isoformat(),
+            "published_at": now_iso(),
+        })
 
     except Exception as e:
         print("Auto Global Market Error:", e)
