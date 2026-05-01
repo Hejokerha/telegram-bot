@@ -1366,32 +1366,51 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
 
 async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
     try:
+        # يعمل فقط ضمن الجلسة الأمريكية
         session = get_session_name()
-
         if session != "الأمريكية":
             return
 
-        pair = random.choice(REAL_PAIRS)
+        # يفحص الأزواج والفريمات مثل منطق السوق العالمي اليدوي
+        candidates = []
 
-        result = analyze_real_market_best(pair)
+        shuffled_pairs = REAL_PAIRS[:]
+        random.shuffle(shuffled_pairs)
 
-        if not result.get("ok"):
+        for pair in shuffled_pairs:
+            for timeframe in REAL_INTERVALS:
+                result = analyze_real_market(pair, timeframe)
+
+                # صفقة مباشرة متاحة
+                if result.get("ok"):
+                    candidates.append(result)
+
+                # فرصة مشروطة متاحة
+                elif result.get("setup_type") == "conditional":
+                    candidates.append(result)
+
+        if not candidates:
             return
 
-        if result.get("confidence", 0) < 75:
-            return
-
-        if result.get("quality", 0) < 80:
-            return
+        # الأفضلية: الصفقة المباشرة أولًا، ثم أعلى جودة
+        best_result = max(
+            candidates,
+            key=lambda r: (
+                1 if r.get("ok") else 0,
+                r.get("quality", 0),
+                r.get("confidence", 0),
+            )
+        )
 
         await context.bot.send_message(
             chat_id=GLOBAL_CHANNEL_ID,
-            text=result.get("message"),
+            text=best_result.get("message"),
             parse_mode="Markdown"
         )
 
     except Exception as e:
         print("Auto Global Market Error:", e)
+
 
 def analyze_real_market_best(pair: str):
     results = [analyze_real_market(pair, tf) for tf in REAL_INTERVALS]
@@ -2070,6 +2089,13 @@ def main():
         raise ValueError("BOT_TOKEN غير موجود داخل ملف .env")
 
     app = Application.builder().token(BOT_TOKEN).build()
+
+    # Auto publish global market
+    app.job_queue.run_repeating(
+        auto_publish_real_market,
+        interval=120,
+        first=15
+    )
 
     job_queue = app.job_queue
 
