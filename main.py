@@ -110,6 +110,15 @@ REAL_PAIRS = [
     "USD/CAD",
     "AUD/USD",
     "NZD/USD",
+    "EUR/JPY",
+    "AUD/JPY",
+    "EUR/GBP",
+    "CAD/JPY",
+    "EUR/CAD",
+    "AUD/CHF",
+    "CHF/CAD",
+    "AUD/CAD",
+    "GBP/AUD",
 ]
 
 REAL_PAIR_TO_YAHOO_SYMBOL = {
@@ -120,6 +129,15 @@ REAL_PAIR_TO_YAHOO_SYMBOL = {
     "USD/CAD": "USDCAD=X",
     "AUD/USD": "AUDUSD=X",
     "NZD/USD": "NZDUSD=X",
+    "EUR/JPY": "EURJPY=X",
+    "AUD/JPY": "AUDJPY=X",
+    "EUR/GBP": "EURGBP=X",
+    "CAD/JPY": "CADJPY=X",
+    "EUR/CAD": "EURCAD=X",
+    "AUD/CHF": "AUDCHF=X",
+    "CHF/CAD": "CHFCAD=X",
+    "AUD/CAD": "AUDCAD=X",
+    "GBP/AUD": "GBPAUD=X",
 }
 
 REAL_PAIR_TO_TV_SYMBOL = {
@@ -130,6 +148,15 @@ REAL_PAIR_TO_TV_SYMBOL = {
     "USD/CAD": "FX_IDC:USDCAD",
     "AUD/USD": "FX_IDC:AUDUSD",
     "NZD/USD": "FX_IDC:NZDUSD",
+    "EUR/JPY": "FX_IDC:EURJPY",
+    "AUD/JPY": "FX_IDC:AUDJPY",
+    "EUR/GBP": "FX_IDC:EURGBP",
+    "CAD/JPY": "FX_IDC:CADJPY",
+    "EUR/CAD": "FX_IDC:EURCAD",
+    "AUD/CHF": "FX_IDC:AUDCHF",
+    "CHF/CAD": "FX_IDC:CHFCAD",
+    "AUD/CAD": "FX_IDC:AUDCAD",
+    "GBP/AUD": "FX_IDC:GBPAUD",
 }
 
 TRADINGVIEW_WS_URL = "wss://data.tradingview.com/socket.io/websocket"
@@ -145,6 +172,15 @@ PAIR_CONTEXT = {
     "USD/CAD": {"round_step": 0.0010, "near_factor": 0.18, "touch_factor": 0.07},
     "AUD/USD": {"round_step": 0.0010, "near_factor": 0.20, "touch_factor": 0.08},
     "NZD/USD": {"round_step": 0.0010, "near_factor": 0.20, "touch_factor": 0.08},
+    "EUR/JPY": {"round_step": 0.10, "near_factor": 0.18, "touch_factor": 0.07},
+    "AUD/JPY": {"round_step": 0.10, "near_factor": 0.20, "touch_factor": 0.08},
+    "CAD/JPY": {"round_step": 0.10, "near_factor": 0.18, "touch_factor": 0.07},
+    "EUR/GBP": {"round_step": 0.0010, "near_factor": 0.18, "touch_factor": 0.07},
+    "EUR/CAD": {"round_step": 0.0010, "near_factor": 0.18, "touch_factor": 0.07},
+    "AUD/CHF": {"round_step": 0.0010, "near_factor": 0.20, "touch_factor": 0.08},
+    "CHF/CAD": {"round_step": 0.0010, "near_factor": 0.18, "touch_factor": 0.07},
+    "AUD/CAD": {"round_step": 0.0010, "near_factor": 0.20, "touch_factor": 0.08},
+    "GBP/AUD": {"round_step": 0.0010, "near_factor": 0.20, "touch_factor": 0.08},
 }
 
 TRADE_COUNTS = [3, 5, 10, 15, 20]
@@ -200,6 +236,17 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["📥 الطلبات المعلقة", "📋 كافة المستخدمين"],
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
+        ["📡 قنوات البوت"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+admin_channels_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🌍 تشغيل نشر العالمي", "🌍 إيقاف نشر العالمي"],
+        ["⚡ تشغيل نشر OTC", "⚡ إيقاف نشر OTC"],
+        ["📊 حالة النشر"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -241,7 +288,11 @@ real_pairs_keyboard = ReplyKeyboardMarkup(
         ["EUR/USD", "GBP/USD"],
         ["USD/JPY", "USD/CHF"],
         ["USD/CAD", "AUD/USD"],
-        ["NZD/USD"],
+        ["NZD/USD", "EUR/JPY"],
+        ["AUD/JPY", "EUR/GBP"],
+        ["CAD/JPY", "EUR/CAD"],
+        ["AUD/CHF", "CHF/CAD"],
+        ["AUD/CAD", "GBP/AUD"],
         ["🔙 رجوع"],
     ],
     resize_keyboard=True
@@ -297,6 +348,40 @@ def approved_ref():
 
 def system_ref():
     return db.reference("system")
+
+
+def channel_publish_ref():
+    return system_ref().child("channel_publish")
+
+
+def get_channel_publish_settings():
+    data = channel_publish_ref().get() or {}
+    return {
+        "global": bool(data.get("global", True)),
+        "otc": bool(data.get("otc", True)),
+    }
+
+
+def is_channel_publish_enabled(channel_key: str) -> bool:
+    return bool(get_channel_publish_settings().get(channel_key, True))
+
+
+def set_channel_publish_enabled(channel_key: str, enabled: bool):
+    channel_publish_ref().update({
+        channel_key: bool(enabled),
+        f"{channel_key}_updated_at": now_iso(),
+    })
+
+
+def format_channel_publish_status() -> str:
+    settings = get_channel_publish_settings()
+    global_status = "شغال ✅" if settings.get("global", True) else "متوقف ⛔"
+    otc_status = "شغال ✅" if settings.get("otc", True) else "متوقف ⛔"
+    return (
+        "📊 حالة نشر القنوات\n\n"
+        f"🌍 قناة السوق العالمي: {global_status}\n"
+        f"⚡ قناة OTC: {otc_status}"
+    )
 
 
 # ===== Helpers =====
@@ -554,6 +639,9 @@ def get_stable_direction(pair: str, dt: datetime) -> str:
 
 async def publish_otc_list(context: ContextTypes.DEFAULT_TYPE):
     try:
+        if not is_channel_publish_enabled("otc"):
+            return
+
         count = CHANNEL_DAILY_SIGNAL_COUNT
         interval_minutes = CHANNEL_SIGNAL_INTERVAL_MINUTES
 
@@ -566,7 +654,7 @@ async def publish_otc_list(context: ContextTypes.DEFAULT_TYPE):
             interval_minutes,
             start_dt
         )
-        message_text = build_signals_message("MIXED OTC", count, interval_minutes, signals)
+        message_text = build_channel_otc_signals_message("MIXED OTC", count, interval_minutes, signals)
 
         await context.bot.send_message(
             chat_id=CHANNEL_ID,
@@ -660,6 +748,36 @@ def build_signals_message(pair: str, count: int, interval_minutes: int, signals:
         # signal شكله: "USD/BRL-OTC — 21:06 — CALL"
         parts = signal.split(" — ")
 
+        if len(parts) == 3:
+            pair_name, signal_time, direction = parts
+            formatted_signals.append(f"M1 {pair_name} {signal_time} {direction}")
+        else:
+            formatted_signals.append(signal)
+
+    return header + "\n".join(formatted_signals)
+
+
+def build_channel_otc_signals_message(pair: str, count: int, interval_minutes: int, signals: list[str]) -> str:
+    """رسالة النشر التلقائي لقناة OTC فقط، بتفاصيل أخف بدون تحذيرات الدوجي/المومنتم/التريند."""
+    header = (
+        "╔══════════════╗\n"
+        "   📊 Quotex Signals - OTC\n"
+        "╚══════════════╝\n\n"
+
+        "⏰ توقيت المنصة\n"
+        "UTC / GMT +3.00\n\n"
+
+        "⚠️ ملاحظات مهمة:\n"
+        "• مدة كل صفقة: 1M\n"
+        "• استخدم مضاعفة واحدة عند الخسارة\n"
+        "• التزم بإدارة رأس المال ولا تدخل بأكثر من صفقة بنفس الوقت\n\n"
+
+        "📍 الإشارات:\n\n"
+    )
+
+    formatted_signals = []
+    for signal in signals:
+        parts = signal.split(" — ")
         if len(parts) == 3:
             pair_name, signal_time, direction = parts
             formatted_signals.append(f"M1 {pair_name} {signal_time} {direction}")
@@ -1851,6 +1969,9 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
         if active_still_running:
             return
 
+        if not is_channel_publish_enabled("global"):
+            return
+
         # قناة السوق العالمي تبقى Global فقط.
         # إذا Quotex حوّل الأزواج إلى OTC، نوقف النشر ولا نرسل أي صفقة OTC هنا.
         if not is_quotex_global_market_open():
@@ -2334,6 +2455,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             set_bot_enabled(False)
             await update.message.reply_text("🛠 تم إيقاف البوت للعامة", reply_markup=admin_main_keyboard)
             return
+
+        if text == "📡 قنوات البوت":
+            context.user_data["step"] = "admin_channel_controls"
+            await update.message.reply_text(
+                format_channel_publish_status() + "\n\nاختر القناة التي تريد تشغيل أو إيقاف النشر فيها 👇",
+                reply_markup=admin_channels_keyboard
+            )
+            return
+
+        if step == "admin_channel_controls":
+            if text == "🌍 تشغيل نشر العالمي":
+                set_channel_publish_enabled("global", True)
+                await update.message.reply_text("✅ تم تشغيل النشر في قناة السوق العالمي", reply_markup=admin_channels_keyboard)
+                return
+
+            if text == "🌍 إيقاف نشر العالمي":
+                set_channel_publish_enabled("global", False)
+                await update.message.reply_text("⛔ تم إيقاف النشر في قناة السوق العالمي", reply_markup=admin_channels_keyboard)
+                return
+
+            if text == "⚡ تشغيل نشر OTC":
+                set_channel_publish_enabled("otc", True)
+                await update.message.reply_text("✅ تم تشغيل النشر في قناة OTC", reply_markup=admin_channels_keyboard)
+                return
+
+            if text == "⚡ إيقاف نشر OTC":
+                set_channel_publish_enabled("otc", False)
+                await update.message.reply_text("⛔ تم إيقاف النشر في قناة OTC", reply_markup=admin_channels_keyboard)
+                return
+
+            if text == "📊 حالة النشر":
+                await update.message.reply_text(format_channel_publish_status(), reply_markup=admin_channels_keyboard)
+                return
 
         if text == "📥 الطلبات المعلقة":
             data = get_all_pending_users()
