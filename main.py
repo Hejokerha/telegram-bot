@@ -35,6 +35,7 @@ UTC = timezone.utc
 UTC_PLUS_3 = timezone(timedelta(hours=3))
 
 CHANNEL_ID = "@quotexsignals_tt"
+GLOBAL_CHANNEL_ID = "@quotbo"
 ADMIN_USERNAME = "@coach_WAEL_trading"
 ADMIN_TELEGRAM_ID = 1582593617
 
@@ -1360,6 +1361,37 @@ def analyze_real_market(pair: str, timeframe_minutes: int):
         )
     }
 
+
+
+
+async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        session = get_session_name()
+
+        if session != "الأمريكية":
+            return
+
+        pair = random.choice(REAL_PAIRS)
+
+        result = analyze_real_market_best(pair)
+
+        if not result.get("ok"):
+            return
+
+        if result.get("confidence", 0) < 75:
+            return
+
+        if result.get("quality", 0) < 80:
+            return
+
+        await context.bot.send_message(
+            chat_id=GLOBAL_CHANNEL_ID,
+            text=result.get("message"),
+            parse_mode="Markdown"
+        )
+
+    except Exception as e:
+        print("Auto Global Market Error:", e)
 
 def analyze_real_market_best(pair: str):
     results = [analyze_real_market(pair, tf) for tf in REAL_INTERVALS]
