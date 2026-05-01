@@ -4,6 +4,10 @@ import hashlib
 import asyncio
 import random
 import requests
+try:
+    import websocket
+except Exception:
+    websocket = None
 from datetime import time
 from datetime import datetime, timedelta, timezone
 from statistics import median
@@ -116,6 +120,19 @@ REAL_PAIR_TO_YAHOO_SYMBOL = {
     "AUD/USD": "AUDUSD=X",
     "NZD/USD": "NZDUSD=X",
 }
+
+REAL_PAIR_TO_TV_SYMBOL = {
+    "EUR/USD": "FX_IDC:EURUSD",
+    "GBP/USD": "FX_IDC:GBPUSD",
+    "USD/JPY": "FX_IDC:USDJPY",
+    "USD/CHF": "FX_IDC:USDCHF",
+    "USD/CAD": "FX_IDC:USDCAD",
+    "AUD/USD": "FX_IDC:AUDUSD",
+    "NZD/USD": "FX_IDC:NZDUSD",
+}
+
+TRADINGVIEW_WS_URL = "wss://data.tradingview.com/socket.io/websocket"
+TRADINGVIEW_RESULT_RETRY_SECONDS = 30
 
 # نسب تقريبية حتى لا تكون مسافات الدعم/المقاومة والـ Round Numbers ثابتة لكل الأزواج.
 # السبب: الأزواج مثل USD/JPY تتحرك بعدد خانات مختلف عن EUR/USD.
@@ -1386,6 +1403,116 @@ def clear_global_active_trade():
 
 
 
+
+def tv_make_session(prefix: str = "qs") -> str:
+    return prefix + "_" + hashlib.sha256(f"{prefix}|{now_iso()}|{random.random()}".encode("utf-8")).hexdigest()[:12]
+
+
+def tv_prepend_header(message: str) -> str:
+    return f"~m~{len(message)}~m~{message}"
+
+
+def tv_send(ws, func: str, params: list):
+    ws.send(tv_prepend_header(json.dumps({"m": func, "p": params}, separators=(",", ":"))))
+
+
+def parse_tradingview_series(raw_message: str):
+    candles = []
+    pattern = re.compile(r'"s":\[(.*?)\}\]', re.DOTALL)
+    match = pattern.search(raw_message)
+    if not match:
+        return candles
+
+    chunk = match.group(1)
+    entries = re.findall(r'\{"i":\d+,"v":\[(.*?)\]\}', chunk)
+    for entry in entries:
+        try:
+            parts = json.loads("[" + entry + "]")
+            if len(parts) < 5:
+                continue
+            ts = int(float(parts[0]))
+            candles.append({
+                "time": datetime.fromtimestamp(ts, tz=UTC),
+                "open": float(parts[1]),
+                "high": float(parts[2]),
+                "low": float(parts[3]),
+                "close": float(parts[4]),
+            })
+        except Exception:
+            continue
+
+    candles.sort(key=lambda c: c["time"])
+    return candles
+
+
+def get_tradingview_candles(pair: str, interval: str = "1", bars: int = 80):
+    """يجلب شموع 1m من TradingView عبر websocket غير رسمي.
+    إذا فشل الاتصال أو لم تتوفر المكتبة يرجع None مع سبب واضح.
+    """
+    if websocket is None:
+        return None, "websocket-client غير مثبت"
+
+    symbol = REAL_PAIR_TO_TV_SYMBOL.get(pair)
+    if not symbol:
+        return None, f"لا يوجد رمز TradingView للزوج {pair}"
+
+    qs = tv_make_session("qs")
+    cs = tv_make_session("cs")
+
+    try:
+        ws = websocket.create_connection(
+            TRADINGVIEW_WS_URL,
+            timeout=12,
+            header=[
+                "Origin: https://www.tradingview.com",
+                "User-Agent: Mozilla/5.0",
+            ],
+        )
+
+        tv_send(ws, "quote_create_session", [qs])
+        tv_send(ws, "quote_set_fields", [qs, "lp", "ch", "chp", "bid", "ask", "open_price", "high_price", "low_price", "prev_close_price"])
+        tv_send(ws, "quote_add_symbols", [qs, symbol, {"flags": ["force_permission"]}])
+        tv_send(ws, "chart_create_session", [cs, ""])
+        tv_send(ws, "resolve_symbol", [cs, "symbol_1", json.dumps({"symbol": symbol, "adjustment": "splits", "session": "regular"})])
+        tv_send(ws, "create_series", [cs, "s1", "s1", "symbol_1", interval, bars])
+
+        raw = ""
+        for _ in range(40):
+            msg = ws.recv()
+            raw += msg
+            if '"timescale_update"' in msg and '"s":[' in msg:
+                candles = parse_tradingview_series(raw)
+                if candles:
+                    ws.close()
+                    return candles[-bars:], None
+
+        ws.close()
+        candles = parse_tradingview_series(raw)
+        if candles:
+            return candles[-bars:], None
+
+        return None, "لم يتم استقبال شموع من TradingView"
+
+    except Exception as e:
+        try:
+            ws.close()
+        except Exception:
+            pass
+        return None, str(e)
+
+
+def get_result_candles(pair: str, limit: int = 80):
+    """مصدر التحقق الأساسي TradingView، والاحتياطي Yahoo إذا فشل."""
+    candles, error_msg = get_tradingview_candles(pair, interval="1", bars=limit)
+    if candles:
+        return candles, "TradingView", None
+
+    fallback_candles, fallback_error = get_candles(pair, timeframe_minutes=1, limit=limit)
+    if fallback_candles:
+        return fallback_candles, "YahooFallback", error_msg
+
+    return None, None, f"TradingView: {error_msg} | Yahoo: {fallback_error}"
+
 def floor_to_minute(dt: datetime) -> datetime:
     return dt.astimezone(UTC).replace(second=0, microsecond=0)
 
@@ -1411,12 +1538,13 @@ def find_candle_by_minute(candles: list[dict], target_dt: datetime):
 
 
 def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: datetime, duration_minutes: int, fallback_entry_price=None):
-    """تحقق أدق للنتيجة:
-    - سعر الدخول من افتتاح شمعة وقت الدخول.
-    - سعر الإغلاق من إغلاق آخر شمعة داخل مدة الصفقة.
-      مثال 5M: دخول 20:10، الإغلاق الحقيقي عند 20:15، نستخدم close شمعة 20:14.
+    """تحقق أقرب إلى TradingView:
+    - المصدر الأساسي TradingView 1m.
+    - سعر الدخول: Open شمعة وقت الدخول.
+    - سعر النتيجة: Close آخر شمعة داخل مدة الصفقة.
+      مثال 5M: دخول 20:10، نحكم على Close شمعة 20:14.
     """
-    candles, error_msg = get_candles(pair, timeframe_minutes=1, limit=80)
+    candles, source_name, error_msg = get_result_candles(pair, limit=100)
     if not candles:
         return None, f"تعذر جلب بيانات التحقق: {error_msg}"
 
@@ -1452,8 +1580,8 @@ def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: da
         "close_price": close_price,
         "entry_time": entry_time,
         "expiry_time": expiry_time,
+        "source": source_name,
     }, None
-
 
 async def resolve_global_active_trade_if_due(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """يرجع True إذا في صفقة عالمية نشطة ولسا ما انتهت.
@@ -1471,7 +1599,7 @@ async def resolve_global_active_trade_if_due(context: ContextTypes.DEFAULT_TYPE)
     # ننتظر بعد انتهاء الصفقة حتى تتوفر شمعة الإغلاق من مصدر البيانات.
     result_check_at = parse_iso(trade.get("result_check_at", ""))
     if not result_check_at:
-        result_check_at = expires_at + timedelta(seconds=90)
+        result_check_at = expires_at + timedelta(seconds=TRADINGVIEW_RESULT_RETRY_SECONDS)
 
     if result_check_at > now_utc():
         return True
@@ -1504,15 +1632,12 @@ async def resolve_global_active_trade_if_due(context: ContextTypes.DEFAULT_TYPE)
             trade["result_check_at"] = (now_utc() + timedelta(seconds=60)).isoformat()
             set_global_active_trade(trade)
 
-            # بعد 5 محاولات نوقف بدون حكم خاطئ.
-            if retry_count >= 5:
-                await context.bot.send_message(
-                    chat_id=GLOBAL_CHANNEL_ID,
-                    text="⚠️ Result unavailable",
-                    parse_mode="Markdown"
-                )
-                clear_global_active_trade()
-                return False
+            # لا ننشر أي شيء غير WIN أو Loss.
+            # إذا لم تتوفر شمعة الإغلاق بعد، ننتظر ونعيد المحاولة.
+            trade["result_check_at"] = (now_utc() + timedelta(seconds=TRADINGVIEW_RESULT_RETRY_SECONDS)).isoformat()
+            trade["result_retry_count"] = int(trade.get("result_retry_count", 0)) + 1
+            set_global_active_trade(trade)
+            return True
 
             return True
 
@@ -1591,7 +1716,7 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
             "duration_minutes": duration_minutes,
             "entry_time": entry_time.isoformat(),
             "expires_at": expires_at.isoformat(),
-            "result_check_at": (expires_at + timedelta(seconds=90)).isoformat(),
+            "result_check_at": (expires_at + timedelta(seconds=TRADINGVIEW_RESULT_RETRY_SECONDS)).isoformat(),
             "published_at": now_iso(),
         })
 
