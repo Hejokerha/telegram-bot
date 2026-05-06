@@ -837,8 +837,11 @@ def is_quotex_global_market_open(check_dt: datetime | None = None) -> bool:
     return True
 
 
-def is_global_publish_window_open(check_dt: datetime | None = None) -> bool:
-    """نافذة نشر قناة السوق العالمي: 10:00 حتى 21:00 بتوقيت سوريا/UTC+3، مع احترام إغلاق Quotex العالمي."""
+
+def is_global_autopublish_allowed(check_dt: datetime | None = None) -> bool:
+    """يسمح بالنشر التلقائي لقناة السوق العالمي فقط بين 10:00 و 21:00 بتوقيت سوريا/UTC+3،
+    بشرط أن يكون سوق Quotex العالمي مفتوحًا أيضًا.
+    """
     dt = (check_dt or now_utc()).astimezone(UTC_PLUS_3)
 
     if not is_quotex_global_market_open(dt):
@@ -2029,7 +2032,7 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
 
         # قناة السوق العالمي تبقى Global فقط.
         # إذا Quotex حوّل الأزواج إلى OTC، نوقف النشر ولا نرسل أي صفقة OTC هنا.
-        if not is_global_publish_window_open():
+        if not is_global_autopublish_allowed():
             await notify_global_market_closed_once(context)
             return
 
