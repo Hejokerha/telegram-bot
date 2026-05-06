@@ -40,7 +40,7 @@ UTC = timezone.utc
 UTC_PLUS_3 = timezone(timedelta(hours=3))
 
 CHANNEL_ID = "@quotexsignals_tt"
-GLOBAL_CHANNEL_ID = "@quotbo"
+GLOBAL_CHANNEL_ID = "-1003918647685"
 ADMIN_USERNAME = "@coach_WAEL_trading"
 ADMIN_TELEGRAM_ID = 1582593617
 
