@@ -869,12 +869,16 @@ def build_global_channel_signal_message(signal: dict) -> str:
 
     return (
         "╔══════════════╗\n"
-        "   🌍 TRADING TIME\n"
+        "   🌍 TRADING TIME BOT\n"
         "╚══════════════╝\n\n"
-        f"💎 {pair}\n"
-        f"🔥 M{timeframe}\n"
-        f"⌛️ {entry_text}\n"
-        f"{direction_line}"
+
+        f"💠 {pair.replace('/', '')}\n"
+        f"⏳ M{timeframe_minutes}\n"
+        f"🕓 {entry_text}\n"
+        f"{'📈 CALL' if direction == 'CALL' else '📉 PUT'}\n\n\n"
+
+        "@coach_WAEL_trading\n"
+        "@sttrade_helper_bot"
     )
 
 
