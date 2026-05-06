@@ -837,6 +837,20 @@ def is_quotex_global_market_open(check_dt: datetime | None = None) -> bool:
     return True
 
 
+def is_global_publish_window_open(check_dt: datetime | None = None) -> bool:
+    """نافذة نشر قناة السوق العالمي: 10:00 حتى 21:00 بتوقيت سوريا/UTC+3، مع احترام إغلاق Quotex العالمي."""
+    dt = (check_dt or now_utc()).astimezone(UTC_PLUS_3)
+
+    if not is_quotex_global_market_open(dt):
+        return False
+
+    return GLOBAL_MARKET_AUTOPUBLISH_START_HOUR_UTC_PLUS_3 <= dt.hour < GLOBAL_MARKET_AUTOPUBLISH_END_HOUR_UTC_PLUS_3
+
+
+def format_global_channel_pair(pair: str) -> str:
+    return pair.replace("/", "")
+
+
 def build_global_channel_signal_message(signal: dict) -> str:
     """رسالة مختصرة خاصة بالنشر التلقائي لقناة السوق العالمي فقط.
     لا تُستخدم في التوليد اليدوي حتى تبقى تفاصيل التحليل للمستخدم كما هي.
@@ -844,6 +858,7 @@ def build_global_channel_signal_message(signal: dict) -> str:
     pair = format_global_channel_pair(str(signal.get("pair", "")))
     direction = str(signal.get("direction", ""))
     timeframe = int(signal.get("timeframe", signal.get("duration_minutes", 1)) or 1)
+
     entry_dt = parse_iso(str(signal.get("entry_time", "")))
     entry_text = entry_dt.astimezone(UTC_PLUS_3).strftime("%H:%M:%S") if entry_dt else "--:--:--"
 
@@ -853,12 +868,10 @@ def build_global_channel_signal_message(signal: dict) -> str:
         "╔══════════════╗\n"
         "   🌍 TRADING TIME BOT\n"
         "╚══════════════╝\n\n"
-
         f"💠 {pair}\n"
         f"⏳ M{timeframe}\n"
         f"🕓 {entry_text}\n"
         f"{direction_line}\n\n\n"
-
         "@coach_WAEL_trading\n"
         "@sttrade_helper_bot"
     )
