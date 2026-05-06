@@ -199,6 +199,9 @@ GLOBAL_SECONDARY_TIMEFRAME_MAX_LEAD_SECONDS = 70
 # إذا تغيّر وقت إغلاق/فتح Quotex لاحقًا، عدّل هذه القيم فقط.
 QUOTEX_GLOBAL_FRIDAY_CLOSE_HOUR_UTC_PLUS_3 = 17
 QUOTEX_GLOBAL_MONDAY_OPEN_HOUR_UTC_PLUS_3 = 0
+GLOBAL_MARKET_AUTOPUBLISH_START_HOUR_UTC_PLUS_3 = 10
+GLOBAL_MARKET_AUTOPUBLISH_END_HOUR_UTC_PLUS_3 = 21
+
 GLOBAL_MARKET_CLOSED_MESSAGE_ENABLED = True
 GLOBAL_MARKET_CLOSED_MESSAGE = (
     "🌍 السوق العالمي مغلق الآن\n\n"
@@ -847,6 +850,16 @@ def set_global_market_channel_state(data: dict):
     global_market_channel_state_ref().update(data)
 
 
+
+def is_global_publish_window_open(check_dt: datetime | None = None) -> bool:
+    dt = (check_dt or now_utc()).astimezone(UTC_PLUS_3)
+
+    if not is_quotex_global_market_open(dt):
+        return False
+
+    return GLOBAL_MARKET_AUTOPUBLISH_START_HOUR_UTC_PLUS_3 <= dt.hour < GLOBAL_MARKET_AUTOPUBLISH_END_HOUR_UTC_PLUS_3
+
+
 async def notify_global_market_closed_once(context: ContextTypes.DEFAULT_TYPE):
     """يرسل رسالة إغلاق مرة واحدة فقط حتى لا يزعج القناة كل دقيقة."""
     if not GLOBAL_MARKET_CLOSED_MESSAGE_ENABLED:
@@ -1318,6 +1331,24 @@ def build_conditional_message(header: str, reason: str, price_text: str, watch_t
     if notes:
         msg += "\n\n📌 ملاحظات التحليل:\n" + "\n".join(notes[:5])
     return msg
+
+
+
+def build_global_channel_signal_message(pair: str, direction: str, timeframe_minutes: int, entry_time_iso: str):
+    entry_dt = parse_iso(entry_time_iso)
+    entry_text = format_utc_plus_3(entry_dt) if entry_dt else "--:--"
+
+    direction_icon = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
+
+    return (
+        "╔══════════════╗\n"
+        "   🌍 TRADING TIME\n"
+        "╚══════════════╝\n\n"
+        f"💱 {pair.replace('/', '')}\n"
+        f"⚡ M{timeframe_minutes}\n"
+        f"⏰ {entry_text}\n"
+        f"{direction_icon}"
+    )
 
 
 def analyze_real_market(pair: str, timeframe_minutes: int):
@@ -1987,7 +2018,7 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
 
         # قناة السوق العالمي تبقى Global فقط.
         # إذا Quotex حوّل الأزواج إلى OTC، نوقف النشر ولا نرسل أي صفقة OTC هنا.
-        if not is_quotex_global_market_open():
+        if not is_global_publish_window_open():
             await notify_global_market_closed_once(context)
             return
 
@@ -2070,6 +2101,24 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         print("Auto Global Market Error:", e)
+
+
+
+def build_global_channel_signal_message(pair: str, direction: str, timeframe_minutes: int, entry_time_iso: str):
+    entry_dt = parse_iso(entry_time_iso)
+    entry_text = format_utc_plus_3(entry_dt) if entry_dt else "--:--"
+
+    direction_icon = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
+
+    return (
+        "╔══════════════╗\n"
+        "   🌍 TRADING TIME\n"
+        "╚══════════════╝\n\n"
+        f"💱 {pair.replace('/', '')}\n"
+        f"⚡ M{timeframe_minutes}\n"
+        f"⏰ {entry_text}\n"
+        f"{direction_icon}"
+    )
 
 
 def analyze_real_market_best(pair: str):
