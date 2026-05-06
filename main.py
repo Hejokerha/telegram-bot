@@ -2087,7 +2087,6 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
             chat_id=GLOBAL_CHANNEL_ID,
             text=build_global_channel_signal_message(best_result),
                             parse_mode="HTML",
-            parse_mode="HTML"
         )
 
         entry_time = parse_iso(best_result.get("entry_time", ""))
