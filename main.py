@@ -40,7 +40,7 @@ UTC = timezone.utc
 UTC_PLUS_3 = timezone(timedelta(hours=3))
 
 CHANNEL_ID = "@quotexsignals_tt"
-GLOBAL_CHANNEL_ID = "-1003918647685"
+GLOBAL_CHANNEL_ID = "@quotbo"
 ADMIN_USERNAME = "@coach_WAEL_trading"
 ADMIN_TELEGRAM_ID = 1582593617
 
@@ -851,6 +851,7 @@ def set_global_market_channel_state(data: dict):
 
 
 
+
 def is_global_publish_window_open(check_dt: datetime | None = None) -> bool:
     dt = (check_dt or now_utc()).astimezone(UTC_PLUS_3)
 
@@ -1334,20 +1335,19 @@ def build_conditional_message(header: str, reason: str, price_text: str, watch_t
 
 
 
+
 def build_global_channel_signal_message(pair: str, direction: str, timeframe_minutes: int, entry_time_iso: str):
     entry_dt = parse_iso(entry_time_iso)
     entry_text = format_utc_plus_3(entry_dt) if entry_dt else "--:--"
-
-    direction_icon = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
 
     return (
         "╔══════════════╗\n"
         "   🌍 TRADING TIME\n"
         "╚══════════════╝\n\n"
-        f"💱 {pair.replace('/', '')}\n"
-        f"⚡ M{timeframe_minutes}\n"
-        f"⏰ {entry_text}\n"
-        f"{direction_icon}"
+        f"💠 {pair.replace('/', '')}\n"
+        f"⏳ M{timeframe_minutes}\n"
+        f"🕓 {entry_text}\n"
+        f"{'📈 CALL' if direction == 'CALL' else '📉 PUT'}"
     )
 
 
@@ -1844,15 +1844,8 @@ def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: da
         return None, f"تعذر جلب بيانات التحقق: {error_msg}"
 
     candles = [c for c in candles if isinstance(c, dict) and "time" in c and "open" in c and "close" in c]
-
-    # مهم جدًا: لا نحسب على شمعة ما زالت تتشكل.
-    # TradingView/Yahoo قد يرجعان شمعة الدقيقة الحالية قبل إغلاقها، وهذا كان يسبب
-    # تسجيل Loss للمضاعفة بينما الشمعة لاحقًا تغلق باتجاه الصفقة.
-    current_open_minute = floor_to_minute(now_utc())
-    candles = [c for c in candles if floor_to_minute(c["time"]) < current_open_minute]
-
     if not candles:
-        return None, "بيانات الشموع المغلقة غير صالحة أو غير متاحة بعد"
+        return None, "بيانات الشموع غير صالحة"
 
     entry_time = floor_to_minute(entry_time)
     duration_minutes = max(1, int(duration_minutes))
@@ -1899,12 +1892,6 @@ def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: da
     # إذا خسرت مباشرة، لا ننشر Loss قبل فحص مضاعفة واحدة بعد انتهاء الصفقة الأساسية.
     martingale_entry_time = expiry_time
     martingale_expiry_time = martingale_entry_time + timedelta(minutes=duration_minutes)
-
-    # لا نفحص المضاعفة قبل إغلاق شمعتها نهائيًا + هامش انتظار بسيط لمصدر البيانات.
-    # مثال 1M: دخول 22:45، الأصلية تغلق 22:46، المضاعفة 22:46 وتغلق 22:47.
-    # لا يجوز الحكم على المضاعفة عند 22:46:30 لأنها ما زالت مفتوحة.
-    if now_utc() < martingale_expiry_time + timedelta(seconds=TRADINGVIEW_RESULT_RETRY_SECONDS):
-        return None, "ننتظر إغلاق شمعة المضاعفة"
 
     martingale_entry_candle = find_candle_by_minute(candles, martingale_entry_time, allow_nearest=False)
     martingale_close_candle = find_candle_by_minute(candles, martingale_expiry_time - timedelta(minutes=1), allow_nearest=False)
@@ -2104,20 +2091,19 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
 def build_global_channel_signal_message(pair: str, direction: str, timeframe_minutes: int, entry_time_iso: str):
     entry_dt = parse_iso(entry_time_iso)
     entry_text = format_utc_plus_3(entry_dt) if entry_dt else "--:--"
-
-    direction_icon = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
 
     return (
         "╔══════════════╗\n"
         "   🌍 TRADING TIME\n"
         "╚══════════════╝\n\n"
-        f"💱 {pair.replace('/', '')}\n"
-        f"⚡ M{timeframe_minutes}\n"
-        f"⏰ {entry_text}\n"
-        f"{direction_icon}"
+        f"💠 {pair.replace('/', '')}\n"
+        f"⏳ M{timeframe_minutes}\n"
+        f"🕓 {entry_text}\n"
+        f"{'📈 CALL' if direction == 'CALL' else '📉 PUT'}"
     )
 
 
