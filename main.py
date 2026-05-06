@@ -865,15 +865,15 @@ def build_global_channel_signal_message(signal: dict) -> str:
     entry_dt = parse_iso(str(signal.get("entry_time", "")))
     entry_text = entry_dt.astimezone(UTC_PLUS_3).strftime("%H:%M:%S") if entry_dt else "--:--:--"
 
-    direction_line = "📈 CALL" if direction == "CALL" else "📉 PUT"
+    direction_line = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
 
     return (
         "╔══════════════╗\n"
         "   🌍 TRADING TIME BOT\n"
         "╚══════════════╝\n\n"
-        f"💠 {pair}\n"
-        f"⏳ M{timeframe}\n"
-        f"🕓 {entry_text}\n"
+        f"💎 {pair}\n"
+        f"🔥 M{timeframe}\n"
+        f"⌛️ {entry_text}\n"
         f"{direction_line}\n\n\n"
         "@coach_WAEL_trading\n"
         "@sttrade_helper_bot"
@@ -2086,7 +2086,8 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
         await context.bot.send_message(
             chat_id=GLOBAL_CHANNEL_ID,
             text=build_global_channel_signal_message(best_result),
-            parse_mode="Markdown"
+                            parse_mode="HTML",
+            parse_mode="HTML"
         )
 
         entry_time = parse_iso(best_result.get("entry_time", ""))
