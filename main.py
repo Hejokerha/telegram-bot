@@ -40,7 +40,7 @@ UTC = timezone.utc
 UTC_PLUS_3 = timezone(timedelta(hours=3))
 
 CHANNEL_ID = "@quotexsignals_tt"
-GLOBAL_CHANNEL_ID = "-1003918647685"
+GLOBAL_CHANNEL_ID = -1003918647685
 ADMIN_USERNAME = "@coach_WAEL_trading"
 ADMIN_TELEGRAM_ID = 1582593617
 
@@ -192,6 +192,8 @@ REAL_INTERVALS = [1, 5, 10]
 GLOBAL_AUTOPUBLISH_PRIMARY_TIMEFRAMES = [1]
 GLOBAL_AUTOPUBLISH_SECONDARY_TIMEFRAMES = [5, 10]
 GLOBAL_SECONDARY_TIMEFRAME_MAX_LEAD_SECONDS = 70
+GLOBAL_MARKET_AUTOPUBLISH_START_HOUR_UTC_PLUS_3 = 10
+GLOBAL_MARKET_AUTOPUBLISH_END_HOUR_UTC_PLUS_3 = 21
 
 # قناة السوق العالمي لا تتحول إلى OTC إطلاقًا.
 # حسب سلوك Quotex الذي ظهر عندك: عند توقف السوق العالمي تصبح الأزواج OTC،
@@ -199,9 +201,6 @@ GLOBAL_SECONDARY_TIMEFRAME_MAX_LEAD_SECONDS = 70
 # إذا تغيّر وقت إغلاق/فتح Quotex لاحقًا، عدّل هذه القيم فقط.
 QUOTEX_GLOBAL_FRIDAY_CLOSE_HOUR_UTC_PLUS_3 = 17
 QUOTEX_GLOBAL_MONDAY_OPEN_HOUR_UTC_PLUS_3 = 0
-GLOBAL_MARKET_AUTOPUBLISH_START_HOUR_UTC_PLUS_3 = 10
-GLOBAL_MARKET_AUTOPUBLISH_END_HOUR_UTC_PLUS_3 = 21
-
 GLOBAL_MARKET_CLOSED_MESSAGE_ENABLED = True
 GLOBAL_MARKET_CLOSED_MESSAGE = (
     "🌍 السوق العالمي مغلق الآن\n\n"
@@ -838,6 +837,47 @@ def is_quotex_global_market_open(check_dt: datetime | None = None) -> bool:
     return True
 
 
+
+
+def is_global_publish_window_open(check_dt: datetime | None = None) -> bool:
+    """نافذة نشر قناة السوق العالمي: من 10:00 صباحًا حتى 21:00 مساءً بتوقيت سوريا/UTC+3.
+    لا تكفي هذه النافذة وحدها؛ يجب أن يكون سوق Quotex العالمي مفتوحًا أيضًا.
+    """
+    dt = (check_dt or now_utc()).astimezone(UTC_PLUS_3)
+
+    if not is_quotex_global_market_open(dt):
+        return False
+
+    return GLOBAL_MARKET_AUTOPUBLISH_START_HOUR_UTC_PLUS_3 <= dt.hour < GLOBAL_MARKET_AUTOPUBLISH_END_HOUR_UTC_PLUS_3
+
+
+def format_global_channel_pair(pair: str) -> str:
+    return pair.replace("/", "")
+
+
+def build_global_channel_signal_message(signal: dict) -> str:
+    """رسالة مختصرة خاصة بالنشر التلقائي لقناة السوق العالمي فقط.
+    لا تُستخدم في التوليد اليدوي حتى تبقى تفاصيل التحليل للمستخدم كما هي.
+    """
+    pair = format_global_channel_pair(str(signal.get("pair", "")))
+    direction = str(signal.get("direction", ""))
+    timeframe = int(signal.get("timeframe", signal.get("duration_minutes", 1)) or 1)
+    entry_dt = parse_iso(str(signal.get("entry_time", "")))
+    entry_text = entry_dt.astimezone(UTC_PLUS_3).strftime("%H:%M:%S") if entry_dt else "--:--:--"
+
+    direction_line = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
+
+    return (
+        "╔══════════════╗\n"
+        "   🌍 TRADING TIME\n"
+        "╚══════════════╝\n\n"
+        f"💎 {pair}\n"
+        f"🔥 M{timeframe}\n"
+        f"⌛️ {entry_text}\n"
+        f"{direction_line}"
+    )
+
+
 def global_market_channel_state_ref():
     return system_ref().child("global_market_channel_state")
 
@@ -848,17 +888,6 @@ def get_global_market_channel_state():
 
 def set_global_market_channel_state(data: dict):
     global_market_channel_state_ref().update(data)
-
-
-
-
-def is_global_publish_window_open(check_dt: datetime | None = None) -> bool:
-    dt = (check_dt or now_utc()).astimezone(UTC_PLUS_3)
-
-    if not is_quotex_global_market_open(dt):
-        return False
-
-    return GLOBAL_MARKET_AUTOPUBLISH_START_HOUR_UTC_PLUS_3 <= dt.hour < GLOBAL_MARKET_AUTOPUBLISH_END_HOUR_UTC_PLUS_3
 
 
 async def notify_global_market_closed_once(context: ContextTypes.DEFAULT_TYPE):
@@ -1332,23 +1361,6 @@ def build_conditional_message(header: str, reason: str, price_text: str, watch_t
     if notes:
         msg += "\n\n📌 ملاحظات التحليل:\n" + "\n".join(notes[:5])
     return msg
-
-
-
-
-def build_global_channel_signal_message(pair: str, direction: str, timeframe_minutes: int, entry_time_iso: str):
-    entry_dt = parse_iso(entry_time_iso)
-    entry_text = format_utc_plus_3(entry_dt) if entry_dt else "--:--"
-
-    return (
-        "╔══════════════╗\n"
-        "   🌍 TRADING TIME\n"
-        "╚══════════════╝\n\n"
-        f"💠 {pair.replace('/', '')}\n"
-        f"⏳ M{timeframe_minutes}\n"
-        f"🕓 {entry_text}\n"
-        f"{'📈 CALL' if direction == 'CALL' else '📉 PUT'}"
-    )
 
 
 def analyze_real_market(pair: str, timeframe_minutes: int):
@@ -1844,8 +1856,15 @@ def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: da
         return None, f"تعذر جلب بيانات التحقق: {error_msg}"
 
     candles = [c for c in candles if isinstance(c, dict) and "time" in c and "open" in c and "close" in c]
+
+    # مهم جدًا: لا نحسب على شمعة ما زالت تتشكل.
+    # TradingView/Yahoo قد يرجعان شمعة الدقيقة الحالية قبل إغلاقها، وهذا كان يسبب
+    # تسجيل Loss للمضاعفة بينما الشمعة لاحقًا تغلق باتجاه الصفقة.
+    current_open_minute = floor_to_minute(now_utc())
+    candles = [c for c in candles if floor_to_minute(c["time"]) < current_open_minute]
+
     if not candles:
-        return None, "بيانات الشموع غير صالحة"
+        return None, "بيانات الشموع المغلقة غير صالحة أو غير متاحة بعد"
 
     entry_time = floor_to_minute(entry_time)
     duration_minutes = max(1, int(duration_minutes))
@@ -1892,6 +1911,12 @@ def get_real_trade_result_from_candles(pair: str, direction: str, entry_time: da
     # إذا خسرت مباشرة، لا ننشر Loss قبل فحص مضاعفة واحدة بعد انتهاء الصفقة الأساسية.
     martingale_entry_time = expiry_time
     martingale_expiry_time = martingale_entry_time + timedelta(minutes=duration_minutes)
+
+    # لا نفحص المضاعفة قبل إغلاق شمعتها نهائيًا + هامش انتظار بسيط لمصدر البيانات.
+    # مثال 1M: دخول 22:45، الأصلية تغلق 22:46، المضاعفة 22:46 وتغلق 22:47.
+    # لا يجوز الحكم على المضاعفة عند 22:46:30 لأنها ما زالت مفتوحة.
+    if now_utc() < martingale_expiry_time + timedelta(seconds=TRADINGVIEW_RESULT_RETRY_SECONDS):
+        return None, "ننتظر إغلاق شمعة المضاعفة"
 
     martingale_entry_candle = find_candle_by_minute(candles, martingale_entry_time, allow_nearest=False)
     martingale_close_candle = find_candle_by_minute(candles, martingale_expiry_time - timedelta(minutes=1), allow_nearest=False)
@@ -2005,15 +2030,14 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
 
         # قناة السوق العالمي تبقى Global فقط.
         # إذا Quotex حوّل الأزواج إلى OTC، نوقف النشر ولا نرسل أي صفقة OTC هنا.
-        if not is_global_publish_window_open():
+        if not is_quotex_global_market_open():
             await notify_global_market_closed_once(context)
             return
 
         mark_global_market_open()
 
-        # يعمل فقط ضمن الجلسة الأمريكية
-        session = get_session_name()
-        if session != "الأمريكية":
+        # النشر التلقائي فقط من 10:00 صباحًا حتى 21:00 مساءً بتوقيت سوريا UTC+3.
+        if not is_global_publish_window_open():
             return
 
         shuffled_pairs = REAL_PAIRS[:]
@@ -2063,7 +2087,7 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
 
         await context.bot.send_message(
             chat_id=GLOBAL_CHANNEL_ID,
-            text=best_result.get("message"),
+            text=build_global_channel_signal_message(best_result),
             parse_mode="Markdown"
         )
 
@@ -2088,23 +2112,6 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         print("Auto Global Market Error:", e)
-
-
-
-
-def build_global_channel_signal_message(pair: str, direction: str, timeframe_minutes: int, entry_time_iso: str):
-    entry_dt = parse_iso(entry_time_iso)
-    entry_text = format_utc_plus_3(entry_dt) if entry_dt else "--:--"
-
-    return (
-        "╔══════════════╗\n"
-        "   🌍 TRADING TIME\n"
-        "╚══════════════╝\n\n"
-        f"💠 {pair.replace('/', '')}\n"
-        f"⏳ M{timeframe_minutes}\n"
-        f"🕓 {entry_text}\n"
-        f"{'📈 CALL' if direction == 'CALL' else '📉 PUT'}"
-    )
 
 
 def analyze_real_market_best(pair: str):
