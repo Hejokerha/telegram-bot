@@ -837,24 +837,6 @@ def is_quotex_global_market_open(check_dt: datetime | None = None) -> bool:
     return True
 
 
-
-
-def is_global_publish_window_open(check_dt: datetime | None = None) -> bool:
-    """نافذة نشر قناة السوق العالمي: من 10:00 صباحًا حتى 21:00 مساءً بتوقيت سوريا/UTC+3.
-    لا تكفي هذه النافذة وحدها؛ يجب أن يكون سوق Quotex العالمي مفتوحًا أيضًا.
-    """
-    dt = (check_dt or now_utc()).astimezone(UTC_PLUS_3)
-
-    if not is_quotex_global_market_open(dt):
-        return False
-
-    return GLOBAL_MARKET_AUTOPUBLISH_START_HOUR_UTC_PLUS_3 <= dt.hour < GLOBAL_MARKET_AUTOPUBLISH_END_HOUR_UTC_PLUS_3
-
-
-def format_global_channel_pair(pair: str) -> str:
-    return pair.replace("/", "")
-
-
 def build_global_channel_signal_message(signal: dict) -> str:
     """رسالة مختصرة خاصة بالنشر التلقائي لقناة السوق العالمي فقط.
     لا تُستخدم في التوليد اليدوي حتى تبقى تفاصيل التحليل للمستخدم كما هي.
@@ -865,17 +847,17 @@ def build_global_channel_signal_message(signal: dict) -> str:
     entry_dt = parse_iso(str(signal.get("entry_time", "")))
     entry_text = entry_dt.astimezone(UTC_PLUS_3).strftime("%H:%M:%S") if entry_dt else "--:--:--"
 
-    direction_line = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
+    direction_line = "📈 CALL" if direction == "CALL" else "📉 PUT"
 
     return (
         "╔══════════════╗\n"
         "   🌍 TRADING TIME BOT\n"
         "╚══════════════╝\n\n"
 
-        f"💠 {pair.replace('/', '')}\n"
-        f"⏳ M{timeframe_minutes}\n"
+        f"💠 {pair}\n"
+        f"⏳ M{timeframe}\n"
         f"🕓 {entry_text}\n"
-        f"{'📈 CALL' if direction == 'CALL' else '📉 PUT'}\n\n\n"
+        f"{direction_line}\n\n\n"
 
         "@coach_WAEL_trading\n"
         "@sttrade_helper_bot"
@@ -2034,15 +2016,11 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
 
         # قناة السوق العالمي تبقى Global فقط.
         # إذا Quotex حوّل الأزواج إلى OTC، نوقف النشر ولا نرسل أي صفقة OTC هنا.
-        if not is_quotex_global_market_open():
+        if not is_global_publish_window_open():
             await notify_global_market_closed_once(context)
             return
 
         mark_global_market_open()
-
-        # النشر التلقائي فقط من 10:00 صباحًا حتى 21:00 مساءً بتوقيت سوريا UTC+3.
-        if not is_global_publish_window_open():
-            return
 
         shuffled_pairs = REAL_PAIRS[:]
         random.shuffle(shuffled_pairs)
