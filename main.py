@@ -5,6 +5,8 @@ import asyncio
 import random
 import re
 import requests
+import logging
+import traceback
 try:
     import websocket
 except Exception:
@@ -161,6 +163,18 @@ REAL_PAIR_TO_TV_SYMBOL = {
 
 TRADINGVIEW_WS_URL = "wss://data.tradingview.com/socket.io/websocket"
 TRADINGVIEW_RESULT_RETRY_SECONDS = 30
+GLOBAL_MIN_CONFIDENCE = int(os.getenv("GLOBAL_MIN_CONFIDENCE", "78"))
+GLOBAL_MIN_QUALITY = int(os.getenv("GLOBAL_MIN_QUALITY", "85"))
+GLOBAL_PAIR_COOLDOWN_MINUTES = int(os.getenv("GLOBAL_PAIR_COOLDOWN_MINUTES", "20"))
+GLOBAL_MAX_RESULT_RETRIES = int(os.getenv("GLOBAL_MAX_RESULT_RETRIES", "40"))
+HTTP_RETRY_ATTEMPTS = int(os.getenv("HTTP_RETRY_ATTEMPTS", "3"))
+HTTP_RETRY_BACKOFF_SECONDS = float(os.getenv("HTTP_RETRY_BACKOFF_SECONDS", "0.8"))
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
+)
+logger = logging.getLogger("trading_time_bot")
 
 # نسب تقريبية حتى لا تكون مسافات الدعم/المقاومة والـ Round Numbers ثابتة لكل الأزواج.
 # السبب: الأزواج مثل USD/JPY تتحرك بعدد خانات مختلف عن EUR/USD.
@@ -401,6 +415,55 @@ def parse_iso(value: str):
     except Exception:
         return None
 
+
+
+def safe_int(value, default: int = 0) -> int:
+    try:
+        return int(value)
+    except Exception:
+        return default
+
+
+def request_json_with_retries(url: str, *, params=None, headers=None, timeout: int = 10, attempts: int | None = None):
+    attempts = attempts or HTTP_RETRY_ATTEMPTS
+    last_error = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            res = requests.get(url, params=params, headers=headers, timeout=timeout)
+            if res.status_code == 200:
+                return res.json(), None
+
+            last_error = f"API status={res.status_code}"
+            if res.status_code < 500 and res.status_code not in {408, 429}:
+                break
+
+        except Exception as e:
+            last_error = str(e)
+
+        if attempt < attempts:
+            delay = HTTP_RETRY_BACKOFF_SECONDS * attempt
+            logger.warning("HTTP retry %s/%s for %s after error: %s", attempt, attempts, url, last_error)
+            try:
+                import time as _time
+                _time.sleep(delay)
+            except Exception:
+                pass
+
+    return None, last_error or "تعذر جلب البيانات"
+
+
+async def safe_send_message(bot, *, chat_id, text: str, parse_mode: str | None = None, reply_markup=None):
+    try:
+        return await bot.send_message(
+            chat_id=chat_id,
+            text=text,
+            parse_mode=parse_mode,
+            reply_markup=reply_markup,
+        )
+    except Exception as e:
+        logger.exception("Telegram send_message failed | chat_id=%s | error=%s", chat_id, e)
+        return None
 
 def format_dt_ar(iso_value: str):
     dt = parse_iso(iso_value)
@@ -665,7 +728,7 @@ async def publish_otc_list(context: ContextTypes.DEFAULT_TYPE):
         )
 
     except Exception as e:
-        print("Publish OTC Error:", e)
+        logger.exception("Publish OTC Error: %s", e)
 
 
 async def schedule_random_daily_otc_list(context: ContextTypes.DEFAULT_TYPE):
@@ -693,10 +756,10 @@ async def schedule_random_daily_otc_list(context: ContextTypes.DEFAULT_TYPE):
             name=f"daily_random_otc_publish_{run_at.strftime('%Y%m%d')}"
         )
 
-        print(f"Next random OTC channel list scheduled at {run_at.isoformat()}")
+        logger.info("Next random OTC channel list scheduled at %s", run_at.isoformat())
 
     except Exception as e:
-        print("Schedule random OTC Error:", e)
+        logger.exception("Schedule random OTC Error: %s", e)
 
 
 def generate_signals(pair: str, count: int, interval_minutes: int, start_dt: datetime):
@@ -908,7 +971,7 @@ async def notify_global_market_closed_once(context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
     except Exception as e:
-        print("Global Market Closed Notify Error:", e)
+        logger.exception("Global Market Closed Notify Error: %s", e)
 
     set_global_market_channel_state({
         "status": "closed",
@@ -1002,7 +1065,7 @@ def get_candles(pair: str, timeframe_minutes: int = 1, limit: int = 180):
     url = f"https://query1.finance.yahoo.com/v8/finance/chart/{symbol}"
 
     try:
-        res = requests.get(
+        data, request_error = request_json_with_retries(
             url,
             params={
                 "range": "5d",
@@ -1017,10 +1080,9 @@ def get_candles(pair: str, timeframe_minutes: int = 1, limit: int = 180):
             timeout=10,
         )
 
-        if res.status_code != 200:
-            return None, f"API status={res.status_code}"
+        if request_error:
+            return None, request_error
 
-        data = res.json()
         chart = (data or {}).get("chart", {})
         result = (chart.get("result") or [None])[0]
         if not result:
@@ -1683,6 +1745,161 @@ def clear_global_active_trade():
 
 
 
+
+def signal_history_ref():
+    return system_ref().child("signal_history")
+
+
+def record_signal_history(signal: dict, source: str = "global_channel") -> str | None:
+    try:
+        payload = {
+            "source": source,
+            "pair": signal.get("pair"),
+            "direction": signal.get("direction"),
+            "timeframe": signal.get("timeframe"),
+            "duration_minutes": signal.get("duration_minutes", signal.get("timeframe", 1)),
+            "confidence": signal.get("confidence"),
+            "quality": signal.get("quality"),
+            "adjusted_quality": signal.get("adjusted_quality", signal.get("quality")),
+            "entry_price": signal.get("entry_price"),
+            "entry_time": signal.get("entry_time"),
+            "published_at": now_iso(),
+            "status": "published",
+        }
+        new_ref = signal_history_ref().push(payload)
+        return new_ref.key
+    except Exception as e:
+        logger.exception("Could not record signal history: %s", e)
+        return None
+
+
+def update_signal_history_result(history_id: str | None, result: dict | None = None, *, status: str = "resolved"):
+    if not history_id:
+        return
+    try:
+        payload = {
+            "status": status,
+            "resolved_at": now_iso(),
+        }
+        if result:
+            payload.update({
+                "is_win": bool(result.get("is_win")),
+                "martingale_step": int(result.get("martingale_step", 0)),
+                "result_source": result.get("source"),
+                "close_price": result.get("close_price"),
+                "martingale_close_price": result.get("martingale_close_price"),
+            })
+        signal_history_ref().child(history_id).update(payload)
+    except Exception as e:
+        logger.exception("Could not update signal history %s: %s", history_id, e)
+
+
+def get_recent_signal_history(hours: int = 24) -> list[dict]:
+    try:
+        data = signal_history_ref().get() or {}
+    except Exception as e:
+        logger.exception("Could not read signal history: %s", e)
+        return []
+
+    cutoff = now_utc() - timedelta(hours=hours)
+    rows = []
+    for signal_id, row in data.items():
+        if not isinstance(row, dict):
+            continue
+        published_at = parse_iso(str(row.get("published_at", "")))
+        if published_at and published_at >= cutoff:
+            row = dict(row)
+            row["id"] = signal_id
+            rows.append(row)
+
+    rows.sort(key=lambda x: x.get("published_at", ""), reverse=True)
+    return rows
+
+
+def is_pair_on_global_cooldown(pair: str, timeframe: int, minutes: int | None = None) -> bool:
+    minutes = minutes or GLOBAL_PAIR_COOLDOWN_MINUTES
+    recent = get_recent_signal_history(hours=max(1, (minutes // 60) + 2))
+    cutoff = now_utc() - timedelta(minutes=minutes)
+
+    for row in recent:
+        if row.get("source") != "global_channel":
+            continue
+        if row.get("pair") != pair:
+            continue
+        if safe_int(row.get("timeframe"), 0) != safe_int(timeframe, 0):
+            continue
+        published_at = parse_iso(str(row.get("published_at", "")))
+        if published_at and published_at >= cutoff:
+            return True
+    return False
+
+
+def get_pair_recent_performance(pair: str, timeframe: int | None = None, lookback: int = 20):
+    rows = get_recent_signal_history(hours=24 * 14)
+    filtered = []
+    for row in rows:
+        if row.get("pair") != pair:
+            continue
+        if timeframe is not None and safe_int(row.get("timeframe"), 0) != safe_int(timeframe, 0):
+            continue
+        if row.get("status") != "resolved" or "is_win" not in row:
+            continue
+        filtered.append(row)
+        if len(filtered) >= lookback:
+            break
+
+    if not filtered:
+        return {"count": 0, "wins": 0, "losses": 0, "win_rate": None}
+
+    wins = sum(1 for row in filtered if row.get("is_win"))
+    losses = len(filtered) - wins
+    return {
+        "count": len(filtered),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": round((wins / len(filtered)) * 100, 1),
+    }
+
+
+def enrich_global_candidate(result: dict) -> dict:
+    result = dict(result)
+    perf = get_pair_recent_performance(result.get("pair"), result.get("timeframe"))
+    adjusted_quality = safe_int(result.get("quality"), 0)
+
+    if perf.get("count", 0) >= 5 and perf.get("win_rate") is not None:
+        win_rate = float(perf["win_rate"])
+        if win_rate < 45:
+            adjusted_quality -= 18
+        elif win_rate < 55:
+            adjusted_quality -= 8
+        elif win_rate >= 70:
+            adjusted_quality += 8
+
+    result["recent_performance"] = perf
+    result["adjusted_quality"] = max(adjusted_quality, 0)
+    return result
+
+
+def is_publishable_global_candidate(result: dict) -> bool:
+    if not result.get("ok"):
+        return False
+
+    if safe_int(result.get("confidence"), 0) < GLOBAL_MIN_CONFIDENCE:
+        return False
+
+    if safe_int(result.get("quality"), 0) < GLOBAL_MIN_QUALITY:
+        return False
+
+    if is_pair_on_global_cooldown(result.get("pair"), result.get("timeframe")):
+        return False
+
+    enriched = enrich_global_candidate(result)
+    if safe_int(enriched.get("adjusted_quality"), 0) < GLOBAL_MIN_QUALITY:
+        return False
+
+    result.update(enriched)
+    return True
+
 def tv_make_session(prefix: str = "qs") -> str:
     return prefix + "_" + hashlib.sha256(f"{prefix}|{now_iso()}|{random.random()}".encode("utf-8")).hexdigest()[:12]
 
@@ -1989,11 +2206,17 @@ async def resolve_global_active_trade_if_due(context: ContextTypes.DEFAULT_TYPE)
 
         if not result:
             if int(trade.get("result_retry_count", 0)) % 5 == 0:
-                print("Global result check waiting:", error_msg)
+                logger.info("Global result check waiting: %s", error_msg)
 
             # إذا البيانات تأخرت، لا نسجل Loss غلط؛ نعيد المحاولة لاحقًا
             # ولا ننشر أي شيء غير WIN أو Loss.
             retry_count = int(trade.get("result_retry_count", 0)) + 1
+            if retry_count >= GLOBAL_MAX_RESULT_RETRIES:
+                logger.error("Global result unresolved after %s retries: %s", retry_count, error_msg)
+                update_signal_history_result(trade.get("history_id"), status="unresolved")
+                clear_global_active_trade()
+                return False
+
             trade["result_retry_count"] = retry_count
             trade["result_check_at"] = (now_utc() + timedelta(seconds=TRADINGVIEW_RESULT_RETRY_SECONDS)).isoformat()
             set_global_active_trade(trade)
@@ -2006,17 +2229,19 @@ async def resolve_global_active_trade_if_due(context: ContextTypes.DEFAULT_TYPE)
         else:
             result_text = "💔 Loss"
 
-        await context.bot.send_message(
+        await safe_send_message(
+            context.bot,
             chat_id=GLOBAL_CHANNEL_ID,
             text=result_text,
             parse_mode="Markdown"
         )
 
+        update_signal_history_result(trade.get("history_id"), result, status="resolved")
         clear_global_active_trade()
         return False
 
     except Exception as e:
-        print("Resolve Global Trade Error:", e)
+        logger.exception("Resolve Global Trade Error: %s", e)
         return True
 
 
@@ -2047,7 +2272,7 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
         for pair in shuffled_pairs:
             for timeframe in GLOBAL_AUTOPUBLISH_PRIMARY_TIMEFRAMES:
                 result = analyze_real_market(pair, timeframe)
-                if result.get("ok"):
+                if is_publishable_global_candidate(result):
                     primary_candidates.append(result)
 
         if primary_candidates:
@@ -2068,7 +2293,7 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
             for pair in shuffled_pairs:
                 for timeframe in allowed_secondary_timeframes:
                     result = analyze_real_market(pair, timeframe)
-                    if result.get("ok"):
+                    if is_publishable_global_candidate(result):
                         candidates.append(result)
 
         if not candidates:
@@ -2078,16 +2303,21 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
         best_result = max(
             candidates,
             key=lambda r: (
-                r.get("quality", 0),
+                r.get("adjusted_quality", r.get("quality", 0)),
                 r.get("confidence", 0),
             )
         )
 
-        await context.bot.send_message(
+        sent_message = await safe_send_message(
+            context.bot,
             chat_id=GLOBAL_CHANNEL_ID,
             text=build_global_channel_signal_message(best_result),
-                            parse_mode="HTML",
+            parse_mode="HTML",
         )
+        if not sent_message:
+            return
+
+        history_id = record_signal_history(best_result, source="global_channel")
 
         entry_time = parse_iso(best_result.get("entry_time", ""))
         duration_minutes = int(best_result.get("duration_minutes", best_result.get("timeframe", 1)))
@@ -2106,10 +2336,12 @@ async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
             "expires_at": expires_at.isoformat(),
             "result_check_at": (expires_at + timedelta(seconds=TRADINGVIEW_RESULT_RETRY_SECONDS)).isoformat(),
             "published_at": now_iso(),
+            "history_id": history_id,
+            "result_retry_count": 0,
         })
 
     except Exception as e:
-        print("Auto Global Market Error:", e)
+        logger.exception("Auto Global Market Error: %s", e)
 
 
 def analyze_real_market_best(pair: str):
@@ -2817,6 +3049,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 # ===== App Runner =====
+
+async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    logger.error(
+        "Telegram handler error | update=%s | error=%s\n%s",
+        update,
+        context.error,
+        "".join(traceback.format_exception(None, context.error, context.error.__traceback__)) if context.error else "",
+    )
+
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN غير موجود داخل ملف .env")
@@ -2848,8 +3089,9 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_admin_buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.add_error_handler(telegram_error_handler)
 
-    print("Bot is running...")
+    logger.info("Bot is running...")
 
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
