@@ -5,6 +5,9 @@ import asyncio
 import random
 import re
 import requests
+import threading
+import time as time_module
+from collections import deque
 import logging
 import traceback
 try:
@@ -43,6 +46,19 @@ UTC_PLUS_3 = timezone(timedelta(hours=3))
 
 CHANNEL_ID = "@quotexsignals_tt"
 GLOBAL_CHANNEL_ID = -1003918647685
+
+# قناة الصفقات المباشرة الجديدة الخاصة بـ OTC Live
+OTC_LIVE_CHANNEL_ID = int(os.getenv("OTC_LIVE_CHANNEL_ID", "-1003880574173"))
+OTC_LIVE_CHANNEL_ENABLED = os.getenv("OTC_LIVE_CHANNEL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+OTC_LIVE_MIN_QUALITY = int(os.getenv("OTC_LIVE_MIN_QUALITY", "65"))
+OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS", "3"))
+OTC_LIVE_MIN_ENTRY_LEAD_SECONDS = int(os.getenv("OTC_LIVE_MIN_ENTRY_LEAD_SECONDS", "10"))
+OTC_LIVE_TIE_EPSILON = float(os.getenv("OTC_LIVE_TIE_EPSILON", "0.0000001"))
+OTC_LIVE_SCAN_INTERVAL_SECONDS = int(os.getenv("OTC_LIVE_SCAN_INTERVAL_SECONDS", "20"))
+OTC_LIVE_TRADE_DURATION_SECONDS = int(os.getenv("OTC_LIVE_TRADE_DURATION_SECONDS", "65"))
+OTC_LIVE_COOLDOWN_SECONDS = int(os.getenv("OTC_LIVE_COOLDOWN_SECONDS", "60"))
+OTC_LIVE_RESULT_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_DELAY_SECONDS", "8"))
+
 ADMIN_USERNAME = "@coach_WAEL_trading"
 ADMIN_TELEGRAM_ID = 1582593617
 
@@ -103,6 +119,40 @@ CHANNEL_OTC_PAIRS = [
 ]
 CHANNEL_DAILY_SIGNAL_COUNT = 35
 CHANNEL_SIGNAL_INTERVAL_MINUTES = 3
+
+
+# ===== Quotex OTC live websocket settings =====
+# ضع ملف cookies.txt بجانب main.py. الملف يجب أن يحتوي cookies جلسة Quotex بسطر واحد.
+QUOTEX_COOKIE_FILE = os.getenv("QUOTEX_COOKIE_FILE", "cookies.txt")
+QUOTEX_WS_URL = "wss://ws2.qxbroker.com/socket.io/?EIO=4&transport=websocket"
+QUOTEX_USER_AGENT = os.getenv(
+    "QUOTEX_USER_AGENT",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/148.0.0.0 Safari/537.36"
+)
+
+OTC_PAIR_TO_QUOTEX_SYMBOL = {
+    "USD/BRL (OTC)": "BRLUSD_otc",
+    "USD/ARS (OTC)": "ARSUSD_otc",
+    "USD/BDT (OTC)": "BDTUSD_otc",
+    "USD/NGN (OTC)": "NGNUSD_otc",
+    "USD/PKR (OTC)": "PKRUSD_otc",
+    "USD/DZD (OTC)": "DZDUSD_otc",
+    "USD/MXN (OTC)": "MXNUSD_otc",
+    "USD/INR (OTC)": "INRUSD_otc",
+    "USD/IDR (OTC)": "IDRUSD_otc",
+    "USD/EGP (OTC)": "EGPUSD_otc",
+    "USD/TRY (OTC)": "TRYUSD_otc",
+    "USD/COP (OTC)": "COPUSD_otc",
+    "EUR/JPY (OTC)": "EURJPY_otc",
+    "EUR/USD (OTC)": "EURUSD_otc",
+    "CAD/CHF (OTC)": "CADCHF_otc",
+    "CAD/JPY (OTC)": "CADJPY_otc",
+    "AUD/CHF (OTC)": "AUDCHF_otc",
+    "AUD/CAD (OTC)": "AUDCAD_otc",
+}
+
 
 REAL_PAIRS = [
     "EUR/USD",
@@ -278,6 +328,22 @@ welcome_keyboard = ReplyKeyboardMarkup(
 market_mode_keyboard = ReplyKeyboardMarkup(
     [
         ["⚡ OTC", "🌍 سوق عالمي"],
+        ["🔙 رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+otc_mode_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🕒 زمني", "⚡ صفقة مباشرة"],
+        ["🔙 رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+otc_live_search_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🔎 ابحث عن صفقة الآن"],
         ["🔙 رجوع"],
     ],
     resize_keyboard=True
@@ -683,6 +749,588 @@ def can_autopublish_timeframe(timeframe_minutes: int, check_dt: datetime | None 
     return 0 < remaining_seconds <= GLOBAL_SECONDARY_TIMEFRAME_MAX_LEAD_SECONDS
 
 
+
+# ===== Quotex OTC Live Feed =====
+class QuotexOTCLiveFeed:
+    """اتصال WebSocket خام مع Quotex للحصول على quotes/stream.
+    الأمر الصحيح للاشتراك الذي تم اختباره: 42["instruments/follow", "BRLUSD_otc"]
+    """
+
+    def __init__(self, symbols: list[str]):
+        self.symbols = list(dict.fromkeys([s for s in symbols if s]))
+        self.ws = None
+        self.connected = False
+        self.started = False
+        self.lock = threading.Lock()
+        self.prices = {symbol: deque(maxlen=3000) for symbol in self.symbols}
+        self.candles = {symbol: {} for symbol in self.symbols}  # bucket_ts -> OHLC from live Quotex ticks
+        self.last_tick = {}
+        self.thread = None
+
+    def start(self):
+        if self.started:
+            return
+        self.started = True
+        self.thread = threading.Thread(target=self._run_forever, daemon=True, name="quotex_otc_live_feed")
+        self.thread.start()
+
+    def _load_cookies(self) -> str | None:
+        try:
+            env_cookies = os.getenv("QUOTEX_COOKIES", "").strip()
+            if env_cookies:
+                return env_cookies
+
+            cookie_path = os.path.abspath(QUOTEX_COOKIE_FILE)
+            if not os.path.exists(cookie_path):
+                logger.warning("Quotex cookies not found. Set QUOTEX_COOKIES env var or add file: %s", cookie_path)
+                return None
+
+            cookies = open(cookie_path, "r", encoding="utf-8").read().strip()
+            if not cookies:
+                logger.warning("Quotex cookies file is empty: %s", cookie_path)
+                return None
+
+            return cookies
+        except Exception as e:
+            logger.exception("Could not read Quotex cookies: %s", e)
+            return None
+
+    def _run_forever(self):
+        if websocket is None:
+            logger.warning("websocket-client غير مثبت، لن يعمل بث OTC المباشر")
+            return
+
+        while True:
+            cookies = self._load_cookies()
+            if not cookies:
+                time_module.sleep(30)
+                continue
+
+            headers = [
+                f"Cookie: {cookies}",
+                f"User-Agent: {QUOTEX_USER_AGENT}",
+                "Origin: https://qxbroker.com",
+                "Referer: https://qxbroker.com/en/trade",
+                "Accept-Language: ar-TR,ar;q=0.9,en-TR;q=0.8,en;q=0.7,tr-TR;q=0.6,tr;q=0.5,en-US;q=0.4",
+                "Cache-Control: no-cache",
+                "Pragma: no-cache",
+            ]
+
+            try:
+                logger.info("Starting Quotex OTC live websocket for symbols: %s", ", ".join(self.symbols))
+                ws_app = websocket.WebSocketApp(
+                    QUOTEX_WS_URL,
+                    header=headers,
+                    on_open=self._on_open,
+                    on_message=self._on_message,
+                    on_error=self._on_error,
+                    on_close=self._on_close,
+                )
+                ws_app.run_forever(ping_interval=0, ping_timeout=None)
+            except Exception as e:
+                logger.exception("Quotex OTC websocket crashed: %s", e)
+
+            self.connected = False
+            time_module.sleep(5)
+
+    def _send_raw(self, packet: str):
+        try:
+            if self.ws:
+                self.ws.send(packet)
+        except Exception as e:
+            logger.warning("Quotex raw send failed: %s", e)
+
+    def _send_event(self, event_name: str, payload):
+        packet = "42" + json.dumps([event_name, payload], separators=(",", ":"))
+        self._send_raw(packet)
+
+    def _keepalive_loop(self):
+        while self.connected:
+            time_module.sleep(10)
+            if self.connected:
+                self._send_raw("3")  # Engine.IO pong
+
+    def _subscribe_loop(self):
+        time_module.sleep(2)
+        for symbol in self.symbols:
+            if not self.connected:
+                break
+            logger.info("Following Quotex OTC symbol: %s", symbol)
+            self._send_event("instruments/follow", symbol)
+            time_module.sleep(0.4)
+
+    def _on_open(self, ws):
+        self.ws = ws
+        self.connected = True
+        logger.info("Quotex OTC websocket opened")
+        self._send_raw("40")  # Socket.IO default namespace
+        threading.Thread(target=self._keepalive_loop, daemon=True).start()
+
+    def _on_message(self, ws, message):
+        try:
+            if isinstance(message, bytes):
+                self._parse_quote_binary(message)
+                return
+
+            if message == "2":
+                ws.send("3")
+                return
+
+            if isinstance(message, str) and message.startswith("40"):
+                logger.info("Quotex OTC Socket.IO namespace connected")
+                threading.Thread(target=self._subscribe_loop, daemon=True).start()
+                return
+        except Exception as e:
+            logger.exception("Quotex message handling error: %s", e)
+
+    def _parse_quote_binary(self, message: bytes):
+        text = message.decode("utf-8", errors="ignore")
+        start = text.find("[[")
+        if start == -1:
+            return
+
+        try:
+            data = json.loads(text[start:])
+        except Exception:
+            return
+
+        if not isinstance(data, list):
+            return
+
+        with self.lock:
+            for row in data:
+                if not isinstance(row, list) or len(row) < 4:
+                    continue
+                symbol = row[0]
+                if symbol not in self.prices:
+                    continue
+                try:
+                    ts = float(row[1])
+                    price = float(row[2])
+                    flag = int(row[3])
+                except Exception:
+                    continue
+                self.prices[symbol].append((ts, price, flag))
+
+                # بناء شموع M1 حقيقية من بث Quotex:
+                # open = أول tick داخل الدقيقة
+                # close = آخر tick داخل نفس الدقيقة
+                bucket_ts = int(ts // 60) * 60
+                symbol_candles = self.candles.setdefault(symbol, {})
+                candle = symbol_candles.get(bucket_ts)
+
+                if candle is None:
+                    candle = {
+                        "symbol": symbol,
+                        "bucket_ts": bucket_ts,
+                        "open": price,
+                        "high": price,
+                        "low": price,
+                        "close": price,
+                        "open_tick_ts": ts,
+                        "close_tick_ts": ts,
+                        "ticks": 1,
+                    }
+                    symbol_candles[bucket_ts] = candle
+                else:
+                    candle["high"] = max(float(candle.get("high", price)), price)
+                    candle["low"] = min(float(candle.get("low", price)), price)
+                    candle["close"] = price
+                    candle["close_tick_ts"] = ts
+                    candle["ticks"] = int(candle.get("ticks", 0)) + 1
+
+                # لا نترك الذاكرة تكبر للأبد
+                if len(symbol_candles) > 240:
+                    for old_bucket in sorted(symbol_candles.keys())[:-200]:
+                        symbol_candles.pop(old_bucket, None)
+
+                self.last_tick[symbol] = {
+                    "symbol": symbol,
+                    "time": ts,
+                    "price": price,
+                    "flag": flag,
+                    "received_at": now_iso(),
+                }
+
+    def _on_error(self, ws, error):
+        logger.warning("Quotex OTC websocket error: %s", error)
+
+    def _on_close(self, ws, close_status_code, close_msg):
+        self.connected = False
+        logger.warning("Quotex OTC websocket closed | code=%s | msg=%s", close_status_code, close_msg)
+
+    def snapshot(self, symbol: str):
+        with self.lock:
+            return dict(self.last_tick.get(symbol) or {})
+
+    def candle(self, symbol: str, entry_ts: float):
+        """يرجع شمعة M1 التي تبدأ عند entry_ts من الكاش المبني لحظيًا."""
+        bucket_ts = int(float(entry_ts) // 60) * 60
+        with self.lock:
+            candle = (self.candles.get(symbol) or {}).get(bucket_ts)
+            return dict(candle) if candle else {}
+
+    def direction(self, symbol: str) -> str | None:
+        """اتجاه بسيط من آخر الأسعار: CALL إذا آخر سعر أعلى من بداية العينة، PUT إذا أقل."""
+        with self.lock:
+            rows = list(self.prices.get(symbol, []))
+
+        if len(rows) < 6:
+            return None
+
+        # نستخدم آخر عدة ticks، ونتجاهل التذبذب الضعيف جدًا.
+        sample = rows[-8:] if len(rows) >= 8 else rows
+        first_price = sample[0][1]
+        last_price = sample[-1][1]
+        up_moves = sum(1 for a, b in zip(sample, sample[1:]) if b[1] > a[1])
+        down_moves = sum(1 for a, b in zip(sample, sample[1:]) if b[1] < a[1])
+
+        if last_price > first_price and up_moves >= down_moves:
+            return "CALL"
+        if last_price < first_price and down_moves >= up_moves:
+            return "PUT"
+        return None
+
+
+quotex_otc_feed = QuotexOTCLiveFeed(list(OTC_PAIR_TO_QUOTEX_SYMBOL.values()))
+
+
+def start_quotex_otc_feed():
+    try:
+        quotex_otc_feed.start()
+    except Exception as e:
+        logger.exception("Could not start Quotex OTC live feed: %s", e)
+
+
+def get_live_otc_direction(pair: str, fallback_dt: datetime | None = None) -> str:
+    symbol = OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
+    if symbol:
+        live_direction = quotex_otc_feed.direction(symbol)
+        if live_direction in {"CALL", "PUT"}:
+            return live_direction
+    return get_stable_direction(pair, fallback_dt or now_utc())
+
+
+def get_live_otc_snapshot(pair: str) -> dict:
+    symbol = OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
+    if not symbol:
+        return {}
+    return quotex_otc_feed.snapshot(symbol)
+
+
+def analyze_best_live_otc_now() -> dict:
+    """يفحص كل أزواج OTC من بث Quotex live ويختار أفضل فرصة M1 حالية.
+    لا يغيّر نظام الليستات الزمني، ويُستخدم فقط في خيار: صفقة مباشرة.
+    """
+    candidates = []
+    now_ts = time_module.time()
+
+    for pair, symbol in OTC_PAIR_TO_QUOTEX_SYMBOL.items():
+        with quotex_otc_feed.lock:
+            rows = list(quotex_otc_feed.prices.get(symbol, []))
+            tick = dict(quotex_otc_feed.last_tick.get(symbol) or {})
+
+        if len(rows) < 10 or not tick:
+            continue
+
+        try:
+            last_exchange_ts = float(tick.get("time", 0))
+            current_price = float(tick.get("price"))
+        except Exception:
+            continue
+
+        # آخر 12 تيك تقريبًا تعطي قراءة سريعة لفريم الدقيقة بدون انتظار طويل.
+        sample = rows[-12:] if len(rows) >= 12 else rows
+        prices = [float(r[1]) for r in sample]
+        first_price = prices[0]
+        last_price = prices[-1]
+        price_range = max(prices) - min(prices)
+        change = last_price - first_price
+
+        up_moves = sum(1 for a, b in zip(prices, prices[1:]) if b > a)
+        down_moves = sum(1 for a, b in zip(prices, prices[1:]) if b < a)
+        flat_moves = max(0, (len(prices) - 1) - up_moves - down_moves)
+
+        if change > 0 and up_moves >= down_moves:
+            direction = "CALL"
+            consistency = up_moves / max(1, up_moves + down_moves + flat_moves)
+        elif change < 0 and down_moves >= up_moves:
+            direction = "PUT"
+            consistency = down_moves / max(1, up_moves + down_moves + flat_moves)
+        else:
+            continue
+
+        if price_range <= 0:
+            continue
+
+        momentum = min(abs(change) / price_range, 1.0)
+        movement_density = (up_moves + down_moves) / max(1, len(prices) - 1)
+
+        # فلترة بسيطة: نتجنب زوجًا ثابتًا جدًا أو متذبذبًا بلا اتجاه.
+        score = int(round((momentum * 45) + (consistency * 40) + (movement_density * 15)))
+
+        if score < 55:
+            continue
+
+        candidates.append({
+            "pair": pair,
+            "symbol": symbol,
+            "direction": direction,
+            "score": score,
+            "price": current_price,
+            "exchange_time": last_exchange_ts,
+            "change": change,
+            "moves": {"up": up_moves, "down": down_moves, "flat": flat_moves},
+            "sample_size": len(sample),
+        })
+
+    if not candidates:
+        return {
+            "ok": False,
+            "message": (
+                "⚡ صفقة مباشرة OTC\n\n"
+                "❌ لا توجد فرصة واضحة الآن على فريم الدقيقة.\n\n"
+                "انتظر 30-60 ثانية ثم اضغط:\n"
+                "🔎 ابحث عن صفقة الآن"
+            )
+        }
+
+    best = max(candidates, key=lambda x: (x["score"], abs(x["change"])))
+    entry_dt = next_full_minute(now_utc())
+    direction_line = "🟢 CALL" if best["direction"] == "CALL" else "🔴 PUT"
+    price_text = f"{best['price']:.5f}" if "JPY" not in best["pair"] else f"{best['price']:.3f}"
+
+    msg = (
+        "⚡ صفقة مباشرة OTC\n\n"
+        f"💱 الزوج: {best['pair']}\n"
+        "🧭 الفريم: M1\n"
+        f"⏰ وقت الدخول: {format_utc_plus_3(entry_dt)}\n"
+        f"📌 الاتجاه: {direction_line}\n"
+        f"💵 السعر الحالي: {price_text}\n"
+        f"📊 قوة الفرصة: {best['score']}%\n\n"
+        "📌 سبب الاختيار:\n"
+        f"• تم فحص {len(candidates)} فرصة من أزواج OTC الحية.\n"
+        f"• هذا الزوج كان الأقوى حسب آخر {best['sample_size']} تحديثات سعرية مباشرة من Quotex.\n\n"
+        "⚠️ التزم بإدارة رأس المال، وادخل فقط إذا بقي الاتجاه بنفس الشكل عند وقت الدخول."
+    )
+
+    return {
+        "ok": True,
+        "pair": best["pair"],
+        "symbol": best["symbol"],
+        "direction": best["direction"],
+        "quality": best["score"],
+        "entry_price": best["price"],
+        "entry_time": entry_dt.isoformat(),
+        "message": msg,
+    }
+
+
+# ===== OTC LIVE CHANNEL AUTOPUBLISH =====
+otc_live_channel_state = {
+    "active": False,
+    "last_published_at": None,
+}
+
+
+def format_otc_live_price(pair: str, value: float) -> str:
+    return f"{value:.3f}" if "JPY" in pair else f"{value:.5f}"
+
+
+def seconds_until_dt(target_dt: datetime) -> float:
+    return max(1.0, (target_dt.astimezone(UTC) - now_utc()).total_seconds())
+
+
+def next_otc_m1_entry_time(check_dt: datetime | None = None) -> datetime:
+    """بداية الشمعة القادمة M1.
+    إذا بقي وقت قليل جدًا قبل بداية الشمعة، ننتقل للشمعة التي بعدها حتى يصل التنبيه قبل الدخول.
+    """
+    base = check_dt or now_utc()
+    entry_dt = next_full_minute(base)
+    remaining = (entry_dt - base.astimezone(UTC)).total_seconds()
+
+    if remaining < OTC_LIVE_MIN_ENTRY_LEAD_SECONDS:
+        entry_dt = next_full_minute(base + timedelta(seconds=OTC_LIVE_MIN_ENTRY_LEAD_SECONDS))
+
+    return entry_dt.astimezone(UTC)
+
+
+def build_otc_live_channel_signal_message(signal: dict) -> str:
+    pair = str(signal.get("pair", ""))
+    direction = str(signal.get("direction", ""))
+    quality = int(signal.get("quality", 0) or 0)
+    entry_dt = parse_iso(str(signal.get("entry_time", ""))) or next_full_minute(now_utc())
+    direction_line = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
+
+    return (
+        "╔══════════════╗\n"
+        "   🔥 Quotex OTC Signal Boot 🔥\n"
+        "╚══════════════╝\n\n"
+        f"💎 {pair}\n"
+        "🔥 M1\n"
+        f"⌛️ {format_utc_plus_3(entry_dt)}\n"
+        f"{direction_line}\n"
+        f"📊 قوة الفرصة: {quality}%\n"
+        "⚠️ التزم بإدارة رأس المال\n\n"
+        "@coach_WAEL_trading\n"
+        "@sttrade_helper_bot"
+    )
+
+
+def build_otc_live_channel_result_message(signal: dict, exit_price: float | None, result: str) -> str:
+    if result == "win":
+        return "WIN✅"
+    if result == "loss":
+        return "Loss💔"
+    return "غير مؤكدة⚠️"
+
+async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
+    signal = dict(context.job.data or {})
+    pair = signal.get("pair")
+    symbol = signal.get("symbol") or OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
+    direction = signal.get("direction")
+    message_id = signal.get("message_id")
+
+    result = "unknown"
+    exit_price = None
+    actual_entry_price = None
+
+    try:
+        entry_ts = float(signal.get("entry_ts") or 0)
+        close_ts = float(signal.get("close_ts") or 0)
+
+        candle = quotex_otc_feed.candle(symbol, entry_ts) if symbol else {}
+
+        if candle:
+            actual_entry_price = float(candle.get("open"))
+            exit_price = float(candle.get("close"))
+            signal["actual_entry_price"] = actual_entry_price
+            signal["actual_entry_tick_ts"] = candle.get("open_tick_ts")
+            signal["close_tick_ts"] = candle.get("close_tick_ts")
+            signal["candle_ticks"] = candle.get("ticks")
+        else:
+            logger.warning("No cached candle found for result | pair=%s | symbol=%s | entry_ts=%s", pair, symbol, entry_ts)
+
+        # fallback محدود إذا لم تتوفر الشمعة
+        if actual_entry_price is None:
+            actual_entry_price = float(signal.get("entry_price", 0) or 0)
+            signal["actual_entry_price"] = actual_entry_price
+
+        if exit_price is None:
+            snapshot = get_live_otc_snapshot(pair)
+            if snapshot and snapshot.get("price") is not None:
+                exit_price = float(snapshot.get("price"))
+
+        if exit_price is not None and actual_entry_price > 0:
+            diff = exit_price - actual_entry_price
+
+            if abs(diff) <= OTC_LIVE_TIE_EPSILON:
+                result = "unknown"
+            elif direction == "CALL":
+                result = "win" if diff > 0 else "loss"
+            elif direction == "PUT":
+                result = "win" if diff < 0 else "loss"
+
+        logger.info(
+            "OTC candle-cache result | pair=%s | direction=%s | open=%s | close=%s | result=%s | ticks=%s | open_tick=%s | close_tick=%s",
+            pair,
+            direction,
+            actual_entry_price,
+            exit_price,
+            result,
+            signal.get("candle_ticks"),
+            signal.get("actual_entry_tick_ts"),
+            signal.get("close_tick_ts"),
+        )
+
+        text = build_otc_live_channel_result_message(signal, exit_price, result)
+        await context.bot.send_message(
+            chat_id=OTC_LIVE_CHANNEL_ID,
+            text=text,
+            reply_to_message_id=message_id
+        )
+
+    except Exception as e:
+        logger.exception("OTC live channel result error: %s", e)
+
+    finally:
+        otc_live_channel_state["active"] = False
+        otc_live_channel_state["last_published_at"] = time_module.time()
+
+
+async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
+    logger.info("OTC LIVE CHANNEL SCAN started | enabled=%s | active=%s | min_quality=%s",
+                OTC_LIVE_CHANNEL_ENABLED, otc_live_channel_state.get("active"), OTC_LIVE_MIN_QUALITY)
+
+    if not OTC_LIVE_CHANNEL_ENABLED:
+        logger.info("OTC LIVE CHANNEL SCAN skipped: disabled")
+        return
+
+    if otc_live_channel_state.get("active"):
+        logger.info("OTC LIVE CHANNEL SCAN skipped: active trade is still running")
+        return
+
+    last_published_at = otc_live_channel_state.get("last_published_at")
+    if last_published_at and time_module.time() - float(last_published_at) < OTC_LIVE_COOLDOWN_SECONDS:
+        remaining = OTC_LIVE_COOLDOWN_SECONDS - (time_module.time() - float(last_published_at))
+        logger.info("OTC LIVE CHANNEL SCAN skipped: cooldown %.1fs remaining", remaining)
+        return
+
+    try:
+        signal = analyze_best_live_otc_now()
+        if not signal.get("ok"):
+            logger.info("OTC LIVE CHANNEL SCAN result: no clear opportunity")
+            return
+
+        quality = int(signal.get("quality", 0) or 0)
+        logger.info("OTC LIVE CHANNEL SCAN best | pair=%s | direction=%s | quality=%s | min=%s",
+                    signal.get("pair"), signal.get("direction"), quality, OTC_LIVE_MIN_QUALITY)
+
+        if quality < OTC_LIVE_MIN_QUALITY:
+            logger.info("OTC LIVE CHANNEL SCAN skipped: quality below minimum")
+            return
+
+        # الدخول مع بداية شمعة M1 القادمة، والإغلاق مع نهاية نفس الشمعة.
+        # النتيجة لاحقًا تُحسب من candle cache: open/close للشمعة نفسها.
+        entry_dt = next_otc_m1_entry_time(now_utc())
+        close_dt = entry_dt + timedelta(seconds=OTC_LIVE_TRADE_DURATION_SECONDS)
+
+        signal["entry_time"] = entry_dt.isoformat()
+        signal["entry_ts"] = entry_dt.timestamp()
+        signal["close_ts"] = close_dt.timestamp()
+
+        text = build_otc_live_channel_signal_message(signal)
+
+        sent = await context.bot.send_message(
+            chat_id=OTC_LIVE_CHANNEL_ID,
+            text=text,
+        )
+
+        signal["message_id"] = sent.message_id
+        signal["published_at"] = now_iso()
+
+        otc_live_channel_state["active"] = True
+
+        resolve_delay = seconds_until_dt(close_dt) + OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS
+        context.job_queue.run_once(
+            resolve_otc_live_channel_trade,
+            when=resolve_delay,
+            data=signal,
+            name=f"otc_live_result_{sent.message_id}",
+        )
+
+        logger.info(
+            "Published OTC live channel signal | pair=%s | direction=%s | quality=%s | result_in=%.1fs",
+            signal.get("pair"),
+            signal.get("direction"),
+            signal.get("quality"),
+            resolve_delay,
+        )
+
+    except Exception as e:
+        otc_live_channel_state["active"] = False
+        logger.exception("OTC live channel publish error: %s", e)
+
 # ===== OTC ENGINE =====
 def get_stable_direction(pair: str, dt: datetime) -> str:
     dt_plus_3 = dt.astimezone(UTC_PLUS_3)
@@ -785,6 +1433,57 @@ def generate_channel_signals_random_pairs(pairs: list[str], count: int, interval
         signals.append(f"{pair} — {formatted_time} — {direction}")
 
     return signals
+
+
+
+
+def generate_live_otc_signals(pair: str, count: int, interval_minutes: int, start_dt: datetime):
+    """خيار منفصل يعتمد على بث Quotex live فقط ولا يؤثر على ليستات OTC العادية."""
+    signals = []
+
+    for i in range(count):
+        entry_time = start_dt + timedelta(minutes=i * interval_minutes)
+        direction = get_live_otc_direction(pair, entry_time)
+        formatted_time = format_utc_plus_3(entry_time)
+        signals.append(f"{pair} — {formatted_time} — {direction}")
+
+    return signals
+
+
+def build_live_otc_signals_message(pair: str, count: int, interval_minutes: int, signals: list[str]) -> str:
+    snapshot = get_live_otc_snapshot(pair)
+    price = snapshot.get("price")
+    tick_time = snapshot.get("time")
+
+    price_line = f"💵 آخر سعر مباشر: {price}" if price is not None else "💵 آخر سعر مباشر: غير متوفر بعد"
+    tick_line = f"🛰 آخر tick: {tick_time}" if tick_time is not None else "🛰 آخر tick: بانتظار البيانات"
+
+    header = (
+        "╔══════════════╗\n"
+        "   📡 Quotex OTC LIVE\n"
+        "╚══════════════╝\n\n"
+        "هذا خيار إضافي منفصل عن ليستات OTC العادية.\n"
+        "يعتمد على حركة السعر المباشرة من Quotex الآن.\n\n"
+        f"{price_line}\n"
+        f"{tick_line}\n\n"
+        "⏰ توقيت المنصة\n"
+        "UTC / GMT +3.00\n\n"
+        "⚠️ ملاحظة:\n"
+        "• هذا الخيار تجريبي مباشر ولا يغيّر نظام الليستات القديم.\n"
+        "• مدة كل صفقة: 1M\n\n"
+        "📍 الإشارات المباشرة:\n\n"
+    )
+
+    formatted_signals = []
+    for signal in signals:
+        parts = signal.split(" — ")
+        if len(parts) == 3:
+            pair_name, signal_time, direction = parts
+            formatted_signals.append(f"M1 {pair_name} {signal_time} {direction}")
+        else:
+            formatted_signals.append(signal)
+
+    return header + "\n".join(formatted_signals)
 
 
 def build_signals_message(pair: str, count: int, interval_minutes: int, signals: list[str]) -> str:
@@ -2373,6 +3072,7 @@ def reset_signal_state(context: ContextTypes.DEFAULT_TYPE):
     context.user_data["pair"] = None
     context.user_data["count"] = None
     context.user_data["interval"] = None
+    context.user_data["otc_submode"] = None
     context.user_data["admin_target_id"] = None
 
 
@@ -2672,7 +3372,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🌍 اختر الزوج العالمي 👇", reply_markup=real_pairs_keyboard)
             return
 
-        if step in {"choose_market_mode", "choose_real_pair", "choose_pair"}:
+        if step in {"choose_market_mode", "choose_real_pair", "choose_pair", "choose_live_otc_pair"}:
             reset_signal_state(context)
             await update.message.reply_text(
                 "↩️ رجعت للقائمة الرئيسية",
@@ -2950,10 +3650,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== Market mode flow =====
     if step == "choose_market_mode":
-        if text == "⚡ OTC":
+        if text in {"⚡ OTC", "OTC"}:
             context.user_data["mode"] = "otc"
-            context.user_data["step"] = "choose_pair"
-            await update.message.reply_text("💱 اختر زوج OTC 👇", reply_markup=otc_pairs_keyboard)
+            context.user_data["step"] = "choose_otc_mode"
+            await update.message.reply_text("⚡ اختر نوع إشارات OTC 👇", reply_markup=otc_mode_keyboard)
             return
 
         if text == "🌍 سوق عالمي":
@@ -2965,7 +3665,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📌 اختر نوع السوق من الأزرار 👇", reply_markup=market_mode_keyboard)
         return
 
-    # ===== OTC flow =====
+    # ===== OTC sub-mode flow =====
+    if step == "choose_otc_mode" and context.user_data.get("mode") == "otc":
+        if text == "🕒 زمني":
+            context.user_data["otc_submode"] = "timed"
+            context.user_data["step"] = "choose_pair"
+            await update.message.reply_text("💱 اختر زوج OTC للّيستة الزمنية 👇", reply_markup=otc_pairs_keyboard)
+            return
+
+        if text == "⚡ صفقة مباشرة":
+            context.user_data["otc_submode"] = "live_now"
+            context.user_data["step"] = "choose_live_otc_action"
+            await update.message.reply_text(
+                "⚡ صفقة مباشرة OTC\n\nاضغط الزر ليبحث البوت الآن عن أفضل فرصة بين كل أزواج OTC على فريم الدقيقة.",
+                reply_markup=otc_live_search_keyboard
+            )
+            return
+
+        await update.message.reply_text("⚡ اختر نوع إشارات OTC من الأزرار 👇", reply_markup=otc_mode_keyboard)
+        return
+
+    # ===== OTC timed list flow - النظام القديم كما هو =====
     if step == "choose_pair" and context.user_data.get("mode") == "otc":
         if text not in OTC_PAIRS:
             await update.message.reply_text("💱 اختر زوجًا من الأزرار 👇", reply_markup=otc_pairs_keyboard)
@@ -2983,13 +3703,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data["count"] = int(text)
 
-        # تم تثبيت الفاصل بين الصفقات على 3 دقائق في OTC حسب الطلب.
+        # النظام الزمني القديم: فاصل 3 دقائق واتجاه ثابت زمني، بدون استخدام بث live.
         interval_minutes = 3
-
         pair = context.user_data["pair"]
         count = context.user_data["count"]
-
-        # أول صفقة تبدأ من الدقيقة القادمة وليس من اللحظة الحالية.
         start_dt = next_full_minute(now_utc())
 
         signals = generate_signals(pair, count, interval_minutes, start_dt)
@@ -2997,6 +3714,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         await update.message.reply_text(
             message_text,
+            reply_markup=build_main_menu_for_user(user.id),
+            parse_mode="Markdown"
+        )
+
+        reset_signal_state(context)
+        return
+
+    # ===== OTC direct trade flow - خيار جديد منفصل =====
+    if step == "choose_live_otc_action" and context.user_data.get("mode") == "otc":
+        if text != "🔎 ابحث عن صفقة الآن":
+            await update.message.reply_text(
+                "اضغط الزر ليبحث البوت عن أفضل فرصة مباشرة الآن 👇",
+                reply_markup=otc_live_search_keyboard
+            )
+            return
+
+        await update.message.reply_text("🔎 جاري فحص أزواج OTC الحية على فريم الدقيقة...")
+        result = analyze_best_live_otc_now()
+
+        await update.message.reply_text(
+            result["message"],
             reply_markup=build_main_menu_for_user(user.id),
             parse_mode="Markdown"
         )
@@ -3064,11 +3802,21 @@ def main():
 
     app = Application.builder().token(BOT_TOKEN).build()
 
+    # تشغيل بث Quotex OTC الحقيقي بالخلفية
+    start_quotex_otc_feed()
+
     # Auto publish global market
     app.job_queue.run_repeating(
         auto_publish_real_market,
         interval=120,
         first=15
+    )
+
+    # Auto publish OTC live direct trades to the new private channel
+    app.job_queue.run_repeating(
+        auto_publish_otc_live_channel,
+        interval=OTC_LIVE_SCAN_INTERVAL_SECONDS,
+        first=25
     )
 
     job_queue = app.job_queue
