@@ -312,7 +312,8 @@ admin_channels_keyboard = ReplyKeyboardMarkup(
     [
         ["🌍 تشغيل نشر العالمي", "🌍 إيقاف نشر العالمي"],
         ["⚡ تشغيل نشر OTC", "⚡ إيقاف نشر OTC"],
-        ["📊 حالة النشر"],
+        ["🔥 تشغيل OTC مباشر", "🔥 إيقاف OTC مباشر"],
+        ["📊 حالة النشر", "📈 إحصائيات OTC مباشر"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -441,6 +442,7 @@ def get_channel_publish_settings():
     return {
         "global": bool(data.get("global", True)),
         "otc": bool(data.get("otc", True)),
+        "otc_live": bool(data.get("otc_live", True)),
     }
 
 
@@ -459,10 +461,12 @@ def format_channel_publish_status() -> str:
     settings = get_channel_publish_settings()
     global_status = "شغال ✅" if settings.get("global", True) else "متوقف ⛔"
     otc_status = "شغال ✅" if settings.get("otc", True) else "متوقف ⛔"
+    otc_live_status = "شغال ✅" if settings.get("otc_live", True) else "متوقف ⛔"
     return (
         "📊 حالة نشر القنوات\n\n"
         f"🌍 قناة السوق العالمي: {global_status}\n"
-        f"⚡ قناة OTC: {otc_status}"
+        f"⚡ قناة OTC الزمني: {otc_status}\n"
+        f"🔥 قناة OTC المباشر: {otc_live_status}"
     )
 
 
@@ -1184,6 +1188,95 @@ def build_otc_live_channel_result_message(signal: dict, exit_price: float | None
         return "Loss💔"
     return "غير مؤكدة⚠️"
 
+
+
+# ===== OTC LIVE CHANNEL STATS =====
+def otc_live_stats_ref():
+    return system_ref().child("otc_live_channel_stats")
+
+
+def get_otc_live_day_key(check_dt: datetime | None = None) -> str:
+    return (check_dt or now_utc()).astimezone(UTC_PLUS_3).strftime("%Y-%m-%d")
+
+
+def record_otc_live_channel_result(signal: dict, result: str):
+    try:
+        day_key = get_otc_live_day_key()
+        ref = otc_live_stats_ref().child(day_key)
+        current = ref.get() or {}
+
+        total = safe_int(current.get("total"), 0) + 1
+        wins = safe_int(current.get("wins"), 0)
+        losses = safe_int(current.get("losses"), 0)
+        unknown = safe_int(current.get("unknown"), 0)
+
+        if result == "win":
+            wins += 1
+        elif result == "loss":
+            losses += 1
+        else:
+            unknown += 1
+
+        ref.update({
+            "date": day_key,
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "unknown": unknown,
+            "updated_at": now_iso(),
+        })
+
+        ref.child("trades").push({
+            "pair": signal.get("pair"),
+            "direction": signal.get("direction"),
+            "quality": signal.get("quality"),
+            "entry_time": signal.get("entry_time"),
+            "result": result,
+            "created_at": now_iso(),
+        })
+    except Exception as e:
+        logger.exception("Could not record OTC live channel result: %s", e)
+
+
+def build_otc_live_stats_message(day_key: str | None = None) -> str:
+    day_key = day_key or get_otc_live_day_key()
+    data = otc_live_stats_ref().child(day_key).get() or {}
+
+    total = safe_int(data.get("total"), 0)
+    wins = safe_int(data.get("wins"), 0)
+    losses = safe_int(data.get("losses"), 0)
+    unknown = safe_int(data.get("unknown"), 0)
+
+    decided = wins + losses
+    win_rate = round((wins / decided) * 100, 1) if decided > 0 else 0
+    loss_rate = round((losses / decided) * 100, 1) if decided > 0 else 0
+
+    return (
+        "╔══════════════╗\n"
+        "   📊 إحصائيات OTC Live\n"
+        "╚══════════════╝\n\n"
+        f"📅 التاريخ: {day_key}\n"
+        f"📌 عدد الصفقات: {total}\n"
+        f"WIN✅: {wins}\n"
+        f"Loss💔: {losses}\n"
+        f"⚠️ غير مؤكدة: {unknown}\n"
+        f"📈 نسبة الربح: {win_rate}%\n"
+        f"📉 نسبة الخسارة: {loss_rate}%\n\n"
+        "@coach_WAEL_trading\n"
+        "@sttrade_helper_bot"
+    )
+
+
+async def publish_daily_otc_live_stats(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        text = build_otc_live_stats_message(get_otc_live_day_key())
+        await context.bot.send_message(
+            chat_id=OTC_LIVE_CHANNEL_ID,
+            text=text
+        )
+    except Exception as e:
+        logger.exception("Daily OTC live stats publish error: %s", e)
+
 async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
     signal = dict(context.job.data or {})
     pair = signal.get("pair")
@@ -1243,11 +1336,12 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             signal.get("close_tick_ts"),
         )
 
+        record_otc_live_channel_result(signal, result)
+
         text = build_otc_live_channel_result_message(signal, exit_price, result)
         await context.bot.send_message(
             chat_id=OTC_LIVE_CHANNEL_ID,
-            text=text,
-            reply_to_message_id=message_id
+            text=text
         )
 
     except Exception as e:
@@ -1262,7 +1356,7 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
     logger.info("OTC LIVE CHANNEL SCAN started | enabled=%s | active=%s | min_quality=%s",
                 OTC_LIVE_CHANNEL_ENABLED, otc_live_channel_state.get("active"), OTC_LIVE_MIN_QUALITY)
 
-    if not OTC_LIVE_CHANNEL_ENABLED:
+    if not OTC_LIVE_CHANNEL_ENABLED or not is_channel_publish_enabled("otc_live"):
         logger.info("OTC LIVE CHANNEL SCAN skipped: disabled")
         return
 
@@ -3470,6 +3564,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("⛔ تم إيقاف النشر في قناة OTC", reply_markup=admin_channels_keyboard)
                 return
 
+            if text == "🔥 تشغيل OTC مباشر":
+                set_channel_publish_enabled("otc_live", True)
+                await update.message.reply_text("🔥 تم تشغيل نشر قناة OTC المباشر ✅", reply_markup=admin_channels_keyboard)
+                return
+
+            if text == "🔥 إيقاف OTC مباشر":
+                set_channel_publish_enabled("otc_live", False)
+                await update.message.reply_text("🔥 تم إيقاف نشر قناة OTC المباشر ⛔", reply_markup=admin_channels_keyboard)
+                return
+
+            if text == "📈 إحصائيات OTC مباشر":
+                await update.message.reply_text(build_otc_live_stats_message(), reply_markup=admin_channels_keyboard)
+                return
+
             if text == "📊 حالة النشر":
                 await update.message.reply_text(format_channel_publish_status(), reply_markup=admin_channels_keyboard)
                 return
@@ -3832,6 +3940,13 @@ def main():
     job_queue.run_once(
         schedule_random_daily_otc_list,
         when=5
+    )
+
+
+    # نشر إحصائيات OTC Live اليومية بنهاية اليوم بتوقيت UTC+3
+    job_queue.run_daily(
+        publish_daily_otc_live_stats,
+        time=time(hour=23, minute=59, tzinfo=UTC_PLUS_3)
     )
 
     app.add_handler(CommandHandler("start", start))
