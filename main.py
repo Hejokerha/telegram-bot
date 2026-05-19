@@ -1377,6 +1377,105 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
         otc_live_channel_state["active"] = False
         logger.exception("OTC live channel publish error: %s", e)
 
+
+# ===== OTC LIVE CHANNEL STATS =====
+def otc_live_stats_ref():
+    return system_ref().child("otc_live_channel_stats")
+
+
+def get_otc_live_day_key(check_dt: datetime | None = None) -> str:
+    return (check_dt or now_utc()).astimezone(UTC_PLUS_3).strftime("%Y-%m-%d")
+
+
+def record_otc_live_channel_result(signal: dict, result: str):
+    try:
+        day_key = get_otc_live_day_key()
+        ref = otc_live_stats_ref().child(day_key)
+
+        current = ref.get() or {}
+        total = safe_int(current.get("total"), 0) + 1
+        wins = safe_int(current.get("wins"), 0)
+        losses = safe_int(current.get("losses"), 0)
+        unknown = safe_int(current.get("unknown"), 0)
+        martingale_wins = safe_int(current.get("martingale_wins"), 0)
+
+        martingale_step = int(signal.get("martingale_step", 0) or 0)
+
+        if result == "win":
+            wins += 1
+            if martingale_step == 1:
+                martingale_wins += 1
+        elif result == "loss":
+            losses += 1
+        else:
+            unknown += 1
+
+        ref.update({
+            "date": day_key,
+            "total": total,
+            "wins": wins,
+            "losses": losses,
+            "unknown": unknown,
+            "martingale_wins": martingale_wins,
+            "updated_at": now_iso(),
+        })
+
+        ref.child("trades").push({
+            "pair": signal.get("pair"),
+            "direction": signal.get("direction"),
+            "quality": signal.get("quality"),
+            "entry_time": signal.get("entry_time"),
+            "result": result,
+            "martingale_step": martingale_step,
+            "created_at": now_iso(),
+        })
+    except Exception as e:
+        logger.exception("Could not record OTC live channel result: %s", e)
+
+
+def build_otc_live_stats_message(day_key: str | None = None) -> str:
+    day_key = day_key or get_otc_live_day_key()
+    data = otc_live_stats_ref().child(day_key).get() or {}
+
+    total = safe_int(data.get("total"), 0)
+    wins = safe_int(data.get("wins"), 0)
+    losses = safe_int(data.get("losses"), 0)
+    unknown = safe_int(data.get("unknown"), 0)
+    martingale_wins = safe_int(data.get("martingale_wins"), 0)
+
+    decided = wins + losses
+    win_rate = round((wins / decided) * 100, 1) if decided > 0 else 0
+    loss_rate = round((losses / decided) * 100, 1) if decided > 0 else 0
+
+    return (
+        "╔══════════════╗\n"
+        "   📊 إحصائيات OTC Live\n"
+        "╚══════════════╝\n\n"
+        f"📅 التاريخ: {day_key}\n"
+        f"📌 عدد الصفقات: {total}\n"
+        f"✅ الرابحة: {wins}\n"
+        f"✅¹ ربح بالمضاعفة: {martingale_wins}\n"
+        f"💔 الخاسرة: {losses}\n"
+        f"⚠️ غير مؤكدة: {unknown}\n"
+        f"📈 نسبة الربح: {win_rate}%\n"
+        f"📉 نسبة الخسارة: {loss_rate}%\n\n"
+        "@coach_WAEL_trading\n"
+        "@sttrade_helper_bot"
+    )
+
+
+async def publish_daily_otc_live_stats(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        yesterday = (now_utc().astimezone(UTC_PLUS_3) - timedelta(days=1)).strftime("%Y-%m-%d")
+        text = build_otc_live_stats_message(yesterday)
+        await context.bot.send_message(
+            chat_id=OTC_LIVE_CHANNEL_ID,
+            text=text
+        )
+    except Exception as e:
+        logger.exception("Daily OTC live stats publish error: %s", e)
+
+
 # ===== OTC ENGINE =====
 def get_stable_direction(pair: str, dt: datetime) -> str:
     dt_plus_3 = dt.astimezone(UTC_PLUS_3)
