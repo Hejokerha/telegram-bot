@@ -51,6 +51,7 @@ GLOBAL_CHANNEL_ID = -1003918647685
 OTC_LIVE_CHANNEL_ID = int(os.getenv("OTC_LIVE_CHANNEL_ID", "-1003880574173"))
 OTC_LIVE_CHANNEL_ENABLED = os.getenv("OTC_LIVE_CHANNEL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 OTC_LIVE_MIN_QUALITY = int(os.getenv("OTC_LIVE_MIN_QUALITY", "65"))
+OTC_LIVE_MIN_PAYOUT = int(os.getenv("OTC_LIVE_MIN_PAYOUT", "80"))
 OTC_LIVE_REVERSE_AUTOPUBLISH = os.getenv("OTC_LIVE_REVERSE_AUTOPUBLISH", "true").lower() == "true"
 OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS", "3"))
 OTC_LIVE_MIN_ENTRY_LEAD_SECONDS = int(os.getenv("OTC_LIVE_MIN_ENTRY_LEAD_SECONDS", "10"))
@@ -152,6 +153,10 @@ OTC_PAIR_TO_QUOTEX_SYMBOL = {
     "CAD/JPY (OTC)": "CADJPY_otc",
     "AUD/CHF (OTC)": "AUDCHF_otc",
     "AUD/CAD (OTC)": "AUDCAD_otc",
+    "AUD/NZD (OTC)": "AUDNZD_otc",
+    "NZD/CAD (OTC)": "NZDCAD_otc",
+    "USD/ZAR (OTC)": "ZARUSD_otc",
+    "USD/PHP (OTC)": "PHPUSD_otc",
 }
 
 
@@ -770,6 +775,7 @@ class QuotexOTCLiveFeed:
         self.prices = {symbol: deque(maxlen=3000) for symbol in self.symbols}
         self.candles = {symbol: {} for symbol in self.symbols}  # bucket_ts -> OHLC from live Quotex ticks
         self.last_tick = {}
+        self.instruments = {}
         self.thread = None
 
     def start(self):
@@ -857,6 +863,10 @@ class QuotexOTCLiveFeed:
 
     def _subscribe_loop(self):
         time_module.sleep(2)
+        # نطلب قائمة الأدوات حتى نعرف payout وحالة OTC قبل النشر
+        self._send_event("instruments/list", [])
+        time_module.sleep(1)
+
         for symbol in self.symbols:
             if not self.connected:
                 break
@@ -902,24 +912,51 @@ class QuotexOTCLiveFeed:
         if not isinstance(data, list):
             return
 
+        # quotes/stream rows شكلها:
+        # ["BRLUSD_otc", timestamp, price, flag]
+        # instruments/list rows شكلها:
+        # [id, "BRLUSD_otc", "USD/BRL (OTC)", ..., payout, ..., is_otc, ...]
         with self.lock:
             for row in data:
-                if not isinstance(row, list) or len(row) < 4:
+                if not isinstance(row, list) or len(row) < 3:
                     continue
+
+                # instruments/list
+                if len(row) >= 15 and isinstance(row[1], str) and row[1].endswith("_otc"):
+                    try:
+                        symbol = str(row[1])
+                        name = str(row[2])
+                        payout = int(float(row[5]))
+                        is_otc = bool(row[14])
+                    except Exception:
+                        continue
+
+                    self.instruments[symbol] = {
+                        "symbol": symbol,
+                        "name": name,
+                        "payout": payout,
+                        "is_otc": is_otc,
+                        "updated_at": now_iso(),
+                    }
+                    continue
+
+                # quotes/stream
+                if len(row) < 4:
+                    continue
+
                 symbol = row[0]
                 if symbol not in self.prices:
                     continue
+
                 try:
                     ts = float(row[1])
                     price = float(row[2])
                     flag = int(row[3])
                 except Exception:
                     continue
+
                 self.prices[symbol].append((ts, price, flag))
 
-                # بناء شموع M1 حقيقية من بث Quotex:
-                # open = أول tick داخل الدقيقة
-                # close = آخر tick داخل نفس الدقيقة
                 bucket_ts = int(ts // 60) * 60
                 symbol_candles = self.candles.setdefault(symbol, {})
                 candle = symbol_candles.get(bucket_ts)
@@ -944,7 +981,6 @@ class QuotexOTCLiveFeed:
                     candle["close_tick_ts"] = ts
                     candle["ticks"] = int(candle.get("ticks", 0)) + 1
 
-                # لا نترك الذاكرة تكبر للأبد
                 if len(symbol_candles) > 240:
                     for old_bucket in sorted(symbol_candles.keys())[:-200]:
                         symbol_candles.pop(old_bucket, None)
@@ -956,6 +992,10 @@ class QuotexOTCLiveFeed:
                     "flag": flag,
                     "received_at": now_iso(),
                 }
+
+    def instrument(self, symbol: str):
+        with self.lock:
+            return dict(self.instruments.get(symbol) or {})
 
     def _on_error(self, ws, error):
         logger.warning("Quotex OTC websocket error: %s", error)
@@ -1044,6 +1084,13 @@ def analyze_best_live_otc_now() -> dict:
         except Exception:
             continue
 
+        instrument = quotex_otc_feed.instrument(symbol)
+        payout = int(instrument.get("payout", 0) or 0)
+        is_otc = bool(instrument.get("is_otc", True))
+
+        if instrument and (not is_otc or payout < OTC_LIVE_MIN_PAYOUT):
+            continue
+
         # آخر 12 تيك تقريبًا تعطي قراءة سريعة لفريم الدقيقة بدون انتظار طويل.
         sample = rows[-12:] if len(rows) >= 12 else rows
         prices = [float(r[1]) for r in sample]
@@ -1087,6 +1134,7 @@ def analyze_best_live_otc_now() -> dict:
             "change": change,
             "moves": {"up": up_moves, "down": down_moves, "flat": flat_moves},
             "sample_size": len(sample),
+            "payout": payout,
         })
 
     if not candidates:
