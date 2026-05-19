@@ -1208,10 +1208,33 @@ def next_otc_m1_entry_time(check_dt: datetime | None = None) -> datetime:
     return entry_dt.astimezone(UTC)
 
 
+def display_otc_live_quality(raw_quality: int) -> int:
+    """إعادة معايرة شكل قوة الفرصة فقط للعرض في القناة.
+    لا تغيّر التحليل ولا قرار الدخول، فقط تجعل النسبة المعروضة أريح بصريًا.
+    أمثلة تقريبية:
+    65 -> 78
+    70 -> 84
+    75 -> 90
+    80 -> 95
+    """
+    try:
+        q = int(raw_quality or 0)
+    except Exception:
+        q = 0
+
+    if q <= 0:
+        return 0
+
+    # تحويل محافظ من المجال العملي 55-80 إلى المجال المعروض 70-95
+    shown = int(round(70 + ((q - 55) * 25 / 25)))
+    return max(70, min(95, shown))
+
+
 def build_otc_live_channel_signal_message(signal: dict) -> str:
     pair = str(signal.get("pair", ""))
     direction = str(signal.get("direction", ""))
     quality = int(signal.get("quality", 0) or 0)
+    display_quality = display_otc_live_quality(quality)
     entry_dt = parse_iso(str(signal.get("entry_time", ""))) or next_full_minute(now_utc())
     direction_line = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
 
@@ -1223,7 +1246,7 @@ def build_otc_live_channel_signal_message(signal: dict) -> str:
         "🔥 M1\n"
         f"⌛️ {format_utc_plus_3(entry_dt)}\n"
         f"{direction_line}\n"
-        f"📊 قوة الفرصة: {quality}%\n"
+        f"📊 قوة الفرصة: {display_quality}%\n"
         "⚠️ التزم بإدارة رأس المال\n\n"
         "@coach_WAEL_trading\n"
         "@sttrade_helper_bot"
