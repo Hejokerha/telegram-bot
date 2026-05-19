@@ -51,6 +51,7 @@ GLOBAL_CHANNEL_ID = -1003918647685
 OTC_LIVE_CHANNEL_ID = int(os.getenv("OTC_LIVE_CHANNEL_ID", "-1003880574173"))
 OTC_LIVE_CHANNEL_ENABLED = os.getenv("OTC_LIVE_CHANNEL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 OTC_LIVE_MIN_QUALITY = int(os.getenv("OTC_LIVE_MIN_QUALITY", "65"))
+OTC_LIVE_REVERSE_AUTOPUBLISH = os.getenv("OTC_LIVE_REVERSE_AUTOPUBLISH", "true").lower() == "true"
 OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS", "3"))
 OTC_LIVE_MIN_ENTRY_LEAD_SECONDS = int(os.getenv("OTC_LIVE_MIN_ENTRY_LEAD_SECONDS", "10"))
 OTC_LIVE_TIE_EPSILON = float(os.getenv("OTC_LIVE_TIE_EPSILON", "0.0000001"))
@@ -1335,6 +1336,19 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
         if quality < OTC_LIVE_MIN_QUALITY:
             logger.info("OTC LIVE CHANNEL SCAN skipped: quality below minimum")
             return
+
+        if OTC_LIVE_REVERSE_AUTOPUBLISH:
+            original_direction = signal.get("direction")
+            if original_direction == "CALL":
+                signal["direction"] = "PUT"
+            elif original_direction == "PUT":
+                signal["direction"] = "CALL"
+
+            signal["original_direction"] = original_direction
+            logger.info(
+                "OTC LIVE CHANNEL direction reversed for next-candle entry | pair=%s | original=%s | published=%s",
+                signal.get("pair"), original_direction, signal.get("direction")
+            )
 
         # الدخول مع بداية شمعة M1 القادمة، والإغلاق مع نهاية نفس الشمعة.
         # النتيجة لاحقًا تُحسب من candle cache: open/close للشمعة نفسها.
