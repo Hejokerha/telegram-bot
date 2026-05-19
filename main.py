@@ -1182,100 +1182,17 @@ def build_otc_live_channel_signal_message(signal: dict) -> str:
 
 
 def build_otc_live_channel_result_message(signal: dict, exit_price: float | None, result: str) -> str:
+    step = int(signal.get("martingale_step", 0) or 0)
+
     if result == "win":
+        if step == 1:
+            return "WIN ✅¹"
         return "WIN✅"
+
     if result == "loss":
         return "Loss💔"
+
     return "غير مؤكدة⚠️"
-
-
-
-# ===== OTC LIVE CHANNEL STATS =====
-def otc_live_stats_ref():
-    return system_ref().child("otc_live_channel_stats")
-
-
-def get_otc_live_day_key(check_dt: datetime | None = None) -> str:
-    return (check_dt or now_utc()).astimezone(UTC_PLUS_3).strftime("%Y-%m-%d")
-
-
-def record_otc_live_channel_result(signal: dict, result: str):
-    try:
-        day_key = get_otc_live_day_key()
-        ref = otc_live_stats_ref().child(day_key)
-        current = ref.get() or {}
-
-        total = safe_int(current.get("total"), 0) + 1
-        wins = safe_int(current.get("wins"), 0)
-        losses = safe_int(current.get("losses"), 0)
-        unknown = safe_int(current.get("unknown"), 0)
-
-        if result == "win":
-            wins += 1
-        elif result == "loss":
-            losses += 1
-        else:
-            unknown += 1
-
-        ref.update({
-            "date": day_key,
-            "total": total,
-            "wins": wins,
-            "losses": losses,
-            "unknown": unknown,
-            "updated_at": now_iso(),
-        })
-
-        ref.child("trades").push({
-            "pair": signal.get("pair"),
-            "direction": signal.get("direction"),
-            "quality": signal.get("quality"),
-            "entry_time": signal.get("entry_time"),
-            "result": result,
-            "created_at": now_iso(),
-        })
-    except Exception as e:
-        logger.exception("Could not record OTC live channel result: %s", e)
-
-
-def build_otc_live_stats_message(day_key: str | None = None) -> str:
-    day_key = day_key or get_otc_live_day_key()
-    data = otc_live_stats_ref().child(day_key).get() or {}
-
-    total = safe_int(data.get("total"), 0)
-    wins = safe_int(data.get("wins"), 0)
-    losses = safe_int(data.get("losses"), 0)
-    unknown = safe_int(data.get("unknown"), 0)
-
-    decided = wins + losses
-    win_rate = round((wins / decided) * 100, 1) if decided > 0 else 0
-    loss_rate = round((losses / decided) * 100, 1) if decided > 0 else 0
-
-    return (
-        "╔══════════════╗\n"
-        "   📊 إحصائيات OTC Live\n"
-        "╚══════════════╝\n\n"
-        f"📅 التاريخ: {day_key}\n"
-        f"📌 عدد الصفقات: {total}\n"
-        f"WIN✅: {wins}\n"
-        f"Loss💔: {losses}\n"
-        f"⚠️ غير مؤكدة: {unknown}\n"
-        f"📈 نسبة الربح: {win_rate}%\n"
-        f"📉 نسبة الخسارة: {loss_rate}%\n\n"
-        "@coach_WAEL_trading\n"
-        "@sttrade_helper_bot"
-    )
-
-
-async def publish_daily_otc_live_stats(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        text = build_otc_live_stats_message(get_otc_live_day_key())
-        await context.bot.send_message(
-            chat_id=OTC_LIVE_CHANNEL_ID,
-            text=text
-        )
-    except Exception as e:
-        logger.exception("Daily OTC live stats publish error: %s", e)
 
 async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
     signal = dict(context.job.data or {})
@@ -1283,6 +1200,7 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
     symbol = signal.get("symbol") or OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
     direction = signal.get("direction")
     message_id = signal.get("message_id")
+    martingale_step = int(signal.get("martingale_step", 0) or 0)
 
     result = "unknown"
     exit_price = None
@@ -1302,9 +1220,11 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             signal["close_tick_ts"] = candle.get("close_tick_ts")
             signal["candle_ticks"] = candle.get("ticks")
         else:
-            logger.warning("No cached candle found for result | pair=%s | symbol=%s | entry_ts=%s", pair, symbol, entry_ts)
+            logger.warning(
+                "No cached candle found for result | pair=%s | symbol=%s | entry_ts=%s | step=%s",
+                pair, symbol, entry_ts, martingale_step
+            )
 
-        # fallback محدود إذا لم تتوفر الشمعة
         if actual_entry_price is None:
             actual_entry_price = float(signal.get("entry_price", 0) or 0)
             signal["actual_entry_price"] = actual_entry_price
@@ -1325,17 +1245,47 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
                 result = "win" if diff < 0 else "loss"
 
         logger.info(
-            "OTC candle-cache result | pair=%s | direction=%s | open=%s | close=%s | result=%s | ticks=%s | open_tick=%s | close_tick=%s",
+            "OTC candle-cache result | pair=%s | direction=%s | open=%s | close=%s | result=%s | step=%s | ticks=%s",
             pair,
             direction,
             actual_entry_price,
             exit_price,
             result,
+            martingale_step,
             signal.get("candle_ticks"),
-            signal.get("actual_entry_tick_ts"),
-            signal.get("close_tick_ts"),
         )
 
+        # مضاعفة واحدة:
+        # إذا خسرت الصفقة الأساسية، لا ننشر خسارة فورًا.
+        # ننتظر الشمعة التالية بنفس الاتجاه ونحسبها كمضاعفة.
+        if result == "loss" and martingale_step == 0:
+            next_entry_dt = datetime.fromtimestamp(close_ts, tz=UTC)
+            next_close_dt = next_entry_dt + timedelta(seconds=OTC_LIVE_TRADE_DURATION_SECONDS)
+
+            signal["martingale_step"] = 1
+            signal["entry_ts"] = next_entry_dt.timestamp()
+            signal["close_ts"] = next_close_dt.timestamp()
+            signal["entry_time"] = next_entry_dt.isoformat()
+
+            delay = seconds_until_dt(next_close_dt) + OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS
+
+            context.job_queue.run_once(
+                resolve_otc_live_channel_trade,
+                when=delay,
+                data=signal,
+                name=f"otc_live_martingale_result_{message_id}",
+            )
+
+            logger.info(
+                "OTC live trade lost first candle, waiting martingale candle | pair=%s | direction=%s | result_in=%.1fs",
+                pair, direction, delay
+            )
+            return
+
+        # نسجل النتيجة النهائية فقط:
+        # win step 0 => WIN✅
+        # win step 1 => WIN ✅¹
+        # loss step 1 => Loss💔
         record_otc_live_channel_result(signal, result)
 
         text = build_otc_live_channel_result_message(signal, exit_price, result)
@@ -1348,8 +1298,10 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("OTC live channel result error: %s", e)
 
     finally:
-        otc_live_channel_state["active"] = False
-        otc_live_channel_state["last_published_at"] = time_module.time()
+        # إذا دخلنا مضاعفة، لا نفتح صفقة جديدة قبل انتهاء المضاعفة.
+        if not (result == "loss" and martingale_step == 0):
+            otc_live_channel_state["active"] = False
+            otc_live_channel_state["last_published_at"] = time_module.time()
 
 
 async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
