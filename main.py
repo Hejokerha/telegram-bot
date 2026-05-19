@@ -59,6 +59,7 @@ OTC_LIVE_TIE_EPSILON = float(os.getenv("OTC_LIVE_TIE_EPSILON", "0.0000001"))
 OTC_LIVE_SCAN_INTERVAL_SECONDS = int(os.getenv("OTC_LIVE_SCAN_INTERVAL_SECONDS", "20"))
 OTC_LIVE_TRADE_DURATION_SECONDS = int(os.getenv("OTC_LIVE_TRADE_DURATION_SECONDS", "65"))
 OTC_LIVE_COOLDOWN_SECONDS = int(os.getenv("OTC_LIVE_COOLDOWN_SECONDS", "60"))
+OTC_LIVE_ACTIVE_TIMEOUT_SECONDS = int(os.getenv("OTC_LIVE_ACTIVE_TIMEOUT_SECONDS", "300"))
 OTC_LIVE_RESULT_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_DELAY_SECONDS", "8"))
 
 ADMIN_USERNAME = "@coach_WAEL_trading"
@@ -1182,6 +1183,7 @@ def analyze_best_live_otc_now() -> dict:
 # ===== OTC LIVE CHANNEL AUTOPUBLISH =====
 otc_live_channel_state = {
     "active": False,
+    "active_since": None,
     "last_published_at": None,
 }
 
@@ -1373,7 +1375,38 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
         # إذا دخلنا مضاعفة، لا نفتح صفقة جديدة قبل انتهاء المضاعفة.
         if not (result == "loss" and martingale_step == 0):
             otc_live_channel_state["active"] = False
+            otc_live_channel_state["active_since"] = None
             otc_live_channel_state["last_published_at"] = time_module.time()
+
+
+
+def reset_stuck_otc_live_trade_if_needed() -> bool:
+    """يفك تعليق حالة active إذا بقيت صفقة OTC معلقة أكثر من الحد المسموح."""
+    try:
+        if not otc_live_channel_state.get("active"):
+            return False
+
+        active_since = otc_live_channel_state.get("active_since")
+        if not active_since:
+            otc_live_channel_state["active_since"] = time_module.time()
+            return False
+
+        elapsed = time_module.time() - float(active_since)
+        if elapsed >= OTC_LIVE_ACTIVE_TIMEOUT_SECONDS:
+            logger.warning(
+                "OTC LIVE active trade watchdog reset | active_for=%.1fs | timeout=%ss",
+                elapsed,
+                OTC_LIVE_ACTIVE_TIMEOUT_SECONDS,
+            )
+            otc_live_channel_state["active"] = False
+            otc_live_channel_state["active_since"] = None
+            otc_live_channel_state["last_published_at"] = time_module.time()
+            return True
+
+    except Exception as e:
+        logger.exception("OTC LIVE active watchdog error: %s", e)
+
+    return False
 
 
 async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
@@ -1385,8 +1418,11 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
         return
 
     if otc_live_channel_state.get("active"):
-        logger.info("OTC LIVE CHANNEL SCAN skipped: active trade is still running")
-        return
+        if reset_stuck_otc_live_trade_if_needed():
+            logger.info("OTC LIVE CHANNEL SCAN recovered from stuck active trade")
+        else:
+            logger.info("OTC LIVE CHANNEL SCAN skipped: active trade is still running")
+            return
 
     last_published_at = otc_live_channel_state.get("last_published_at")
     if last_published_at and time_module.time() - float(last_published_at) < OTC_LIVE_COOLDOWN_SECONDS:
@@ -1441,6 +1477,7 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
         signal["published_at"] = now_iso()
 
         otc_live_channel_state["active"] = True
+        otc_live_channel_state["active_since"] = time_module.time()
 
         resolve_delay = seconds_until_dt(close_dt) + OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS
         context.job_queue.run_once(
