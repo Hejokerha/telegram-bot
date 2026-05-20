@@ -1771,20 +1771,81 @@ def build_otc_live_stats_message(day_key: str | None = None) -> str:
     day_key = day_key or get_otc_live_day_key()
     data = otc_live_stats_ref().child(day_key).get() or {}
 
-    total = safe_int(data.get("total"), 0)
-    wins = safe_int(data.get("wins"), 0)
-    direct_wins = safe_int(data.get("direct_wins"), 0)
-    losses = safe_int(data.get("losses"), 0)
-    unknown = safe_int(data.get("unknown"), 0)
-    martingale_wins = safe_int(data.get("martingale_wins"), 0)
+    # نحاول إعادة بناء الإحصائية من سجل الصفقات نفسه.
+    # هذا مهم لأن النسخ القديمة لم تكن تحفظ direct_wins/net_units.
+    trades_raw = data.get("trades") or {}
+    trades = []
+    if isinstance(trades_raw, dict):
+        for _, trade in trades_raw.items():
+            if isinstance(trade, dict):
+                trades.append(trade)
+
+    if trades:
+        total = len(trades)
+        wins = 0
+        direct_wins = 0
+        losses = 0
+        unknown = 0
+        martingale_wins = 0
+        net_units = 0.0
+        gross_win_units = 0.0
+        gross_loss_units = 0.0
+
+        for trade in trades:
+            result = str(trade.get("result", "unknown"))
+            step = safe_int(trade.get("martingale_step"), 0)
+            payout = safe_int(trade.get("payout"), 80)
+
+            units = trade.get("units")
+            if units is None:
+                units = otc_live_trade_units(result, step, payout)
+            else:
+                try:
+                    units = float(units)
+                except Exception:
+                    units = otc_live_trade_units(result, step, payout)
+
+            if result == "win":
+                wins += 1
+                if step == 1:
+                    martingale_wins += 1
+                else:
+                    direct_wins += 1
+            elif result == "loss":
+                losses += 1
+            else:
+                unknown += 1
+
+            net_units += float(units)
+            if units > 0:
+                gross_win_units += float(units)
+            elif units < 0:
+                gross_loss_units += float(units)
+
+        net_units = round(net_units, 2)
+        gross_win_units = round(gross_win_units, 2)
+        gross_loss_units = round(gross_loss_units, 2)
+
+    else:
+        total = safe_int(data.get("total"), 0)
+        wins = safe_int(data.get("wins"), 0)
+        direct_wins = safe_int(data.get("direct_wins"), 0)
+        losses = safe_int(data.get("losses"), 0)
+        unknown = safe_int(data.get("unknown"), 0)
+        martingale_wins = safe_int(data.get("martingale_wins"), 0)
+        net_units = round(float(data.get("net_units", 0) or 0), 2)
+        gross_win_units = round(float(data.get("gross_win_units", 0) or 0), 2)
+        gross_loss_units = round(float(data.get("gross_loss_units", 0) or 0), 2)
+
+        # fallback للبيانات القديمة:
+        # إذا عندنا wins و martingale_wins لكن direct_wins غير محفوظ،
+        # نحسبه تقريبيًا من wins - martingale_wins.
+        if direct_wins == 0 and wins > 0:
+            direct_wins = max(0, wins - martingale_wins)
 
     decided = wins + losses
     win_rate = round((wins / decided) * 100, 1) if decided > 0 else 0
     loss_rate = round((losses / decided) * 100, 1) if decided > 0 else 0
-
-    net_units = round(float(data.get("net_units", 0) or 0), 2)
-    gross_win_units = round(float(data.get("gross_win_units", 0) or 0), 2)
-    gross_loss_units = round(float(data.get("gross_loss_units", 0) or 0), 2)
     avg_units = round(net_units / decided, 3) if decided > 0 else 0
 
     if net_units > 0:
