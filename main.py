@@ -60,6 +60,12 @@ OTC_LIVE_SCAN_INTERVAL_SECONDS = int(os.getenv("OTC_LIVE_SCAN_INTERVAL_SECONDS",
 OTC_LIVE_TRADE_DURATION_SECONDS = int(os.getenv("OTC_LIVE_TRADE_DURATION_SECONDS", "65"))
 OTC_LIVE_COOLDOWN_SECONDS = int(os.getenv("OTC_LIVE_COOLDOWN_SECONDS", "60"))
 OTC_LIVE_ACTIVE_TIMEOUT_SECONDS = int(os.getenv("OTC_LIVE_ACTIVE_TIMEOUT_SECONDS", "300"))
+OTC_LIVE_ADAPTIVE_FILTER_ENABLED = os.getenv("OTC_LIVE_ADAPTIVE_FILTER_ENABLED", "true").lower() == "true"
+OTC_LIVE_PAIR_RECENT_LIMIT = int(os.getenv("OTC_LIVE_PAIR_RECENT_LIMIT", "10"))
+OTC_LIVE_PAIR_MAX_RECENT_LOSSES = int(os.getenv("OTC_LIVE_PAIR_MAX_RECENT_LOSSES", "3"))
+OTC_LIVE_DIRECTION_RECENT_LIMIT = int(os.getenv("OTC_LIVE_DIRECTION_RECENT_LIMIT", "8"))
+OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES = int(os.getenv("OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES", "2"))
+OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS = float(os.getenv("OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS", "-4.0"))
 OTC_LIVE_RESULT_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_DELAY_SECONDS", "8"))
 
 ADMIN_USERNAME = "@coach_WAEL_trading"
@@ -1149,7 +1155,41 @@ def analyze_best_live_otc_now() -> dict:
             )
         }
 
-    best = max(candidates, key=lambda x: (x["score"], abs(x["change"])))
+    ranked_candidates = sorted(candidates, key=lambda x: (x["score"], abs(x["change"])), reverse=True)
+
+    best = None
+    for candidate in ranked_candidates:
+        effective_direction = candidate.get("direction")
+        if OTC_LIVE_REVERSE_AUTOPUBLISH:
+            if effective_direction == "CALL":
+                effective_direction = "PUT"
+            elif effective_direction == "PUT":
+                effective_direction = "CALL"
+
+        blocked, reason = is_otc_live_candidate_blocked(candidate.get("pair"), effective_direction)
+        if blocked:
+            logger.info(
+                "OTC LIVE adaptive filter skipped candidate | pair=%s | direction=%s | reason=%s",
+                candidate.get("pair"),
+                effective_direction,
+                reason,
+            )
+            continue
+
+        best = candidate
+        break
+
+    if best is None:
+        return {
+            "ok": False,
+            "message": (
+                "⚡ صفقة مباشرة OTC\n\n"
+                "❌ لا توجد فرصة مناسبة الآن بعد فلتر التعلم الذكي.\n\n"
+                "انتظر 30-60 ثانية ثم اضغط:\n"
+                "🔎 ابحث عن صفقة الآن"
+            )
+        }
+
     entry_dt = next_full_minute(now_utc())
     direction_line = "🟢 CALL" if best["direction"] == "CALL" else "🔴 PUT"
     price_text = f"{best['price']:.5f}" if "JPY" not in best["pair"] else f"{best['price']:.3f}"
@@ -1175,6 +1215,7 @@ def analyze_best_live_otc_now() -> dict:
         "direction": best["direction"],
         "quality": best["score"],
         "entry_price": best["price"],
+        "payout": best.get("payout", 80),
         "entry_time": entry_dt.isoformat(),
         "message": msg,
     }
@@ -1500,6 +1541,82 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("OTC live channel publish error: %s", e)
 
 
+
+# ===== OTC LIVE ADAPTIVE FILTER =====
+def otc_live_trade_units(result: str, martingale_step: int = 0, payout: float | int | None = None) -> float:
+    """حساب النتيجة المالية بالوحدات.
+    WIN مباشر = payout
+    WIN بالمضاعفة = -1 + 2*payout
+    Loss بعد المضاعفة = -3
+    """
+    try:
+        payout_rate = float(payout or 80) / 100.0
+    except Exception:
+        payout_rate = 0.80
+
+    if result == "win":
+        if int(martingale_step or 0) == 1:
+            return round(-1.0 + (2.0 * payout_rate), 4)
+        return round(payout_rate, 4)
+
+    if result == "loss":
+        return -3.0
+
+    return 0.0
+
+
+def get_otc_live_recent_trades(day_key: str | None = None, limit: int = 300) -> list[dict]:
+    try:
+        day_key = day_key or get_otc_live_day_key()
+        raw = otc_live_stats_ref().child(day_key).child("trades").get() or {}
+
+        rows = []
+        if isinstance(raw, dict):
+            for trade_id, trade in raw.items():
+                if isinstance(trade, dict):
+                    item = dict(trade)
+                    item["_id"] = trade_id
+                    rows.append(item)
+
+        rows.sort(key=lambda x: str(x.get("created_at", "")))
+        return rows[-limit:]
+    except Exception as e:
+        logger.exception("Could not read OTC live recent trades: %s", e)
+        return []
+
+
+def is_otc_live_candidate_blocked(pair: str, direction: str) -> tuple[bool, str]:
+    """فلتر تعلم بسيط:
+    لا يغير التحليل، فقط يمنع الأنماط التي أثبتت خسارة نهائية كثيرة اليوم.
+    """
+    if not OTC_LIVE_ADAPTIVE_FILTER_ENABLED:
+        return False, ""
+
+    trades = get_otc_live_recent_trades(limit=400)
+    if not trades:
+        return False, ""
+
+    pair_trades = [t for t in trades if t.get("pair") == pair]
+    pair_recent = pair_trades[-OTC_LIVE_PAIR_RECENT_LIMIT:]
+    pair_losses = sum(1 for t in pair_recent if t.get("result") == "loss")
+    pair_units = sum(float(t.get("units", 0) or 0) for t in pair_recent)
+
+    if len(pair_recent) >= max(4, OTC_LIVE_PAIR_MAX_RECENT_LOSSES) and pair_losses >= OTC_LIVE_PAIR_MAX_RECENT_LOSSES:
+        return True, f"pair_recent_losses={pair_losses}/{len(pair_recent)}"
+
+    if len(pair_recent) >= 5 and pair_units <= OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS:
+        return True, f"pair_recent_units={pair_units:.2f}"
+
+    dir_trades = [t for t in trades if t.get("pair") == pair and t.get("direction") == direction]
+    dir_recent = dir_trades[-OTC_LIVE_DIRECTION_RECENT_LIMIT:]
+    dir_losses = sum(1 for t in dir_recent if t.get("result") == "loss")
+
+    if len(dir_recent) >= max(3, OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES) and dir_losses >= OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES:
+        return True, f"direction_recent_losses={dir_losses}/{len(dir_recent)}"
+
+    return False, ""
+
+
 # ===== OTC LIVE CHANNEL STATS =====
 def otc_live_stats_ref():
     return system_ref().child("otc_live_channel_stats")
@@ -1520,35 +1637,52 @@ def record_otc_live_channel_result(signal: dict, result: str):
         losses = safe_int(current.get("losses"), 0)
         unknown = safe_int(current.get("unknown"), 0)
         martingale_wins = safe_int(current.get("martingale_wins"), 0)
+        direct_wins = safe_int(current.get("direct_wins"), 0)
 
         martingale_step = int(signal.get("martingale_step", 0) or 0)
+        payout = int(float(signal.get("payout", 80) or 80))
+        units = otc_live_trade_units(result, martingale_step, payout)
 
         if result == "win":
             wins += 1
             if martingale_step == 1:
                 martingale_wins += 1
+            else:
+                direct_wins += 1
         elif result == "loss":
             losses += 1
         else:
             unknown += 1
 
+        net_units = round(float(current.get("net_units", 0) or 0) + units, 4)
+        gross_win_units = round(float(current.get("gross_win_units", 0) or 0) + max(units, 0), 4)
+        gross_loss_units = round(float(current.get("gross_loss_units", 0) or 0) + min(units, 0), 4)
+
         ref.update({
             "date": day_key,
             "total": total,
             "wins": wins,
+            "direct_wins": direct_wins,
             "losses": losses,
             "unknown": unknown,
             "martingale_wins": martingale_wins,
+            "net_units": net_units,
+            "gross_win_units": gross_win_units,
+            "gross_loss_units": gross_loss_units,
             "updated_at": now_iso(),
         })
 
         ref.child("trades").push({
             "pair": signal.get("pair"),
+            "symbol": signal.get("symbol"),
             "direction": signal.get("direction"),
+            "original_direction": signal.get("original_direction"),
             "quality": signal.get("quality"),
+            "payout": payout,
             "entry_time": signal.get("entry_time"),
             "result": result,
             "martingale_step": martingale_step,
+            "units": units,
             "created_at": now_iso(),
         })
     except Exception as e:
@@ -1561,6 +1695,7 @@ def build_otc_live_stats_message(day_key: str | None = None) -> str:
 
     total = safe_int(data.get("total"), 0)
     wins = safe_int(data.get("wins"), 0)
+    direct_wins = safe_int(data.get("direct_wins"), 0)
     losses = safe_int(data.get("losses"), 0)
     unknown = safe_int(data.get("unknown"), 0)
     martingale_wins = safe_int(data.get("martingale_wins"), 0)
@@ -1569,18 +1704,35 @@ def build_otc_live_stats_message(day_key: str | None = None) -> str:
     win_rate = round((wins / decided) * 100, 1) if decided > 0 else 0
     loss_rate = round((losses / decided) * 100, 1) if decided > 0 else 0
 
+    net_units = round(float(data.get("net_units", 0) or 0), 2)
+    gross_win_units = round(float(data.get("gross_win_units", 0) or 0), 2)
+    gross_loss_units = round(float(data.get("gross_loss_units", 0) or 0), 2)
+    avg_units = round(net_units / decided, 3) if decided > 0 else 0
+
+    if net_units > 0:
+        money_status = "🟢 رابح"
+    elif net_units < 0:
+        money_status = "🔴 خاسر"
+    else:
+        money_status = "⚪ تعادل"
+
     return (
         "╔══════════════╗\n"
         "   📊 إحصائيات OTC Live\n"
         "╚══════════════╝\n\n"
         f"📅 التاريخ: {day_key}\n"
         f"📌 عدد الصفقات: {total}\n"
-        f"✅ الرابحة: {wins}\n"
+        f"✅ ربح مباشر: {direct_wins}\n"
         f"✅¹ ربح بالمضاعفة: {martingale_wins}\n"
-        f"💔 الخاسرة: {losses}\n"
-        f"⚠️ غير مؤكدة: {unknown}\n"
-        f"📈 نسبة الربح: {win_rate}%\n"
-        f"📉 نسبة الخسارة: {loss_rate}%\n\n"
+        f"💔 خسارة نهائية: {losses}\n"
+        f"⚠️ غير مؤكدة: {unknown}\n\n"
+        f"📈 نسبة نجاح الإشارات: {win_rate}%\n"
+        f"📉 نسبة الخسارة النهائية: {loss_rate}%\n\n"
+        f"💰 صافي الوحدات: {net_units}\n"
+        f"➕ وحدات رابحة: {gross_win_units}\n"
+        f"➖ وحدات خاسرة: {gross_loss_units}\n"
+        f"📊 متوسط الوحدة/صفقة: {avg_units}\n"
+        f"💵 الأداء المالي: {money_status}\n\n"
         "@coach_WAEL_trading\n"
         "@sttrade_helper_bot"
     )
