@@ -61,11 +61,11 @@ OTC_LIVE_TRADE_DURATION_SECONDS = int(os.getenv("OTC_LIVE_TRADE_DURATION_SECONDS
 OTC_LIVE_COOLDOWN_SECONDS = int(os.getenv("OTC_LIVE_COOLDOWN_SECONDS", "60"))
 OTC_LIVE_ACTIVE_TIMEOUT_SECONDS = int(os.getenv("OTC_LIVE_ACTIVE_TIMEOUT_SECONDS", "300"))
 OTC_LIVE_ADAPTIVE_FILTER_ENABLED = os.getenv("OTC_LIVE_ADAPTIVE_FILTER_ENABLED", "true").lower() == "true"
-OTC_LIVE_PAIR_RECENT_LIMIT = int(os.getenv("OTC_LIVE_PAIR_RECENT_LIMIT", "10"))
-OTC_LIVE_PAIR_MAX_RECENT_LOSSES = int(os.getenv("OTC_LIVE_PAIR_MAX_RECENT_LOSSES", "3"))
-OTC_LIVE_DIRECTION_RECENT_LIMIT = int(os.getenv("OTC_LIVE_DIRECTION_RECENT_LIMIT", "8"))
-OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES = int(os.getenv("OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES", "2"))
-OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS = float(os.getenv("OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS", "-4.0"))
+OTC_LIVE_PAIR_RECENT_LIMIT = int(os.getenv("OTC_LIVE_PAIR_RECENT_LIMIT", "20"))
+OTC_LIVE_PAIR_MAX_RECENT_LOSSES = int(os.getenv("OTC_LIVE_PAIR_MAX_RECENT_LOSSES", "5"))
+OTC_LIVE_DIRECTION_RECENT_LIMIT = int(os.getenv("OTC_LIVE_DIRECTION_RECENT_LIMIT", "15"))
+OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES = int(os.getenv("OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES", "4"))
+OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS = float(os.getenv("OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS", "-8.0"))
 OTC_LIVE_RESULT_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_DELAY_SECONDS", "8"))
 
 ADMIN_USERNAME = "@coach_WAEL_trading"
@@ -1180,15 +1180,15 @@ def analyze_best_live_otc_now() -> dict:
         break
 
     if best is None:
-        return {
-            "ok": False,
-            "message": (
-                "⚡ صفقة مباشرة OTC\n\n"
-                "❌ لا توجد فرصة مناسبة الآن بعد فلتر التعلم الذكي.\n\n"
-                "انتظر 30-60 ثانية ثم اضغط:\n"
-                "🔎 ابحث عن صفقة الآن"
-            )
-        }
+        # Soft fallback:
+        # إذا الفلتر منع كل المرشحين، لا نوقف البوت كليًا.
+        # نأخذ أفضل فرصة خام حتى يبقى النشر شغال، لكن نسجل ذلك في اللوج.
+        best = ranked_candidates[0]
+        logger.info(
+            "OTC LIVE adaptive soft fallback used | pair=%s | score=%s",
+            best.get("pair"),
+            best.get("score"),
+        )
 
     entry_dt = next_full_minute(now_utc())
     direction_line = "🟢 CALL" if best["direction"] == "CALL" else "🔴 PUT"
@@ -1349,15 +1349,7 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             if snapshot and snapshot.get("price") is not None:
                 exit_price = float(snapshot.get("price"))
 
-        if exit_price is not None and actual_entry_price > 0:
-            diff = exit_price - actual_entry_price
-
-            if abs(diff) <= OTC_LIVE_TIE_EPSILON:
-                result = "unknown"
-            elif direction == "CALL":
-                result = "win" if diff > 0 else "loss"
-            elif direction == "PUT":
-                result = "win" if diff < 0 else "loss"
+        result = resolve_candle_direction_result(direction, actual_entry_price, exit_price)
 
         logger.info(
             "OTC candle-cache result | pair=%s | direction=%s | open=%s | close=%s | result=%s | step=%s | ticks=%s",
@@ -1369,6 +1361,11 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             martingale_step,
             signal.get("candle_ticks"),
         )
+
+        if martingale_step == 0:
+            signal["first_candle_result"] = result
+            signal["first_candle_open"] = actual_entry_price
+            signal["first_candle_close"] = exit_price
 
         # مضاعفة واحدة:
         # إذا خسرت الصفقة الأساسية، لا ننشر خسارة فورًا.
@@ -1397,10 +1394,16 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        # نسجل اختبار NORMAL vs REVERSE بعد النتيجة النهائية.
+        record_otc_live_shadow_direction_test(
+            signal=signal,
+            first_result=str(signal.get("first_candle_result", result)),
+            final_result=result,
+            candle_open=signal.get("first_candle_open", actual_entry_price),
+            candle_close=signal.get("first_candle_close", exit_price),
+        )
+
         # نسجل النتيجة النهائية فقط:
-        # win step 0 => WIN✅
-        # win step 1 => WIN ✅¹
-        # loss step 1 => Loss💔
         record_otc_live_channel_result(signal, result)
 
         text = build_otc_live_channel_result_message(signal, exit_price, result)
@@ -1418,36 +1421,6 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             otc_live_channel_state["active"] = False
             otc_live_channel_state["active_since"] = None
             otc_live_channel_state["last_published_at"] = time_module.time()
-
-
-
-def reset_stuck_otc_live_trade_if_needed() -> bool:
-    """يفك تعليق حالة active إذا بقيت صفقة OTC معلقة أكثر من الحد المسموح."""
-    try:
-        if not otc_live_channel_state.get("active"):
-            return False
-
-        active_since = otc_live_channel_state.get("active_since")
-        if not active_since:
-            otc_live_channel_state["active_since"] = time_module.time()
-            return False
-
-        elapsed = time_module.time() - float(active_since)
-        if elapsed >= OTC_LIVE_ACTIVE_TIMEOUT_SECONDS:
-            logger.warning(
-                "OTC LIVE active trade watchdog reset | active_for=%.1fs | timeout=%ss",
-                elapsed,
-                OTC_LIVE_ACTIVE_TIMEOUT_SECONDS,
-            )
-            otc_live_channel_state["active"] = False
-            otc_live_channel_state["active_since"] = None
-            otc_live_channel_state["last_published_at"] = time_module.time()
-            return True
-
-    except Exception as e:
-        logger.exception("OTC LIVE active watchdog error: %s", e)
-
-    return False
 
 
 async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
@@ -1586,13 +1559,13 @@ def get_otc_live_recent_trades(day_key: str | None = None, limit: int = 300) -> 
 
 
 def is_otc_live_candidate_blocked(pair: str, direction: str) -> tuple[bool, str]:
-    """فلتر تعلم بسيط:
-    لا يغير التحليل، فقط يمنع الأنماط التي أثبتت خسارة نهائية كثيرة اليوم.
+    """فلتر تعلم ناعم:
+    لا يمنع بسرعة. يحتاج بيانات كافية وخسائر واضحة قبل أن يتجنب النمط.
     """
     if not OTC_LIVE_ADAPTIVE_FILTER_ENABLED:
         return False, ""
 
-    trades = get_otc_live_recent_trades(limit=400)
+    trades = get_otc_live_recent_trades(limit=500)
     if not trades:
         return False, ""
 
@@ -1601,20 +1574,125 @@ def is_otc_live_candidate_blocked(pair: str, direction: str) -> tuple[bool, str]
     pair_losses = sum(1 for t in pair_recent if t.get("result") == "loss")
     pair_units = sum(float(t.get("units", 0) or 0) for t in pair_recent)
 
-    if len(pair_recent) >= max(4, OTC_LIVE_PAIR_MAX_RECENT_LOSSES) and pair_losses >= OTC_LIVE_PAIR_MAX_RECENT_LOSSES:
-        return True, f"pair_recent_losses={pair_losses}/{len(pair_recent)}"
+    # لا نحكم على الزوج إلا بعد عدد صفقات كافي
+    if len(pair_recent) >= OTC_LIVE_PAIR_RECENT_LIMIT:
+        if pair_losses >= OTC_LIVE_PAIR_MAX_RECENT_LOSSES:
+            return True, f"soft_pair_losses={pair_losses}/{len(pair_recent)}"
 
-    if len(pair_recent) >= 5 and pair_units <= OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS:
-        return True, f"pair_recent_units={pair_units:.2f}"
+        if pair_units <= OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS:
+            return True, f"soft_pair_units={pair_units:.2f}"
 
     dir_trades = [t for t in trades if t.get("pair") == pair and t.get("direction") == direction]
     dir_recent = dir_trades[-OTC_LIVE_DIRECTION_RECENT_LIMIT:]
     dir_losses = sum(1 for t in dir_recent if t.get("result") == "loss")
+    dir_units = sum(float(t.get("units", 0) or 0) for t in dir_recent)
 
-    if len(dir_recent) >= max(3, OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES) and dir_losses >= OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES:
-        return True, f"direction_recent_losses={dir_losses}/{len(dir_recent)}"
+    # لا نحكم على الزوج + الاتجاه إلا بعد عدد صفقات كافي
+    if len(dir_recent) >= OTC_LIVE_DIRECTION_RECENT_LIMIT:
+        if dir_losses >= OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES:
+            return True, f"soft_direction_losses={dir_losses}/{len(dir_recent)}"
+
+        if dir_units <= -6.0:
+            return True, f"soft_direction_units={dir_units:.2f}"
 
     return False, ""
+
+
+# ===== OTC LIVE SHADOW DIRECTION TEST =====
+def opposite_otc_direction(direction: str) -> str:
+    if direction == "CALL":
+        return "PUT"
+    if direction == "PUT":
+        return "CALL"
+    return direction
+
+
+def resolve_candle_direction_result(direction: str, open_price: float | None, close_price: float | None) -> str:
+    try:
+        if open_price is None or close_price is None:
+            return "unknown"
+        open_price = float(open_price)
+        close_price = float(close_price)
+        diff = close_price - open_price
+
+        if abs(diff) <= OTC_LIVE_TIE_EPSILON:
+            return "unknown"
+        if direction == "CALL":
+            return "win" if diff > 0 else "loss"
+        if direction == "PUT":
+            return "win" if diff < 0 else "loss"
+    except Exception:
+        return "unknown"
+
+    return "unknown"
+
+
+def record_otc_live_shadow_direction_test(signal: dict, first_result: str, final_result: str, candle_open: float | None, candle_close: float | None):
+    """يسجل اختبار NORMAL vs REVERSE بالخلفية.
+    normal_direction = الاتجاه الأصلي قبل العكس
+    reverse_direction = الاتجاه المنشور بعد العكس
+    """
+    try:
+        day_key = get_otc_live_day_key()
+        ref = otc_live_stats_ref().child(day_key).child("shadow_direction_test")
+
+        published_direction = signal.get("direction")
+        original_direction = signal.get("original_direction") or opposite_otc_direction(published_direction)
+
+        # نتيجة أول شمعة للاتجاه المنشور
+        reverse_first = resolve_candle_direction_result(published_direction, candle_open, candle_close)
+
+        # نتيجة أول شمعة للاتجاه الأصلي
+        normal_first = resolve_candle_direction_result(original_direction, candle_open, candle_close)
+
+        # لأن NORMAL عكس REVERSE في نفس الشمعة، لو المنشور خسر الأولى فالأصلي ربح مباشر غالبًا.
+        # لو المنشور ربح مباشر، الأصلي خسر الأولى. لا نعرف مضاعفته المستقبلية كاملة هنا،
+        # لذلك نسجل اختبار أول شمعة بدقة، والنتيجة المالية النهائية للمنشور فقط.
+        current = ref.get() or {}
+
+        normal_first_wins = safe_int(current.get("normal_first_wins"), 0)
+        normal_first_losses = safe_int(current.get("normal_first_losses"), 0)
+        reverse_first_wins = safe_int(current.get("reverse_first_wins"), 0)
+        reverse_first_losses = safe_int(current.get("reverse_first_losses"), 0)
+        total = safe_int(current.get("total"), 0) + 1
+
+        if normal_first == "win":
+            normal_first_wins += 1
+        elif normal_first == "loss":
+            normal_first_losses += 1
+
+        if reverse_first == "win":
+            reverse_first_wins += 1
+        elif reverse_first == "loss":
+            reverse_first_losses += 1
+
+        ref.update({
+            "total": total,
+            "normal_first_wins": normal_first_wins,
+            "normal_first_losses": normal_first_losses,
+            "reverse_first_wins": reverse_first_wins,
+            "reverse_first_losses": reverse_first_losses,
+            "updated_at": now_iso(),
+        })
+
+        ref.child("trades").push({
+            "pair": signal.get("pair"),
+            "symbol": signal.get("symbol"),
+            "quality": signal.get("quality"),
+            "payout": signal.get("payout"),
+            "published_direction": published_direction,
+            "original_direction": original_direction,
+            "normal_first_result": normal_first,
+            "reverse_first_result": reverse_first,
+            "published_final_result": final_result,
+            "published_first_result": first_result,
+            "open": candle_open,
+            "close": candle_close,
+            "created_at": now_iso(),
+        })
+
+    except Exception as e:
+        logger.exception("Could not record shadow direction test: %s", e)
 
 
 # ===== OTC LIVE CHANNEL STATS =====
@@ -1716,6 +1794,23 @@ def build_otc_live_stats_message(day_key: str | None = None) -> str:
     else:
         money_status = "⚪ تعادل"
 
+    shadow = data.get("shadow_direction_test") or {}
+    shadow_total = safe_int(shadow.get("total"), 0)
+    normal_w = safe_int(shadow.get("normal_first_wins"), 0)
+    normal_l = safe_int(shadow.get("normal_first_losses"), 0)
+    reverse_w = safe_int(shadow.get("reverse_first_wins"), 0)
+    reverse_l = safe_int(shadow.get("reverse_first_losses"), 0)
+
+    normal_rate = round((normal_w / max(1, normal_w + normal_l)) * 100, 1) if shadow_total else 0
+    reverse_rate = round((reverse_w / max(1, reverse_w + reverse_l)) * 100, 1) if shadow_total else 0
+
+    if normal_rate > reverse_rate:
+        best_mode = "NORMAL ➡️"
+    elif reverse_rate > normal_rate:
+        best_mode = "REVERSE 🔁"
+    else:
+        best_mode = "متعادل"
+
     return (
         "╔══════════════╗\n"
         "   📊 إحصائيات OTC Live\n"
@@ -1733,6 +1828,10 @@ def build_otc_live_stats_message(day_key: str | None = None) -> str:
         f"➖ وحدات خاسرة: {gross_loss_units}\n"
         f"📊 متوسط الوحدة/صفقة: {avg_units}\n"
         f"💵 الأداء المالي: {money_status}\n\n"
+        "🧪 اختبار الاتجاه أول شمعة:\n"
+        f"➡️ NORMAL: {normal_w}W / {normal_l}L | {normal_rate}%\n"
+        f"🔁 REVERSE: {reverse_w}W / {reverse_l}L | {reverse_rate}%\n"
+        f"🏆 الأفضل حاليًا: {best_mode}\n\n"
         "@coach_WAEL_trading\n"
         "@sttrade_helper_bot"
     )
