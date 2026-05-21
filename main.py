@@ -56,10 +56,11 @@ OTC_LIVE_REVERSE_AUTOPUBLISH = os.getenv("OTC_LIVE_REVERSE_AUTOPUBLISH", "true")
 OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS", "3"))
 OTC_LIVE_MIN_ENTRY_LEAD_SECONDS = int(os.getenv("OTC_LIVE_MIN_ENTRY_LEAD_SECONDS", "10"))
 OTC_LIVE_TIE_EPSILON = float(os.getenv("OTC_LIVE_TIE_EPSILON", "0.0000001"))
-OTC_LIVE_SCAN_INTERVAL_SECONDS = int(os.getenv("OTC_LIVE_SCAN_INTERVAL_SECONDS", "20"))
+OTC_LIVE_SCAN_INTERVAL_SECONDS = int(os.getenv("OTC_LIVE_SCAN_INTERVAL_SECONDS", "5"))
 OTC_LIVE_TRADE_DURATION_SECONDS = int(os.getenv("OTC_LIVE_TRADE_DURATION_SECONDS", "65"))
 OTC_LIVE_COOLDOWN_SECONDS = int(os.getenv("OTC_LIVE_COOLDOWN_SECONDS", "60"))
 OTC_LIVE_ACTIVE_TIMEOUT_SECONDS = int(os.getenv("OTC_LIVE_ACTIVE_TIMEOUT_SECONDS", "300"))
+OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS = int(os.getenv("OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS", "15"))
 OTC_LIVE_ADAPTIVE_FILTER_ENABLED = os.getenv("OTC_LIVE_ADAPTIVE_FILTER_ENABLED", "true").lower() == "true"
 OTC_LIVE_PAIR_RECENT_LIMIT = int(os.getenv("OTC_LIVE_PAIR_RECENT_LIMIT", "20"))
 OTC_LIVE_PAIR_MAX_RECENT_LOSSES = int(os.getenv("OTC_LIVE_PAIR_MAX_RECENT_LOSSES", "5"))
@@ -1239,38 +1240,10 @@ def seconds_until_dt(target_dt: datetime) -> float:
 
 def next_otc_m1_entry_time(check_dt: datetime | None = None) -> datetime:
     """بداية الشمعة القادمة M1.
-    إذا بقي وقت قليل جدًا قبل بداية الشمعة، ننتقل للشمعة التي بعدها حتى يصل التنبيه قبل الدخول.
+    بما أن النشر مسموح فقط بآخر 15 ثانية، الدخول يكون على بداية الشمعة القادمة مباشرة.
     """
-    base = check_dt or now_utc()
-    entry_dt = next_full_minute(base)
-    remaining = (entry_dt - base.astimezone(UTC)).total_seconds()
-
-    if remaining < OTC_LIVE_MIN_ENTRY_LEAD_SECONDS:
-        entry_dt = next_full_minute(base + timedelta(seconds=OTC_LIVE_MIN_ENTRY_LEAD_SECONDS))
-
-    return entry_dt.astimezone(UTC)
-
-
-def display_otc_live_quality(raw_quality: int) -> int:
-    """إعادة معايرة شكل قوة الفرصة فقط للعرض في القناة.
-    لا تغيّر التحليل ولا قرار الدخول، فقط تجعل النسبة المعروضة أريح بصريًا.
-    أمثلة تقريبية:
-    65 -> 78
-    70 -> 84
-    75 -> 90
-    80 -> 95
-    """
-    try:
-        q = int(raw_quality or 0)
-    except Exception:
-        q = 0
-
-    if q <= 0:
-        return 0
-
-    # تحويل محافظ من المجال العملي 55-80 إلى المجال المعروض 70-95
-    shown = int(round(70 + ((q - 55) * 25 / 25)))
-    return max(70, min(95, shown))
+    base = (check_dt or now_utc()).astimezone(UTC)
+    return next_full_minute(base).astimezone(UTC)
 
 
 def build_otc_live_channel_signal_message(signal: dict) -> str:
@@ -1423,6 +1396,17 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             otc_live_channel_state["last_published_at"] = time_module.time()
 
 
+
+def is_inside_otc_entry_scan_window(check_dt: datetime | None = None) -> tuple[bool, float]:
+    """يسمح بالبحث فقط في آخر X ثانية قبل بداية الشمعة الجديدة.
+    إذا X=15، يسمح بين الثانية 45 و59 من كل دقيقة.
+    """
+    now_dt = (check_dt or now_utc()).astimezone(UTC)
+    next_entry = next_full_minute(now_dt)
+    remaining = (next_entry - now_dt).total_seconds()
+    return 0 < remaining <= OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS, remaining
+
+
 async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
     logger.info("OTC LIVE CHANNEL SCAN started | enabled=%s | active=%s | min_quality=%s",
                 OTC_LIVE_CHANNEL_ENABLED, otc_live_channel_state.get("active"), OTC_LIVE_MIN_QUALITY)
@@ -1445,6 +1429,15 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        inside_window, remaining_to_entry = is_inside_otc_entry_scan_window(now_utc())
+        if not inside_window:
+            logger.info(
+                "OTC LIVE CHANNEL SCAN skipped: outside last %ss window | remaining=%.1fs",
+                OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS,
+                remaining_to_entry,
+            )
+            return
+
         signal = analyze_best_live_otc_now()
         if not signal.get("ok"):
             logger.info("OTC LIVE CHANNEL SCAN result: no clear opportunity")
