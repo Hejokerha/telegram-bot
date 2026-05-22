@@ -63,6 +63,10 @@ OTC_LIVE_ACTIVE_TIMEOUT_SECONDS = int(os.getenv("OTC_LIVE_ACTIVE_TIMEOUT_SECONDS
 OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS = int(os.getenv("OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS", "15"))
 OTC_LIVE_SMART_MARTINGALE_ENABLED = os.getenv("OTC_LIVE_SMART_MARTINGALE_ENABLED", "true").lower() == "true"
 OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE = int(os.getenv("OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE", "2"))
+OTC_LIVE_AUTO_MARKET_MODE_ENABLED = os.getenv("OTC_LIVE_AUTO_MARKET_MODE_ENABLED", "true").lower() == "true"
+OTC_LIVE_AUTO_MODE_MIN_SAMPLES = int(os.getenv("OTC_LIVE_AUTO_MODE_MIN_SAMPLES", "20"))
+OTC_LIVE_AUTO_MODE_EDGE_PERCENT = float(os.getenv("OTC_LIVE_AUTO_MODE_EDGE_PERCENT", "8"))
+OTC_LIVE_AUTO_MODE_DEFAULT = os.getenv("OTC_LIVE_AUTO_MODE_DEFAULT", "REVERSE").upper()
 OTC_LIVE_ADAPTIVE_FILTER_ENABLED = os.getenv("OTC_LIVE_ADAPTIVE_FILTER_ENABLED", "true").lower() == "true"
 OTC_LIVE_PAIR_RECENT_LIMIT = int(os.getenv("OTC_LIVE_PAIR_RECENT_LIMIT", "20"))
 OTC_LIVE_PAIR_MAX_RECENT_LOSSES = int(os.getenv("OTC_LIVE_PAIR_MAX_RECENT_LOSSES", "5"))
@@ -1163,7 +1167,8 @@ def analyze_best_live_otc_now() -> dict:
     best = None
     for candidate in ranked_candidates:
         effective_direction = candidate.get("direction")
-        if OTC_LIVE_REVERSE_AUTOPUBLISH:
+        reverse_now, auto_mode, auto_reason = should_reverse_otc_live_signal()
+        if reverse_now:
             if effective_direction == "CALL":
                 effective_direction = "PUT"
             elif effective_direction == "PUT":
@@ -1634,7 +1639,11 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
             logger.info("OTC LIVE CHANNEL SCAN skipped: quality below minimum")
             return
 
-        if OTC_LIVE_REVERSE_AUTOPUBLISH:
+        reverse_now, auto_mode, auto_reason = should_reverse_otc_live_signal()
+        signal["auto_market_mode"] = auto_mode
+        signal["auto_market_reason"] = auto_reason
+
+        if reverse_now:
             original_direction = signal.get("direction")
             if original_direction == "CALL":
                 signal["direction"] = "PUT"
@@ -1643,8 +1652,14 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
 
             signal["original_direction"] = original_direction
             logger.info(
-                "OTC LIVE CHANNEL direction reversed for next-candle entry | pair=%s | original=%s | published=%s",
-                signal.get("pair"), original_direction, signal.get("direction")
+                "OTC LIVE AUTO MODE | mode=%s | reason=%s | pair=%s | original=%s | published=%s",
+                auto_mode, auto_reason, signal.get("pair"), original_direction, signal.get("direction")
+            )
+        else:
+            signal["original_direction"] = signal.get("direction")
+            logger.info(
+                "OTC LIVE AUTO MODE | mode=%s | reason=%s | pair=%s | direction=%s",
+                auto_mode, auto_reason, signal.get("pair"), signal.get("direction")
             )
 
         # الدخول مع بداية شمعة M1 القادمة، والإغلاق مع نهاية نفس الشمعة.
@@ -1783,6 +1798,75 @@ def is_otc_live_candidate_blocked(pair: str, direction: str) -> tuple[bool, str]
             return True, f"soft_direction_units={dir_units:.2f}"
 
     return False, ""
+
+
+
+# ===== OTC LIVE AUTO MARKET MODE =====
+def get_otc_live_shadow_summary(day_key: str | None = None) -> dict:
+    try:
+        day_key = day_key or get_otc_live_day_key()
+        data = otc_live_stats_ref().child(day_key).child("shadow_direction_test").get() or {}
+
+        normal_w = safe_int(data.get("normal_first_wins"), 0)
+        normal_l = safe_int(data.get("normal_first_losses"), 0)
+        reverse_w = safe_int(data.get("reverse_first_wins"), 0)
+        reverse_l = safe_int(data.get("reverse_first_losses"), 0)
+
+        normal_total = normal_w + normal_l
+        reverse_total = reverse_w + reverse_l
+        total = max(normal_total, reverse_total, safe_int(data.get("total"), 0))
+
+        normal_rate = round((normal_w / normal_total) * 100, 1) if normal_total > 0 else 0
+        reverse_rate = round((reverse_w / reverse_total) * 100, 1) if reverse_total > 0 else 0
+
+        return {
+            "total": total,
+            "normal_w": normal_w,
+            "normal_l": normal_l,
+            "reverse_w": reverse_w,
+            "reverse_l": reverse_l,
+            "normal_rate": normal_rate,
+            "reverse_rate": reverse_rate,
+        }
+    except Exception as e:
+        logger.exception("Could not read OTC live shadow summary: %s", e)
+        return {
+            "total": 0,
+            "normal_w": 0,
+            "normal_l": 0,
+            "reverse_w": 0,
+            "reverse_l": 0,
+            "normal_rate": 0,
+            "reverse_rate": 0,
+        }
+
+
+def get_otc_live_auto_market_mode() -> tuple[str, str]:
+    if not OTC_LIVE_AUTO_MARKET_MODE_ENABLED:
+        return OTC_LIVE_AUTO_MODE_DEFAULT, "auto_disabled_default"
+
+    summary = get_otc_live_shadow_summary()
+    total = int(summary.get("total", 0) or 0)
+    normal_rate = float(summary.get("normal_rate", 0) or 0)
+    reverse_rate = float(summary.get("reverse_rate", 0) or 0)
+
+    if total < OTC_LIVE_AUTO_MODE_MIN_SAMPLES:
+        return OTC_LIVE_AUTO_MODE_DEFAULT, f"not_enough_samples_{total}/{OTC_LIVE_AUTO_MODE_MIN_SAMPLES}"
+
+    edge = abs(reverse_rate - normal_rate)
+
+    if edge < OTC_LIVE_AUTO_MODE_EDGE_PERCENT:
+        return OTC_LIVE_AUTO_MODE_DEFAULT, f"weak_edge_{edge:.1f}%"
+
+    if normal_rate > reverse_rate:
+        return "NORMAL", f"normal_better_{normal_rate:.1f}_vs_{reverse_rate:.1f}"
+
+    return "REVERSE", f"reverse_better_{reverse_rate:.1f}_vs_{normal_rate:.1f}"
+
+
+def should_reverse_otc_live_signal() -> tuple[bool, str, str]:
+    mode, reason = get_otc_live_auto_market_mode()
+    return mode == "REVERSE", mode, reason
 
 
 # ===== OTC LIVE SHADOW DIRECTION TEST =====
@@ -1942,6 +2026,8 @@ def record_otc_live_channel_result(signal: dict, result: str):
             "symbol": signal.get("symbol"),
             "direction": signal.get("direction"),
             "original_direction": signal.get("original_direction"),
+            "auto_market_mode": signal.get("auto_market_mode"),
+            "auto_market_reason": signal.get("auto_market_reason"),
             "quality": signal.get("quality"),
             "payout": payout,
             "entry_time": signal.get("entry_time"),
@@ -2079,7 +2165,8 @@ def build_otc_live_stats_message(day_key: str | None = None) -> str:
         "🧪 اختبار الاتجاه أول شمعة:\n"
         f"➡️ NORMAL: {normal_w}W / {normal_l}L | {normal_rate}%\n"
         f"🔁 REVERSE: {reverse_w}W / {reverse_l}L | {reverse_rate}%\n"
-        f"🏆 الأفضل حاليًا: {best_mode}\n\n"
+        f"🏆 الأفضل حاليًا: {best_mode}\n"
+        f"🧠 وضع السوق الحالي: {get_otc_live_auto_market_mode()[0]}\n\n"
         "@coach_WAEL_trading\n"
         "@sttrade_helper_bot"
     )
