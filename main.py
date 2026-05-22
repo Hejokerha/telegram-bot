@@ -1246,6 +1246,22 @@ def next_otc_m1_entry_time(check_dt: datetime | None = None) -> datetime:
     return next_full_minute(base).astimezone(UTC)
 
 
+def display_otc_live_quality(raw_quality: int) -> int:
+    """إعادة معايرة شكل قوة الفرصة فقط للعرض في القناة.
+    لا تغيّر التحليل ولا قرار الدخول.
+    """
+    try:
+        q = int(raw_quality or 0)
+    except Exception:
+        q = 0
+
+    if q <= 0:
+        return 0
+
+    shown = int(round(q + 15))
+    return max(70, min(95, shown))
+
+
 def build_otc_live_channel_signal_message(signal: dict) -> str:
     pair = str(signal.get("pair", ""))
     direction = str(signal.get("direction", ""))
