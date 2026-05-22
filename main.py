@@ -61,13 +61,6 @@ OTC_LIVE_TRADE_DURATION_SECONDS = int(os.getenv("OTC_LIVE_TRADE_DURATION_SECONDS
 OTC_LIVE_COOLDOWN_SECONDS = int(os.getenv("OTC_LIVE_COOLDOWN_SECONDS", "60"))
 OTC_LIVE_ACTIVE_TIMEOUT_SECONDS = int(os.getenv("OTC_LIVE_ACTIVE_TIMEOUT_SECONDS", "300"))
 OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS = int(os.getenv("OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS", "15"))
-OTC_LIVE_SMART_MARTINGALE_ENABLED = os.getenv("OTC_LIVE_SMART_MARTINGALE_ENABLED", "true").lower() == "true"
-OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE = int(os.getenv("OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE", "5"))
-OTC_LIVE_MARTINGALE_ADVICE_RETRY_SECONDS = [5, 3, 1]
-OTC_LIVE_AUTO_MARKET_MODE_ENABLED = os.getenv("OTC_LIVE_AUTO_MARKET_MODE_ENABLED", "true").lower() == "true"
-OTC_LIVE_AUTO_MODE_MIN_SAMPLES = int(os.getenv("OTC_LIVE_AUTO_MODE_MIN_SAMPLES", "20"))
-OTC_LIVE_AUTO_MODE_EDGE_PERCENT = float(os.getenv("OTC_LIVE_AUTO_MODE_EDGE_PERCENT", "8"))
-OTC_LIVE_AUTO_MODE_DEFAULT = os.getenv("OTC_LIVE_AUTO_MODE_DEFAULT", "REVERSE").upper()
 OTC_LIVE_ADAPTIVE_FILTER_ENABLED = os.getenv("OTC_LIVE_ADAPTIVE_FILTER_ENABLED", "true").lower() == "true"
 OTC_LIVE_PAIR_RECENT_LIMIT = int(os.getenv("OTC_LIVE_PAIR_RECENT_LIMIT", "20"))
 OTC_LIVE_PAIR_MAX_RECENT_LOSSES = int(os.getenv("OTC_LIVE_PAIR_MAX_RECENT_LOSSES", "5"))
@@ -1168,8 +1161,7 @@ def analyze_best_live_otc_now() -> dict:
     best = None
     for candidate in ranked_candidates:
         effective_direction = candidate.get("direction")
-        reverse_now, auto_mode, auto_reason = should_reverse_otc_live_signal()
-        if reverse_now:
+        if OTC_LIVE_REVERSE_AUTOPUBLISH:
             if effective_direction == "CALL":
                 effective_direction = "PUT"
             elif effective_direction == "PUT":
@@ -1234,9 +1226,6 @@ def analyze_best_live_otc_now() -> dict:
 otc_live_channel_state = {
     "active": False,
     "active_since": None,
-    "martingale_direction": None,
-    "martingale_decision_type": None,
-    "martingale_for_message_id": None,
     "last_published_at": None,
 }
 
@@ -1309,170 +1298,6 @@ def build_otc_live_channel_result_message(signal: dict, exit_price: float | None
 
     return "غير مؤكدة⚠️"
 
-
-def get_otc_live_recent_price_rows(symbol: str, limit: int = 14) -> list[tuple[float, float, int]]:
-    try:
-        with quotex_otc_feed.lock:
-            rows = list(quotex_otc_feed.prices.get(symbol, []))[-limit:]
-        return rows
-    except Exception:
-        return []
-
-
-def build_smart_martingale_decision(signal: dict, open_price: float | None, current_price: float | None) -> dict:
-    """يقرر اتجاه المضاعفة قبل نهاية الشمعة بثواني.
-    المنطق:
-    - إذا الصفقة ليست خاسرة الآن: لا نرسل مضاعفة.
-    - إذا الخسارة تتقلص آخر اللحظات: مضاعفة بنفس الاتجاه.
-    - إذا الخسارة تتوسع آخر اللحظات: مضاعفة بعكس الاتجاه.
-    """
-    pair = signal.get("pair")
-    symbol = signal.get("symbol") or OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
-    direction = signal.get("direction")
-
-    if open_price is None or current_price is None or direction not in {"CALL", "PUT"}:
-        return {"needed": False, "reason": "missing_data"}
-
-    current_result = resolve_candle_direction_result(direction, open_price, current_price)
-
-    # لا ننتظر الخسارة الأكيدة فقط، لأن آخر ثانيتين ممكن تقلب النتيجة بسرعة.
-    # إذا الصفقة ليست رابحة بفرق واضح، نعتبرها بحاجة لتنبيه مضاعفة احتياطي.
-    diff_now = float(current_price) - float(open_price)
-    if direction == "PUT":
-        diff_now = -diff_now
-
-    # هامش أمان صغير جدًا حسب عدد الخانات، حتى لا تفوتنا الصفقة التي تنقلب بآخر لحظة.
-    safe_margin = 0.00003
-    if pair and "JPY" in str(pair):
-        safe_margin = 0.003
-
-    if current_result == "win" and diff_now > safe_margin:
-        return {
-            "needed": False,
-            "reason": "trade_safely_winning",
-            "current_result": current_result,
-            "diff_now": diff_now,
-            "safe_margin": safe_margin,
-        }
-
-    rows = get_otc_live_recent_price_rows(symbol, limit=12) if symbol else []
-    prices = [float(r[1]) for r in rows if len(r) >= 2]
-
-    if len(prices) >= 4:
-        recent_change = prices[-1] - prices[0]
-    else:
-        recent_change = float(current_price) - float(open_price)
-
-    loss_amount = abs(float(current_price) - float(open_price))
-
-    # هل آخر اللحظات تتحرك لصالح الصفقة الأصلية أم ضدها؟
-    if direction == "CALL":
-        recovery = recent_change > 0
-    else:
-        recovery = recent_change < 0
-
-    if recovery:
-        martingale_direction = direction
-        decision_type = "same"
-    else:
-        martingale_direction = opposite_otc_direction(direction)
-        decision_type = "opposite"
-
-    return {
-        "needed": True,
-        "decision_type": decision_type,
-        "martingale_direction": martingale_direction,
-        "current_result": current_result,
-        "open_price": float(open_price),
-        "current_price": float(current_price),
-        "recent_change": float(recent_change),
-        "loss_amount": float(loss_amount),
-    }
-
-
-def build_smart_martingale_message(decision: dict) -> str:
-    martingale_direction = decision.get("martingale_direction")
-    decision_type = decision.get("decision_type")
-
-    direction_line = "🟢 CALL" if martingale_direction == "CALL" else "🔴 PUT"
-
-    if decision_type == "same":
-        title = "ضاعف بنفس اتجاه الصفقة"
-    else:
-        title = "ضاعف بعكس اتجاه الصفقة"
-
-    return (
-        "⚠️ تنبيه مضاعفة\\n\\n"
-        f"{title}\\n"
-        f"{direction_line}"
-    )
-
-
-async def send_smart_martingale_advice(context: ContextTypes.DEFAULT_TYPE):
-    signal = dict(context.job.data or {})
-
-    try:
-        if not OTC_LIVE_SMART_MARTINGALE_ENABLED:
-            return
-
-        if int(signal.get("martingale_advice_sent", 0) or 0) == 1:
-            return
-
-        if otc_live_channel_state.get("martingale_for_message_id") == signal.get("message_id"):
-            return
-
-        pair = signal.get("pair")
-        symbol = signal.get("symbol") or OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
-        entry_ts = float(signal.get("entry_ts") or 0)
-
-        candle = quotex_otc_feed.candle(symbol, entry_ts) if symbol else {}
-        open_price = candle.get("open") if candle else None
-
-        snapshot = get_live_otc_snapshot(pair)
-        current_price = snapshot.get("price") if snapshot else None
-
-        if open_price is None or current_price is None:
-            return
-
-        decision = build_smart_martingale_decision(signal, float(open_price), float(current_price))
-
-        if not decision.get("needed"):
-            logger.info(
-                "Smart martingale advice skipped | pair=%s | reason=%s | current_result=%s",
-                pair,
-                decision.get("reason"),
-                decision.get("current_result"),
-            )
-            return
-
-        signal["martingale_direction"] = decision.get("martingale_direction")
-        signal["martingale_decision_type"] = decision.get("decision_type")
-        signal["martingale_advice_sent"] = 1
-
-        # نخزن القرار بحالة الصفقة الحالية حتى يستخدمه resolve عند الخسارة
-        otc_live_channel_state["martingale_direction"] = decision.get("martingale_direction")
-        otc_live_channel_state["martingale_decision_type"] = decision.get("decision_type")
-        otc_live_channel_state["martingale_for_message_id"] = signal.get("message_id")
-
-        await context.bot.send_message(
-            chat_id=OTC_LIVE_CHANNEL_ID,
-            text=build_smart_martingale_message(decision)
-        )
-
-        logger.info(
-            "Smart martingale advice sent | pair=%s | original=%s | martingale=%s | type=%s | open=%s | current=%s",
-            pair,
-            signal.get("direction"),
-            decision.get("martingale_direction"),
-            decision.get("decision_type"),
-            decision.get("open_price"),
-            decision.get("current_price"),
-        )
-
-    except Exception as e:
-        logger.exception("Smart martingale advice error: %s", e)
-
-
 async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
     signal = dict(context.job.data or {})
     pair = signal.get("pair")
@@ -1531,37 +1356,14 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             signal["first_candle_open"] = actual_entry_price
             signal["first_candle_close"] = exit_price
 
-        # مضاعفة واحدة ذكية:
-        # إذا خسرت الصفقة الأساسية، نستخدم قرار آخر ثانيتين إن وجد:
-        # نفس اتجاه الصفقة أو عكس اتجاه الصفقة.
+        # مضاعفة واحدة:
+        # إذا خسرت الصفقة الأساسية، لا ننشر خسارة فورًا.
+        # ننتظر الشمعة التالية بنفس الاتجاه ونحسبها كمضاعفة.
         if result == "loss" and martingale_step == 0:
             next_entry_dt = datetime.fromtimestamp(close_ts, tz=UTC)
             next_close_dt = next_entry_dt + timedelta(seconds=OTC_LIVE_TRADE_DURATION_SECONDS)
 
-            chosen_martingale_direction = otc_live_channel_state.get("martingale_direction")
-            decision_msg_id = otc_live_channel_state.get("martingale_for_message_id")
-
-            if decision_msg_id != message_id or chosen_martingale_direction not in {"CALL", "PUT"}:
-                # fallback إذا لم يصل قرار المضاعفة لأي سبب.
-                # نرسل تنبيه فوري حتى لا تكون WIN¹ بدون معرفة المستخدم.
-                chosen_martingale_direction = direction
-                try:
-                    await context.bot.send_message(
-                        chat_id=OTC_LIVE_CHANNEL_ID,
-                        text=(
-                            "⚠️ تنبيه مضاعفة\n\n"
-                            "ضاعف بنفس اتجاه الصفقة\n"
-                            f"{'🟢 CALL' if chosen_martingale_direction == 'CALL' else '🔴 PUT'}"
-                        )
-                    )
-                except Exception as e:
-                    logger.warning("Could not send fallback martingale advice: %s", e)
-
             signal["martingale_step"] = 1
-            signal["martingale_base_direction"] = direction
-            signal["direction"] = chosen_martingale_direction
-            signal["martingale_direction"] = chosen_martingale_direction
-            signal["martingale_decision_type"] = otc_live_channel_state.get("martingale_decision_type", "same")
             signal["entry_ts"] = next_entry_dt.timestamp()
             signal["close_ts"] = next_close_dt.timestamp()
             signal["entry_time"] = next_entry_dt.isoformat()
@@ -1576,8 +1378,8 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             )
 
             logger.info(
-                "OTC live trade lost first candle, waiting smart martingale candle | pair=%s | original=%s | martingale=%s | result_in=%.1fs",
-                pair, direction, chosen_martingale_direction, delay
+                "OTC live trade lost first candle, waiting martingale candle | pair=%s | direction=%s | result_in=%.1fs",
+                pair, direction, delay
             )
             return
 
@@ -1607,9 +1409,6 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
         if not (result == "loss" and martingale_step == 0):
             otc_live_channel_state["active"] = False
             otc_live_channel_state["active_since"] = None
-            otc_live_channel_state["martingale_direction"] = None
-            otc_live_channel_state["martingale_decision_type"] = None
-            otc_live_channel_state["martingale_for_message_id"] = None
             otc_live_channel_state["last_published_at"] = time_module.time()
 
 
@@ -1668,11 +1467,7 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
             logger.info("OTC LIVE CHANNEL SCAN skipped: quality below minimum")
             return
 
-        reverse_now, auto_mode, auto_reason = should_reverse_otc_live_signal()
-        signal["auto_market_mode"] = auto_mode
-        signal["auto_market_reason"] = auto_reason
-
-        if reverse_now:
+        if OTC_LIVE_REVERSE_AUTOPUBLISH:
             original_direction = signal.get("direction")
             if original_direction == "CALL":
                 signal["direction"] = "PUT"
@@ -1681,14 +1476,8 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
 
             signal["original_direction"] = original_direction
             logger.info(
-                "OTC LIVE AUTO MODE | mode=%s | reason=%s | pair=%s | original=%s | published=%s",
-                auto_mode, auto_reason, signal.get("pair"), original_direction, signal.get("direction")
-            )
-        else:
-            signal["original_direction"] = signal.get("direction")
-            logger.info(
-                "OTC LIVE AUTO MODE | mode=%s | reason=%s | pair=%s | direction=%s",
-                auto_mode, auto_reason, signal.get("pair"), signal.get("direction")
+                "OTC LIVE CHANNEL direction reversed for next-candle entry | pair=%s | original=%s | published=%s",
+                signal.get("pair"), original_direction, signal.get("direction")
             )
 
         # الدخول مع بداية شمعة M1 القادمة، والإغلاق مع نهاية نفس الشمعة.
@@ -1714,18 +1503,6 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
         otc_live_channel_state["active_since"] = time_module.time()
 
         resolve_delay = seconds_until_dt(close_dt) + OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS
-        if OTC_LIVE_SMART_MARTINGALE_ENABLED:
-            for retry_sec in OTC_LIVE_MARTINGALE_ADVICE_RETRY_SECONDS:
-                advice_dt = close_dt - timedelta(seconds=retry_sec)
-                advice_delay = seconds_until_dt(advice_dt)
-
-                context.job_queue.run_once(
-                    send_smart_martingale_advice,
-                    when=advice_delay,
-                    data=signal,
-                    name=f"otc_live_martingale_advice_{sent.message_id}_{retry_sec}s",
-                )
-
         context.job_queue.run_once(
             resolve_otc_live_channel_trade,
             when=resolve_delay,
@@ -1828,75 +1605,6 @@ def is_otc_live_candidate_blocked(pair: str, direction: str) -> tuple[bool, str]
             return True, f"soft_direction_units={dir_units:.2f}"
 
     return False, ""
-
-
-
-# ===== OTC LIVE AUTO MARKET MODE =====
-def get_otc_live_shadow_summary(day_key: str | None = None) -> dict:
-    try:
-        day_key = day_key or get_otc_live_day_key()
-        data = otc_live_stats_ref().child(day_key).child("shadow_direction_test").get() or {}
-
-        normal_w = safe_int(data.get("normal_first_wins"), 0)
-        normal_l = safe_int(data.get("normal_first_losses"), 0)
-        reverse_w = safe_int(data.get("reverse_first_wins"), 0)
-        reverse_l = safe_int(data.get("reverse_first_losses"), 0)
-
-        normal_total = normal_w + normal_l
-        reverse_total = reverse_w + reverse_l
-        total = max(normal_total, reverse_total, safe_int(data.get("total"), 0))
-
-        normal_rate = round((normal_w / normal_total) * 100, 1) if normal_total > 0 else 0
-        reverse_rate = round((reverse_w / reverse_total) * 100, 1) if reverse_total > 0 else 0
-
-        return {
-            "total": total,
-            "normal_w": normal_w,
-            "normal_l": normal_l,
-            "reverse_w": reverse_w,
-            "reverse_l": reverse_l,
-            "normal_rate": normal_rate,
-            "reverse_rate": reverse_rate,
-        }
-    except Exception as e:
-        logger.exception("Could not read OTC live shadow summary: %s", e)
-        return {
-            "total": 0,
-            "normal_w": 0,
-            "normal_l": 0,
-            "reverse_w": 0,
-            "reverse_l": 0,
-            "normal_rate": 0,
-            "reverse_rate": 0,
-        }
-
-
-def get_otc_live_auto_market_mode() -> tuple[str, str]:
-    if not OTC_LIVE_AUTO_MARKET_MODE_ENABLED:
-        return OTC_LIVE_AUTO_MODE_DEFAULT, "auto_disabled_default"
-
-    summary = get_otc_live_shadow_summary()
-    total = int(summary.get("total", 0) or 0)
-    normal_rate = float(summary.get("normal_rate", 0) or 0)
-    reverse_rate = float(summary.get("reverse_rate", 0) or 0)
-
-    if total < OTC_LIVE_AUTO_MODE_MIN_SAMPLES:
-        return OTC_LIVE_AUTO_MODE_DEFAULT, f"not_enough_samples_{total}/{OTC_LIVE_AUTO_MODE_MIN_SAMPLES}"
-
-    edge = abs(reverse_rate - normal_rate)
-
-    if edge < OTC_LIVE_AUTO_MODE_EDGE_PERCENT:
-        return OTC_LIVE_AUTO_MODE_DEFAULT, f"weak_edge_{edge:.1f}%"
-
-    if normal_rate > reverse_rate:
-        return "NORMAL", f"normal_better_{normal_rate:.1f}_vs_{reverse_rate:.1f}"
-
-    return "REVERSE", f"reverse_better_{reverse_rate:.1f}_vs_{normal_rate:.1f}"
-
-
-def should_reverse_otc_live_signal() -> tuple[bool, str, str]:
-    mode, reason = get_otc_live_auto_market_mode()
-    return mode == "REVERSE", mode, reason
 
 
 # ===== OTC LIVE SHADOW DIRECTION TEST =====
@@ -2056,8 +1764,6 @@ def record_otc_live_channel_result(signal: dict, result: str):
             "symbol": signal.get("symbol"),
             "direction": signal.get("direction"),
             "original_direction": signal.get("original_direction"),
-            "auto_market_mode": signal.get("auto_market_mode"),
-            "auto_market_reason": signal.get("auto_market_reason"),
             "quality": signal.get("quality"),
             "payout": payout,
             "entry_time": signal.get("entry_time"),
@@ -2195,8 +1901,7 @@ def build_otc_live_stats_message(day_key: str | None = None) -> str:
         "🧪 اختبار الاتجاه أول شمعة:\n"
         f"➡️ NORMAL: {normal_w}W / {normal_l}L | {normal_rate}%\n"
         f"🔁 REVERSE: {reverse_w}W / {reverse_l}L | {reverse_rate}%\n"
-        f"🏆 الأفضل حاليًا: {best_mode}\n"
-        f"🧠 وضع السوق الحالي: {get_otc_live_auto_market_mode()[0]}\n\n"
+        f"🏆 الأفضل حاليًا: {best_mode}\n\n"
         "@coach_WAEL_trading\n"
         "@sttrade_helper_bot"
     )
