@@ -62,7 +62,8 @@ OTC_LIVE_COOLDOWN_SECONDS = int(os.getenv("OTC_LIVE_COOLDOWN_SECONDS", "60"))
 OTC_LIVE_ACTIVE_TIMEOUT_SECONDS = int(os.getenv("OTC_LIVE_ACTIVE_TIMEOUT_SECONDS", "300"))
 OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS = int(os.getenv("OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS", "15"))
 OTC_LIVE_SMART_MARTINGALE_ENABLED = os.getenv("OTC_LIVE_SMART_MARTINGALE_ENABLED", "true").lower() == "true"
-OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE = int(os.getenv("OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE", "2"))
+OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE = int(os.getenv("OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE", "5"))
+OTC_LIVE_MARTINGALE_ADVICE_RETRY_SECONDS = [5, 3, 1]
 OTC_LIVE_AUTO_MARKET_MODE_ENABLED = os.getenv("OTC_LIVE_AUTO_MARKET_MODE_ENABLED", "true").lower() == "true"
 OTC_LIVE_AUTO_MODE_MIN_SAMPLES = int(os.getenv("OTC_LIVE_AUTO_MODE_MIN_SAMPLES", "20"))
 OTC_LIVE_AUTO_MODE_EDGE_PERCENT = float(os.getenv("OTC_LIVE_AUTO_MODE_EDGE_PERCENT", "8"))
@@ -1334,11 +1335,24 @@ def build_smart_martingale_decision(signal: dict, open_price: float | None, curr
 
     current_result = resolve_candle_direction_result(direction, open_price, current_price)
 
-    if current_result != "loss":
+    # لا ننتظر الخسارة الأكيدة فقط، لأن آخر ثانيتين ممكن تقلب النتيجة بسرعة.
+    # إذا الصفقة ليست رابحة بفرق واضح، نعتبرها بحاجة لتنبيه مضاعفة احتياطي.
+    diff_now = float(current_price) - float(open_price)
+    if direction == "PUT":
+        diff_now = -diff_now
+
+    # هامش أمان صغير جدًا حسب عدد الخانات، حتى لا تفوتنا الصفقة التي تنقلب بآخر لحظة.
+    safe_margin = 0.00003
+    if pair and "JPY" in str(pair):
+        safe_margin = 0.003
+
+    if current_result == "win" and diff_now > safe_margin:
         return {
             "needed": False,
-            "reason": "trade_not_losing",
+            "reason": "trade_safely_winning",
             "current_result": current_result,
+            "diff_now": diff_now,
+            "safe_margin": safe_margin,
         }
 
     rows = get_otc_live_recent_price_rows(symbol, limit=12) if symbol else []
@@ -1402,6 +1416,9 @@ async def send_smart_martingale_advice(context: ContextTypes.DEFAULT_TYPE):
             return
 
         if int(signal.get("martingale_advice_sent", 0) or 0) == 1:
+            return
+
+        if otc_live_channel_state.get("martingale_for_message_id") == signal.get("message_id"):
             return
 
         pair = signal.get("pair")
@@ -1525,8 +1542,20 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             decision_msg_id = otc_live_channel_state.get("martingale_for_message_id")
 
             if decision_msg_id != message_id or chosen_martingale_direction not in {"CALL", "PUT"}:
-                # fallback إذا لم يصل قرار آخر ثانيتين لأي سبب
+                # fallback إذا لم يصل قرار المضاعفة لأي سبب.
+                # نرسل تنبيه فوري حتى لا تكون WIN¹ بدون معرفة المستخدم.
                 chosen_martingale_direction = direction
+                try:
+                    await context.bot.send_message(
+                        chat_id=OTC_LIVE_CHANNEL_ID,
+                        text=(
+                            "⚠️ تنبيه مضاعفة\n\n"
+                            "ضاعف بنفس اتجاه الصفقة\n"
+                            f"{'🟢 CALL' if chosen_martingale_direction == 'CALL' else '🔴 PUT'}"
+                        )
+                    )
+                except Exception as e:
+                    logger.warning("Could not send fallback martingale advice: %s", e)
 
             signal["martingale_step"] = 1
             signal["martingale_base_direction"] = direction
@@ -1686,15 +1715,16 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
 
         resolve_delay = seconds_until_dt(close_dt) + OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS
         if OTC_LIVE_SMART_MARTINGALE_ENABLED:
-            advice_dt = close_dt - timedelta(seconds=OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE)
-            advice_delay = seconds_until_dt(advice_dt)
+            for retry_sec in OTC_LIVE_MARTINGALE_ADVICE_RETRY_SECONDS:
+                advice_dt = close_dt - timedelta(seconds=retry_sec)
+                advice_delay = seconds_until_dt(advice_dt)
 
-            context.job_queue.run_once(
-                send_smart_martingale_advice,
-                when=advice_delay,
-                data=signal,
-                name=f"otc_live_martingale_advice_{sent.message_id}",
-            )
+                context.job_queue.run_once(
+                    send_smart_martingale_advice,
+                    when=advice_delay,
+                    data=signal,
+                    name=f"otc_live_martingale_advice_{sent.message_id}_{retry_sec}s",
+                )
 
         context.job_queue.run_once(
             resolve_otc_live_channel_trade,
