@@ -1435,11 +1435,10 @@ def build_smart_martingale_message(decision: dict) -> str:
         title = "ضاعف بعكس اتجاه الصفقة"
 
     return (
-        "⚠️ تنبيه مضاعفة\\n\\n"
-        f"{title}\\n"
+        "⚠️ تنبيه مضاعفة\n\n"
+        f"{title}\n"
         f"{direction_line}"
     )
-
 
 async def send_smart_martingale_advice(context: ContextTypes.DEFAULT_TYPE):
     signal = dict(context.job.data or {})
