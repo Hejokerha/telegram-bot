@@ -2094,7 +2094,7 @@ def build_otc_live_stats_from_trades(trades: list[dict], title: str, day_key: st
         money_status = "⚪ تعادل"
 
     reset_at = get_otc_live_stats_reset_at()
-    reset_line = f"🧹 من بعد التصفير: {reset_at}\\n" if reset_at else ""
+    reset_line = f"🧹 من بعد التصفير: {reset_at}\n" if reset_at else ""
 
     best_pair_line = ""
     worst_pair_line = ""
@@ -2102,31 +2102,30 @@ def build_otc_live_stats_from_trades(trades: list[dict], title: str, day_key: st
         sorted_pairs = sorted(pair_stats.items(), key=lambda kv: kv[1]["units"], reverse=True)
         best_pair, best_data = sorted_pairs[0]
         worst_pair, worst_data = sorted_pairs[-1]
-        best_pair_line = f"🏆 أفضل زوج: {best_pair} | {round(best_data['units'], 2)} وحدة\\n"
-        worst_pair_line = f"⚠️ أضعف زوج: {worst_pair} | {round(worst_data['units'], 2)} وحدة\\n"
+        best_pair_line = f"🏆 أفضل زوج: {best_pair} | {round(best_data['units'], 2)} وحدة\n"
+        worst_pair_line = f"⚠️ أضعف زوج: {worst_pair} | {round(worst_data['units'], 2)} وحدة\n"
 
     return (
-        "╔══════════════╗\\n"
-        f"   {title}\\n"
-        "╚══════════════╝\\n\\n"
-        f"📅 التاريخ: {day_key or get_otc_live_day_key()}\\n"
+        "╔══════════════╗\n"
+        f"   {title}\n"
+        "╚══════════════╝\n\n"
+        f"📅 التاريخ: {day_key or get_otc_live_day_key()}\n"
         f"{reset_line}"
-        f"📌 عدد الصفقات: {total}\\n"
-        f"✅ ربح مباشر: {direct_wins}\\n"
-        f"✅¹ ربح بالمضاعفة: {martingale_wins}\\n"
-        f"💔 خسارة نهائية: {losses}\\n"
-        f"⚠️ غير مؤكدة: {unknown}\\n\\n"
-        f"📈 نسبة نجاح الإشارات: {win_rate}%\\n"
-        f"📉 نسبة الخسارة النهائية: {loss_rate}%\\n\\n"
-        f"💰 صافي الوحدات: {net_units}\\n"
-        f"➕ وحدات رابحة: {gross_win_units}\\n"
-        f"➖ وحدات خاسرة: {gross_loss_units}\\n"
-        f"📊 متوسط الوحدة/صفقة: {avg_units}\\n"
-        f"💵 الأداء المالي: {money_status}\\n\\n"
+        f"📌 عدد الصفقات: {total}\n"
+        f"✅ ربح مباشر: {direct_wins}\n"
+        f"✅¹ ربح بالمضاعفة: {martingale_wins}\n"
+        f"💔 خسارة نهائية: {losses}\n"
+        f"⚠️ غير مؤكدة: {unknown}\n\n"
+        f"📈 نسبة نجاح الإشارات: {win_rate}%\n"
+        f"📉 نسبة الخسارة النهائية: {loss_rate}%\n\n"
+        f"💰 صافي الوحدات: {net_units}\n"
+        f"➕ وحدات رابحة: {gross_win_units}\n"
+        f"➖ وحدات خاسرة: {gross_loss_units}\n"
+        f"📊 متوسط الوحدة/صفقة: {avg_units}\n"
+        f"💵 الأداء المالي: {money_status}\n\n"
         f"{best_pair_line}"
         f"{worst_pair_line}"
     )
-
 
 # ===== OTC LIVE CHANNEL STATS =====
 def otc_live_stats_ref():
