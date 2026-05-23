@@ -63,6 +63,8 @@ OTC_LIVE_ACTIVE_TIMEOUT_SECONDS = int(os.getenv("OTC_LIVE_ACTIVE_TIMEOUT_SECONDS
 OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS = int(os.getenv("OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS", "15"))
 OTC_LIVE_SMART_MARTINGALE_ENABLED = os.getenv("OTC_LIVE_SMART_MARTINGALE_ENABLED", "true").lower() == "true"
 OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE = int(os.getenv("OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE", "2"))
+OTC_LIVE_AUTO_FLIP_AFTER_CONSECUTIVE_LOSSES = os.getenv("OTC_LIVE_AUTO_FLIP_AFTER_CONSECUTIVE_LOSSES", "true").lower() == "true"
+OTC_LIVE_FLIP_LOSS_COUNT = int(os.getenv("OTC_LIVE_FLIP_LOSS_COUNT", "2"))
 OTC_LIVE_ADAPTIVE_FILTER_ENABLED = os.getenv("OTC_LIVE_ADAPTIVE_FILTER_ENABLED", "true").lower() == "true"
 OTC_LIVE_PAIR_RECENT_LIMIT = int(os.getenv("OTC_LIVE_PAIR_RECENT_LIMIT", "20"))
 OTC_LIVE_PAIR_MAX_RECENT_LOSSES = int(os.getenv("OTC_LIVE_PAIR_MAX_RECENT_LOSSES", "5"))
@@ -1163,7 +1165,7 @@ def analyze_best_live_otc_now() -> dict:
     best = None
     for candidate in ranked_candidates:
         effective_direction = candidate.get("direction")
-        if OTC_LIVE_REVERSE_AUTOPUBLISH:
+        if should_reverse_otc_live_signal_by_forced_mode():
             if effective_direction == "CALL":
                 effective_direction = "PUT"
             elif effective_direction == "PUT":
@@ -1231,6 +1233,9 @@ otc_live_channel_state = {
     "martingale_direction": None,
     "martingale_decision_type": None,
     "martingale_for_message_id": None,
+    "force_mode": "REVERSE",
+    "consecutive_losses": 0,
+    "last_flip_at": None,
     "last_published_at": None,
 }
 
@@ -1302,6 +1307,52 @@ def build_otc_live_channel_result_message(signal: dict, exit_price: float | None
         return "Loss💔"
 
     return "غير مؤكدة⚠️"
+
+
+
+# ===== OTC LIVE STYLE FLIP AFTER LOSSES =====
+def get_otc_live_forced_mode() -> str:
+    mode = str(otc_live_channel_state.get("force_mode") or "REVERSE").upper()
+    if mode not in {"REVERSE", "NORMAL"}:
+        mode = "REVERSE"
+    return mode
+
+
+def should_reverse_otc_live_signal_by_forced_mode() -> bool:
+    return get_otc_live_forced_mode() == "REVERSE"
+
+
+def update_otc_live_style_after_final_result(result: str):
+    """إذا صار Loss نهائي مرتين متتاليتين، نعكس الأسلوب بين REVERSE/NORMAL."""
+    try:
+        if not OTC_LIVE_AUTO_FLIP_AFTER_CONSECUTIVE_LOSSES:
+            return
+
+        if result == "loss":
+            otc_live_channel_state["consecutive_losses"] = int(otc_live_channel_state.get("consecutive_losses", 0) or 0) + 1
+        elif result == "win":
+            otc_live_channel_state["consecutive_losses"] = 0
+        else:
+            return
+
+        losses = int(otc_live_channel_state.get("consecutive_losses", 0) or 0)
+        if losses >= OTC_LIVE_FLIP_LOSS_COUNT:
+            old_mode = get_otc_live_forced_mode()
+            new_mode = "NORMAL" if old_mode == "REVERSE" else "REVERSE"
+
+            otc_live_channel_state["force_mode"] = new_mode
+            otc_live_channel_state["consecutive_losses"] = 0
+            otc_live_channel_state["last_flip_at"] = now_iso()
+
+            logger.warning(
+                "OTC LIVE STYLE FLIPPED after %s consecutive losses | old=%s | new=%s",
+                losses,
+                old_mode,
+                new_mode,
+            )
+
+    except Exception as e:
+        logger.exception("Could not update OTC live style after result: %s", e)
 
 
 def get_otc_live_recent_price_rows(symbol: str, limit: int = 14) -> list[tuple[float, float, int]]:
@@ -1558,6 +1609,7 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
 
         # نسجل النتيجة النهائية فقط:
         record_otc_live_channel_result(signal, result)
+        update_otc_live_style_after_final_result(result)
 
         text = build_otc_live_channel_result_message(signal, exit_price, result)
         await context.bot.send_message(
@@ -1634,7 +1686,10 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
             logger.info("OTC LIVE CHANNEL SCAN skipped: quality below minimum")
             return
 
-        if OTC_LIVE_REVERSE_AUTOPUBLISH:
+        current_style_mode = get_otc_live_forced_mode()
+        signal["style_mode"] = current_style_mode
+
+        if should_reverse_otc_live_signal_by_forced_mode():
             original_direction = signal.get("direction")
             if original_direction == "CALL":
                 signal["direction"] = "PUT"
@@ -1643,8 +1698,14 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
 
             signal["original_direction"] = original_direction
             logger.info(
-                "OTC LIVE CHANNEL direction reversed for next-candle entry | pair=%s | original=%s | published=%s",
-                signal.get("pair"), original_direction, signal.get("direction")
+                "OTC LIVE STYLE MODE | mode=%s | pair=%s | original=%s | published=%s",
+                current_style_mode, signal.get("pair"), original_direction, signal.get("direction")
+            )
+        else:
+            signal["original_direction"] = signal.get("direction")
+            logger.info(
+                "OTC LIVE STYLE MODE | mode=%s | pair=%s | direction=%s",
+                current_style_mode, signal.get("pair"), signal.get("direction")
             )
 
         # الدخول مع بداية شمعة M1 القادمة، والإغلاق مع نهاية نفس الشمعة.
@@ -1942,6 +2003,7 @@ def record_otc_live_channel_result(signal: dict, result: str):
             "symbol": signal.get("symbol"),
             "direction": signal.get("direction"),
             "original_direction": signal.get("original_direction"),
+            "style_mode": signal.get("style_mode"),
             "quality": signal.get("quality"),
             "payout": payout,
             "entry_time": signal.get("entry_time"),
@@ -2079,7 +2141,8 @@ def build_otc_live_stats_message(day_key: str | None = None) -> str:
         "🧪 اختبار الاتجاه أول شمعة:\n"
         f"➡️ NORMAL: {normal_w}W / {normal_l}L | {normal_rate}%\n"
         f"🔁 REVERSE: {reverse_w}W / {reverse_l}L | {reverse_rate}%\n"
-        f"🏆 الأفضل حاليًا: {best_mode}\n\n"
+        f"🏆 الأفضل حاليًا: {best_mode}\n"
+        f"🧠 أسلوب البوت الحالي: {get_otc_live_forced_mode()}\n\n"
         "@coach_WAEL_trading\n"
         "@sttrade_helper_bot"
     )
