@@ -318,7 +318,7 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["📥 الطلبات المعلقة", "📋 كافة المستخدمين"],
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
-        ["📡 قنوات البوت"],
+        ["📡 قنوات البوت", "📢 رسالة جماعية"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -329,7 +329,16 @@ admin_channels_keyboard = ReplyKeyboardMarkup(
         ["🌍 تشغيل نشر العالمي", "🌍 إيقاف نشر العالمي"],
         ["⚡ تشغيل نشر OTC", "⚡ إيقاف نشر OTC"],
         ["🔥 تشغيل OTC مباشر", "🔥 إيقاف OTC مباشر"],
-        ["📊 حالة النشر", "📈 إحصائيات OTC مباشر"],
+        ["📊 حالة النشر", "📊 إحصائيات قناة OTC"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+admin_otc_stats_keyboard = ReplyKeyboardMarkup(
+    [
+        ["📈 إحصائيات OTC مباشر", "🔢 إحصائيات آخر عدد صفقات"],
+        ["🤖 تحليل ونصائح البوت", "🧹 تصفير إحصائيات OTC"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -1301,8 +1310,7 @@ def build_otc_live_channel_result_message(signal: dict, exit_price: float | None
     if result == "loss":
         return "Loss💔"
 
-    return "غير مؤكدة⚠️"
-
+    return "Doji⚖️"
 
 def get_otc_live_recent_price_rows(symbol: str, limit: int = 14) -> list[tuple[float, float, int]]:
     try:
@@ -1383,11 +1391,10 @@ def build_smart_martingale_message(decision: dict) -> str:
         title = "ضاعف بعكس اتجاه الصفقة"
 
     return (
-        "⚠️ تنبيه مضاعفة\\n\\n"
-        f"{title}\\n"
+        "⚠️ تنبيه مضاعفة\n\n"
+        f"{title}\n"
         f"{direction_line}"
     )
-
 
 async def send_smart_martingale_advice(context: ContextTypes.DEFAULT_TYPE):
     signal = dict(context.job.data or {})
@@ -1588,6 +1595,39 @@ def is_inside_otc_entry_scan_window(check_dt: datetime | None = None) -> tuple[b
     next_entry = next_full_minute(now_dt)
     remaining = (next_entry - now_dt).total_seconds()
     return 0 < remaining <= OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS, remaining
+
+
+
+def reset_stuck_otc_live_trade_if_needed() -> bool:
+    """يفك تعليق حالة active إذا بقيت صفقة OTC معلقة أكثر من الحد المسموح."""
+    try:
+        if not otc_live_channel_state.get("active"):
+            return False
+
+        active_since = otc_live_channel_state.get("active_since")
+        if not active_since:
+            otc_live_channel_state["active_since"] = time_module.time()
+            return False
+
+        elapsed = time_module.time() - float(active_since)
+        if elapsed >= OTC_LIVE_ACTIVE_TIMEOUT_SECONDS:
+            logger.warning(
+                "OTC LIVE active trade watchdog reset | active_for=%.1fs | timeout=%ss",
+                elapsed,
+                OTC_LIVE_ACTIVE_TIMEOUT_SECONDS,
+            )
+            otc_live_channel_state["active"] = False
+            otc_live_channel_state["active_since"] = None
+            otc_live_channel_state["martingale_direction"] = None
+            otc_live_channel_state["martingale_decision_type"] = None
+            otc_live_channel_state["martingale_for_message_id"] = None
+            otc_live_channel_state["last_published_at"] = time_module.time()
+            return True
+
+    except Exception as e:
+        logger.exception("OTC LIVE active watchdog error: %s", e)
+
+    return False
 
 
 async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
@@ -1882,6 +1922,211 @@ def record_otc_live_shadow_direction_test(signal: dict, first_result: str, final
         logger.exception("Could not record shadow direction test: %s", e)
 
 
+
+# ===== OTC LIVE ADMIN STATS TOOLS =====
+def otc_live_stats_control_ref():
+    return system_ref().child("otc_live_channel_stats_control")
+
+
+def get_otc_live_stats_reset_at() -> str:
+    try:
+        data = otc_live_stats_control_ref().get() or {}
+        return str(data.get("reset_at", "") or "")
+    except Exception:
+        return ""
+
+
+def reset_otc_live_stats_marker():
+    try:
+        otc_live_stats_control_ref().update({
+            "reset_at": now_iso(),
+            "reset_by_admin": True,
+        })
+    except Exception as e:
+        logger.exception("Could not reset OTC live stats marker: %s", e)
+
+
+def get_otc_live_trades(day_key: str | None = None, after_reset: bool = True, limit: int | None = None) -> list[dict]:
+    try:
+        day_key = day_key or get_otc_live_day_key()
+        reset_at = get_otc_live_stats_reset_at() if after_reset else ""
+
+        raw = otc_live_stats_ref().child(day_key).child("trades").get() or {}
+        rows = []
+        if isinstance(raw, dict):
+            for trade_id, trade in raw.items():
+                if isinstance(trade, dict):
+                    item = dict(trade)
+                    item["_id"] = trade_id
+                    created_at = str(item.get("created_at", "") or "")
+                    if reset_at and created_at and created_at < reset_at:
+                        continue
+                    rows.append(item)
+
+        rows.sort(key=lambda x: str(x.get("created_at", "")))
+        if limit and int(limit) > 0:
+            rows = rows[-int(limit):]
+        return rows
+    except Exception as e:
+        logger.exception("Could not read OTC live trades: %s", e)
+        return []
+
+
+def calculate_otc_live_trade_stats(trades: list[dict]) -> dict:
+    total = len(trades)
+    wins = 0
+    direct_wins = 0
+    losses = 0
+    unknown = 0
+    martingale_wins = 0
+    net_units = 0.0
+    gross_win_units = 0.0
+    gross_loss_units = 0.0
+    pair_stats = {}
+
+    for trade in trades:
+        result = str(trade.get("result", "unknown"))
+        step = safe_int(trade.get("martingale_step"), 0)
+        payout = safe_int(trade.get("payout"), 80)
+
+        units = trade.get("units")
+        if units is None:
+            units = otc_live_trade_units(result, step, payout)
+        else:
+            try:
+                units = float(units)
+            except Exception:
+                units = otc_live_trade_units(result, step, payout)
+
+        pair = str(trade.get("pair", "غير معروف"))
+        pair_info = pair_stats.setdefault(pair, {"total": 0, "wins": 0, "losses": 0, "unknown": 0, "units": 0.0})
+        pair_info["total"] += 1
+        pair_info["units"] += float(units)
+
+        if result == "win":
+            wins += 1
+            pair_info["wins"] += 1
+            if step == 1:
+                martingale_wins += 1
+            else:
+                direct_wins += 1
+        elif result == "loss":
+            losses += 1
+            pair_info["losses"] += 1
+        else:
+            unknown += 1
+            pair_info["unknown"] += 1
+
+        net_units += float(units)
+        if units > 0:
+            gross_win_units += float(units)
+        elif units < 0:
+            gross_loss_units += float(units)
+
+    decided = wins + losses
+    win_rate = round((wins / decided) * 100, 1) if decided > 0 else 0
+    loss_rate = round((losses / decided) * 100, 1) if decided > 0 else 0
+    avg_units = round(net_units / decided, 3) if decided > 0 else 0
+
+    return {
+        "total": total,
+        "wins": wins,
+        "direct_wins": direct_wins,
+        "martingale_wins": martingale_wins,
+        "losses": losses,
+        "unknown": unknown,
+        "decided": decided,
+        "win_rate": win_rate,
+        "loss_rate": loss_rate,
+        "net_units": round(net_units, 2),
+        "gross_win_units": round(gross_win_units, 2),
+        "gross_loss_units": round(gross_loss_units, 2),
+        "avg_units": avg_units,
+        "pair_stats": pair_stats,
+    }
+
+
+def build_otc_live_stats_from_trades(trades: list[dict], title: str, day_key: str | None = None, include_advice: bool = False) -> str:
+    stats = calculate_otc_live_trade_stats(trades)
+
+    if stats["net_units"] > 0:
+        money_status = "🟢 رابح"
+    elif stats["net_units"] < 0:
+        money_status = "🔴 خاسر"
+    else:
+        money_status = "⚪ تعادل"
+
+    reset_at = get_otc_live_stats_reset_at()
+    reset_line = f"🧹 من بعد التصفير: {reset_at}\n" if reset_at else ""
+
+    best_pair_line = ""
+    worst_pair_line = ""
+    if stats["pair_stats"]:
+        sorted_pairs = sorted(stats["pair_stats"].items(), key=lambda kv: kv[1]["units"], reverse=True)
+        best_pair, best_data = sorted_pairs[0]
+        worst_pair, worst_data = sorted_pairs[-1]
+        best_pair_line = f"🏆 أفضل زوج: {best_pair} | {round(best_data['units'], 2)} وحدة\n"
+        worst_pair_line = f"⚠️ أضعف زوج: {worst_pair} | {round(worst_data['units'], 2)} وحدة\n"
+
+    advice = ""
+    if include_advice:
+        advice = build_otc_live_bot_advice(stats)
+
+    return (
+        "╔══════════════╗\n"
+        f"   {title}\n"
+        "╚══════════════╝\n\n"
+        f"📅 التاريخ: {day_key or get_otc_live_day_key()}\n"
+        f"{reset_line}"
+        f"📌 عدد الصفقات: {stats['total']}\n"
+        f"✅ ربح مباشر: {stats['direct_wins']}\n"
+        f"✅¹ ربح بالمضاعفة: {stats['martingale_wins']}\n"
+        f"💔 خسارة نهائية: {stats['losses']}\n"
+        f"⚖️ دوجي: {stats['unknown']}\n\n"
+        f"📈 نسبة نجاح الإشارات: {stats['win_rate']}%\n"
+        f"📉 نسبة الخسارة النهائية: {stats['loss_rate']}%\n\n"
+        f"💰 صافي الوحدات: {stats['net_units']}\n"
+        f"➕ وحدات رابحة: {stats['gross_win_units']}\n"
+        f"➖ وحدات خاسرة: {stats['gross_loss_units']}\n"
+        f"📊 متوسط الوحدة/صفقة: {stats['avg_units']}\n"
+        f"💵 الأداء المالي: {money_status}\n\n"
+        f"{best_pair_line}"
+        f"{worst_pair_line}"
+        f"{advice}"
+    )
+
+
+def build_otc_live_bot_advice(stats: dict) -> str:
+    advice_lines = ["\n🤖 نصائح البوت بناءً على الإحصائيات:"]
+
+    if stats["total"] < 20:
+        advice_lines.append("• العينة قليلة، انتظر 20 صفقة على الأقل قبل الحكم.")
+    else:
+        if stats["net_units"] > 0:
+            advice_lines.append("• الأداء المالي موجب، لا تغيّر الإعدادات بسرعة.")
+        else:
+            advice_lines.append("• الأداء المالي سلبي، راقب الخسائر النهائية قبل زيادة الصفقات.")
+
+        if stats["loss_rate"] >= 25:
+            advice_lines.append("• الخسارة النهائية مرتفعة، الأفضل تفعيل Safety Pause لاحقًا.")
+        elif stats["loss_rate"] <= 15:
+            advice_lines.append("• الخسارة النهائية منخفضة نسبيًا، الوضع جيد حاليًا.")
+
+        if stats["martingale_wins"] > stats["direct_wins"]:
+            advice_lines.append("• الربح يعتمد كثيرًا على المضاعفة، هذا إنذار خطر.")
+        elif stats["direct_wins"] >= stats["martingale_wins"]:
+            advice_lines.append("• الربح المباشر جيد مقارنة بالمضاعفة.")
+
+    pair_stats = stats.get("pair_stats") or {}
+    if pair_stats:
+        sorted_pairs = sorted(pair_stats.items(), key=lambda kv: kv[1]["units"])
+        worst_pair, worst_data = sorted_pairs[0]
+        if worst_data["units"] < 0:
+            advice_lines.append(f"• أضعف زوج حاليًا: {worst_pair}، راقبه أو أوقفه مؤقتًا إذا تكررت خسائره.")
+
+    return "\n".join(advice_lines) + "\n"
+
+
 # ===== OTC LIVE CHANNEL STATS =====
 def otc_live_stats_ref():
     return system_ref().child("otc_live_channel_stats")
@@ -1956,92 +2201,15 @@ def record_otc_live_channel_result(signal: dict, result: str):
 
 def build_otc_live_stats_message(day_key: str | None = None) -> str:
     day_key = day_key or get_otc_live_day_key()
+    trades = get_otc_live_trades(day_key=day_key, after_reset=True)
+    base_message = build_otc_live_stats_from_trades(
+        trades=trades,
+        title="📊 إحصائيات OTC Live",
+        day_key=day_key,
+        include_advice=False,
+    )
+
     data = otc_live_stats_ref().child(day_key).get() or {}
-
-    # نحاول إعادة بناء الإحصائية من سجل الصفقات نفسه.
-    # هذا مهم لأن النسخ القديمة لم تكن تحفظ direct_wins/net_units.
-    trades_raw = data.get("trades") or {}
-    trades = []
-    if isinstance(trades_raw, dict):
-        for _, trade in trades_raw.items():
-            if isinstance(trade, dict):
-                trades.append(trade)
-
-    if trades:
-        total = len(trades)
-        wins = 0
-        direct_wins = 0
-        losses = 0
-        unknown = 0
-        martingale_wins = 0
-        net_units = 0.0
-        gross_win_units = 0.0
-        gross_loss_units = 0.0
-
-        for trade in trades:
-            result = str(trade.get("result", "unknown"))
-            step = safe_int(trade.get("martingale_step"), 0)
-            payout = safe_int(trade.get("payout"), 80)
-
-            units = trade.get("units")
-            if units is None:
-                units = otc_live_trade_units(result, step, payout)
-            else:
-                try:
-                    units = float(units)
-                except Exception:
-                    units = otc_live_trade_units(result, step, payout)
-
-            if result == "win":
-                wins += 1
-                if step == 1:
-                    martingale_wins += 1
-                else:
-                    direct_wins += 1
-            elif result == "loss":
-                losses += 1
-            else:
-                unknown += 1
-
-            net_units += float(units)
-            if units > 0:
-                gross_win_units += float(units)
-            elif units < 0:
-                gross_loss_units += float(units)
-
-        net_units = round(net_units, 2)
-        gross_win_units = round(gross_win_units, 2)
-        gross_loss_units = round(gross_loss_units, 2)
-
-    else:
-        total = safe_int(data.get("total"), 0)
-        wins = safe_int(data.get("wins"), 0)
-        direct_wins = safe_int(data.get("direct_wins"), 0)
-        losses = safe_int(data.get("losses"), 0)
-        unknown = safe_int(data.get("unknown"), 0)
-        martingale_wins = safe_int(data.get("martingale_wins"), 0)
-        net_units = round(float(data.get("net_units", 0) or 0), 2)
-        gross_win_units = round(float(data.get("gross_win_units", 0) or 0), 2)
-        gross_loss_units = round(float(data.get("gross_loss_units", 0) or 0), 2)
-
-        # fallback للبيانات القديمة:
-        # إذا عندنا wins و martingale_wins لكن direct_wins غير محفوظ،
-        # نحسبه تقريبيًا من wins - martingale_wins.
-        if direct_wins == 0 and wins > 0:
-            direct_wins = max(0, wins - martingale_wins)
-
-    decided = wins + losses
-    win_rate = round((wins / decided) * 100, 1) if decided > 0 else 0
-    loss_rate = round((losses / decided) * 100, 1) if decided > 0 else 0
-    avg_units = round(net_units / decided, 3) if decided > 0 else 0
-
-    if net_units > 0:
-        money_status = "🟢 رابح"
-    elif net_units < 0:
-        money_status = "🔴 خاسر"
-    else:
-        money_status = "⚪ تعادل"
-
     shadow = data.get("shadow_direction_test") or {}
     shadow_total = safe_int(shadow.get("total"), 0)
     normal_w = safe_int(shadow.get("normal_first_wins"), 0)
@@ -2059,24 +2227,8 @@ def build_otc_live_stats_message(day_key: str | None = None) -> str:
     else:
         best_mode = "متعادل"
 
-    return (
-        "╔══════════════╗\n"
-        "   📊 إحصائيات OTC Live\n"
-        "╚══════════════╝\n\n"
-        f"📅 التاريخ: {day_key}\n"
-        f"📌 عدد الصفقات: {total}\n"
-        f"✅ ربح مباشر: {direct_wins}\n"
-        f"✅¹ ربح بالمضاعفة: {martingale_wins}\n"
-        f"💔 خسارة نهائية: {losses}\n"
-        f"⚠️ غير مؤكدة: {unknown}\n\n"
-        f"📈 نسبة نجاح الإشارات: {win_rate}%\n"
-        f"📉 نسبة الخسارة النهائية: {loss_rate}%\n\n"
-        f"💰 صافي الوحدات: {net_units}\n"
-        f"➕ وحدات رابحة: {gross_win_units}\n"
-        f"➖ وحدات خاسرة: {gross_loss_units}\n"
-        f"📊 متوسط الوحدة/صفقة: {avg_units}\n"
-        f"💵 الأداء المالي: {money_status}\n\n"
-        "🧪 اختبار الاتجاه أول شمعة:\n"
+    extra = (
+        "\n🧪 اختبار الاتجاه أول شمعة:\n"
         f"➡️ NORMAL: {normal_w}W / {normal_l}L | {normal_rate}%\n"
         f"🔁 REVERSE: {reverse_w}W / {reverse_l}L | {reverse_rate}%\n"
         f"🏆 الأفضل حاليًا: {best_mode}\n\n"
@@ -2084,11 +2236,31 @@ def build_otc_live_stats_message(day_key: str | None = None) -> str:
         "@sttrade_helper_bot"
     )
 
+    return base_message + extra
+
 
 async def publish_daily_otc_live_stats(context: ContextTypes.DEFAULT_TYPE):
     try:
         yesterday = (now_utc().astimezone(UTC_PLUS_3) - timedelta(days=1)).strftime("%Y-%m-%d")
-        text = build_otc_live_stats_message(yesterday)
+        trades = get_otc_live_trades(day_key=yesterday, after_reset=False)
+        stats = calculate_otc_live_trade_stats(trades)
+
+        if stats["wins"] >= stats["losses"]:
+            title = "today totally win ✅"
+        else:
+            title = "today totally loss 💔"
+
+        text = (
+            "╔══════════════╗\n"
+            f"    {title}\n"
+            "╚══════════════╝\n"
+            "—————————\n"
+            f"{stats['wins']} win\n"
+            "—————————\n"
+            f"{stats['losses']} loss\n"
+            "—————————"
+        )
+
         await context.bot.send_message(
             chat_id=OTC_LIVE_CHANNEL_ID,
             text=text
@@ -4121,8 +4293,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_welcome_flow(update)
         return
 
+    # ===== Admin waiting inputs =====
+    if is_admin(user.id) and step == "otc_stats_waiting_count":
+        clean_text = text.strip()
+        if clean_text.isdigit():
+            count = int(clean_text)
+            if count <= 0:
+                await update.message.reply_text("اكتب رقم أكبر من صفر.", reply_markup=admin_otc_stats_keyboard)
+                return
+
+            context.user_data["step"] = None
+            trades = get_otc_live_trades(limit=count)
+            await update.message.reply_text(
+                build_otc_live_stats_from_trades(
+                    trades=trades,
+                    title=f"📊 إحصائيات آخر {count} صفقة",
+                    include_advice=True,
+                ),
+                reply_markup=admin_otc_stats_keyboard
+            )
+            return
+
+        context.user_data["step"] = None
+        await update.message.reply_text("تم إلغاء الطلب لأنك لم ترسل رقمًا.", reply_markup=admin_otc_stats_keyboard)
+        return
+
+    if is_admin(user.id) and step == "admin_broadcast_waiting_message":
+        message = text.strip()
+        if not message:
+            await update.message.reply_text("الرسالة فارغة، تم الإلغاء.", reply_markup=admin_main_keyboard)
+            context.user_data["step"] = None
+            return
+
+        context.user_data["step"] = None
+        all_users = get_all_users() or {}
+        sent_count = 0
+        failed_count = 0
+        broadcast_text = "📢 رسالة من الأدمن\n\n" + message
+
+        for uid in list(all_users.keys()):
+            try:
+                await context.bot.send_message(chat_id=int(uid), text=broadcast_text)
+                sent_count += 1
+            except Exception:
+                failed_count += 1
+
+        await update.message.reply_text(
+            f"📢 تم إرسال الرسالة الجماعية.\n\n✅ وصل: {sent_count}\n❌ فشل: {failed_count}",
+            reply_markup=admin_main_keyboard
+        )
+        return
+
     # ===== Common buttons =====
     if text == "🔙 رجوع":
+        if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message"}:
+            context.user_data["step"] = None
+            await update.message.reply_text("تم الرجوع.", reply_markup=admin_main_keyboard)
+            return
+
         if step == "choose_count":
             context.user_data["step"] = "choose_pair"
             await update.message.reply_text("💱 اختر الزوج 👇", reply_markup=otc_pairs_keyboard)
@@ -4246,12 +4474,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("🔥 تم إيقاف نشر قناة OTC المباشر ⛔", reply_markup=admin_channels_keyboard)
                 return
 
-            if text == "📈 إحصائيات OTC مباشر":
-                await update.message.reply_text(build_otc_live_stats_message(), reply_markup=admin_channels_keyboard)
+            if text == "📊 إحصائيات قناة OTC":
+                await update.message.reply_text("📊 قسم إحصائيات قناة OTC 👇", reply_markup=admin_otc_stats_keyboard)
                 return
 
             if text == "📊 حالة النشر":
                 await update.message.reply_text(format_channel_publish_status(), reply_markup=admin_channels_keyboard)
+                return
+
+        if is_admin(user.id):
+            if text == "📈 إحصائيات OTC مباشر":
+                await update.message.reply_text(build_otc_live_stats_message(), reply_markup=admin_otc_stats_keyboard)
+                return
+
+            if text == "🔢 إحصائيات آخر عدد صفقات":
+                context.user_data["step"] = "otc_stats_waiting_count"
+                await update.message.reply_text(
+                    "🔢 اكتب عدد الصفقات التي تريد فحصها، مثال: 50 أو 100",
+                    reply_markup=admin_otc_stats_keyboard
+                )
+                return
+
+            if text == "🤖 تحليل ونصائح البوت":
+                trades = get_otc_live_trades()
+                await update.message.reply_text(
+                    build_otc_live_stats_from_trades(
+                        trades=trades,
+                        title="🤖 تحليل ونصائح OTC",
+                        include_advice=True,
+                    ),
+                    reply_markup=admin_otc_stats_keyboard
+                )
+                return
+
+            if text == "🧹 تصفير إحصائيات OTC":
+                reset_otc_live_stats_marker()
+                await update.message.reply_text(
+                    "🧹 تم تصفير إحصائيات OTC من هذه اللحظة.\n"
+                    "أي إحصائية لاحقة ستُحسب من بعد هذا التصفير.",
+                    reply_markup=admin_otc_stats_keyboard
+                )
                 return
 
         if text == "📥 الطلبات المعلقة":
