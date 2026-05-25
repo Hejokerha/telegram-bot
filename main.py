@@ -61,7 +61,7 @@ OTC_LIVE_TRADE_DURATION_SECONDS = int(os.getenv("OTC_LIVE_TRADE_DURATION_SECONDS
 OTC_LIVE_COOLDOWN_SECONDS = int(os.getenv("OTC_LIVE_COOLDOWN_SECONDS", "60"))
 OTC_LIVE_ACTIVE_TIMEOUT_SECONDS = int(os.getenv("OTC_LIVE_ACTIVE_TIMEOUT_SECONDS", "300"))
 OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS = int(os.getenv("OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS", "15"))
-OTC_LIVE_SMART_MARTINGALE_ENABLED = os.getenv("OTC_LIVE_SMART_MARTINGALE_ENABLED", "false").lower() == "true"
+OTC_LIVE_SMART_MARTINGALE_ENABLED = os.getenv("OTC_LIVE_SMART_MARTINGALE_ENABLED", "true").lower() == "true"
 OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE = int(os.getenv("OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE", "2"))
 OTC_LIVE_AUTO_FLIP_AFTER_CONSECUTIVE_LOSSES = os.getenv("OTC_LIVE_AUTO_FLIP_AFTER_CONSECUTIVE_LOSSES", "true").lower() == "true"
 OTC_LIVE_FLIP_LOSS_COUNT = int(os.getenv("OTC_LIVE_FLIP_LOSS_COUNT", "2"))
@@ -1366,12 +1366,14 @@ def get_otc_live_recent_price_rows(symbol: str, limit: int = 14) -> list[tuple[f
 
 
 def build_smart_martingale_decision(signal: dict, open_price: float | None, current_price: float | None) -> dict:
-    """مضاعفة آمنة:
-    إذا الصفقة ليست خاسرة الآن لا نرسل تنبيه.
-    إذا الصفقة خاسرة أو قريبة من الخسارة، المضاعفة تكون بنفس اتجاه الصفقة الأصلية فقط.
-    سبب التعديل: تجربة المضاعفة بعكس الاتجاه أعطت سلسلة خسائر متتالية.
+    """يقرر اتجاه المضاعفة قبل نهاية الشمعة بثواني.
+    المنطق:
+    - إذا الصفقة ليست خاسرة الآن: لا نرسل مضاعفة.
+    - إذا الخسارة تتقلص آخر اللحظات: مضاعفة بنفس الاتجاه.
+    - إذا الخسارة تتوسع آخر اللحظات: مضاعفة بعكس الاتجاه.
     """
     pair = signal.get("pair")
+    symbol = signal.get("symbol") or OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
     direction = signal.get("direction")
 
     if open_price is None or current_price is None or direction not in {"CALL", "PUT"}:
@@ -1379,42 +1381,62 @@ def build_smart_martingale_decision(signal: dict, open_price: float | None, curr
 
     current_result = resolve_candle_direction_result(direction, open_price, current_price)
 
-    diff_now = float(current_price) - float(open_price)
-    if direction == "PUT":
-        diff_now = -diff_now
-
-    safe_margin = 0.00003
-    if pair and "JPY" in str(pair):
-        safe_margin = 0.003
-
-    if current_result == "win" and diff_now > safe_margin:
+    if current_result != "loss":
         return {
             "needed": False,
-            "reason": "trade_safely_winning",
+            "reason": "trade_not_losing",
             "current_result": current_result,
-            "diff_now": diff_now,
-            "safe_margin": safe_margin,
         }
+
+    rows = get_otc_live_recent_price_rows(symbol, limit=12) if symbol else []
+    prices = [float(r[1]) for r in rows if len(r) >= 2]
+
+    if len(prices) >= 4:
+        recent_change = prices[-1] - prices[0]
+    else:
+        recent_change = float(current_price) - float(open_price)
+
+    loss_amount = abs(float(current_price) - float(open_price))
+
+    # هل آخر اللحظات تتحرك لصالح الصفقة الأصلية أم ضدها؟
+    if direction == "CALL":
+        recovery = recent_change > 0
+    else:
+        recovery = recent_change < 0
+
+    if recovery:
+        martingale_direction = direction
+        decision_type = "same"
+    else:
+        martingale_direction = opposite_otc_direction(direction)
+        decision_type = "opposite"
 
     return {
         "needed": True,
-        "decision_type": "same",
-        "martingale_direction": direction,
+        "decision_type": decision_type,
+        "martingale_direction": martingale_direction,
         "current_result": current_result,
         "open_price": float(open_price),
         "current_price": float(current_price),
-        "recent_change": 0.0,
-        "loss_amount": abs(float(current_price) - float(open_price)),
+        "recent_change": float(recent_change),
+        "loss_amount": float(loss_amount),
     }
 
 
 def build_smart_martingale_message(decision: dict) -> str:
     martingale_direction = decision.get("martingale_direction")
+    decision_type = decision.get("decision_type")
+
     direction_line = "🟢 CALL" if martingale_direction == "CALL" else "🔴 PUT"
+
+    if decision_type == "same":
+        title = "ضاعف بنفس اتجاه الصفقة"
+    else:
+        title = "ضاعف بعكس اتجاه الصفقة"
 
     return (
         "⚠️ تنبيه مضاعفة\n\n"
-        "ضاعف بنفس اتجاه الصفقة\n"
+        f"{title}\n"
         f"{direction_line}"
     )
 
@@ -1545,8 +1567,12 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             next_entry_dt = datetime.fromtimestamp(close_ts, tz=UTC)
             next_close_dt = next_entry_dt + timedelta(seconds=OTC_LIVE_TRADE_DURATION_SECONDS)
 
-            # المضاعفة ثابتة بنفس اتجاه الصفقة الأصلية بدون رسالة تنبيه.
-            chosen_martingale_direction = direction
+            chosen_martingale_direction = otc_live_channel_state.get("martingale_direction")
+            decision_msg_id = otc_live_channel_state.get("martingale_for_message_id")
+
+            if decision_msg_id != message_id or chosen_martingale_direction not in {"CALL", "PUT"}:
+                # fallback إذا لم يصل قرار آخر ثانيتين لأي سبب
+                chosen_martingale_direction = direction
 
             signal["martingale_step"] = 1
             signal["martingale_base_direction"] = direction
@@ -1738,6 +1764,17 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
         otc_live_channel_state["active_since"] = time_module.time()
 
         resolve_delay = seconds_until_dt(close_dt) + OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS
+        if OTC_LIVE_SMART_MARTINGALE_ENABLED:
+            advice_dt = close_dt - timedelta(seconds=OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE)
+            advice_delay = seconds_until_dt(advice_dt)
+
+            context.job_queue.run_once(
+                send_smart_martingale_advice,
+                when=advice_delay,
+                data=signal,
+                name=f"otc_live_martingale_advice_{sent.message_id}",
+            )
+
         context.job_queue.run_once(
             resolve_otc_live_channel_trade,
             when=resolve_delay,
