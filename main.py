@@ -1241,6 +1241,7 @@ otc_live_channel_state = {
     "martingale_direction": None,
     "martingale_decision_type": None,
     "martingale_for_message_id": None,
+    "martingale_advice_message_id": None,
     "last_published_at": None,
 }
 
@@ -1456,10 +1457,11 @@ async def send_smart_martingale_advice(context: ContextTypes.DEFAULT_TYPE):
         otc_live_channel_state["martingale_decision_type"] = decision.get("decision_type")
         otc_live_channel_state["martingale_for_message_id"] = signal.get("message_id")
 
-        await context.bot.send_message(
+        sent_advice = await context.bot.send_message(
             chat_id=OTC_LIVE_CHANNEL_ID,
             text=build_smart_martingale_message(decision)
         )
+        otc_live_channel_state["martingale_advice_message_id"] = sent_advice.message_id
 
         logger.info(
             "Smart martingale advice sent | pair=%s | original=%s | martingale=%s | type=%s | open=%s | current=%s",
@@ -1527,6 +1529,8 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             martingale_step,
             signal.get("candle_ticks"),
         )
+
+        await delete_martingale_advice_if_direct_win(context, signal, result, martingale_step)
 
         if martingale_step == 0:
             signal["first_candle_result"] = result
@@ -1612,6 +1616,7 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             otc_live_channel_state["martingale_direction"] = None
             otc_live_channel_state["martingale_decision_type"] = None
             otc_live_channel_state["martingale_for_message_id"] = None
+            otc_live_channel_state["martingale_advice_message_id"] = None
             otc_live_channel_state["last_published_at"] = time_module.time()
 
 
@@ -1650,6 +1655,7 @@ def reset_stuck_otc_live_trade_if_needed() -> bool:
             otc_live_channel_state["martingale_direction"] = None
             otc_live_channel_state["martingale_decision_type"] = None
             otc_live_channel_state["martingale_for_message_id"] = None
+            otc_live_channel_state["martingale_advice_message_id"] = None
             otc_live_channel_state["last_published_at"] = time_module.time()
             return True
 
@@ -2155,6 +2161,39 @@ def build_otc_live_bot_advice(stats: dict) -> str:
             advice_lines.append(f"• أضعف زوج حاليًا: {worst_pair}، راقبه أو أوقفه مؤقتًا إذا تكررت خسائره.")
 
     return "\n".join(advice_lines) + "\n"
+
+async def delete_martingale_advice_if_direct_win(context: ContextTypes.DEFAULT_TYPE, signal: dict, result: str, martingale_step: int):
+    """إذا تم إرسال تنبيه مضاعفة مبكرًا ثم ربحت الصفقة مباشر، نحذف التنبيه لتنظيف القناة."""
+    try:
+        if result != "win" or int(martingale_step or 0) != 0:
+            return
+
+        advice_message_id = otc_live_channel_state.get("martingale_advice_message_id")
+        advice_for_message_id = otc_live_channel_state.get("martingale_for_message_id")
+        signal_message_id = signal.get("message_id")
+
+        if not advice_message_id:
+            return
+
+        if advice_for_message_id and signal_message_id and advice_for_message_id != signal_message_id:
+            return
+
+        await context.bot.delete_message(
+            chat_id=OTC_LIVE_CHANNEL_ID,
+            message_id=int(advice_message_id)
+        )
+
+        logger.info(
+            "Deleted early martingale advice because trade won directly | pair=%s | advice_message_id=%s",
+            signal.get("pair"),
+            advice_message_id,
+        )
+
+        otc_live_channel_state["martingale_advice_message_id"] = None
+
+    except Exception as e:
+        logger.warning("Could not delete martingale advice message: %s", e)
+
 
 
 # ===== OTC LIVE CHANNEL STATS =====
