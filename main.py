@@ -5289,20 +5289,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         context.user_data["step"] = None
-        all_users = get_all_users() or {}
+        approved_users = get_all_approved_users() or {}
         sent_count = 0
         failed_count = 0
+        skipped_count = 0
         broadcast_text = "📢 رسالة من الأدمن\n\n" + message
 
-        for uid in list(all_users.keys()):
+        for uid in list(approved_users.keys()):
             try:
-                await context.bot.send_message(chat_id=int(uid), text=broadcast_text)
+                user_id_int = int(uid)
+
+                # نرسل فقط للمستخدمين المفعّلين حاليًا، ونتجاهل المحظور أو المنتهي.
+                if not is_approved(user_id_int):
+                    skipped_count += 1
+                    continue
+
+                await context.bot.send_message(chat_id=user_id_int, text=broadcast_text)
                 sent_count += 1
             except Exception:
                 failed_count += 1
 
         await update.message.reply_text(
-            f"📢 تم إرسال الرسالة الجماعية.\n\n✅ وصل: {sent_count}\n❌ فشل: {failed_count}",
+            f"📢 تم إرسال الرسالة الجماعية للمستخدمين المفعّلين فقط.\n\n"
+            f"✅ وصل: {sent_count}\n"
+            f"⏭️ تم تجاهل غير المفعّلين/المنتهيين: {skipped_count}\n"
+            f"❌ فشل: {failed_count}",
             reply_markup=admin_main_keyboard
         )
         return
@@ -5409,20 +5420,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("الرسالة فارغة، تم الإلغاء.", reply_markup=admin_main_keyboard)
             return
 
-        all_users = get_all_users() or {}
+        approved_users = get_all_approved_users() or {}
         sent_count = 0
         failed_count = 0
+        skipped_count = 0
         broadcast_text = "📢 رسالة من الأدمن\n\n" + message
 
-        for uid in list(all_users.keys()):
+        for uid in list(approved_users.keys()):
             try:
-                await context.bot.send_message(chat_id=int(uid), text=broadcast_text)
+                user_id_int = int(uid)
+
+                # نرسل فقط للمستخدمين المفعّلين حاليًا، ونتجاهل المحظور أو المنتهي.
+                if not is_approved(user_id_int):
+                    skipped_count += 1
+                    continue
+
+                await context.bot.send_message(chat_id=user_id_int, text=broadcast_text)
                 sent_count += 1
             except Exception:
                 failed_count += 1
 
         await update.message.reply_text(
-            f"📢 تم إرسال الرسالة الجماعية.\n\n✅ وصل: {sent_count}\n❌ فشل: {failed_count}",
+            f"📢 تم إرسال الرسالة الجماعية للمستخدمين المفعّلين فقط.\n\n"
+            f"✅ وصل: {sent_count}\n"
+            f"⏭️ تم تجاهل غير المفعّلين/المنتهيين: {skipped_count}\n"
+            f"❌ فشل: {failed_count}",
             reply_markup=admin_main_keyboard
         )
         return
