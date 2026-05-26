@@ -5400,6 +5400,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
+    # ===== Broadcast waiting input fixed =====
+    if is_admin(user.id) and step == "admin_broadcast_waiting_message":
+        message = text.strip()
+        context.user_data["step"] = None
+
+        if not message:
+            await update.message.reply_text("الرسالة فارغة، تم الإلغاء.", reply_markup=admin_main_keyboard)
+            return
+
+        all_users = get_all_users() or {}
+        sent_count = 0
+        failed_count = 0
+        broadcast_text = "📢 رسالة من الأدمن\n\n" + message
+
+        for uid in list(all_users.keys()):
+            try:
+                await context.bot.send_message(chat_id=int(uid), text=broadcast_text)
+                sent_count += 1
+            except Exception:
+                failed_count += 1
+
+        await update.message.reply_text(
+            f"📢 تم إرسال الرسالة الجماعية.\n\n✅ وصل: {sent_count}\n❌ فشل: {failed_count}",
+            reply_markup=admin_main_keyboard
+        )
+        return
+
+    if is_admin(user.id) and text == "📢 رسالة جماعية":
+        context.user_data["step"] = "admin_broadcast_waiting_message"
+        await update.message.reply_text(
+            "📢 اكتب الآن الرسالة التي تريد إرسالها لجميع مستخدمي البوت.\n\n"
+            "لإلغاء العملية اضغط رجوع.",
+            reply_markup=admin_main_keyboard
+        )
+        return
+
     # ===== Common buttons =====
     if text == "🔙 رجوع":
         if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message", "otc_list_waiting_text", "otc_pair_diagnostics_waiting", "otc_candle_diagnostics_waiting"}:
