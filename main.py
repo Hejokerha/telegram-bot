@@ -2006,6 +2006,12 @@ def record_otc_live_shadow_direction_test(signal: dict, first_result: str, final
 
 
 # ===== OTC LIST WATCHER / RESULTS CHECKER =====
+OTC_PAIR_TIME_RE = re.compile(
+    r"(?P<pair>[A-Z]{3}/[A-Z]{3})\s*(?:\(OTC\))?\s+"
+    r"(?P<hour>\d{1,2}):(?P<minute>\d{2})",
+    re.IGNORECASE
+)
+
 OTC_LIST_TRADE_RE = re.compile(
     r"(?P<pair>[A-Z]{3}/[A-Z]{3})\s*\(OTC\)\s+"
     r"(?P<hour>\d{1,2}):(?P<minute>\d{2})\s+"
@@ -2138,10 +2144,10 @@ def parse_otc_list_trades(raw_text: str) -> list[dict]:
 
 def otc_list_entry_datetime(hour: int, minute: int) -> datetime:
     """تحديد تاريخ وقت الصفقة بذكاء.
-    مهم جدًا لليستات التي تبدأ عند 00:00 بعد منتصف الليل.
-    نجرّب أمس/اليوم/بكرا، ونختار:
-    - أول وقت مستقبلي لم تنتهِ نتيجته بعد.
-    - وإذا كلها منتهية، نختار أقرب وقت ماضي.
+    القاعدة:
+    - إذا وقت الصفقة صار اليوم خلال آخر 12 ساعة، نختار اليوم.
+    - إذا وقت الصفقة قادم خلال 12 ساعة، نختار الوقت القادم.
+    - هذا يحل مشكلة 00:00 قبل منتصف الليل بدون أن يحول صفقات اليوم إلى بكرا.
     """
     now_local = now_utc().astimezone(UTC_PLUS_3)
 
@@ -2154,22 +2160,26 @@ def otc_list_entry_datetime(hour: int, minute: int) -> datetime:
         )
         candidates.append(candidate)
 
-    # وقت جاهزية النتيجة: الصفقة + شمعة أصلية + شمعة مضاعفة + سماحية بسيطة
-    def ready_time(dt_local: datetime) -> datetime:
-        return dt_local + timedelta(seconds=130)
-
-    future_candidates = [
+    # 1) الأفضل: أقرب وقت ماضي حديث، لأن أغلب فحص النتائج يتم بعد الصفقة بدقائق أو ساعات.
+    recent_past = [
         dt for dt in candidates
-        if ready_time(dt) >= now_local
+        if dt <= now_local and (now_local - dt).total_seconds() <= 12 * 3600
     ]
+    if recent_past:
+        chosen = max(recent_past)
+        return chosen.astimezone(UTC)
 
-    if future_candidates:
-        # خذ أقرب وقت قادم أو لم تنته نتيجته بعد
-        chosen = min(future_candidates, key=lambda dt: abs((dt - now_local).total_seconds()))
-    else:
-        # كل الأوقات منتهية، خذ الأقرب للماضي
-        chosen = min(candidates, key=lambda dt: abs((dt - now_local).total_seconds()))
+    # 2) إذا الصفقة لسه قادمة قريبًا، مثل ليستة 00:00 قبل منتصف الليل.
+    near_future = [
+        dt for dt in candidates
+        if dt > now_local and (dt - now_local).total_seconds() <= 12 * 3600
+    ]
+    if near_future:
+        chosen = min(near_future)
+        return chosen.astimezone(UTC)
 
+    # 3) fallback: أقرب وقت مطلقًا.
+    chosen = min(candidates, key=lambda dt: abs((dt - now_local).total_seconds()))
     return chosen.astimezone(UTC)
 
 
@@ -5109,15 +5119,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["step"] = None
         raw = text.strip()
         try:
-            match = OTC_LIST_TRADE_RE.search(raw)
-            if match:
-                pair = f"{match.group('pair').upper()} (OTC)"
-                hour = int(match.group("hour"))
-                minute = int(match.group("minute"))
-            else:
-                parts = raw.split()
-                pair = normalize_otc_pair_input(parts[0])
-                hour, minute = map(int, parts[1].split(":"))
+            match = OTC_PAIR_TIME_RE.search(raw)
+            if not match:
+                raise ValueError("pair_time_not_found")
+
+            pair = f"{match.group('pair').upper()} (OTC)"
+            hour = int(match.group("hour"))
+            minute = int(match.group("minute"))
 
             entry_dt = otc_list_entry_datetime(hour, minute)
             await update.message.reply_text(
@@ -5126,10 +5134,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
         except Exception:
             await update.message.reply_text(
-                "اكتب الزوج والوقت بهذا الشكل:\nUSD/BDT (OTC) 15:53",
+                "اكتب الزوج والوقت بهذا الشكل:\n"
+                "USD/BDT (OTC) 15:53\n\n"
+                "أو:\n"
+                "USD/BDT 15:53",
                 reply_markup=admin_otc_stats_keyboard
             )
         return
+
 
     # ===== Common buttons =====
     if text == "🔙 رجوع":
