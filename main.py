@@ -61,6 +61,12 @@ OTC_LIVE_TRADE_DURATION_SECONDS = int(os.getenv("OTC_LIVE_TRADE_DURATION_SECONDS
 OTC_LIVE_COOLDOWN_SECONDS = int(os.getenv("OTC_LIVE_COOLDOWN_SECONDS", "60"))
 OTC_LIVE_ACTIVE_TIMEOUT_SECONDS = int(os.getenv("OTC_LIVE_ACTIVE_TIMEOUT_SECONDS", "300"))
 OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS = int(os.getenv("OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS", "15"))
+OTC_LIVE_LEARNING_ENABLED = os.getenv("OTC_LIVE_LEARNING_ENABLED", "true").lower() == "true"
+OTC_LIVE_PAIR_LOSS_LOOKBACK = int(os.getenv("OTC_LIVE_PAIR_LOSS_LOOKBACK", "10"))
+OTC_LIVE_PAIR_LOSS_LIMIT = int(os.getenv("OTC_LIVE_PAIR_LOSS_LIMIT", "2"))
+OTC_LIVE_PAIR_COOLDOWN_MINUTES = int(os.getenv("OTC_LIVE_PAIR_COOLDOWN_MINUTES", "30"))
+OTC_LIVE_CAUTION_LOOKBACK = int(os.getenv("OTC_LIVE_CAUTION_LOOKBACK", "15"))
+OTC_LIVE_CAUTION_MIN_QUALITY_BOOST = int(os.getenv("OTC_LIVE_CAUTION_MIN_QUALITY_BOOST", "8"))
 OTC_LIVE_SMART_MARTINGALE_ENABLED = os.getenv("OTC_LIVE_SMART_MARTINGALE_ENABLED", "true").lower() == "true"
 OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE = int(os.getenv("OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE", "8"))
 OTC_LIVE_MARTINGALE_ADVICE_CHECK_SECONDS = [12, 8, 5, 3]
@@ -340,6 +346,7 @@ admin_otc_stats_keyboard = ReplyKeyboardMarkup(
     [
         ["📈 إحصائيات OTC مباشر", "🔢 إحصائيات آخر عدد صفقات"],
         ["🤖 تحليل ونصائح البوت", "🧹 تصفير إحصائيات OTC"],
+        ["🧠 حالة تعلم OTC Live"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["⬅️ رجوع"],
     ],
@@ -1624,6 +1631,7 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
 
         # نسجل النتيجة النهائية فقط:
         record_otc_live_channel_result(signal, result)
+        update_otc_live_learning_after_result(signal, result)
 
         text = build_otc_live_channel_result_message(signal, exit_price, result)
         await context.bot.send_message(
@@ -1728,11 +1736,19 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
             return
 
         quality = int(signal.get("quality", 0) or 0)
-        logger.info("OTC LIVE CHANNEL SCAN best | pair=%s | direction=%s | quality=%s | min=%s",
-                    signal.get("pair"), signal.get("direction"), quality, OTC_LIVE_MIN_QUALITY)
+        effective_min_quality, quality_reason = get_otc_live_effective_min_quality()
 
-        if quality < OTC_LIVE_MIN_QUALITY:
-            logger.info("OTC LIVE CHANNEL SCAN skipped: quality below minimum")
+        logger.info("OTC LIVE CHANNEL SCAN best | pair=%s | direction=%s | quality=%s | min=%s | learning=%s",
+                    signal.get("pair"), signal.get("direction"), quality, effective_min_quality, quality_reason)
+
+        pair_blocked, block_reason = is_otc_live_pair_blocked_by_learning(signal.get("pair"))
+        if pair_blocked:
+            logger.info("OTC LIVE CHANNEL SCAN skipped by learning | pair=%s | reason=%s",
+                        signal.get("pair"), block_reason)
+            return
+
+        if quality < effective_min_quality:
+            logger.info("OTC LIVE CHANNEL SCAN skipped: quality below effective minimum | %s", quality_reason)
             return
 
         if OTC_LIVE_REVERSE_AUTOPUBLISH:
@@ -2577,6 +2593,163 @@ async def delete_martingale_advice_if_direct_win(context: ContextTypes.DEFAULT_T
     except Exception as e:
         logger.warning("Could not delete martingale advice message: %s", e)
 
+
+
+
+# ===== OTC LIVE LOSS LEARNING SYSTEM =====
+def otc_live_learning_ref():
+    return system_ref().child("otc_live_learning")
+
+
+def get_otc_live_recent_trades_for_learning(day_key: str | None = None, limit: int = 30) -> list[dict]:
+    try:
+        day_key = day_key or get_otc_live_day_key()
+        raw = otc_live_stats_ref().child(day_key).child("trades").get() or {}
+        rows = []
+        if isinstance(raw, dict):
+            for trade_id, trade in raw.items():
+                if isinstance(trade, dict):
+                    item = dict(trade)
+                    item["_id"] = trade_id
+                    rows.append(item)
+        rows.sort(key=lambda x: str(x.get("created_at", "")))
+        return rows[-int(limit):] if limit and int(limit) > 0 else rows
+    except Exception as e:
+        logger.exception("Could not read recent OTC trades for learning: %s", e)
+        return []
+
+
+def get_otc_live_trade_units_for_learning(trade: dict) -> float:
+    try:
+        units = trade.get("units")
+        if units is not None:
+            return float(units)
+    except Exception:
+        pass
+    return float(otc_live_trade_units(
+        str(trade.get("result", "unknown")),
+        safe_int(trade.get("martingale_step"), 0),
+        safe_int(trade.get("payout"), 80),
+    ))
+
+
+def get_otc_live_pair_cooldown_until(pair: str) -> float:
+    try:
+        data = otc_live_learning_ref().child("pair_cooldowns").child(safe_key(pair)).get() or {}
+        return float(data.get("until_ts", 0) or 0)
+    except Exception:
+        return 0.0
+
+
+def set_otc_live_pair_cooldown(pair: str, minutes: int, reason: str):
+    try:
+        until_ts = time_module.time() + (int(minutes) * 60)
+        otc_live_learning_ref().child("pair_cooldowns").child(safe_key(pair)).set({
+            "pair": pair,
+            "until_ts": until_ts,
+            "until_iso": datetime.fromtimestamp(until_ts, tz=UTC).isoformat(),
+            "reason": reason,
+            "updated_at": now_iso(),
+        })
+        logger.warning("OTC learning pair cooldown set | pair=%s | minutes=%s | reason=%s", pair, minutes, reason)
+    except Exception as e:
+        logger.exception("Could not set OTC pair cooldown: %s", e)
+
+
+def clear_expired_otc_live_pair_cooldowns():
+    try:
+        raw = otc_live_learning_ref().child("pair_cooldowns").get() or {}
+        now_ts = time_module.time()
+        if isinstance(raw, dict):
+            for key, data in raw.items():
+                if isinstance(data, dict) and float(data.get("until_ts", 0) or 0) <= now_ts:
+                    otc_live_learning_ref().child("pair_cooldowns").child(key).delete()
+    except Exception as e:
+        logger.exception("Could not clear expired OTC pair cooldowns: %s", e)
+
+
+def is_otc_live_pair_blocked_by_learning(pair: str) -> tuple[bool, str]:
+    if not OTC_LIVE_LEARNING_ENABLED:
+        return False, ""
+    until_ts = get_otc_live_pair_cooldown_until(pair)
+    if until_ts > time_module.time():
+        remaining_min = round((until_ts - time_module.time()) / 60, 1)
+        return True, f"pair cooldown {remaining_min}m remaining"
+    return False, ""
+
+
+def is_otc_live_caution_mode() -> tuple[bool, float, int]:
+    if not OTC_LIVE_LEARNING_ENABLED:
+        return False, 0.0, 0
+    trades = get_otc_live_recent_trades_for_learning(limit=OTC_LIVE_CAUTION_LOOKBACK)
+    decided = [t for t in trades if str(t.get("result")) in {"win", "loss"}]
+    if len(decided) < max(5, min(OTC_LIVE_CAUTION_LOOKBACK, 10)):
+        return False, 0.0, len(decided)
+    net_units = round(sum(get_otc_live_trade_units_for_learning(t) for t in decided), 2)
+    return net_units < 0, net_units, len(decided)
+
+
+def get_otc_live_effective_min_quality() -> tuple[int, str]:
+    base_quality = int(OTC_LIVE_MIN_QUALITY)
+    caution, net_units, count = is_otc_live_caution_mode()
+    if caution:
+        boosted = base_quality + int(OTC_LIVE_CAUTION_MIN_QUALITY_BOOST)
+        return boosted, f"caution mode: last {count} trades net={net_units}, min_quality {base_quality}->{boosted}"
+    return base_quality, "normal"
+
+
+def update_otc_live_learning_after_result(signal: dict, result: str):
+    try:
+        if not OTC_LIVE_LEARNING_ENABLED:
+            return
+        pair = signal.get("pair")
+        if not pair or result not in {"win", "loss"}:
+            return
+        clear_expired_otc_live_pair_cooldowns()
+        recent = get_otc_live_recent_trades_for_learning(limit=max(OTC_LIVE_PAIR_LOSS_LOOKBACK, 10))
+        recent_pair = [t for t in recent if str(t.get("pair")) == str(pair)]
+        recent_pair = recent_pair[-OTC_LIVE_PAIR_LOSS_LOOKBACK:]
+        pair_losses = sum(1 for t in recent_pair if str(t.get("result")) == "loss")
+        if result == "loss" and pair_losses >= OTC_LIVE_PAIR_LOSS_LIMIT:
+            set_otc_live_pair_cooldown(
+                pair,
+                OTC_LIVE_PAIR_COOLDOWN_MINUTES,
+                f"{pair_losses} losses in last {len(recent_pair)} pair trades",
+            )
+    except Exception as e:
+        logger.exception("Could not update OTC live learning after result: %s", e)
+
+
+def format_otc_live_learning_status() -> str:
+    try:
+        clear_expired_otc_live_pair_cooldowns()
+        caution, net_units, count = is_otc_live_caution_mode()
+        min_quality, quality_reason = get_otc_live_effective_min_quality()
+        raw_cd = otc_live_learning_ref().child("pair_cooldowns").get() or {}
+        lines = []
+        now_ts = time_module.time()
+        if isinstance(raw_cd, dict):
+            for _, data in raw_cd.items():
+                if isinstance(data, dict):
+                    until_ts = float(data.get("until_ts", 0) or 0)
+                    if until_ts > now_ts:
+                        remaining = round((until_ts - now_ts) / 60, 1)
+                        lines.append(f"• {data.get('pair')}: {remaining} دقيقة")
+        cooldown_text = "\n".join(lines) if lines else "لا يوجد أزواج موقوفة حاليًا."
+        return (
+            "╔══════════════╗\n"
+            "   🧠 تعلم OTC Live\n"
+            "╚══════════════╝\n\n"
+            f"الحالة: {'وضع حذر ⚠️' if caution else 'طبيعي ✅'}\n"
+            f"آخر {count} صفقات صافيها: {net_units}\n"
+            f"حد الجودة الحالي: {min_quality}\n"
+            f"السبب: {quality_reason}\n\n"
+            "الأزواج الموقوفة مؤقتًا:\n"
+            f"{cooldown_text}"
+        )
+    except Exception as e:
+        logger.exception("Could not build learning status: %s", e)
+        return "تعذر عرض حالة التعلم."
 
 
 # ===== OTC LIVE CHANNEL STATS =====
@@ -4995,6 +5168,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=admin_otc_stats_keyboard
                 )
                 return
+
+            if text == "🧠 حالة تعلم OTC Live":
+                await update.message.reply_text(
+                    format_otc_live_learning_status(),
+                    reply_markup=admin_otc_stats_keyboard
+                )
+                return
+
 
             if text == "🧹 تصفير إحصائيات OTC":
                 reset_otc_live_stats_marker()
