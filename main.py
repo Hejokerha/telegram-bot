@@ -1067,7 +1067,23 @@ class QuotexOTCLiveFeed:
         return None
 
 
-quotex_otc_feed = QuotexOTCLiveFeed(list(OTC_PAIR_TO_QUOTEX_SYMBOL.values()))
+OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS = []
+for _pair_key, _mapped_symbol in OTC_PAIR_TO_QUOTEX_SYMBOL.items():
+    if _mapped_symbol and _mapped_symbol not in OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS:
+        OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS.append(_mapped_symbol)
+    try:
+        _base_symbol = _pair_key.replace(" (OTC)", "").replace("/", "").upper()
+        if len(_base_symbol) == 6:
+            for _symbol_candidate in (
+                f"{_base_symbol}_otc",
+                f"{_base_symbol[3:]}{_base_symbol[:3]}_otc",
+            ):
+                if _symbol_candidate not in OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS:
+                    OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS.append(_symbol_candidate)
+    except Exception:
+        pass
+
+quotex_otc_feed = QuotexOTCLiveFeed(OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS)
 
 
 def start_quotex_otc_feed():
@@ -1979,6 +1995,37 @@ OTC_LIST_TRADE_RE = re.compile(
 )
 
 
+
+def get_otc_possible_symbols_for_pair(pair: str) -> list[str]:
+    """يرجع كل الرموز المحتملة للزوج لأن بعض أزواج OTC تظهر معكوسة في Quotex."""
+    symbols = []
+    mapped = OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
+    if mapped:
+        symbols.append(mapped)
+
+    try:
+        base = pair.replace(" (OTC)", "").replace("/", "").upper()
+        if len(base) == 6:
+            symbols.append(f"{base}_otc")
+            symbols.append(f"{base[3:]}{base[:3]}_otc")
+    except Exception:
+        pass
+
+    unique = []
+    for s in symbols:
+        if s and s not in unique:
+            unique.append(s)
+    return unique
+
+
+def get_otc_cached_candle_for_pair(pair: str, entry_ts: float) -> tuple[dict, str | None]:
+    for symbol in get_otc_possible_symbols_for_pair(pair):
+        candle = quotex_otc_feed.candle(symbol, entry_ts)
+        if candle:
+            return candle, symbol
+    return {}, None
+
+
 def parse_otc_list_trades(raw_text: str) -> list[dict]:
     trades = []
     for line in (raw_text or "").splitlines():
@@ -2034,10 +2081,9 @@ def candle_color_from_prices(open_price, close_price) -> str:
 def detect_otc_list_momentum_violation(trade: dict) -> tuple[bool, str]:
     """المخالفة = الصفقة عكس مومنتم 4 شموع متتالية قبل وقت الدخول."""
     pair = trade.get("pair")
-    symbol = OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
     direction = trade.get("direction")
 
-    if not symbol or direction not in {"CALL", "PUT"}:
+    if direction not in {"CALL", "PUT"}:
         return False, ""
 
     entry_dt = otc_list_entry_datetime(int(trade["hour"]), int(trade["minute"]))
@@ -2045,7 +2091,7 @@ def detect_otc_list_momentum_violation(trade: dict) -> tuple[bool, str]:
 
     colors = []
     for i in range(4, 0, -1):
-        candle = quotex_otc_feed.candle(symbol, entry_ts - (60 * i))
+        candle, _used_symbol = get_otc_cached_candle_for_pair(pair, entry_ts - (60 * i))
         if not candle:
             return False, ""
 
@@ -2066,19 +2112,22 @@ def detect_otc_list_momentum_violation(trade: dict) -> tuple[bool, str]:
 
 def evaluate_otc_list_trade(trade: dict) -> dict:
     pair = trade.get("pair")
-    symbol = OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
     direction = trade.get("direction")
     entry_dt = otc_list_entry_datetime(int(trade["hour"]), int(trade["minute"]))
     entry_ts = entry_dt.timestamp()
 
     violation, violation_reason = detect_otc_list_momentum_violation(trade)
 
-    if not symbol:
-        return {**trade, "result": "unknown", "mark": "Doji⚖️", "note": "symbol_not_found", "violation": violation, "violation_reason": violation_reason}
-
-    first_candle = quotex_otc_feed.candle(symbol, entry_ts)
+    first_candle, used_symbol = get_otc_cached_candle_for_pair(pair, entry_ts)
     if not first_candle:
-        return {**trade, "result": "unknown", "mark": "Doji⚖️", "note": "no_first_candle", "violation": violation, "violation_reason": violation_reason}
+        return {
+            **trade,
+            "result": "no_data",
+            "mark": "No Data⚠️",
+            "note": "no_first_candle",
+            "violation": violation,
+            "violation_reason": violation_reason,
+        }
 
     first_result = resolve_candle_direction_result(
         direction,
@@ -2090,10 +2139,10 @@ def evaluate_otc_list_trade(trade: dict) -> dict:
         result = "win"
         mark = "✅"
     elif first_result == "loss":
-        second_candle = quotex_otc_feed.candle(symbol, entry_ts + 60)
+        second_candle, _used_symbol2 = get_otc_cached_candle_for_pair(pair, entry_ts + 60)
         if not second_candle:
-            result = "loss"
-            mark = "↘️"
+            result = "no_data"
+            mark = "No Data⚠️"
         else:
             second_result = resolve_candle_direction_result(
                 direction,
@@ -2152,6 +2201,7 @@ def build_otc_list_results_message(raw_text: str) -> tuple[str, dict]:
     martingale_win_count = sum(1 for item in evaluated if item["result"] == "martingale_win")
     loss_count = sum(1 for item in evaluated if item["result"] == "loss")
     doji_count = sum(1 for item in evaluated if item["result"] == "unknown")
+    no_data_count = sum(1 for item in evaluated if item["result"] == "no_data")
 
     lines = [
         "╔══════════════╗",
@@ -2186,6 +2236,9 @@ def build_otc_list_results_message(raw_text: str) -> tuple[str, dict]:
     if doji_count:
         lines.append(f"{doji_count} Doji⚖️")
 
+    if no_data_count:
+        lines.append(f"{no_data_count} No Data⚠️")
+
     lines.append("——————————————")
 
     meta = {
@@ -2195,6 +2248,7 @@ def build_otc_list_results_message(raw_text: str) -> tuple[str, dict]:
         "martingale_win": martingale_win_count,
         "loss": loss_count,
         "doji": doji_count,
+        "no_data": no_data_count,
         "violations": len(violation_items),
     }
 
