@@ -2056,14 +2056,40 @@ def parse_otc_list_trades(raw_text: str) -> list[dict]:
 
 
 def otc_list_entry_datetime(hour: int, minute: int) -> datetime:
+    """تحديد تاريخ وقت الصفقة بذكاء.
+    مهم جدًا لليستات التي تبدأ عند 00:00 بعد منتصف الليل.
+    نجرّب أمس/اليوم/بكرا، ونختار:
+    - أول وقت مستقبلي لم تنتهِ نتيجته بعد.
+    - وإذا كلها منتهية، نختار أقرب وقت ماضي.
+    """
     now_local = now_utc().astimezone(UTC_PLUS_3)
-    entry_local = now_local.replace(hour=hour, minute=minute, second=0, microsecond=0)
 
-    # إذا فحصت ليستة بعد منتصف الليل وكانت أوقاتها من أمس.
-    if entry_local > now_local + timedelta(hours=1):
-        entry_local -= timedelta(days=1)
+    candidates = []
+    for day_shift in (-1, 0, 1):
+        candidate = (
+            now_local
+            .replace(hour=hour, minute=minute, second=0, microsecond=0)
+            + timedelta(days=day_shift)
+        )
+        candidates.append(candidate)
 
-    return entry_local.astimezone(UTC)
+    # وقت جاهزية النتيجة: الصفقة + شمعة أصلية + شمعة مضاعفة + سماحية بسيطة
+    def ready_time(dt_local: datetime) -> datetime:
+        return dt_local + timedelta(seconds=130)
+
+    future_candidates = [
+        dt for dt in candidates
+        if ready_time(dt) >= now_local
+    ]
+
+    if future_candidates:
+        # خذ أقرب وقت قادم أو لم تنته نتيجته بعد
+        chosen = min(future_candidates, key=lambda dt: abs((dt - now_local).total_seconds()))
+    else:
+        # كل الأوقات منتهية، خذ الأقرب للماضي
+        chosen = min(candidates, key=lambda dt: abs((dt - now_local).total_seconds()))
+
+    return chosen.astimezone(UTC)
 
 
 def candle_color_from_prices(open_price, close_price) -> str:
@@ -2152,7 +2178,7 @@ def evaluate_otc_list_trade(trade: dict) -> dict:
 
             if second_result == "win":
                 result = "martingale_win"
-                mark = "⚠️✅"
+                mark = "✅¹"
             elif second_result == "loss":
                 result = "loss"
                 mark = "↘️"
@@ -2221,7 +2247,7 @@ def build_otc_list_results_message(raw_text: str) -> tuple[str, dict]:
             "——————————————",
         ])
         for item in violation_items:
-            lines.append(format_otc_list_trade_line(item))
+            lines.append(format_otc_list_trade_line(item) + " ❗")
 
     lines.extend([
         "",
@@ -2231,7 +2257,7 @@ def build_otc_list_results_message(raw_text: str) -> tuple[str, dict]:
     ])
 
     if martingale_win_count:
-        lines.append(f"{martingale_win_count} win¹⚠️✅")
+        lines.append(f"{martingale_win_count} win¹✅")
 
     if doji_count:
         lines.append(f"{doji_count} Doji⚖️")
@@ -2271,21 +2297,50 @@ def get_otc_list_ready_delay_seconds(raw_text: str) -> tuple[float, int]:
     return delay, len(trades)
 
 
+
+def otc_list_results_ref(admin_id: int):
+    return system_ref().child("otc_list_results").child(str(admin_id))
+
+
+def save_ready_otc_list_result(admin_id: int, raw_text: str, result_text: str, meta: dict):
+    try:
+        otc_list_results_ref(admin_id).set({
+            "raw_text": raw_text,
+            "result_text": result_text,
+            "meta": meta or {},
+            "ready_at": now_iso(),
+        })
+    except Exception as e:
+        logger.exception("Could not save ready OTC list result: %s", e)
+
+
+def get_ready_otc_list_result(admin_id: int) -> dict:
+    try:
+        return otc_list_results_ref(admin_id).get() or {}
+    except Exception as e:
+        logger.exception("Could not read ready OTC list result: %s", e)
+        return {}
+
+
 async def notify_otc_list_results_ready(context: ContextTypes.DEFAULT_TYPE):
     data = dict(context.job.data or {})
     admin_id = int(data.get("admin_id"))
+    raw_text = data.get("raw_text") or ""
+
     try:
+        result_text, meta = build_otc_list_results_message(raw_text)
+        save_ready_otc_list_result(admin_id, raw_text, result_text, meta)
+
         await context.bot.send_message(
             chat_id=admin_id,
             text=(
-                "✅ نتائج ليستة OTC جاهزة.\n\n"
-                "اضغط الزر بالأسفل لعرض النتائج ونسخها."
+                "✅ نتائج ليستة OTC جاهزة ومحفوظة.\n\n"
+                "اضغط الزر بالأسفل لعرض النتائج ونسخها بأي وقت."
             ),
             reply_markup=admin_otc_list_ready_keyboard
         )
     except Exception as e:
         logger.exception("Could not notify admin that OTC list results are ready: %s", e)
-
 
 # ===== OTC LIVE ADMIN STATS TOOLS =====
 def otc_live_stats_control_ref():
@@ -4756,13 +4811,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         context.user_data["last_otc_list_raw_text"] = raw_list
         context.user_data["last_otc_list_result_text"] = None
+        try:
+            otc_list_results_ref(user.id).delete()
+        except Exception:
+            pass
 
         delay, count = get_otc_list_ready_delay_seconds(raw_list)
 
         context.job_queue.run_once(
             notify_otc_list_results_ready,
             when=delay,
-            data={"admin_id": user.id},
+            data={"admin_id": user.id, "raw_text": raw_list},
             name=f"otc_list_ready_{user.id}_{int(time_module.time())}",
         )
 
@@ -4956,15 +5015,24 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             if text == "📋 عرض نتائج الليستة":
-                raw_list = context.user_data.get("last_otc_list_raw_text")
-                if not raw_list:
+                saved_result = get_ready_otc_list_result(user.id)
+                result_text = saved_result.get("result_text")
+
+                if not result_text:
+                    raw_list = context.user_data.get("last_otc_list_raw_text")
+                    if not raw_list:
+                        await update.message.reply_text(
+                            "لا توجد ليستة محفوظة بعد. أرسل ليستة أولًا من زر: 🧾 فحص ليستة OTC",
+                            reply_markup=admin_otc_stats_keyboard
+                        )
+                        return
+
                     await update.message.reply_text(
-                        "لا توجد ليستة محفوظة بعد. أرسل ليستة أولًا من زر: 🧾 فحص ليستة OTC",
+                        "⏳ النتيجة لم تُحفظ بعد. انتظر رسالة: نتائج الليستة جاهزة.",
                         reply_markup=admin_otc_stats_keyboard
                     )
                     return
 
-                result_text, meta = build_otc_list_results_message(raw_list)
                 context.user_data["last_otc_list_result_text"] = result_text
 
                 await update.message.reply_text(
