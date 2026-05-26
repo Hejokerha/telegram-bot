@@ -346,7 +346,7 @@ admin_otc_stats_keyboard = ReplyKeyboardMarkup(
     [
         ["📈 إحصائيات OTC مباشر", "🔢 إحصائيات آخر عدد صفقات"],
         ["🤖 تحليل ونصائح البوت", "🧹 تصفير إحصائيات OTC"],
-        ["🧠 حالة تعلم OTC Live"],
+        ["🧠 حالة تعلم OTC Live", "🔎 فحص بيانات زوج OTC"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["⬅️ رجوع"],
     ],
@@ -2162,11 +2162,36 @@ def evaluate_otc_list_trade(trade: dict) -> dict:
 
     first_candle, used_symbol = get_otc_cached_candle_for_pair(pair, entry_ts)
     if not first_candle:
+        possible_symbols = get_otc_possible_symbols_for_pair(pair)
+        recent_status = []
+        try:
+            now_ts = time_module.time()
+            with quotex_otc_feed.lock:
+                for _sym in possible_symbols:
+                    _prices = list(quotex_otc_feed.prices.get(_sym, []))
+                    if _prices:
+                        _age = round(now_ts - float(_prices[-1][0]), 1)
+                        recent_status.append(f"{_sym}: last_tick_age={_age}s ticks={len(_prices)}")
+                    else:
+                        recent_status.append(f"{_sym}: no_ticks")
+        except Exception:
+            pass
+
+        logger.warning(
+            "OTC list No Data | pair=%s | time=%02d:%02d | symbols=%s | status=%s",
+            pair,
+            int(trade.get("hour", 0)),
+            int(trade.get("minute", 0)),
+            possible_symbols,
+            "; ".join(recent_status),
+        )
+
         return {
             **trade,
             "result": "no_data",
             "mark": "No Data⚠️",
             "note": "no_first_candle",
+            "debug": "; ".join(recent_status),
             "violation": violation,
             "violation_reason": violation_reason,
         }
@@ -2338,14 +2363,164 @@ def get_ready_otc_list_result(admin_id: int) -> dict:
         return {}
 
 
-async def notify_otc_list_results_ready(context: ContextTypes.DEFAULT_TYPE):
+def get_otc_list_job_ref(admin_id: int, list_id: str):
+    return system_ref().child("otc_list_jobs").child(str(admin_id)).child(str(list_id))
+
+
+def save_otc_list_job(admin_id: int, list_id: str, raw_text: str, trades: list[dict]):
+    try:
+        get_otc_list_job_ref(admin_id, list_id).set({
+            "raw_text": raw_text,
+            "trades": trades,
+            "created_at": now_iso(),
+            "status": "watching",
+        })
+    except Exception as e:
+        logger.exception("Could not save OTC list job: %s", e)
+
+
+def save_otc_list_trade_result(admin_id: int, list_id: str, index: int, item: dict):
+    try:
+        get_otc_list_job_ref(admin_id, list_id).child("results").child(str(index)).set(item)
+    except Exception as e:
+        logger.exception("Could not save OTC list trade result: %s", e)
+
+
+def get_otc_list_job(admin_id: int, list_id: str) -> dict:
+    try:
+        return get_otc_list_job_ref(admin_id, list_id).get() or {}
+    except Exception as e:
+        logger.exception("Could not read OTC list job: %s", e)
+        return {}
+
+
+def build_otc_list_results_message_from_items(items: list[dict]) -> tuple[str, dict]:
+    if not items:
+        return "❌ لا توجد نتائج محفوظة لهذه الليستة.", {"total": 0}
+
+    regular_items = [item for item in items if not item.get("violation")]
+    violation_items = [item for item in items if item.get("violation")]
+
+    win_count = sum(1 for item in items if item.get("result") in {"win", "martingale_win"})
+    direct_win_count = sum(1 for item in items if item.get("result") == "win")
+    martingale_win_count = sum(1 for item in items if item.get("result") == "martingale_win")
+    loss_count = sum(1 for item in items if item.get("result") == "loss")
+    doji_count = sum(1 for item in items if item.get("result") == "unknown")
+    no_data_count = sum(1 for item in items if item.get("result") == "no_data")
+
+    lines = [
+        "╔══════════════╗",
+        "   🟢 Quotex Results 🟢",
+        "╚══════════════╝",
+        "",
+    ]
+
+    for item in regular_items:
+        lines.append(format_otc_list_trade_line(item))
+
+    if violation_items:
+        lines.extend([
+            "",
+            "——————————————",
+            "⚠️ الصفقات المخالفة",
+            "——————————————",
+        ])
+        for item in violation_items:
+            lines.append(format_otc_list_trade_line(item) + " ❗")
+
+    lines.extend([
+        "",
+        "——————————————",
+        f"{win_count} win✅",
+        f"{loss_count} loss↘️",
+    ])
+
+    if martingale_win_count:
+        lines.append(f"{martingale_win_count} win¹✅")
+
+    if doji_count:
+        lines.append(f"{doji_count} Doji⚖️")
+
+    if no_data_count:
+        lines.append(f"{no_data_count} No Data⚠️")
+
+    lines.append("——————————————")
+
+    meta = {
+        "total": len(items),
+        "win": win_count,
+        "direct_win": direct_win_count,
+        "martingale_win": martingale_win_count,
+        "loss": loss_count,
+        "doji": doji_count,
+        "no_data": no_data_count,
+        "violations": len(violation_items),
+    }
+
+    return "\n".join(lines), meta
+
+
+async def evaluate_single_otc_list_trade_job(context: ContextTypes.DEFAULT_TYPE):
     data = dict(context.job.data or {})
     admin_id = int(data.get("admin_id"))
-    raw_text = data.get("raw_text") or ""
+    list_id = str(data.get("list_id"))
+    index = int(data.get("index"))
+    trade = dict(data.get("trade") or {})
 
     try:
-        result_text, meta = build_otc_list_results_message(raw_text)
+        item = evaluate_otc_list_trade(trade)
+        item["index"] = index
+        item["evaluated_at"] = now_iso()
+        save_otc_list_trade_result(admin_id, list_id, index, item)
+
+        logger.info(
+            "OTC list trade evaluated | admin=%s | list=%s | index=%s | pair=%s | time=%02d:%02d | result=%s",
+            admin_id,
+            list_id,
+            index,
+            item.get("pair"),
+            int(item.get("hour", 0)),
+            int(item.get("minute", 0)),
+            item.get("result"),
+        )
+    except Exception as e:
+        logger.exception("Could not evaluate OTC list trade job: %s", e)
+
+
+async def finalize_otc_list_results_job(context: ContextTypes.DEFAULT_TYPE):
+    data = dict(context.job.data or {})
+    admin_id = int(data.get("admin_id"))
+    list_id = str(data.get("list_id"))
+
+    try:
+        job = get_otc_list_job(admin_id, list_id)
+        trades = job.get("trades") or []
+        results_raw = job.get("results") or {}
+
+        items = []
+        for idx, trade in enumerate(trades):
+            saved = results_raw.get(str(idx)) if isinstance(results_raw, dict) else None
+            if isinstance(saved, dict):
+                items.append(saved)
+            else:
+                # fallback أخير إذا job الصفقة لم يعمل لأي سبب
+                item = evaluate_otc_list_trade(trade)
+                item["index"] = idx
+                item["evaluated_at"] = now_iso()
+                items.append(item)
+                save_otc_list_trade_result(admin_id, list_id, idx, item)
+
+        items.sort(key=lambda x: int(x.get("index", 0)))
+        result_text, meta = build_otc_list_results_message_from_items(items)
+
+        raw_text = job.get("raw_text") or ""
         save_ready_otc_list_result(admin_id, raw_text, result_text, meta)
+
+        get_otc_list_job_ref(admin_id, list_id).update({
+            "status": "ready",
+            "ready_at": now_iso(),
+            "meta": meta,
+        })
 
         await context.bot.send_message(
             chat_id=admin_id,
@@ -2355,8 +2530,14 @@ async def notify_otc_list_results_ready(context: ContextTypes.DEFAULT_TYPE):
             ),
             reply_markup=admin_otc_list_ready_keyboard
         )
+
     except Exception as e:
-        logger.exception("Could not notify admin that OTC list results are ready: %s", e)
+        logger.exception("Could not finalize OTC list results: %s", e)
+
+
+async def notify_otc_list_results_ready(context: ContextTypes.DEFAULT_TYPE):
+    # Deprecated path: kept for compatibility. New system uses finalize_otc_list_results_job.
+    await finalize_otc_list_results_job(context)
 
 # ===== OTC LIVE ADMIN STATS TOOLS =====
 def otc_live_stats_control_ref():
@@ -2594,6 +2775,103 @@ async def delete_martingale_advice_if_direct_win(context: ContextTypes.DEFAULT_T
         logger.warning("Could not delete martingale advice message: %s", e)
 
 
+
+
+
+# ===== OTC FEED DIAGNOSTICS =====
+def get_otc_feed_diagnostics_for_pair(pair: str) -> str:
+    try:
+        possible_symbols = get_otc_possible_symbols_for_pair(pair) if "get_otc_possible_symbols_for_pair" in globals() else []
+        if not possible_symbols:
+            mapped = OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
+            if mapped:
+                possible_symbols = [mapped]
+
+        if not possible_symbols:
+            return (
+                "🔎 فحص بيانات زوج OTC\n\n"
+                f"الزوج: {pair}\n"
+                "الحالة: ❌ الزوج غير موجود في خريطة الرموز."
+            )
+
+        lines = [
+            "🔎 فحص بيانات زوج OTC",
+            "",
+            f"الزوج: {pair}",
+            f"الرموز المحتملة: {', '.join(possible_symbols)}",
+            "",
+        ]
+
+        now_ts = time_module.time()
+        any_live = False
+
+        with quotex_otc_feed.lock:
+            for symbol in possible_symbols:
+                prices = list(quotex_otc_feed.prices.get(symbol, []))
+                candles_dict = dict(quotex_otc_feed.candles.get(symbol, {}) or {})
+
+                tick_count = len(prices)
+                candle_count = len(candles_dict)
+
+                last_tick_line = "لا يوجد"
+                last_tick_age = None
+
+                if prices:
+                    try:
+                        last_ts = float(prices[-1][0])
+                        last_price = prices[-1][1]
+                        last_tick_age = round(now_ts - last_ts, 1)
+                        last_tick_dt = datetime.fromtimestamp(last_ts, tz=UTC).astimezone(UTC_PLUS_3)
+                        last_tick_line = f"{last_tick_dt.strftime('%H:%M:%S')} | السعر: {last_price} | منذ {last_tick_age}s"
+                        if last_tick_age <= 20:
+                            any_live = True
+                    except Exception:
+                        pass
+
+                last_candle_line = "لا يوجد"
+                if candles_dict:
+                    try:
+                        latest_bucket = max(candles_dict.keys())
+                        latest_candle = candles_dict.get(latest_bucket) or {}
+                        latest_dt = datetime.fromtimestamp(float(latest_bucket), tz=UTC).astimezone(UTC_PLUS_3)
+                        last_candle_line = (
+                            f"{latest_dt.strftime('%H:%M')} | "
+                            f"O:{latest_candle.get('open')} C:{latest_candle.get('close')}"
+                        )
+                    except Exception:
+                        pass
+
+                status = "✅ شغال" if last_tick_age is not None and last_tick_age <= 20 else "⚠️ لا توجد ticks حديثة"
+
+                lines.extend([
+                    f"• الرمز: {symbol}",
+                    f"  الحالة: {status}",
+                    f"  عدد ticks بالكاش: {tick_count}",
+                    f"  عدد الشموع بالكاش: {candle_count}",
+                    f"  آخر tick: {last_tick_line}",
+                    f"  آخر شمعة: {last_candle_line}",
+                    "",
+                ])
+
+        if any_live:
+            lines.append("الخلاصة: البيانات واصلة لهذا الزوج ✅")
+        else:
+            lines.append("الخلاصة: لا توجد بيانات حديثة لهذا الزوج ❌")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.exception("OTC feed diagnostics error: %s", e)
+        return "تعذر فحص بيانات الزوج بسبب خطأ داخلي."
+
+
+def normalize_otc_pair_input(text_value: str) -> str:
+    raw = (text_value or "").strip().upper()
+    raw = raw.replace(" OTC", " (OTC)")
+    if "(OTC)" not in raw:
+        raw = raw + " (OTC)"
+    raw = raw.replace("  ", " ")
+    return raw
 
 
 # ===== OTC LIVE LOSS LEARNING SYSTEM =====
@@ -4989,26 +5267,54 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
 
-        delay, count = get_otc_list_ready_delay_seconds(raw_list)
+        list_id = str(int(time_module.time()))
+        parsed_trades = parse_otc_list_trades(raw_list)
+        save_otc_list_job(user.id, list_id, raw_list, parsed_trades)
+
+        # نحسب كل صفقة لوحدها بعد انتهاء شمعتها والمضاعفة مباشرة، حتى لا تضيع بيانات الليستات الطويلة.
+        latest_delay = 1.0
+        for idx, trade in enumerate(parsed_trades):
+            entry_dt = otc_list_entry_datetime(int(trade["hour"]), int(trade["minute"]))
+            ready_dt = entry_dt + timedelta(seconds=130)
+            trade_delay = max(1.0, (ready_dt - now_utc()).total_seconds())
+            latest_delay = max(latest_delay, trade_delay)
+
+            context.job_queue.run_once(
+                evaluate_single_otc_list_trade_job,
+                when=trade_delay,
+                data={"admin_id": user.id, "list_id": list_id, "index": idx, "trade": trade},
+                name=f"otc_list_trade_{user.id}_{list_id}_{idx}",
+            )
 
         context.job_queue.run_once(
-            notify_otc_list_results_ready,
-            when=delay,
-            data={"admin_id": user.id, "raw_text": raw_list},
-            name=f"otc_list_ready_{user.id}_{int(time_module.time())}",
+            finalize_otc_list_results_job,
+            when=latest_delay + 2,
+            data={"admin_id": user.id, "list_id": list_id},
+            name=f"otc_list_finalize_{user.id}_{list_id}",
         )
 
-        ready_minutes = round(delay / 60, 1)
+        context.user_data["last_otc_list_id"] = list_id
+
+        ready_minutes = round((latest_delay + 2) / 60, 1)
         await update.message.reply_text(
-            f"✅ تم استلام الليستة وعدد صفقاتها: {count}\n"
-            f"⏳ سأراقبها وأخبرك عندما تصبح النتائج جاهزة تقريبًا بعد {ready_minutes} دقيقة.",
+            f"✅ تم استلام الليستة وعدد صفقاتها: {len(parsed_trades)}\n"
+            f"⏳ سأحسب كل صفقة فور انتهائها، وأخبرك عندما تصبح النتيجة النهائية جاهزة تقريبًا بعد {ready_minutes} دقيقة.",
+            reply_markup=admin_otc_stats_keyboard
+        )
+        return
+
+    if is_admin(user.id) and step == "otc_pair_diagnostics_waiting":
+        context.user_data["step"] = None
+        pair = normalize_otc_pair_input(text)
+        await update.message.reply_text(
+            get_otc_feed_diagnostics_for_pair(pair),
             reply_markup=admin_otc_stats_keyboard
         )
         return
 
     # ===== Common buttons =====
     if text == "🔙 رجوع":
-        if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message", "otc_list_waiting_text"}:
+        if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message", "otc_list_waiting_text", "otc_pair_diagnostics_waiting"}:
             context.user_data["step"] = None
             await update.message.reply_text("تم الرجوع.", reply_markup=admin_main_keyboard)
             return
@@ -5172,6 +5478,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if text == "🧠 حالة تعلم OTC Live":
                 await update.message.reply_text(
                     format_otc_live_learning_status(),
+                    reply_markup=admin_otc_stats_keyboard
+                )
+                return
+
+            if text == "🔎 فحص بيانات زوج OTC":
+                context.user_data["step"] = "otc_pair_diagnostics_waiting"
+                await update.message.reply_text(
+                    "🔎 أرسل اسم الزوج لفحص بياناته، مثال:\nUSD/BRL (OTC)",
                     reply_markup=admin_otc_stats_keyboard
                 )
                 return
