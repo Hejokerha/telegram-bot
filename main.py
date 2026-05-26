@@ -60,7 +60,9 @@ OTC_LIVE_SCAN_INTERVAL_SECONDS = int(os.getenv("OTC_LIVE_SCAN_INTERVAL_SECONDS",
 OTC_LIVE_TRADE_DURATION_SECONDS = int(os.getenv("OTC_LIVE_TRADE_DURATION_SECONDS", "65"))
 OTC_LIVE_COOLDOWN_SECONDS = int(os.getenv("OTC_LIVE_COOLDOWN_SECONDS", "60"))
 OTC_LIVE_ACTIVE_TIMEOUT_SECONDS = int(os.getenv("OTC_LIVE_ACTIVE_TIMEOUT_SECONDS", "300"))
-OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS = int(os.getenv("OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS", "15"))
+OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS = int(os.getenv("OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS", "20"))
+OTC_LIVE_ENTRY_MIN_REMAINING_SECONDS = float(os.getenv("OTC_LIVE_ENTRY_MIN_REMAINING_SECONDS", "15"))
+OTC_LIVE_ENTRY_MAX_REMAINING_SECONDS = float(os.getenv("OTC_LIVE_ENTRY_MAX_REMAINING_SECONDS", "20"))
 OTC_LIVE_LEARNING_ENABLED = os.getenv("OTC_LIVE_LEARNING_ENABLED", "true").lower() == "true"
 OTC_LIVE_PAIR_LOSS_LOOKBACK = int(os.getenv("OTC_LIVE_PAIR_LOSS_LOOKBACK", "10"))
 OTC_LIVE_PAIR_LOSS_LIMIT = int(os.getenv("OTC_LIVE_PAIR_LOSS_LIMIT", "2"))
@@ -1697,48 +1699,23 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
 
 
 def is_inside_otc_entry_scan_window(check_dt: datetime | None = None) -> tuple[bool, float]:
-    """يسمح بالبحث فقط في آخر X ثانية قبل بداية الشمعة الجديدة.
-    إذا X=15، يسمح بين الثانية 45 و59 من كل دقيقة.
+    """Strict final decision window.
+    لا يتم تحليل أو اختيار الصفقة إلا داخل نافذة النشر نفسها.
+    الافتراضي:
+    - باقي 20 إلى 15 ثانية على بداية شمعة M1 القادمة => مسموح التحليل والنشر.
+    - خارج هذه النافذة => لا تحليل ولا قرار.
     """
-    now_dt = (check_dt or now_utc()).astimezone(UTC)
-    next_entry = next_full_minute(now_dt)
-    remaining = (next_entry - now_dt).total_seconds()
-    return 0 < remaining <= OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS, remaining
+    check_dt = check_dt or now_utc()
+    entry_dt = next_otc_m1_entry_time(check_dt)
+    remaining = (entry_dt - check_dt.astimezone(UTC)).total_seconds()
 
+    inside = (
+        OTC_LIVE_ENTRY_MIN_REMAINING_SECONDS
+        <= remaining
+        <= OTC_LIVE_ENTRY_MAX_REMAINING_SECONDS
+    )
 
-
-def reset_stuck_otc_live_trade_if_needed() -> bool:
-    """يفك تعليق حالة active إذا بقيت صفقة OTC معلقة أكثر من الحد المسموح."""
-    try:
-        if not otc_live_channel_state.get("active"):
-            return False
-
-        active_since = otc_live_channel_state.get("active_since")
-        if not active_since:
-            otc_live_channel_state["active_since"] = time_module.time()
-            return False
-
-        elapsed = time_module.time() - float(active_since)
-        if elapsed >= OTC_LIVE_ACTIVE_TIMEOUT_SECONDS:
-            logger.warning(
-                "OTC LIVE active trade watchdog reset | active_for=%.1fs | timeout=%ss",
-                elapsed,
-                OTC_LIVE_ACTIVE_TIMEOUT_SECONDS,
-            )
-            otc_live_channel_state["active"] = False
-            otc_live_channel_state["active_since"] = None
-            otc_live_channel_state["martingale_direction"] = None
-            otc_live_channel_state["martingale_decision_type"] = None
-            otc_live_channel_state["martingale_for_message_id"] = None
-            otc_live_channel_state["martingale_advice_message_id"] = None
-            otc_live_channel_state["last_published_at"] = time_module.time()
-            return True
-
-    except Exception as e:
-        logger.exception("OTC LIVE active watchdog error: %s", e)
-
-    return False
-
+    return inside, remaining
 
 async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
     logger.info("OTC LIVE CHANNEL SCAN started | enabled=%s | active=%s | min_quality=%s",
@@ -1765,12 +1742,14 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
         inside_window, remaining_to_entry = is_inside_otc_entry_scan_window(now_utc())
         if not inside_window:
             logger.info(
-                "OTC LIVE CHANNEL SCAN skipped: outside last %ss window | remaining=%.1fs",
-                OTC_LIVE_ENTRY_SCAN_WINDOW_SECONDS,
+                "OTC LIVE CHANNEL SCAN skipped: outside strict final decision window | allowed=%.1f-%.1fs remaining | current_remaining=%.1fs",
+                OTC_LIVE_ENTRY_MIN_REMAINING_SECONDS,
+                OTC_LIVE_ENTRY_MAX_REMAINING_SECONDS,
                 remaining_to_entry,
             )
             return
 
+        # مهم: لا يتم تحليل واختيار الصفقة إلا الآن، بعد التأكد أننا داخل نافذة 20–15 ثانية.
         signal = analyze_best_live_otc_now()
         if not signal.get("ok"):
             logger.info("OTC LIVE CHANNEL SCAN result: no clear opportunity")
