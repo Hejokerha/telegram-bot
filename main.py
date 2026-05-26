@@ -1513,6 +1513,44 @@ async def send_smart_martingale_advice(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Smart martingale advice error: %s", e)
 
 
+
+async def delete_martingale_advice_if_direct_win(context: ContextTypes.DEFAULT_TYPE, signal: dict, result: str, martingale_step: int):
+    """إذا تم إرسال تنبيه مضاعفة مبكرًا ثم ربحت الصفقة مباشر، نحذف التنبيه لتنظيف القناة.
+    مهم: هذه الدالة لا يجب أن توقف إرسال النتيجة حتى لو فشل الحذف.
+    """
+    try:
+        if result != "win" or int(martingale_step or 0) != 0:
+            return
+
+        advice_message_id = otc_live_channel_state.get("martingale_advice_message_id")
+        advice_for_message_id = otc_live_channel_state.get("martingale_for_message_id")
+        signal_message_id = signal.get("message_id")
+
+        if not advice_message_id:
+            return
+
+        if advice_for_message_id and signal_message_id and advice_for_message_id != signal_message_id:
+            return
+
+        try:
+            await context.bot.delete_message(
+                chat_id=OTC_LIVE_CHANNEL_ID,
+                message_id=int(advice_message_id)
+            )
+            logger.info(
+                "Deleted early martingale advice because trade won directly | pair=%s | advice_message_id=%s",
+                signal.get("pair"),
+                advice_message_id,
+            )
+        except Exception as e:
+            logger.warning("Could not delete martingale advice message: %s", e)
+
+        otc_live_channel_state["martingale_advice_message_id"] = None
+
+    except Exception as e:
+        logger.warning("delete_martingale_advice_if_direct_win failed safely: %s", e)
+
+
 async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
     signal = dict(context.job.data or {})
     pair = signal.get("pair")
