@@ -349,6 +349,7 @@ admin_otc_stats_keyboard = ReplyKeyboardMarkup(
         ["📈 إحصائيات OTC مباشر", "🔢 إحصائيات آخر عدد صفقات"],
         ["🤖 تحليل ونصائح البوت", "🧹 تصفير إحصائيات OTC"],
         ["🧠 حالة تعلم OTC Live", "🔎 فحص بيانات زوج OTC"],
+        ["🕯️ فحص شمعة OTC"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["⬅️ رجوع"],
     ],
@@ -2014,6 +2015,68 @@ OTC_LIST_TRADE_RE = re.compile(
 
 
 
+
+def get_otc_candle_debug_for_pair_time(pair: str, entry_ts: float) -> str:
+    try:
+        possible_symbols = get_otc_possible_symbols_for_pair(pair)
+        target_bucket = int(float(entry_ts) // 60) * 60
+        target_dt = datetime.fromtimestamp(target_bucket, tz=UTC).astimezone(UTC_PLUS_3)
+
+        lines = [
+            f"target={target_dt.strftime('%Y-%m-%d %H:%M:%S')}",
+            f"target_bucket={target_bucket}",
+        ]
+
+        with quotex_otc_feed.lock:
+            for symbol in possible_symbols:
+                candles = dict(quotex_otc_feed.candles.get(symbol, {}) or {})
+                prices = list(quotex_otc_feed.prices.get(symbol, []) or [])
+
+                candle_keys = sorted(candles.keys())
+                nearest = []
+                for key in candle_keys:
+                    try:
+                        diff = int(key) - int(target_bucket)
+                        if abs(diff) <= 600:
+                            dt = datetime.fromtimestamp(float(key), tz=UTC).astimezone(UTC_PLUS_3)
+                            c = candles.get(key) or {}
+                            nearest.append(
+                                f"{dt.strftime('%H:%M')} diff={diff}s O={c.get('open')} C={c.get('close')}"
+                            )
+                    except Exception:
+                        pass
+
+                tick_in_target = 0
+                for row in prices:
+                    try:
+                        ts = float(row[0])
+                        if int(ts // 60) * 60 == target_bucket:
+                            tick_in_target += 1
+                    except Exception:
+                        pass
+
+                last_tick = "none"
+                if prices:
+                    try:
+                        last_ts = float(prices[-1][0])
+                        last_dt = datetime.fromtimestamp(last_ts, tz=UTC).astimezone(UTC_PLUS_3)
+                        last_tick = f"{last_dt.strftime('%H:%M:%S')} price={prices[-1][1]}"
+                    except Exception:
+                        pass
+
+                lines.extend([
+                    f"symbol={symbol}",
+                    f"candles_count={len(candle_keys)} ticks_count={len(prices)} ticks_in_target_minute={tick_in_target}",
+                    f"last_tick={last_tick}",
+                    "near_candles=" + (" | ".join(nearest[-10:]) if nearest else "none"),
+                ])
+
+        return " ; ".join(lines)
+    except Exception as e:
+        logger.exception("Could not build candle debug: %s", e)
+        return "debug_error"
+
+
 def get_otc_possible_symbols_for_pair(pair: str) -> list[str]:
     """يرجع كل الرموز المحتملة للزوج لأن بعض أزواج OTC تظهر معكوسة في Quotex."""
     symbols = []
@@ -2179,13 +2242,16 @@ def evaluate_otc_list_trade(trade: dict) -> dict:
         except Exception:
             pass
 
+        candle_debug = get_otc_candle_debug_for_pair_time(pair, entry_ts)
+
         logger.warning(
-            "OTC list No Data | pair=%s | time=%02d:%02d | symbols=%s | status=%s",
+            "OTC list No Data | pair=%s | time=%02d:%02d | symbols=%s | status=%s | candle_debug=%s",
             pair,
             int(trade.get("hour", 0)),
             int(trade.get("minute", 0)),
             possible_symbols,
             "; ".join(recent_status),
+            candle_debug,
         )
 
         return {
@@ -2194,6 +2260,7 @@ def evaluate_otc_list_trade(trade: dict) -> dict:
             "mark": "No Data⚠️",
             "note": "no_first_candle",
             "debug": "; ".join(recent_status),
+            "candle_debug": candle_debug,
             "violation": violation,
             "violation_reason": violation_reason,
         }
@@ -5038,9 +5105,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if is_admin(user.id) and step == "otc_candle_diagnostics_waiting":
+        context.user_data["step"] = None
+        raw = text.strip()
+        try:
+            match = OTC_LIST_TRADE_RE.search(raw)
+            if match:
+                pair = f"{match.group('pair').upper()} (OTC)"
+                hour = int(match.group("hour"))
+                minute = int(match.group("minute"))
+            else:
+                parts = raw.split()
+                pair = normalize_otc_pair_input(parts[0])
+                hour, minute = map(int, parts[1].split(":"))
+
+            entry_dt = otc_list_entry_datetime(hour, minute)
+            await update.message.reply_text(
+                "🕯️ فحص شمعة OTC\n\n" + get_otc_candle_debug_for_pair_time(pair, entry_dt.timestamp()),
+                reply_markup=admin_otc_stats_keyboard
+            )
+        except Exception:
+            await update.message.reply_text(
+                "اكتب الزوج والوقت بهذا الشكل:\nUSD/BDT (OTC) 15:53",
+                reply_markup=admin_otc_stats_keyboard
+            )
+        return
+
     # ===== Common buttons =====
     if text == "🔙 رجوع":
-        if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message", "otc_list_waiting_text", "otc_pair_diagnostics_waiting"}:
+        if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message", "otc_list_waiting_text", "otc_pair_diagnostics_waiting", "otc_candle_diagnostics_waiting"}:
             context.user_data["step"] = None
             await update.message.reply_text("تم الرجوع.", reply_markup=admin_main_keyboard)
             return
@@ -5212,6 +5305,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["step"] = "otc_pair_diagnostics_waiting"
                 await update.message.reply_text(
                     "🔎 أرسل اسم الزوج لفحص بياناته، مثال:\nUSD/BRL (OTC)",
+                    reply_markup=admin_otc_stats_keyboard
+                )
+                return
+
+            if text == "🕯️ فحص شمعة OTC":
+                context.user_data["step"] = "otc_candle_diagnostics_waiting"
+                await update.message.reply_text(
+                    "🕯️ أرسل الزوج والوقت لفحص الشمعة، مثال:\nUSD/BDT (OTC) 15:53",
                     reply_markup=admin_otc_stats_keyboard
                 )
                 return
