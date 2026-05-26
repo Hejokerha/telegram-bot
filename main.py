@@ -67,6 +67,8 @@ OTC_LIVE_PAIR_LOSS_LIMIT = int(os.getenv("OTC_LIVE_PAIR_LOSS_LIMIT", "2"))
 OTC_LIVE_PAIR_COOLDOWN_MINUTES = int(os.getenv("OTC_LIVE_PAIR_COOLDOWN_MINUTES", "30"))
 OTC_LIVE_CAUTION_LOOKBACK = int(os.getenv("OTC_LIVE_CAUTION_LOOKBACK", "15"))
 OTC_LIVE_CAUTION_MIN_QUALITY_BOOST = int(os.getenv("OTC_LIVE_CAUTION_MIN_QUALITY_BOOST", "8"))
+OTC_LIST_NO_DATA_RETRY_SECONDS = int(os.getenv("OTC_LIST_NO_DATA_RETRY_SECONDS", "15"))
+OTC_LIST_NO_DATA_MAX_RETRIES = int(os.getenv("OTC_LIST_NO_DATA_MAX_RETRIES", "6"))
 OTC_LIVE_SMART_MARTINGALE_ENABLED = os.getenv("OTC_LIVE_SMART_MARTINGALE_ENABLED", "true").lower() == "true"
 OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE = int(os.getenv("OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE", "8"))
 OTC_LIVE_MARTINGALE_ADVICE_CHECK_SECONDS = [12, 8, 5, 3]
@@ -2465,16 +2467,46 @@ async def evaluate_single_otc_list_trade_job(context: ContextTypes.DEFAULT_TYPE)
     admin_id = int(data.get("admin_id"))
     list_id = str(data.get("list_id"))
     index = int(data.get("index"))
+    retry = int(data.get("retry", 0) or 0)
     trade = dict(data.get("trade") or {})
 
     try:
         item = evaluate_otc_list_trade(trade)
         item["index"] = index
         item["evaluated_at"] = now_iso()
+        item["retry"] = retry
+
+        if item.get("result") == "no_data" and retry < OTC_LIST_NO_DATA_MAX_RETRIES:
+            logger.warning(
+                "OTC list trade No Data, retry scheduled | admin=%s | list=%s | index=%s | pair=%s | time=%02d:%02d | retry=%s/%s",
+                admin_id,
+                list_id,
+                index,
+                trade.get("pair"),
+                int(trade.get("hour", 0)),
+                int(trade.get("minute", 0)),
+                retry + 1,
+                OTC_LIST_NO_DATA_MAX_RETRIES,
+            )
+
+            context.job_queue.run_once(
+                evaluate_single_otc_list_trade_job,
+                when=OTC_LIST_NO_DATA_RETRY_SECONDS,
+                data={
+                    "admin_id": admin_id,
+                    "list_id": list_id,
+                    "index": index,
+                    "trade": trade,
+                    "retry": retry + 1,
+                },
+                name=f"otc_list_trade_retry_{admin_id}_{list_id}_{index}_{retry + 1}",
+            )
+            return
+
         save_otc_list_trade_result(admin_id, list_id, index, item)
 
         logger.info(
-            "OTC list trade evaluated | admin=%s | list=%s | index=%s | pair=%s | time=%02d:%02d | result=%s",
+            "OTC list trade evaluated | admin=%s | list=%s | index=%s | pair=%s | time=%02d:%02d | result=%s | retry=%s",
             admin_id,
             list_id,
             index,
@@ -2482,28 +2514,62 @@ async def evaluate_single_otc_list_trade_job(context: ContextTypes.DEFAULT_TYPE)
             int(item.get("hour", 0)),
             int(item.get("minute", 0)),
             item.get("result"),
+            retry,
         )
     except Exception as e:
         logger.exception("Could not evaluate OTC list trade job: %s", e)
-
 
 async def finalize_otc_list_results_job(context: ContextTypes.DEFAULT_TYPE):
     data = dict(context.job.data or {})
     admin_id = int(data.get("admin_id"))
     list_id = str(data.get("list_id"))
+    finalize_retry = int(data.get("finalize_retry", 0) or 0)
 
     try:
         job = get_otc_list_job(admin_id, list_id)
         trades = job.get("trades") or []
         results_raw = job.get("results") or {}
 
+        # إذا لسه في صفقات لم تُحفظ بسبب retries، انتظر قليلًا قبل التجميع النهائي.
+        saved_count = len(results_raw) if isinstance(results_raw, dict) else 0
+        if saved_count < len(trades) and finalize_retry < OTC_LIST_NO_DATA_MAX_RETRIES:
+            logger.warning(
+                "OTC list finalizer waiting for pending results | admin=%s | list=%s | saved=%s/%s | retry=%s",
+                admin_id,
+                list_id,
+                saved_count,
+                len(trades),
+                finalize_retry + 1,
+            )
+
+            context.job_queue.run_once(
+                finalize_otc_list_results_job,
+                when=OTC_LIST_NO_DATA_RETRY_SECONDS,
+                data={
+                    "admin_id": admin_id,
+                    "list_id": list_id,
+                    "finalize_retry": finalize_retry + 1,
+                },
+                name=f"otc_list_finalize_retry_{admin_id}_{list_id}_{finalize_retry + 1}",
+            )
+            return
+
         items = []
         for idx, trade in enumerate(trades):
             saved = results_raw.get(str(idx)) if isinstance(results_raw, dict) else None
+
             if isinstance(saved, dict):
+                # إذا محفوظة No Data، نجرب مرة أخيرة عند العرض النهائي لأن البيانات قد تكون وصلت بعد الحفظ.
+                if saved.get("result") == "no_data":
+                    fresh = evaluate_otc_list_trade(trade)
+                    fresh["index"] = idx
+                    fresh["evaluated_at"] = now_iso()
+                    fresh["retry"] = safe_int(saved.get("retry"), 0) + 1
+                    if fresh.get("result") != "no_data":
+                        saved = fresh
+                        save_otc_list_trade_result(admin_id, list_id, idx, saved)
                 items.append(saved)
             else:
-                # fallback أخير إذا job الصفقة لم يعمل لأي سبب
                 item = evaluate_otc_list_trade(trade)
                 item["index"] = idx
                 item["evaluated_at"] = now_iso()
@@ -2533,346 +2599,6 @@ async def finalize_otc_list_results_job(context: ContextTypes.DEFAULT_TYPE):
 
     except Exception as e:
         logger.exception("Could not finalize OTC list results: %s", e)
-
-
-async def notify_otc_list_results_ready(context: ContextTypes.DEFAULT_TYPE):
-    # Deprecated path: kept for compatibility. New system uses finalize_otc_list_results_job.
-    await finalize_otc_list_results_job(context)
-
-# ===== OTC LIVE ADMIN STATS TOOLS =====
-def otc_live_stats_control_ref():
-    return system_ref().child("otc_live_channel_stats_control")
-
-
-def get_otc_live_stats_reset_at() -> str:
-    try:
-        data = otc_live_stats_control_ref().get() or {}
-        return str(data.get("reset_at", "") or "")
-    except Exception:
-        return ""
-
-
-def reset_otc_live_stats_marker():
-    try:
-        otc_live_stats_control_ref().update({
-            "reset_at": now_iso(),
-            "reset_by_admin": True,
-        })
-    except Exception as e:
-        logger.exception("Could not reset OTC live stats marker: %s", e)
-
-
-def get_otc_live_trades(day_key: str | None = None, after_reset: bool = True, limit: int | None = None) -> list[dict]:
-    try:
-        day_key = day_key or get_otc_live_day_key()
-        reset_at = get_otc_live_stats_reset_at() if after_reset else ""
-
-        raw = otc_live_stats_ref().child(day_key).child("trades").get() or {}
-        rows = []
-        if isinstance(raw, dict):
-            for trade_id, trade in raw.items():
-                if isinstance(trade, dict):
-                    item = dict(trade)
-                    item["_id"] = trade_id
-                    created_at = str(item.get("created_at", "") or "")
-                    if reset_at and created_at and created_at < reset_at:
-                        continue
-                    rows.append(item)
-
-        rows.sort(key=lambda x: str(x.get("created_at", "")))
-        if limit and int(limit) > 0:
-            rows = rows[-int(limit):]
-        return rows
-    except Exception as e:
-        logger.exception("Could not read OTC live trades: %s", e)
-        return []
-
-
-def calculate_otc_live_trade_stats(trades: list[dict]) -> dict:
-    total = len(trades)
-    wins = 0
-    direct_wins = 0
-    losses = 0
-    unknown = 0
-    martingale_wins = 0
-    net_units = 0.0
-    gross_win_units = 0.0
-    gross_loss_units = 0.0
-    pair_stats = {}
-
-    for trade in trades:
-        result = str(trade.get("result", "unknown"))
-        step = safe_int(trade.get("martingale_step"), 0)
-        payout = safe_int(trade.get("payout"), 80)
-
-        units = trade.get("units")
-        if units is None:
-            units = otc_live_trade_units(result, step, payout)
-        else:
-            try:
-                units = float(units)
-            except Exception:
-                units = otc_live_trade_units(result, step, payout)
-
-        pair = str(trade.get("pair", "غير معروف"))
-        pair_info = pair_stats.setdefault(pair, {"total": 0, "wins": 0, "losses": 0, "unknown": 0, "units": 0.0})
-        pair_info["total"] += 1
-        pair_info["units"] += float(units)
-
-        if result == "win":
-            wins += 1
-            pair_info["wins"] += 1
-            if step == 1:
-                martingale_wins += 1
-            else:
-                direct_wins += 1
-        elif result == "loss":
-            losses += 1
-            pair_info["losses"] += 1
-        else:
-            unknown += 1
-            pair_info["unknown"] += 1
-
-        net_units += float(units)
-        if units > 0:
-            gross_win_units += float(units)
-        elif units < 0:
-            gross_loss_units += float(units)
-
-    decided = wins + losses
-    win_rate = round((wins / decided) * 100, 1) if decided > 0 else 0
-    loss_rate = round((losses / decided) * 100, 1) if decided > 0 else 0
-    avg_units = round(net_units / decided, 3) if decided > 0 else 0
-
-    return {
-        "total": total,
-        "wins": wins,
-        "direct_wins": direct_wins,
-        "martingale_wins": martingale_wins,
-        "losses": losses,
-        "unknown": unknown,
-        "decided": decided,
-        "win_rate": win_rate,
-        "loss_rate": loss_rate,
-        "net_units": round(net_units, 2),
-        "gross_win_units": round(gross_win_units, 2),
-        "gross_loss_units": round(gross_loss_units, 2),
-        "avg_units": avg_units,
-        "pair_stats": pair_stats,
-    }
-
-
-def build_otc_live_stats_from_trades(trades: list[dict], title: str, day_key: str | None = None, include_advice: bool = False) -> str:
-    stats = calculate_otc_live_trade_stats(trades)
-
-    if stats["net_units"] > 0:
-        money_status = "🟢 رابح"
-    elif stats["net_units"] < 0:
-        money_status = "🔴 خاسر"
-    else:
-        money_status = "⚪ تعادل"
-
-    reset_at = get_otc_live_stats_reset_at()
-    reset_line = f"🧹 من بعد التصفير: {reset_at}\n" if reset_at else ""
-
-    best_pair_line = ""
-    worst_pair_line = ""
-    if stats["pair_stats"]:
-        sorted_pairs = sorted(stats["pair_stats"].items(), key=lambda kv: kv[1]["units"], reverse=True)
-        best_pair, best_data = sorted_pairs[0]
-        worst_pair, worst_data = sorted_pairs[-1]
-        best_pair_line = f"🏆 أفضل زوج: {best_pair} | {round(best_data['units'], 2)} وحدة\n"
-        worst_pair_line = f"⚠️ أضعف زوج: {worst_pair} | {round(worst_data['units'], 2)} وحدة\n"
-
-    advice = ""
-    if include_advice:
-        advice = build_otc_live_bot_advice(stats)
-
-    return (
-        "╔══════════════╗\n"
-        f"   {title}\n"
-        "╚══════════════╝\n\n"
-        f"📅 التاريخ: {day_key or get_otc_live_day_key()}\n"
-        f"{reset_line}"
-        f"📌 عدد الصفقات: {stats['total']}\n"
-        f"✅ ربح مباشر: {stats['direct_wins']}\n"
-        f"✅¹ ربح بالمضاعفة: {stats['martingale_wins']}\n"
-        f"💔 خسارة نهائية: {stats['losses']}\n"
-        f"⚖️ دوجي: {stats['unknown']}\n\n"
-        f"📈 نسبة نجاح الإشارات: {stats['win_rate']}%\n"
-        f"📉 نسبة الخسارة النهائية: {stats['loss_rate']}%\n\n"
-        f"💰 صافي الوحدات: {stats['net_units']}\n"
-        f"➕ وحدات رابحة: {stats['gross_win_units']}\n"
-        f"➖ وحدات خاسرة: {stats['gross_loss_units']}\n"
-        f"📊 متوسط الوحدة/صفقة: {stats['avg_units']}\n"
-        f"💵 الأداء المالي: {money_status}\n\n"
-        f"{best_pair_line}"
-        f"{worst_pair_line}"
-        f"{advice}"
-    )
-
-
-def build_otc_live_bot_advice(stats: dict) -> str:
-    advice_lines = ["\n🤖 نصائح البوت بناءً على الإحصائيات:"]
-
-    if stats["total"] < 20:
-        advice_lines.append("• العينة قليلة، انتظر 20 صفقة على الأقل قبل الحكم.")
-    else:
-        if stats["net_units"] > 0:
-            advice_lines.append("• الأداء المالي موجب، لا تغيّر الإعدادات بسرعة.")
-        else:
-            advice_lines.append("• الأداء المالي سلبي، راقب الخسائر النهائية قبل زيادة الصفقات.")
-
-        if stats["loss_rate"] >= 25:
-            advice_lines.append("• الخسارة النهائية مرتفعة، الأفضل تفعيل Safety Pause لاحقًا.")
-        elif stats["loss_rate"] <= 15:
-            advice_lines.append("• الخسارة النهائية منخفضة نسبيًا، الوضع جيد حاليًا.")
-
-        if stats["martingale_wins"] > stats["direct_wins"]:
-            advice_lines.append("• الربح يعتمد كثيرًا على المضاعفة، هذا إنذار خطر.")
-        elif stats["direct_wins"] >= stats["martingale_wins"]:
-            advice_lines.append("• الربح المباشر جيد مقارنة بالمضاعفة.")
-
-    pair_stats = stats.get("pair_stats") or {}
-    if pair_stats:
-        sorted_pairs = sorted(pair_stats.items(), key=lambda kv: kv[1]["units"])
-        worst_pair, worst_data = sorted_pairs[0]
-        if worst_data["units"] < 0:
-            advice_lines.append(f"• أضعف زوج حاليًا: {worst_pair}، راقبه أو أوقفه مؤقتًا إذا تكررت خسائره.")
-
-    return "\n".join(advice_lines) + "\n"
-
-async def delete_martingale_advice_if_direct_win(context: ContextTypes.DEFAULT_TYPE, signal: dict, result: str, martingale_step: int):
-    """إذا تم إرسال تنبيه مضاعفة مبكرًا ثم ربحت الصفقة مباشر، نحذف التنبيه لتنظيف القناة."""
-    try:
-        if result != "win" or int(martingale_step or 0) != 0:
-            return
-
-        advice_message_id = otc_live_channel_state.get("martingale_advice_message_id")
-        advice_for_message_id = otc_live_channel_state.get("martingale_for_message_id")
-        signal_message_id = signal.get("message_id")
-
-        if not advice_message_id:
-            return
-
-        if advice_for_message_id and signal_message_id and advice_for_message_id != signal_message_id:
-            return
-
-        await context.bot.delete_message(
-            chat_id=OTC_LIVE_CHANNEL_ID,
-            message_id=int(advice_message_id)
-        )
-
-        logger.info(
-            "Deleted early martingale advice because trade won directly | pair=%s | advice_message_id=%s",
-            signal.get("pair"),
-            advice_message_id,
-        )
-
-        otc_live_channel_state["martingale_advice_message_id"] = None
-
-    except Exception as e:
-        logger.warning("Could not delete martingale advice message: %s", e)
-
-
-
-
-
-# ===== OTC FEED DIAGNOSTICS =====
-def get_otc_feed_diagnostics_for_pair(pair: str) -> str:
-    try:
-        possible_symbols = get_otc_possible_symbols_for_pair(pair) if "get_otc_possible_symbols_for_pair" in globals() else []
-        if not possible_symbols:
-            mapped = OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
-            if mapped:
-                possible_symbols = [mapped]
-
-        if not possible_symbols:
-            return (
-                "🔎 فحص بيانات زوج OTC\n\n"
-                f"الزوج: {pair}\n"
-                "الحالة: ❌ الزوج غير موجود في خريطة الرموز."
-            )
-
-        lines = [
-            "🔎 فحص بيانات زوج OTC",
-            "",
-            f"الزوج: {pair}",
-            f"الرموز المحتملة: {', '.join(possible_symbols)}",
-            "",
-        ]
-
-        now_ts = time_module.time()
-        any_live = False
-
-        with quotex_otc_feed.lock:
-            for symbol in possible_symbols:
-                prices = list(quotex_otc_feed.prices.get(symbol, []))
-                candles_dict = dict(quotex_otc_feed.candles.get(symbol, {}) or {})
-
-                tick_count = len(prices)
-                candle_count = len(candles_dict)
-
-                last_tick_line = "لا يوجد"
-                last_tick_age = None
-
-                if prices:
-                    try:
-                        last_ts = float(prices[-1][0])
-                        last_price = prices[-1][1]
-                        last_tick_age = round(now_ts - last_ts, 1)
-                        last_tick_dt = datetime.fromtimestamp(last_ts, tz=UTC).astimezone(UTC_PLUS_3)
-                        last_tick_line = f"{last_tick_dt.strftime('%H:%M:%S')} | السعر: {last_price} | منذ {last_tick_age}s"
-                        if last_tick_age <= 20:
-                            any_live = True
-                    except Exception:
-                        pass
-
-                last_candle_line = "لا يوجد"
-                if candles_dict:
-                    try:
-                        latest_bucket = max(candles_dict.keys())
-                        latest_candle = candles_dict.get(latest_bucket) or {}
-                        latest_dt = datetime.fromtimestamp(float(latest_bucket), tz=UTC).astimezone(UTC_PLUS_3)
-                        last_candle_line = (
-                            f"{latest_dt.strftime('%H:%M')} | "
-                            f"O:{latest_candle.get('open')} C:{latest_candle.get('close')}"
-                        )
-                    except Exception:
-                        pass
-
-                status = "✅ شغال" if last_tick_age is not None and last_tick_age <= 20 else "⚠️ لا توجد ticks حديثة"
-
-                lines.extend([
-                    f"• الرمز: {symbol}",
-                    f"  الحالة: {status}",
-                    f"  عدد ticks بالكاش: {tick_count}",
-                    f"  عدد الشموع بالكاش: {candle_count}",
-                    f"  آخر tick: {last_tick_line}",
-                    f"  آخر شمعة: {last_candle_line}",
-                    "",
-                ])
-
-        if any_live:
-            lines.append("الخلاصة: البيانات واصلة لهذا الزوج ✅")
-        else:
-            lines.append("الخلاصة: لا توجد بيانات حديثة لهذا الزوج ❌")
-
-        return "\n".join(lines)
-
-    except Exception as e:
-        logger.exception("OTC feed diagnostics error: %s", e)
-        return "تعذر فحص بيانات الزوج بسبب خطأ داخلي."
-
-
-def normalize_otc_pair_input(text_value: str) -> str:
-    raw = (text_value or "").strip().upper()
-    raw = raw.replace(" OTC", " (OTC)")
-    if "(OTC)" not in raw:
-        raw = raw + " (OTC)"
-    raw = raw.replace("  ", " ")
-    return raw
-
 
 # ===== OTC LIVE LOSS LEARNING SYSTEM =====
 def otc_live_learning_ref():
