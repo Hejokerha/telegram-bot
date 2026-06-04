@@ -342,10 +342,9 @@ admin_main_keyboard = ReplyKeyboardMarkup(
 
 admin_channels_keyboard = ReplyKeyboardMarkup(
     [
-        ["🌍 تشغيل نشر العالمي", "🌍 إيقاف نشر العالمي"],
         ["⚡ تشغيل نشر OTC", "⚡ إيقاف نشر OTC"],
         ["🔥 تشغيل OTC مباشر", "🔥 إيقاف OTC مباشر"],
-        ["📊 حالة النشر", "📊 إحصائيات قناة OTC"],
+        ["📊 إحصائيات قناة OTC"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -354,10 +353,7 @@ admin_channels_keyboard = ReplyKeyboardMarkup(
 admin_otc_stats_keyboard = ReplyKeyboardMarkup(
     [
         ["📈 إحصائيات OTC مباشر", "🔢 إحصائيات آخر عدد صفقات"],
-        ["🤖 تحليل ونصائح البوت", "🧹 تصفير إحصائيات OTC"],
-        ["🧠 حالة تعلم OTC Live", "🔎 فحص بيانات زوج OTC"],
-        ["🌐 أزواج OTC الديناميكية"],
-        ["🕯️ فحص شمعة OTC"],
+        ["🧹 تصفير إحصائيات OTC"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["⬅️ رجوع"],
     ],
@@ -515,16 +511,13 @@ def set_channel_publish_enabled(channel_key: str, enabled: bool):
 
 def format_channel_publish_status() -> str:
     settings = get_channel_publish_settings()
-    global_status = "شغال ✅" if settings.get("global", True) else "متوقف ⛔"
     otc_status = "شغال ✅" if settings.get("otc", True) else "متوقف ⛔"
     otc_live_status = "شغال ✅" if settings.get("otc_live", True) else "متوقف ⛔"
     return (
         "📊 حالة نشر القنوات\n\n"
-        f"🌍 قناة السوق العالمي: {global_status}\n"
         f"⚡ قناة OTC الزمني: {otc_status}\n"
         f"🔥 قناة OTC المباشر: {otc_live_status}"
     )
-
 
 # ===== Helpers =====
 def now_utc():
@@ -3101,6 +3094,8 @@ def calculate_otc_live_trade_stats(trades: list[dict]) -> dict:
     gross_win_units = 0.0
     gross_loss_units = 0.0
     pair_stats = {}
+    mg_same = {"total": 0, "wins": 0, "losses": 0}
+    mg_opposite = {"total": 0, "wins": 0, "losses": 0}
 
     for trade in trades:
         result = str(trade.get("result", "unknown"))
@@ -3120,6 +3115,21 @@ def calculate_otc_live_trade_stats(trades: list[dict]) -> dict:
         pair_info = pair_stats.setdefault(pair, {"total": 0, "wins": 0, "losses": 0, "unknown": 0, "units": 0.0})
         pair_info["total"] += 1
         pair_info["units"] += float(units)
+
+        if step == 1:
+            decision_type = str(trade.get("martingale_decision_type") or "").lower()
+            if decision_type == "same":
+                mg_same["total"] += 1
+                if result == "win":
+                    mg_same["wins"] += 1
+                elif result == "loss":
+                    mg_same["losses"] += 1
+            elif decision_type in {"opposite", "reverse"}:
+                mg_opposite["total"] += 1
+                if result == "win":
+                    mg_opposite["wins"] += 1
+                elif result == "loss":
+                    mg_opposite["losses"] += 1
 
         if result == "win":
             wins += 1
@@ -3195,6 +3205,14 @@ def build_otc_live_bot_advice(stats: dict) -> str:
     return "\n".join(advice_lines) + "\n"
 
 
+
+def get_otc_live_current_direction_mode_label() -> str:
+    try:
+        return "REVERSE 🔁" if OTC_LIVE_REVERSE_AUTOPUBLISH else "NORMAL ➡️"
+    except Exception:
+        return "غير معروف"
+
+
 def build_otc_live_stats_from_trades(trades: list[dict], title: str, day_key: str | None = None, include_advice: bool = False) -> str:
     stats = calculate_otc_live_trade_stats(trades)
 
@@ -3216,6 +3234,18 @@ def build_otc_live_stats_from_trades(trades: list[dict], title: str, day_key: st
         worst_pair, worst_data = sorted_pairs[-1]
         best_pair_line = f"🏆 أفضل زوج: {best_pair} | {round(best_data['units'], 2)} وحدة\n"
         worst_pair_line = f"⚠️ أضعف زوج: {worst_pair} | {round(worst_data['units'], 2)} وحدة\n"
+
+    mg_same = stats.get("mg_same", {"total": 0, "wins": 0, "losses": 0})
+    mg_opposite = stats.get("mg_opposite", {"total": 0, "wins": 0, "losses": 0})
+
+    def _rate(w, total):
+        return round((int(w) / max(1, int(total))) * 100, 1) if int(total) > 0 else 0
+
+    smart_mg_line = (
+        "🧠 إحصائيات المضاعفة الذكية:\n"
+        f"↔️ بنفس اتجاه الصفقة: {mg_same.get('wins', 0)}W / {mg_same.get('losses', 0)}L | {_rate(mg_same.get('wins', 0), mg_same.get('total', 0))}%\n"
+        f"🔁 بعكس اتجاه الصفقة: {mg_opposite.get('wins', 0)}W / {mg_opposite.get('losses', 0)}L | {_rate(mg_opposite.get('wins', 0), mg_opposite.get('total', 0))}%\n\n"
+    )
 
     advice = build_otc_live_bot_advice(stats) if include_advice else ""
 
@@ -3239,6 +3269,7 @@ def build_otc_live_stats_from_trades(trades: list[dict], title: str, day_key: st
         f"💵 الأداء المالي: {money_status}\n\n"
         f"{best_pair_line}"
         f"{worst_pair_line}"
+        f"{smart_mg_line}"
         f"{advice}"
     )
 
@@ -3309,6 +3340,9 @@ def record_otc_live_channel_result(signal: dict, result: str):
             "result": result,
             "martingale_step": martingale_step,
             "units": units,
+            "martingale_decision_type": signal.get("martingale_decision_type"),
+            "martingale_direction": signal.get("martingale_direction"),
+            "martingale_base_direction": signal.get("martingale_base_direction"),
             "created_at": now_iso(),
         })
     except Exception as e:
@@ -3347,7 +3381,8 @@ def build_otc_live_stats_message(day_key: str | None = None) -> str:
         "\n🧪 اختبار الاتجاه أول شمعة:\n"
         f"➡️ NORMAL: {normal_w}W / {normal_l}L | {normal_rate}%\n"
         f"🔁 REVERSE: {reverse_w}W / {reverse_l}L | {reverse_rate}%\n"
-        f"🏆 الأفضل حاليًا: {best_mode}\n\n"
+        f"🏆 الأفضل حاليًا: {best_mode}\n"
+        f"🧠 أسلوب البوت الحالي: {get_otc_live_current_direction_mode_label()}\n\n"
         "@coach_WAEL_trading\n"
         "@sttrade_helper_bot"
     )
@@ -5822,15 +5857,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if step == "admin_channel_controls":
-            if text == "🌍 تشغيل نشر العالمي":
-                set_channel_publish_enabled("global", True)
-                await update.message.reply_text("✅ تم تشغيل النشر في قناة السوق العالمي", reply_markup=admin_channels_keyboard)
-                return
-
-            if text == "🌍 إيقاف نشر العالمي":
-                set_channel_publish_enabled("global", False)
-                await update.message.reply_text("⛔ تم إيقاف النشر في قناة السوق العالمي", reply_markup=admin_channels_keyboard)
-                return
 
             if text == "⚡ تشغيل نشر OTC":
                 set_channel_publish_enabled("otc", True)
@@ -6328,13 +6354,7 @@ def main():
 
     # تشغيل بث Quotex OTC الحقيقي بالخلفية
     start_quotex_otc_feed()
-
-    # Auto publish global market
-    app.job_queue.run_repeating(
-        auto_publish_real_market,
-        interval=120,
-        first=15
-    )
+    # Auto publish global market disabled: global channel removed from bot.
 
     # Auto publish OTC live direct trades to the new private channel
     app.job_queue.run_repeating(
