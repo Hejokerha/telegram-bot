@@ -1170,58 +1170,101 @@ for _pair_key, _mapped_symbol in OTC_PAIR_TO_QUOTEX_SYMBOL.items():
 quotex_otc_feed = QuotexOTCLiveFeed(OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS)
 
 
+
+FIAT_CURRENCY_CODES = {
+    # Majors
+    "USD", "EUR", "GBP", "JPY", "CHF", "CAD", "AUD", "NZD",
+    # Platform/common OTC fiat currencies
+    "BRL", "ARS", "BDT", "NGN", "PKR", "DZD", "EGP", "IDR", "MXN", "PHP",
+    "INR", "ZAR", "COP", "CAD", "CHF",
+    # Extra ISO fiat currencies for safety
+    "AED", "AFN", "ALL", "AMD", "ANG", "AOA", "AWG", "AZN",
+    "BAM", "BBD", "BGN", "BHD", "BIF", "BMD", "BND", "BOB", "BSD", "BTN", "BWP", "BYN", "BZD",
+    "CDF", "CLP", "CNY", "CRC", "CUP", "CVE", "CZK",
+    "DJF", "DKK", "DOP",
+    "ERN", "ETB",
+    "FJD", "FKP",
+    "GEL", "GHS", "GIP", "GMD", "GNF", "GTQ", "GYD",
+    "HKD", "HNL", "HTG", "HUF",
+    "ILS", "IQD", "IRR", "ISK",
+    "JMD", "JOD",
+    "KES", "KGS", "KHR", "KMF", "KRW", "KWD", "KYD", "KZT",
+    "LAK", "LBP", "LKR", "LRD", "LSL", "LYD",
+    "MAD", "MDL", "MGA", "MKD", "MMK", "MNT", "MOP", "MRU", "MUR", "MVR", "MWK", "MYR", "MZN",
+    "NAD", "NIO", "NOK", "NPR",
+    "OMR",
+    "PAB", "PEN", "PGK", "PLN", "PYG",
+    "QAR",
+    "RON", "RSD", "RUB", "RWF",
+    "SAR", "SBD", "SCR", "SDG", "SEK", "SGD", "SHP", "SLE", "SOS", "SRD", "SSP", "STN", "SYP", "SZL",
+    "THB", "TJS", "TMT", "TND", "TOP", "TRY", "TTD", "TWD", "TZS",
+    "UAH", "UGX", "UYU", "UZS",
+    "VES", "VND", "VUV",
+    "WST",
+    "XAF", "XCD", "XOF", "XPF",
+    "YER",
+    "ZMW", "ZWL",
+}
+
+
 def is_valid_otc_currency_pair_name(name: str) -> bool:
-    """فلتر أزواج العملات فقط.
-    يقبل:
-    - USD/BRL (OTC)
-    - USD/BRL
-    - USDBRL_otc
-    - BRLUSD_otc
-    ويرفض: Silver, Axie, stocks, crypto symbols, commodities.
+    """فلتر قسم Currencies فقط.
+    لا يكفي أن يكون الشكل AAA/BBB، بل يجب أن يكون الطرفان من عملات FIAT حقيقية.
+    هذا يمنع USD/DOT و USD/AVA وأي كريبتو أو سهم أو معدن.
     """
     try:
-        value = str(name or "").strip().upper()
-        value = value.replace("  ", " ")
-
+        value = str(name or "").strip().upper().replace("  ", " ")
         if not value:
             return False
 
-        # الشكل الظاهر: USD/BRL أو USD/BRL (OTC)
-        if re.fullmatch(r"[A-Z]{3}/[A-Z]{3}( \(OTC\))?", value):
-            return True
+        base = quote = None
 
-        # الشكل الداخلي: USDBRL_otc أو BRLUSD_otc
-        if re.fullmatch(r"[A-Z]{6}_OTC", value):
-            return True
+        m = re.fullmatch(r"([A-Z]{3})/([A-Z]{3})( \(OTC\))?", value)
+        if m:
+            base, quote = m.group(1), m.group(2)
 
-        return False
+        if base is None:
+            m = re.fullmatch(r"([A-Z]{3})([A-Z]{3})_OTC", value)
+            if m:
+                base, quote = m.group(1), m.group(2)
+
+        if not base or not quote:
+            return False
+
+        return base in FIAT_CURRENCY_CODES and quote in FIAT_CURRENCY_CODES
+
     except Exception:
         return False
 
 
 def normalize_otc_currency_pair_name(name: str, symbol: str | None = None) -> str | None:
-    """توحيد اسم الزوج ليظهر دائمًا بشكل USD/BRL (OTC) قدر الإمكان."""
+    """توحيد اسم زوج العملات فقط ليظهر بشكل AAA/BBB (OTC)."""
     try:
         raw = str(name or "").strip().upper().replace("  ", " ")
 
-        m = re.fullmatch(r"([A-Z]{3})/([A-Z]{3})( \(OTC\))?", raw)
+        m = re.fullmatch(r"([A-Z]{3})/([A-Z]{3})( \\(OTC\\))?", raw)
         if m:
-            return f"{m.group(1)}/{m.group(2)} (OTC)"
+            base, quote = m.group(1), m.group(2)
+            candidate = f"{base}/{quote} (OTC)"
+            return candidate if is_valid_otc_currency_pair_name(candidate) else None
 
-        sym = str(symbol or "").strip().upper()
-        sym = sym.replace("_OTC", "")
+        sym = str(symbol or "").strip().upper().replace("_OTC", "")
         if re.fullmatch(r"[A-Z]{6}", sym):
             a = sym[:3]
             b = sym[3:]
 
-            # إذا الرمز الداخلي مقلوب مثل BRLUSD، نعرضه USD/BRL عندما أحد الطرفين USD.
+            # إذا كان أحد الطرفين USD، نعرض USD أولًا لتطابق أسماء المنصة مثل USD/BRL.
             if b == "USD":
-                return f"{b}/{a} (OTC)"
-            return f"{a}/{b} (OTC)"
+                candidate = f"{b}/{a} (OTC)"
+            else:
+                candidate = f"{a}/{b} (OTC)"
+
+            return candidate if is_valid_otc_currency_pair_name(candidate) else None
 
         return None
     except Exception:
         return None
+
 
 
 def get_otc_analysis_pair_map() -> dict:
@@ -1256,6 +1299,14 @@ def get_otc_analysis_pair_map() -> dict:
 
     except Exception as e:
         logger.exception("Dynamic OTC pair universe error: %s", e)
+
+    # تنظيف نهائي: لا نسمح إلا بأزواج Currencies الحقيقية.
+    pair_map = {
+        normalize_otc_currency_pair_name(pair, symbol): symbol
+        for pair, symbol in pair_map.items()
+        if normalize_otc_currency_pair_name(pair, symbol)
+        and is_valid_otc_currency_pair_name(normalize_otc_currency_pair_name(pair, symbol))
+    }
 
     return pair_map
 
