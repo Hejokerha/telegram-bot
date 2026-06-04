@@ -52,6 +52,10 @@ OTC_LIVE_CHANNEL_ID = int(os.getenv("OTC_LIVE_CHANNEL_ID", "-1003880574173"))
 OTC_LIVE_CHANNEL_ENABLED = os.getenv("OTC_LIVE_CHANNEL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 OTC_LIVE_MIN_QUALITY = int(os.getenv("OTC_LIVE_MIN_QUALITY", "65"))
 OTC_LIVE_MIN_PAYOUT = int(os.getenv("OTC_LIVE_MIN_PAYOUT", "80"))
+OTC_LIVE_DYNAMIC_PAIRS_ENABLED = os.getenv("OTC_LIVE_DYNAMIC_PAIRS_ENABLED", "true").lower() == "true"
+OTC_LIVE_DYNAMIC_MIN_PAYOUT = int(os.getenv("OTC_LIVE_DYNAMIC_MIN_PAYOUT", str(OTC_LIVE_MIN_PAYOUT)))
+OTC_LIVE_MAX_DYNAMIC_PAIRS = int(os.getenv("OTC_LIVE_MAX_DYNAMIC_PAIRS", "80"))
+OTC_LIVE_TOP_CANDIDATES_POOL = int(os.getenv("OTC_LIVE_TOP_CANDIDATES_POOL", "5"))
 OTC_LIVE_REVERSE_AUTOPUBLISH = os.getenv("OTC_LIVE_REVERSE_AUTOPUBLISH", "true").lower() == "true"
 OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS", "3"))
 OTC_LIVE_MIN_ENTRY_LEAD_SECONDS = int(os.getenv("OTC_LIVE_MIN_ENTRY_LEAD_SECONDS", "10"))
@@ -823,6 +827,67 @@ class QuotexOTCLiveFeed:
         self.instruments = {}
         self.thread = None
 
+    def add_symbol(self, symbol: str):
+        """إضافة رمز OTC جديد أثناء التشغيل والاشتراك به مباشرة إذا الاتصال مفتوح."""
+        try:
+            if not symbol:
+                return
+
+            with self.lock:
+                if symbol in self.symbols:
+                    return
+
+                self.symbols.append(symbol)
+                self.prices.setdefault(symbol, deque(maxlen=3000))
+                self.candles.setdefault(symbol, {})
+
+            logger.info("Dynamic OTC symbol added: %s", symbol)
+
+            if self.connected:
+                try:
+                    self._send_event("instruments/follow", symbol)
+                    logger.info("Dynamic OTC symbol followed: %s", symbol)
+                except Exception as e:
+                    logger.warning("Could not follow dynamic OTC symbol %s: %s", symbol, e)
+
+        except Exception as e:
+            logger.exception("Could not add dynamic OTC symbol: %s", e)
+
+    def get_dynamic_otc_pairs(self, min_payout: int | None = None) -> dict:
+        """يرجع خريطة name -> symbol للأزواج OTC المتاحة من instruments/list."""
+        min_payout = int(min_payout if min_payout is not None else OTC_LIVE_DYNAMIC_MIN_PAYOUT)
+
+        result = {}
+        try:
+            with self.lock:
+                instruments = dict(self.instruments or {})
+
+            for symbol, info in instruments.items():
+                if not isinstance(info, dict):
+                    continue
+
+                name = str(info.get("name") or "").strip()
+                payout = int(info.get("payout") or 0)
+                is_otc = bool(info.get("is_otc", False))
+
+                if not symbol or not symbol.endswith("_otc"):
+                    continue
+                if not is_otc:
+                    continue
+                if payout < min_payout:
+                    continue
+                if not name or "(OTC)" not in name:
+                    continue
+
+                result[name] = symbol
+
+            return result
+
+        except Exception as e:
+            logger.exception("Could not build dynamic OTC pairs: %s", e)
+            return result
+
+
     def start(self):
         if self.started:
             return
@@ -1100,6 +1165,51 @@ for _pair_key, _mapped_symbol in OTC_PAIR_TO_QUOTEX_SYMBOL.items():
 
 quotex_otc_feed = QuotexOTCLiveFeed(OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS)
 
+def get_otc_analysis_pair_map() -> dict:
+    """خريطة الأزواج التي يستخدمها OTC Live للتحليل.
+    إذا instruments/list أعطانا أزواج OTC كثيرة، نستخدمها.
+    إذا لم تصل البيانات بعد، نرجع للقائمة اليدوية القديمة.
+    """
+    pair_map = dict(OTC_PAIR_TO_QUOTEX_SYMBOL)
+
+    try:
+        if OTC_LIVE_DYNAMIC_PAIRS_ENABLED:
+            dynamic_pairs = quotex_otc_feed.get_dynamic_otc_pairs(OTC_LIVE_DYNAMIC_MIN_PAYOUT)
+            added = 0
+
+            for pair_name, symbol in dynamic_pairs.items():
+                if pair_name not in pair_map:
+                    pair_map[pair_name] = symbol
+                    added += 1
+
+                    # نتأكد أنه مشترك بالرمز حتى يبدأ جمع ticks.
+                    quotex_otc_feed.add_symbol(symbol)
+
+                    if len(pair_map) >= OTC_LIVE_MAX_DYNAMIC_PAIRS:
+                        break
+
+            if added:
+                logger.info("OTC dynamic pair universe added %s pairs | total=%s", added, len(pair_map))
+
+    except Exception as e:
+        logger.exception("Dynamic OTC pair universe error: %s", e)
+
+    return pair_map
+
+
+def get_otc_symbol_for_pair(pair: str) -> str | None:
+    """يرجع الرمز الداخلي للزوج من الخريطة الديناميكية أو اليدوية."""
+    try:
+        dynamic_map = get_otc_analysis_pair_map()
+        if pair in dynamic_map:
+            return dynamic_map[pair]
+    except Exception:
+        pass
+
+    return OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
+
+
+
 
 def start_quotex_otc_feed():
     try:
@@ -1109,7 +1219,7 @@ def start_quotex_otc_feed():
 
 
 def get_live_otc_direction(pair: str, fallback_dt: datetime | None = None) -> str:
-    symbol = OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
+    symbol = get_otc_symbol_for_pair(pair)
     if symbol:
         live_direction = quotex_otc_feed.direction(symbol)
         if live_direction in {"CALL", "PUT"}:
@@ -1118,7 +1228,7 @@ def get_live_otc_direction(pair: str, fallback_dt: datetime | None = None) -> st
 
 
 def get_live_otc_snapshot(pair: str) -> dict:
-    symbol = OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
+    symbol = get_otc_symbol_for_pair(pair)
     if not symbol:
         return {}
     return quotex_otc_feed.snapshot(symbol)
@@ -1131,7 +1241,9 @@ def analyze_best_live_otc_now() -> dict:
     candidates = []
     now_ts = time_module.time()
 
-    for pair, symbol in OTC_PAIR_TO_QUOTEX_SYMBOL.items():
+    pair_map = get_otc_analysis_pair_map()
+
+    for pair, symbol in pair_map.items():
         with quotex_otc_feed.lock:
             rows = list(quotex_otc_feed.prices.get(symbol, []))
             tick = dict(quotex_otc_feed.last_tick.get(symbol) or {})
@@ -1209,10 +1321,17 @@ def analyze_best_live_otc_now() -> dict:
             )
         }
 
-    ranked_candidates = sorted(candidates, key=lambda x: (x["score"], abs(x["change"])), reverse=True)
+    ranked_candidates = sorted(candidates, key=lambda x: (x["score"], abs(x["change"]), int(x.get("payout", 0) or 0)), reverse=True)
+
+    # بدل اختيار Top 1 دائمًا، نأخذ من أفضل عدة فرص لتقليل احتكار نفس الزوج للنشر.
+    top_pool = ranked_candidates[:max(1, int(OTC_LIVE_TOP_CANDIDATES_POOL))]
+    last_pair = otc_live_channel_state.get("last_pair") if "otc_live_channel_state" in globals() else None
 
     best = None
-    for candidate in ranked_candidates:
+    for candidate in top_pool:
+        if last_pair and candidate.get("pair") == last_pair and len(top_pool) > 1:
+            continue
+
         effective_direction = candidate.get("direction")
         if OTC_LIVE_REVERSE_AUTOPUBLISH:
             if effective_direction == "CALL":
@@ -1257,7 +1376,7 @@ def analyze_best_live_otc_now() -> dict:
         f"💵 السعر الحالي: {price_text}\n"
         f"📊 قوة الفرصة: {best['score']}%\n\n"
         "📌 سبب الاختيار:\n"
-        f"• تم فحص {len(candidates)} فرصة من أزواج OTC الحية.\n"
+        f"• تم فحص {len(pair_map)} زوج OTC حي، وظهرت {len(candidates)} فرصة مرشحة.\n"
         f"• هذا الزوج كان الأقوى حسب آخر {best['sample_size']} تحديثات سعرية مباشرة من Quotex.\n\n"
         "⚠️ التزم بإدارة رأس المال، وادخل فقط إذا بقي الاتجاه بنفس الشكل عند وقت الدخول."
     )
@@ -1372,7 +1491,7 @@ def build_smart_martingale_decision(signal: dict, open_price: float | None, curr
     - إذا الخسارة تتوسع آخر اللحظات: مضاعفة بعكس الاتجاه.
     """
     pair = signal.get("pair")
-    symbol = signal.get("symbol") or OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
+    symbol = signal.get("symbol") or get_otc_symbol_for_pair(pair)
     direction = signal.get("direction")
 
     if open_price is None or current_price is None or direction not in {"CALL", "PUT"}:
@@ -1466,7 +1585,7 @@ async def send_smart_martingale_advice(context: ContextTypes.DEFAULT_TYPE):
             return
 
         pair = signal.get("pair")
-        symbol = signal.get("symbol") or OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
+        symbol = signal.get("symbol") or get_otc_symbol_for_pair(pair)
         entry_ts = float(signal.get("entry_ts") or 0)
 
         candle = quotex_otc_feed.candle(symbol, entry_ts) if symbol else {}
@@ -1559,7 +1678,7 @@ async def delete_martingale_advice_if_direct_win(context: ContextTypes.DEFAULT_T
 async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
     signal = dict(context.job.data or {})
     pair = signal.get("pair")
-    symbol = signal.get("symbol") or OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
+    symbol = signal.get("symbol") or get_otc_symbol_for_pair(pair)
     direction = signal.get("direction")
     message_id = signal.get("message_id")
     martingale_step = int(signal.get("martingale_step", 0) or 0)
@@ -1842,6 +1961,7 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
 
         signal["message_id"] = sent.message_id
         signal["published_at"] = now_iso()
+        otc_live_channel_state["last_pair"] = signal.get("pair")
 
         otc_live_channel_state["active"] = True
         otc_live_channel_state["active_since"] = time_module.time()
@@ -2856,6 +2976,35 @@ def update_otc_live_learning_after_result(signal: dict, result: str):
             )
     except Exception as e:
         logger.exception("Could not update OTC live learning after result: %s", e)
+
+
+
+def format_otc_dynamic_universe_status() -> str:
+    try:
+        dynamic_pairs = quotex_otc_feed.get_dynamic_otc_pairs(OTC_LIVE_DYNAMIC_MIN_PAYOUT)
+        pair_map = get_otc_analysis_pair_map()
+
+        sample_pairs = list(pair_map.keys())[:30]
+        sample_text = "\n".join(f"• {p}" for p in sample_pairs)
+        if len(pair_map) > len(sample_pairs):
+            sample_text += f"\n... و {len(pair_map) - len(sample_pairs)} زوج إضافي"
+
+        return (
+            "╔══════════════╗\n"
+            "   🌐 أزواج OTC الديناميكية\n"
+            "╚══════════════╝\n\n"
+            f"الحالة: {'مفعلة ✅' if OTC_LIVE_DYNAMIC_PAIRS_ENABLED else 'متوقفة ⛔'}\n"
+            f"أزواج مكتشفة من المنصة: {len(dynamic_pairs)}\n"
+            f"إجمالي أزواج التحليل: {len(pair_map)}\n"
+            f"حد payout: {OTC_LIVE_DYNAMIC_MIN_PAYOUT}%\n"
+            f"أقصى عدد أزواج: {OTC_LIVE_MAX_DYNAMIC_PAIRS}\n\n"
+            "عينة من الأزواج:\n"
+            f"{sample_text if sample_text else 'لا يوجد بعد'}"
+        )
+    except Exception as e:
+        logger.exception("Could not build dynamic universe status: %s", e)
+        return "تعذر عرض حالة أزواج OTC الديناميكية."
+
 
 
 def format_otc_live_learning_status() -> str:
@@ -5711,6 +5860,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=admin_otc_stats_keyboard
                 )
                 return
+
+            if text == "🌐 أزواج OTC الديناميكية":
+                await update.message.reply_text(
+                    format_otc_dynamic_universe_status(),
+                    reply_markup=admin_otc_stats_keyboard
+                )
+                return
+
 
             if text == "🔎 فحص بيانات زوج OTC":
                 context.user_data["step"] = "otc_pair_diagnostics_waiting"
