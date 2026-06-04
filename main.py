@@ -875,14 +875,15 @@ class QuotexOTCLiveFeed:
                     continue
                 if payout < min_payout:
                     continue
-                if not name or "(OTC)" not in name:
+                normalized_name = normalize_otc_currency_pair_name(name, symbol)
+                if not normalized_name:
                     continue
 
-                # فلتر صارم: نأخذ أزواج العملات فقط، ونستبعد المعادن/الأسهم/الكريبتو.
-                if not is_valid_otc_currency_pair_name(name):
+                # فلتر أزواج العملات فقط، ونستبعد المعادن/الأسهم/الكريبتو.
+                if not is_valid_otc_currency_pair_name(normalized_name):
                     continue
 
-                result[name] = symbol
+                result[normalized_name] = symbol
 
             return result
 
@@ -1170,12 +1171,57 @@ quotex_otc_feed = QuotexOTCLiveFeed(OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS)
 
 
 def is_valid_otc_currency_pair_name(name: str) -> bool:
-    """نقبل فقط أزواج العملات داخل OTC مثل USD/BRL (OTC)، ونرفض Silver / Crypto / Stocks."""
+    """فلتر أزواج العملات فقط.
+    يقبل:
+    - USD/BRL (OTC)
+    - USD/BRL
+    - USDBRL_otc
+    - BRLUSD_otc
+    ويرفض: Silver, Axie, stocks, crypto symbols, commodities.
+    """
     try:
         value = str(name or "").strip().upper()
-        return bool(re.fullmatch(r"[A-Z]{3}/[A-Z]{3} \\(OTC\\)", value))
+        value = value.replace("  ", " ")
+
+        if not value:
+            return False
+
+        # الشكل الظاهر: USD/BRL أو USD/BRL (OTC)
+        if re.fullmatch(r"[A-Z]{3}/[A-Z]{3}( \(OTC\))?", value):
+            return True
+
+        # الشكل الداخلي: USDBRL_otc أو BRLUSD_otc
+        if re.fullmatch(r"[A-Z]{6}_OTC", value):
+            return True
+
+        return False
     except Exception:
         return False
+
+
+def normalize_otc_currency_pair_name(name: str, symbol: str | None = None) -> str | None:
+    """توحيد اسم الزوج ليظهر دائمًا بشكل USD/BRL (OTC) قدر الإمكان."""
+    try:
+        raw = str(name or "").strip().upper().replace("  ", " ")
+
+        m = re.fullmatch(r"([A-Z]{3})/([A-Z]{3})( \(OTC\))?", raw)
+        if m:
+            return f"{m.group(1)}/{m.group(2)} (OTC)"
+
+        sym = str(symbol or "").strip().upper()
+        sym = sym.replace("_OTC", "")
+        if re.fullmatch(r"[A-Z]{6}", sym):
+            a = sym[:3]
+            b = sym[3:]
+
+            # إذا الرمز الداخلي مقلوب مثل BRLUSD، نعرضه USD/BRL عندما أحد الطرفين USD.
+            if b == "USD":
+                return f"{b}/{a} (OTC)"
+            return f"{a}/{b} (OTC)"
+
+        return None
+    except Exception:
+        return None
 
 
 def get_otc_analysis_pair_map() -> dict:
@@ -1191,11 +1237,12 @@ def get_otc_analysis_pair_map() -> dict:
             added = 0
 
             for pair_name, symbol in dynamic_pairs.items():
-                if not is_valid_otc_currency_pair_name(pair_name):
+                normalized_name = normalize_otc_currency_pair_name(pair_name, symbol)
+                if not normalized_name or not is_valid_otc_currency_pair_name(normalized_name):
                     continue
 
-                if pair_name not in pair_map:
-                    pair_map[pair_name] = symbol
+                if normalized_name not in pair_map:
+                    pair_map[normalized_name] = symbol
                     added += 1
 
                     # نتأكد أنه مشترك بالرمز حتى يبدأ جمع ticks.
@@ -1260,8 +1307,10 @@ def analyze_best_live_otc_now() -> dict:
     pair_map = get_otc_analysis_pair_map()
 
     for pair, symbol in pair_map.items():
-        if not is_valid_otc_currency_pair_name(pair):
+        normalized_pair = normalize_otc_currency_pair_name(pair, symbol)
+        if not normalized_pair or not is_valid_otc_currency_pair_name(normalized_pair):
             continue
+        pair = normalized_pair
 
         with quotex_otc_feed.lock:
             rows = list(quotex_otc_feed.prices.get(symbol, []))
@@ -1330,6 +1379,12 @@ def analyze_best_live_otc_now() -> dict:
         })
 
     if not candidates:
+        try:
+            logger.info("OTC LIVE no candidates | pair_map_count=%s | dynamic_enabled=%s | min_payout=%s",
+                        len(pair_map), OTC_LIVE_DYNAMIC_PAIRS_ENABLED, OTC_LIVE_DYNAMIC_MIN_PAYOUT)
+        except Exception:
+            pass
+
         return {
             "ok": False,
             "message": (
