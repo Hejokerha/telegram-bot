@@ -356,6 +356,7 @@ admin_otc_stats_keyboard = ReplyKeyboardMarkup(
         ["📈 إحصائيات OTC مباشر", "🔢 إحصائيات آخر عدد صفقات"],
         ["🤖 تحليل ونصائح البوت", "🧹 تصفير إحصائيات OTC"],
         ["🧠 حالة تعلم OTC Live", "🔎 فحص بيانات زوج OTC"],
+        ["🌐 أزواج OTC الديناميكية"],
         ["🕯️ فحص شمعة OTC"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["⬅️ رجوع"],
@@ -5642,6 +5643,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===== Broadcast waiting input fixed =====
     if is_admin(user.id) and step == "admin_broadcast_waiting_message":
         message = text.strip()
+
+        if message in {"رجوع", "⬅️ رجوع", "🔙 رجوع"}:
+            context.user_data["step"] = None
+            await update.message.reply_text("تم إلغاء الرسالة الجماعية.", reply_markup=admin_main_keyboard)
+            return
+
         context.user_data["step"] = None
 
         if not message:
