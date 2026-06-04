@@ -600,6 +600,11 @@ def save_user_record(user_id: int, data: dict):
 
 
 def save_pending_user(user_id: int, data: dict):
+    # إذا المستخدم كان مرفوضًا/ملغى التفعيل، نزيل حالته القديمة حتى يصبح pending فعليًا.
+    try:
+        approved_ref().child(str(user_id)).delete()
+    except Exception:
+        pass
     pending_ref().child(str(user_id)).set(data)
 
 
@@ -3096,6 +3101,8 @@ def calculate_otc_live_trade_stats(trades: list[dict]) -> dict:
     pair_stats = {}
     mg_same = {"total": 0, "wins": 0, "losses": 0}
     mg_opposite = {"total": 0, "wins": 0, "losses": 0}
+    mg_same = {"total": 0, "wins": 0, "losses": 0}
+    mg_opposite = {"total": 0, "wins": 0, "losses": 0}
 
     for trade in trades:
         result = str(trade.get("result", "unknown"))
@@ -3115,6 +3122,21 @@ def calculate_otc_live_trade_stats(trades: list[dict]) -> dict:
         pair_info = pair_stats.setdefault(pair, {"total": 0, "wins": 0, "losses": 0, "unknown": 0, "units": 0.0})
         pair_info["total"] += 1
         pair_info["units"] += float(units)
+
+        if step == 1:
+            decision_type = str(trade.get("martingale_decision_type") or "").lower()
+            if decision_type == "same":
+                mg_same["total"] += 1
+                if result == "win":
+                    mg_same["wins"] += 1
+                elif result == "loss":
+                    mg_same["losses"] += 1
+            elif decision_type in {"opposite", "reverse"}:
+                mg_opposite["total"] += 1
+                if result == "win":
+                    mg_opposite["wins"] += 1
+                elif result == "loss":
+                    mg_opposite["losses"] += 1
 
         if step == 1:
             decision_type = str(trade.get("martingale_decision_type") or "").lower()
@@ -3171,6 +3193,8 @@ def calculate_otc_live_trade_stats(trades: list[dict]) -> dict:
         "gross_loss_units": round(gross_loss_units, 2),
         "avg_units": avg_units,
         "pair_stats": pair_stats,
+        "mg_same": mg_same,
+        "mg_opposite": mg_opposite,
     }
 
 
@@ -5432,34 +5456,53 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_admin(user.id) and not is_approved(user.id):
         current_status = get_user_status(user.id)
 
+        # فيديو الشرح مسموح حتى قبل التفعيل
+        if text == "🎥 مشاهدة فيديو شرح البوت":
+            await update.message.reply_text(
+                "🎥 فيديو شرح البوت:\n"
+                "https://www.youtube.com/watch?v=YPqgJcgvyFw",
+                reply_markup=welcome_keyboard
+            )
+            return
+
+        # رجوع للمستخدم غير المفعل يرجعه لقائمة الاشتراك، ولا يعلقه بخطوات قديمة
+        if text in {"🔙 رجوع", "⬅️ رجوع", "رجوع"}:
+            reset_signal_state(context)
+            await update.message.reply_text("تم الرجوع.", reply_markup=welcome_keyboard)
+            return
+
+        # pending لا يرسل طلب ثاني قبل القرار
         if current_status == "pending":
             await update.message.reply_text(
                 "⏳ لديك طلب تفعيل قيد المراجعة بالفعل.\n\n"
-                "لا يمكنك إرسال طلب جديد قبل أن يتم قبول أو رفض الطلب السابق."
+                "لا يمكنك إرسال طلب جديد قبل أن يتم قبول أو رفض الطلب السابق.",
+                reply_markup=welcome_keyboard
             )
             return
 
-        if current_status == "blocked":
-            await update.message.reply_text(
-                "⛔ حسابك غير مفعّل حاليًا.\n\n"
-                "إذا كنت ترى أن هذا بالخطأ، تواصل مع الأدمن."
-            )
-            return
-
+        # نعم أنا منضم: مسموحة للجديد والمرفوض والملغى تفعيله والمنتهي
         if text == "✅ نعم، أنا منضم":
             context.user_data["step"] = "waiting_quotex_id"
             await update.message.reply_text(
                 "📩 أرسل ID الخاص بحسابك على QUOTEX ليتم فحص حسابك.\n"
-                "بعد التأكد سيتم إتاحة البوت لك بشكل مجاني."
+                "بعد التأكد سيتم إتاحة البوت لك بشكل مجاني.",
+                reply_markup=ReplyKeyboardMarkup([["🔙 رجوع"]], resize_keyboard=True)
             )
             return
 
         if text == "❌ لا، لست مشتركًا":
-            await update.message.reply_text(WELCOME_MESSAGE)
+            await update.message.reply_text(WELCOME_MESSAGE, reply_markup=welcome_keyboard)
             return
 
         if step == "waiting_quotex_id":
             quotex_id = text.strip()
+
+            if not quotex_id or quotex_id in {"✅ نعم، أنا منضم", "❌ لا، لست مشتركًا"}:
+                await update.message.reply_text(
+                    "📩 أرسل ID حسابك في Quotex فقط.",
+                    reply_markup=ReplyKeyboardMarkup([["🔙 رجوع"]], resize_keyboard=True)
+                )
+                return
 
             pending_data = {
                 "telegram_id": user.id,
@@ -5474,13 +5517,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             save_user_record(user.id, {
                 "quotex_id": quotex_id,
                 "status": "pending",
+                "name": user.full_name,
+                "username": user.username or "",
+                "updated_at": now_iso(),
             })
 
             await update.message.reply_text(
                 "📩 تم استلام طلبك بنجاح\n\n"
                 "تم حفظ Quotex ID الخاص بك وإرساله للإدارة للمراجعة.\n"
                 "بعد التأكد، سيتم تفعيل البوت لك مجانًا.\n\n"
-                "يرجى انتظار موافقة الأدمن ✅"
+                "يرجى انتظار موافقة الأدمن ✅",
+                reply_markup=welcome_keyboard
             )
 
             username_text = f"@{user.username}" if user.username else "بدون username"
@@ -5505,6 +5552,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["step"] = "pending_review"
             return
 
+        # أي خيار آخر لغير المفعل يرجع لقائمة الاشتراك بدل تعليق المستخدم
         await send_welcome_flow(update)
         return
 
