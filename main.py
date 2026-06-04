@@ -56,6 +56,7 @@ OTC_LIVE_DYNAMIC_PAIRS_ENABLED = os.getenv("OTC_LIVE_DYNAMIC_PAIRS_ENABLED", "tr
 OTC_LIVE_DYNAMIC_MIN_PAYOUT = int(os.getenv("OTC_LIVE_DYNAMIC_MIN_PAYOUT", str(OTC_LIVE_MIN_PAYOUT)))
 OTC_LIVE_MAX_DYNAMIC_PAIRS = int(os.getenv("OTC_LIVE_MAX_DYNAMIC_PAIRS", "80"))
 OTC_LIVE_TOP_CANDIDATES_POOL = int(os.getenv("OTC_LIVE_TOP_CANDIDATES_POOL", "5"))
+OTC_LIVE_ALLOWED_FALLBACK_ENABLED = os.getenv("OTC_LIVE_ALLOWED_FALLBACK_ENABLED", "true").lower() == "true"
 OTC_LIVE_REVERSE_AUTOPUBLISH = os.getenv("OTC_LIVE_REVERSE_AUTOPUBLISH", "true").lower() == "true"
 OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS", "3"))
 OTC_LIVE_MIN_ENTRY_LEAD_SECONDS = int(os.getenv("OTC_LIVE_MIN_ENTRY_LEAD_SECONDS", "10"))
@@ -184,6 +185,31 @@ OTC_PAIR_TO_QUOTEX_SYMBOL = {
     "USD/PHP (OTC)": "PHPUSD_otc",
 }
 
+
+OTC_CURRENCIES_ALLOWED_PAIRS = {
+    "CAD/CHF (OTC)",
+    "NZD/JPY (OTC)",
+    "USD/IDR (OTC)",
+    "USD/DZD (OTC)",
+    "EUR/NZD (OTC)",
+    "USD/MXN (OTC)",
+    "AUD/NZD (OTC)",
+    "USD/PKR (OTC)",
+    "USD/BRL (OTC)",
+    "USD/EGP (OTC)",
+    "USD/COP (OTC)",
+    "NZD/USD (OTC)",
+    "NZD/CAD (OTC)",
+    "USD/ARS (OTC)",
+    "USD/BDT (OTC)",
+    "USD/INR (OTC)",
+    "USD/NGN (OTC)",
+    "USD/PHP (OTC)",
+    "USD/ZAR (OTC)",
+    "GBP/NZD (OTC)",
+    "EUR/CHF (OTC)",
+    "AUD/USD (OTC)",
+}
 
 REAL_PAIRS = [
     "EUR/USD",
@@ -1167,6 +1193,15 @@ for _pair_key, _mapped_symbol in OTC_PAIR_TO_QUOTEX_SYMBOL.items():
     except Exception:
         pass
 
+
+for _allowed_pair in OTC_CURRENCIES_ALLOWED_PAIRS:
+    try:
+        for _symbol_candidate in possible_symbols_for_currency_pair(_allowed_pair):
+            if _symbol_candidate not in OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS:
+                OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS.append(_symbol_candidate)
+    except Exception:
+        pass
+
 quotex_otc_feed = QuotexOTCLiveFeed(OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS)
 
 
@@ -1207,15 +1242,58 @@ FIAT_CURRENCY_CODES = {
 }
 
 
+
+def normalize_pair_name_basic(pair: str) -> str:
+    raw = str(pair or "").strip().upper().replace("  ", " ")
+    raw = raw.replace(" OTC", " (OTC)")
+    if "(OTC)" not in raw and "/" in raw:
+        raw = raw + " (OTC)"
+    return raw
+
+
+def is_allowed_otc_currency_pair(pair: str) -> bool:
+    return normalize_pair_name_basic(pair) in OTC_CURRENCIES_ALLOWED_PAIRS
+
+
+def possible_symbols_for_currency_pair(pair: str) -> list[str]:
+    """رموز محتملة للزوج داخل Quotex، لأن بعض أزواج USD تأتي معكوسة مثل BRLUSD_otc."""
+    pair = normalize_pair_name_basic(pair).replace(" (OTC)", "")
+    if "/" not in pair:
+        return []
+
+    base, quote = pair.split("/", 1)
+    symbols = []
+
+    # الشكل الطبيعي
+    symbols.append(f"{base}{quote}_otc")
+
+    # الشكل المعكوس، مهم جدًا لأزواج مثل USD/BRL التي تظهر داخليًا BRLUSD_otc
+    symbols.append(f"{quote}{base}_otc")
+
+    # إزالة التكرار
+    return list(dict.fromkeys(symbols))
+
+
+def allowed_otc_currency_fallback_map() -> dict:
+    """Fallback مؤقت عند بداية التشغيل قبل وصول instruments/list."""
+    result = {}
+    for pair in OTC_CURRENCIES_ALLOWED_PAIRS:
+        # نعطي الأولوية للماب اليدوي إذا موجود، وإلا أول رمز محتمل.
+        symbol = OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
+        if not symbol:
+            symbols = possible_symbols_for_currency_pair(pair)
+            symbol = symbols[0] if symbols else None
+        if symbol:
+            result[pair] = symbol
+    return result
+
+
 def is_valid_otc_currency_pair_name(name: str) -> bool:
-    """فلتر قسم Currencies فقط.
-    لا يكفي أن يكون الشكل AAA/BBB، بل يجب أن يكون الطرفان من عملات FIAT حقيقية.
-    هذا يمنع USD/DOT و USD/AVA وأي كريبتو أو سهم أو معدن.
-    """
+    """نقبل فقط أزواج قسم Currencies التي حددناها من واجهة Quotex."""
     try:
-        value = str(name or "").strip().upper().replace("  ", " ")
-        if not value:
-            return False
+        return is_allowed_otc_currency_pair(name)
+    except Exception:
+        return False
 
         base = quote = None
 
@@ -1238,9 +1316,28 @@ def is_valid_otc_currency_pair_name(name: str) -> bool:
 
 
 def normalize_otc_currency_pair_name(name: str, symbol: str | None = None) -> str | None:
-    """توحيد اسم زوج العملات فقط ليظهر بشكل AAA/BBB (OTC)."""
+    """توحيد اسم الزوج بشرط أن يكون من Currencies المسموحة."""
     try:
-        raw = str(name or "").strip().upper().replace("  ", " ")
+        raw = normalize_pair_name_basic(name)
+        if raw in OTC_CURRENCIES_ALLOWED_PAIRS:
+            return raw
+
+        sym = str(symbol or "").strip().upper().replace("_OTC", "")
+        if re.fullmatch(r"[A-Z]{6}", sym):
+            a, b = sym[:3], sym[3:]
+
+            candidates = [
+                f"{a}/{b} (OTC)",
+                f"{b}/{a} (OTC)",
+            ]
+
+            for candidate in candidates:
+                if candidate in OTC_CURRENCIES_ALLOWED_PAIRS:
+                    return candidate
+
+        return None
+    except Exception:
+        return None
 
         m = re.fullmatch(r"([A-Z]{3})/([A-Z]{3})( \\(OTC\\))?", raw)
         if m:
@@ -1268,60 +1365,80 @@ def normalize_otc_currency_pair_name(name: str, symbol: str | None = None) -> st
 
 
 def get_otc_analysis_pair_map() -> dict:
-    """خريطة الأزواج التي يستخدمها OTC Live للتحليل.
-    إذا instruments/list أعطانا أزواج OTC كثيرة، نستخدمها.
-    إذا لم تصل البيانات بعد، نرجع للقائمة اليدوية القديمة.
+    """أزواج OTC Live للتحليل.
+    يعتمد على:
+    1) قائمة Currencies المسموحة من الواجهة.
+    2) توفر الزوج الآن في instruments/list كـ OTC وبـ payout مناسب.
+    3) fallback مؤقت للقائمة المسموحة عند بداية التشغيل إذا instruments/list لم يصل بعد.
     """
-    pair_map = dict(OTC_PAIR_TO_QUOTEX_SYMBOL)
+    live_map = {}
 
     try:
         if OTC_LIVE_DYNAMIC_PAIRS_ENABLED:
-            dynamic_pairs = quotex_otc_feed.get_dynamic_otc_pairs(OTC_LIVE_DYNAMIC_MIN_PAYOUT)
-            added = 0
+            with quotex_otc_feed.lock:
+                instruments = dict(quotex_otc_feed.instruments or {})
 
-            for pair_name, symbol in dynamic_pairs.items():
-                normalized_name = normalize_otc_currency_pair_name(pair_name, symbol)
-                if not normalized_name or not is_valid_otc_currency_pair_name(normalized_name):
+            for symbol, info in instruments.items():
+                if not isinstance(info, dict):
                     continue
 
-                if normalized_name not in pair_map:
-                    pair_map[normalized_name] = symbol
-                    added += 1
+                name = str(info.get("name") or "").strip()
+                payout = int(info.get("payout") or 0)
+                is_otc = bool(info.get("is_otc", False))
 
-                    # نتأكد أنه مشترك بالرمز حتى يبدأ جمع ticks.
-                    quotex_otc_feed.add_symbol(symbol)
+                if not symbol or not str(symbol).endswith("_otc"):
+                    continue
+                if not is_otc:
+                    continue
+                if payout < OTC_LIVE_DYNAMIC_MIN_PAYOUT:
+                    continue
 
-                    if len(pair_map) >= OTC_LIVE_MAX_DYNAMIC_PAIRS:
-                        break
+                normalized = normalize_otc_currency_pair_name(name, symbol)
+                if not normalized:
+                    continue
 
-            if added:
-                logger.info("OTC dynamic pair universe added %s pairs | total=%s", added, len(pair_map))
+                live_map[normalized] = symbol
+                quotex_otc_feed.add_symbol(symbol)
+
+                if len(live_map) >= OTC_LIVE_MAX_DYNAMIC_PAIRS:
+                    break
 
     except Exception as e:
-        logger.exception("Dynamic OTC pair universe error: %s", e)
+        logger.exception("Dynamic OTC currencies availability error: %s", e)
 
-    # تنظيف نهائي: لا نسمح إلا بأزواج Currencies الحقيقية.
-    pair_map = {
-        normalize_otc_currency_pair_name(pair, symbol): symbol
-        for pair, symbol in pair_map.items()
-        if normalize_otc_currency_pair_name(pair, symbol)
-        and is_valid_otc_currency_pair_name(normalize_otc_currency_pair_name(pair, symbol))
-    }
+    # إذا وصلت بيانات instruments/list، نستخدم المتاح الآن فقط.
+    if live_map:
+        return live_map
 
-    return pair_map
+    # عند بداية التشغيل فقط، قبل وصول instruments/list، نستخدم fallback حتى لا يتوقف البوت.
+    if OTC_LIVE_ALLOWED_FALLBACK_ENABLED:
+        fallback = allowed_otc_currency_fallback_map()
+        try:
+            for symbol in fallback.values():
+                quotex_otc_feed.add_symbol(symbol)
+        except Exception:
+            pass
+        return fallback
+
+    return {}
+
 
 
 def get_otc_symbol_for_pair(pair: str) -> str | None:
-    """يرجع الرمز الداخلي للزوج من الخريطة الديناميكية أو اليدوية."""
+    """يرجع الرمز الداخلي فقط إذا الزوج من Currencies المسموحة ومتاح بالخريطة الحالية."""
     try:
-        dynamic_map = get_otc_analysis_pair_map()
-        if pair in dynamic_map:
-            return dynamic_map[pair]
+        pair = normalize_pair_name_basic(pair)
+        if not is_allowed_otc_currency_pair(pair):
+            return None
+
+        pair_map = get_otc_analysis_pair_map()
+        if pair in pair_map:
+            return pair_map[pair]
+
     except Exception:
         pass
 
-    return OTC_PAIR_TO_QUOTEX_SYMBOL.get(pair)
-
+    return None
 
 
 
@@ -3106,29 +3223,25 @@ def update_otc_live_learning_after_result(signal: dict, result: str):
 
 def format_otc_dynamic_universe_status() -> str:
     try:
-        dynamic_pairs = quotex_otc_feed.get_dynamic_otc_pairs(OTC_LIVE_DYNAMIC_MIN_PAYOUT)
-        pair_map = get_otc_analysis_pair_map()
-
-        sample_pairs = list(pair_map.keys())[:30]
+        live_map = get_otc_analysis_pair_map()
+        sample_pairs = list(live_map.keys())[:30]
         sample_text = "\n".join(f"• {p}" for p in sample_pairs)
-        if len(pair_map) > len(sample_pairs):
-            sample_text += f"\n... و {len(pair_map) - len(sample_pairs)} زوج إضافي"
+        if len(live_map) > len(sample_pairs):
+            sample_text += f"\n... و {len(live_map) - len(sample_pairs)} زوج إضافي"
 
         return (
             "╔══════════════╗\n"
-            "   🌐 أزواج OTC الديناميكية\n"
+            "   🌐 Currencies OTC المتاحة\n"
             "╚══════════════╝\n\n"
-            f"الحالة: {'مفعلة ✅' if OTC_LIVE_DYNAMIC_PAIRS_ENABLED else 'متوقفة ⛔'}\n"
-            f"أزواج مكتشفة من المنصة: {len(dynamic_pairs)}\n"
-            f"إجمالي أزواج التحليل: {len(pair_map)}\n"
-            f"حد payout: {OTC_LIVE_DYNAMIC_MIN_PAYOUT}%\n"
-            f"أقصى عدد أزواج: {OTC_LIVE_MAX_DYNAMIC_PAIRS}\n\n"
-            "عينة من الأزواج:\n"
+            f"الأزواج المسموحة من Currencies: {len(OTC_CURRENCIES_ALLOWED_PAIRS)}\n"
+            f"الأزواج المتاحة الآن للتحليل: {len(live_map)}\n"
+            f"حد payout: {OTC_LIVE_DYNAMIC_MIN_PAYOUT}%\n\n"
+            "المتاح الآن:\n"
             f"{sample_text if sample_text else 'لا يوجد بعد'}"
         )
     except Exception as e:
         logger.exception("Could not build dynamic universe status: %s", e)
-        return "تعذر عرض حالة أزواج OTC الديناميكية."
+        return "تعذر عرض حالة أزواج OTC."
 
 
 
