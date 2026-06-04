@@ -5357,6 +5357,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     step = context.user_data.get("step")
 
+    # ===== Absolute cancel guard for admin waiting states =====
+    if is_admin(user.id) and text.strip() in {"رجوع", "⬅️ رجوع", "🔙 رجوع"}:
+        if context.user_data.get("step") in {
+            "admin_broadcast_waiting_message",
+            "admin_message_user_waiting_text",
+            "otc_stats_waiting_count",
+            "otc_list_waiting_text",
+            "otc_pair_diagnostics_waiting",
+            "otc_candle_diagnostics_waiting",
+        }:
+            context.user_data["step"] = None
+            context.user_data.pop("target_user_id", None)
+            context.user_data.pop("target_message_user_id", None)
+            await update.message.reply_text("تم إلغاء العملية.", reply_markup=admin_main_keyboard)
+            return
+
     save_user_record(user.id, {
         "telegram_id": user.id,
         "name": user.full_name,
@@ -5522,6 +5538,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_count = 0
         failed_count = 0
         skipped_count = 0
+        if message in {"رجوع", "⬅️ رجوع", "🔙 رجوع"}:
+            await update.message.reply_text("تم إلغاء الرسالة الجماعية.", reply_markup=admin_main_keyboard)
+            return
+
         broadcast_text = "📢 رسالة من الأدمن\n\n" + message
 
         for uid in list(approved_users.keys()):
@@ -5659,6 +5679,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sent_count = 0
         failed_count = 0
         skipped_count = 0
+        if message in {"رجوع", "⬅️ رجوع", "🔙 رجوع"}:
+            await update.message.reply_text("تم إلغاء الرسالة الجماعية.", reply_markup=admin_main_keyboard)
+            return
+
         broadcast_text = "📢 رسالة من الأدمن\n\n" + message
 
         for uid in list(approved_users.keys()):
