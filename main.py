@@ -878,6 +878,10 @@ class QuotexOTCLiveFeed:
                 if not name or "(OTC)" not in name:
                     continue
 
+                # فلتر صارم: نأخذ أزواج العملات فقط، ونستبعد المعادن/الأسهم/الكريبتو.
+                if not is_valid_otc_currency_pair_name(name):
+                    continue
+
                 result[name] = symbol
 
             return result
@@ -1164,6 +1168,16 @@ for _pair_key, _mapped_symbol in OTC_PAIR_TO_QUOTEX_SYMBOL.items():
 
 quotex_otc_feed = QuotexOTCLiveFeed(OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS)
 
+
+def is_valid_otc_currency_pair_name(name: str) -> bool:
+    """نقبل فقط أزواج العملات داخل OTC مثل USD/BRL (OTC)، ونرفض Silver / Crypto / Stocks."""
+    try:
+        value = str(name or "").strip().upper()
+        return bool(re.fullmatch(r"[A-Z]{3}/[A-Z]{3} \\(OTC\\)", value))
+    except Exception:
+        return False
+
+
 def get_otc_analysis_pair_map() -> dict:
     """خريطة الأزواج التي يستخدمها OTC Live للتحليل.
     إذا instruments/list أعطانا أزواج OTC كثيرة، نستخدمها.
@@ -1177,6 +1191,9 @@ def get_otc_analysis_pair_map() -> dict:
             added = 0
 
             for pair_name, symbol in dynamic_pairs.items():
+                if not is_valid_otc_currency_pair_name(pair_name):
+                    continue
+
                 if pair_name not in pair_map:
                     pair_map[pair_name] = symbol
                     added += 1
@@ -1243,6 +1260,9 @@ def analyze_best_live_otc_now() -> dict:
     pair_map = get_otc_analysis_pair_map()
 
     for pair, symbol in pair_map.items():
+        if not is_valid_otc_currency_pair_name(pair):
+            continue
+
         with quotex_otc_feed.lock:
             rows = list(quotex_otc_feed.prices.get(symbol, []))
             tick = dict(quotex_otc_feed.last_tick.get(symbol) or {})
@@ -3119,9 +3139,12 @@ def calculate_otc_live_trade_stats(trades: list[dict]) -> dict:
                 units = otc_live_trade_units(result, step, payout)
 
         pair = str(trade.get("pair", "غير معروف"))
-        pair_info = pair_stats.setdefault(pair, {"total": 0, "wins": 0, "losses": 0, "unknown": 0, "units": 0.0})
-        pair_info["total"] += 1
-        pair_info["units"] += float(units)
+        if is_valid_otc_currency_pair_name(pair):
+            pair_info = pair_stats.setdefault(pair, {"total": 0, "wins": 0, "losses": 0, "unknown": 0, "units": 0.0})
+            pair_info["total"] += 1
+            pair_info["units"] += float(units)
+        else:
+            pair_info = None
 
         if step == 1:
             decision_type = str(trade.get("martingale_decision_type") or "").lower()
@@ -3155,17 +3178,20 @@ def calculate_otc_live_trade_stats(trades: list[dict]) -> dict:
 
         if result == "win":
             wins += 1
-            pair_info["wins"] += 1
+            if pair_info is not None:
+                pair_info["wins"] += 1
             if step == 1:
                 martingale_wins += 1
             else:
                 direct_wins += 1
         elif result == "loss":
             losses += 1
-            pair_info["losses"] += 1
+            if pair_info is not None:
+                pair_info["losses"] += 1
         else:
             unknown += 1
-            pair_info["unknown"] += 1
+            if pair_info is not None:
+                pair_info["unknown"] += 1
 
         net_units += float(units)
         if units > 0:
