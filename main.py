@@ -318,7 +318,8 @@ if not firebase_admin._apps:
 # ===== Keyboards =====
 main_keyboard = ReplyKeyboardMarkup(
     [
-        ["📊 توليد إشارات", "👤 حسابي"],
+        ["📊 توليد إشارات"],
+        ["🎥 مشاهدة فيديو شرح البوت"],
         ["📞 تواصل مع المسؤول"],
     ],
     resize_keyboard=True
@@ -370,6 +371,7 @@ admin_otc_list_ready_keyboard = ReplyKeyboardMarkup(
 welcome_keyboard = ReplyKeyboardMarkup(
     [
         ["✅ نعم، أنا منضم", "❌ لا، لست مشتركًا"],
+        ["🎥 مشاهدة فيديو شرح البوت"],
     ],
     resize_keyboard=True
 )
@@ -459,6 +461,7 @@ admin_duration_keyboard = ReplyKeyboardMarkup(
     [
         ["🗓 أسبوع", "🗓 شهر"],
         ["♾ دائم", "⛔ إلغاء التفعيل"],
+        ["💬 إرسال رسالة"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -4987,10 +4990,23 @@ def build_pending_request_keyboard(user_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("♾ دائم", callback_data=f"approve_forever:{user_id}")
         ],
         [
-            InlineKeyboardButton("❌ رفض", callback_data=f"reject:{user_id}")
+            InlineKeyboardButton("❌ رفض", callback_data=f"reject:{user_id}"),
+            InlineKeyboardButton("💬 إرسال رسالة", callback_data=f"message_user:{user_id}"),
+        ],
+    ])
+
+
+def build_user_admin_inline_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("⛔ إلغاء التفعيل", callback_data=f"reject:{user_id}"),
+            InlineKeyboardButton("💬 إرسال رسالة", callback_data=f"message_user:{user_id}"),
         ]
     ])
 
+
+def build_user_video_keyboard() -> ReplyKeyboardMarkup:
+    return main_keyboard
 
 async def send_welcome_flow(update: Update):
     await update.message.reply_text(
@@ -5072,6 +5088,17 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
 
     user_data = get_user_record(target_id)
     target_name = user_data.get("name", "المستخدم") if user_data else "المستخدم"
+
+    if action == "message_user":
+        context.user_data["admin_message_target_id"] = target_id
+        context.user_data["step"] = "admin_direct_message_waiting"
+        await query.message.reply_text(
+            f"💬 اكتب الآن الرسالة التي تريد إرسالها إلى {target_name}\n"
+            f"🆔 Telegram ID: <code>{target_id}</code>",
+            parse_mode="HTML",
+            reply_markup=admin_main_keyboard
+        )
+        return
 
     if action == "approve_week":
         set_user_expiry(target_id, "week")
@@ -5192,8 +5219,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_maintenance_message(update)
         return
 
+    if text == "🎥 مشاهدة فيديو شرح البوت":
+        await update.message.reply_text(
+            "🎥 فيديو شرح البوت:\n"
+            "https://www.youtube.com/watch?v=YPqgJcgvyFw",
+            reply_markup=build_main_menu_for_user(user.id) if is_approved(user.id) or is_admin(user.id) else welcome_keyboard
+        )
+        return
+
     # ===== Non-approved users =====
     if not is_admin(user.id) and not is_approved(user.id):
+        current_status = get_user_status(user.id)
+
+        if current_status == "pending":
+            await update.message.reply_text(
+                "⏳ لديك طلب تفعيل قيد المراجعة بالفعل.\n\n"
+                "لا يمكنك إرسال طلب جديد قبل أن يتم قبول أو رفض الطلب السابق."
+            )
+            return
+
+        if current_status == "blocked":
+            await update.message.reply_text(
+                "⛔ حسابك غير مفعّل حاليًا.\n\n"
+                "إذا كنت ترى أن هذا بالخطأ، تواصل مع الأدمن."
+            )
+            return
+
         if text == "✅ نعم، أنا منضم":
             context.user_data["step"] = "waiting_quotex_id"
             await update.message.reply_text(
@@ -5257,6 +5308,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ===== Admin waiting inputs =====
+    # ===== Admin direct message to one user =====
+    if is_admin(user.id) and step == "admin_direct_message_waiting":
+        target_id = context.user_data.get("admin_message_target_id")
+        message = text.strip()
+
+        if not target_id:
+            context.user_data["step"] = None
+            await update.message.reply_text("❌ لا يوجد مستخدم محدد.", reply_markup=admin_main_keyboard)
+            return
+
+        if not message:
+            context.user_data["step"] = None
+            await update.message.reply_text("تم إلغاء الرسالة لأنها فارغة.", reply_markup=admin_main_keyboard)
+            return
+
+        try:
+            await context.bot.send_message(
+                chat_id=int(target_id),
+                text="💬 رسالة من الأدمن\n\n" + message
+            )
+            await update.message.reply_text("✅ تم إرسال الرسالة للمستخدم.", reply_markup=admin_main_keyboard)
+        except Exception as e:
+            await update.message.reply_text(f"❌ فشل إرسال الرسالة: {e}", reply_markup=admin_main_keyboard)
+
+        context.user_data["step"] = None
+        context.user_data["admin_message_target_id"] = None
+        return
+
     if is_admin(user.id) and step == "otc_stats_waiting_count":
         clean_text = text.strip()
         if clean_text.isdigit():
@@ -5719,23 +5798,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("📭 لا يوجد طلبات معلقة حاليًا.", reply_markup=admin_main_keyboard)
                 return
 
-            lines = []
+            await update.message.reply_text("📥 الطلبات المعلقة 👇", reply_markup=admin_main_keyboard)
+
             for _, item in data.items():
                 username = f"@{item.get('username')}" if item.get("username") else "بدون username"
-                lines.append(
+                target_id = int(item.get("telegram_id"))
+                msg = (
                     "📥 طلب تفعيل\n\n"
                     f"👤 الاسم: {item.get('name')}\n"
                     f"🔗 اليوزر: {username}\n"
-                    f"🆔 Telegram ID: <code>{item.get('telegram_id')}</code>\n"
-                    f"💱 Quotex ID: <code>{item.get('quotex_id')}</code>\n\n"
-                    "──────────────"
+                    f"🆔 Telegram ID: <code>{target_id}</code>\n"
+                    f"💱 Quotex ID: <code>{item.get('quotex_id')}</code>\n"
+                    f"⏰ تاريخ الطلب: {format_dt_ar(item.get('created_at', ''))}\n\n"
+                    "اختر الإجراء المناسب من الأزرار 👇"
                 )
 
-            await update.message.reply_text(
-                "\n\n".join(lines),
-                parse_mode="HTML",
-                reply_markup=admin_main_keyboard
-            )
+                await update.message.reply_text(
+                    msg,
+                    parse_mode="HTML",
+                    reply_markup=build_pending_request_keyboard(target_id)
+                )
             return
 
         if text == "📋 كافة المستخدمين":
@@ -5752,33 +5834,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not is_approved(user_id):
                     continue
 
-                user_data = all_users.get(user_id_str)
-                if not user_data:
-                    continue
-
-                approved_active_list.append((user_id_str, user_data))
+                user_data = all_users.get(user_id_str, {}) or {}
+                approved_data = approved_users.get(user_id_str, {}) or {}
+                merged = dict(user_data)
+                merged.update({k: v for k, v in approved_data.items() if k not in merged or merged.get(k) in {None, "", "غير موجود"}})
+                approved_active_list.append((user_id_str, merged))
 
             if not approved_active_list:
                 await update.message.reply_text("📭 لا يوجد مستخدمون مفعّلون حاليًا.", reply_markup=admin_main_keyboard)
                 return
 
-            lines = []
-            for user_id_str, data in approved_active_list:
+            await update.message.reply_text(f"📋 كافة المستخدمين المفعّلين: {len(approved_active_list)}", reply_markup=admin_main_keyboard)
+
+            for user_id_str, data in approved_active_list[:50]:
                 name = data.get("name", "غير معروف")
                 username = f"@{data.get('username')}" if data.get("username") else "بدون username"
-                lines.append(
+                quotex_id = data.get("quotex_id", "غير موجود")
+                expires_at = data.get("expires_at", "غير محدد")
+                expires_text = "دائم" if expires_at == "forever" else format_dt_ar(expires_at)
+
+                msg = (
                     f"👤 {name} | {username}\n"
-                    f"🆔 ID: <code>{user_id_str}</code>\n"
+                    f"🆔 Telegram ID: <code>{user_id_str}</code>\n"
+                    f"💱 Quotex ID: <code>{quotex_id}</code>\n"
                     f"📌 الحالة: approved\n"
+                    f"⏳ الصلاحية: {expires_text}\n"
                     "──────────────"
                 )
 
-            msg = "\n".join(lines[:50])
-            await update.message.reply_text(
-                msg,
-                parse_mode="HTML",
-                reply_markup=admin_main_keyboard
-            )
+                await update.message.reply_text(
+                    msg,
+                    parse_mode="HTML",
+                    reply_markup=build_user_admin_inline_keyboard(int(user_id_str))
+                )
             return
 
         if text == "🟢 المستخدمون النشطون":
@@ -5885,6 +5973,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 except Exception:
                     pass
                 context.user_data["step"] = None
+                return
+
+            if text == "💬 إرسال رسالة":
+                context.user_data["admin_message_target_id"] = target_id
+                context.user_data["step"] = "admin_direct_message_waiting"
+                await update.message.reply_text(
+                    "💬 اكتب الآن الرسالة التي تريد إرسالها لهذا المستخدم.",
+                    reply_markup=admin_main_keyboard
+                )
                 return
 
     # ===== Market mode flow =====
