@@ -3145,11 +3145,30 @@ def otc_list_result_icon_from_line(line: str) -> str:
         return "⚖️"
     if "loss" in s or "❌" in raw or "↘️" in raw:
         return "❌"
-    if "win¹" in s or "win1" in s or "✅¹" in raw or "⚠️✅" in raw:
-        return "⚠️✅"
+    if "win¹" in s or "win1" in s or "✅¹" in raw or "✅¹" in raw or "⚠️✅" in raw:
+        return "✅¹"
     if "win" in s or "✅" in raw:
         return "✅"
     return "⚠️"
+
+
+def otc_list_is_violation_from_line(line: str) -> bool:
+    """المخالفة المقصودة: صفقة عكس مومنتم، وليست ربح مضاعفة."""
+    raw = str(line or "")
+    s = raw.lower()
+
+    # ✅¹ كان تنسيق قديم للربح بالمضاعفة، وليس مخالفة.
+    if "⚠️✅" in raw or "✅¹" in raw:
+        return False
+
+    return any(token in s or token in raw for token in [
+        "مخالفة",
+        "عكس مومنتم",
+        "عكس momentum",
+        "against momentum",
+        "violation",
+        "⚠️",
+    ])
 
 
 def format_otc_result_row_fixed(pair: str, time_str: str, direction: str, icon: str) -> str:
@@ -3164,30 +3183,24 @@ def format_otc_result_row_fixed(pair: str, time_str: str, direction: str, icon: 
     else:
         dir_text = direction
 
-    # أعمدة ثابتة لحتى الرموز تصير تحت بعض في Telegram.
     return f"{pair:<15} {time_str:<5} {dir_text:<11} {icon}"
 
 
-
-def normalize_pretty_otc_result_for_telegram(result_text: str) -> str:
-    """إذا كانت النتيجة محفوظة بصيغة ``` قديمة، حولها إلى <pre> HTML."""
-    raw = str(result_text or "")
-    stripped = raw.strip()
-    if stripped.startswith("<pre>") and stripped.endswith("</pre>"):
-        return raw
-    if stripped.startswith("```") and stripped.endswith("```"):
-        inner = stripped.strip("`").strip()
-        return "<pre>" + html.escape(inner) + "</pre>"
-    return raw
-
-
 def prettify_existing_otc_result_text(result_text: str) -> str:
-    """إعادة تنسيق نتائج ليستة OTC لتظهر منظمة في Telegram."""
+    """إعادة تنسيق نتائج ليستة OTC:
+    ✅ ربح مباشر
+    ✅¹ ربح مضاعفة
+    ❌ خسارة
+    ⚖️ دوجي
+    ⚠️ للصفقات المخالفة أو No Data فقط
+    """
     try:
         raw = str(result_text or "")
-        rows = []
+        normal_rows = []
+        violation_rows = []
 
-        wins = losses = doji = nodata = mg = 0
+        wins = 0
+        losses = 0
 
         for line in raw.splitlines():
             m = re.search(
@@ -3199,55 +3212,73 @@ def prettify_existing_otc_result_text(result_text: str) -> str:
                 continue
 
             icon = otc_list_result_icon_from_line(line)
+            is_violation = otc_list_is_violation_from_line(line)
 
-            if icon == "✅":
+            # الخلاصة النهائية: win/loss فقط.
+            if icon in {"✅", "✅¹"}:
                 wins += 1
-            elif icon == "⚠️✅":
-                wins += 1
-                mg += 1
             elif icon == "❌":
                 losses += 1
-            elif icon == "⚖️":
-                doji += 1
-            else:
-                nodata += 1
 
-            rows.append(format_otc_result_row_fixed(
+            row = format_otc_result_row_fixed(
                 pair=m.group(1),
                 time_str=m.group(2),
                 direction=m.group(3),
                 icon=icon,
-            ))
+            )
 
-        if not rows:
+            if is_violation:
+                violation_rows.append(row)
+            else:
+                normal_rows.append(row)
+
+        if not normal_rows and not violation_rows:
             return raw
 
         lines = [
             "🟢 Quotex Results 🟢",
             "━━━━━━━━━━━━━━━━",
             "",
-            *rows,
+        ]
+
+        lines.extend(normal_rows)
+
+        if violation_rows:
+            lines += [
+                "",
+                "⚠️ الصفقات المخالفة",
+                "━━━━━━━━━━━━━━━━",
+                *violation_rows,
+            ]
+
+        lines += [
             "",
             "━━━━━━━━━━━━━━━━",
             f"{wins} win ✅",
             f"{losses} loss ❌",
+            "━━━━━━━━━━━━━━━━",
         ]
 
-        if mg:
-            lines.append(f"{mg} win¹ ⚠️✅")
-        if doji:
-            lines.append(f"{doji} Doji ⚖️")
-        if nodata:
-            lines.append(f"{nodata} No Data ⚠️")
-
-        lines.append("━━━━━━━━━━━━━━━━")
-
-        # HTML pre يثبت المسافات بدون ظهور علامات ``` في تلجرام.
         return "<pre>" + html.escape("\n".join(lines)) + "</pre>"
 
     except Exception as e:
         logger.warning("Could not prettify OTC list result text: %s", e)
         return str(result_text or "")
+
+
+def normalize_pretty_otc_result_for_telegram(result_text: str) -> str:
+    raw = str(result_text or "")
+    stripped = raw.strip()
+
+    if stripped.startswith("<pre>") and stripped.endswith("</pre>"):
+        inner = html.unescape(stripped.replace("<pre>", "").replace("</pre>", ""))
+        return prettify_existing_otc_result_text(inner)
+
+    if stripped.startswith("```") and stripped.endswith("```"):
+        inner = stripped.strip("`").strip()
+        return prettify_existing_otc_result_text(inner)
+
+    return prettify_existing_otc_result_text(raw)
 
 
 
@@ -3312,6 +3343,7 @@ async def finalize_otc_list_results_job(context: ContextTypes.DEFAULT_TYPE):
         result_text, meta = build_otc_list_results_message_from_items(items)
 
         raw_text = job.get("raw_text") or ""
+        result_text = prettify_existing_otc_result_text(result_text)
         save_ready_otc_list_result(admin_id, raw_text, result_text, meta)
 
         get_otc_list_job_ref(admin_id, list_id).update({
