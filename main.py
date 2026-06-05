@@ -1,4 +1,5 @@
 import os
+import html
 import json
 import hashlib
 import asyncio
@@ -3167,6 +3168,19 @@ def format_otc_result_row_fixed(pair: str, time_str: str, direction: str, icon: 
     return f"{pair:<15} {time_str:<5} {dir_text:<11} {icon}"
 
 
+
+def normalize_pretty_otc_result_for_telegram(result_text: str) -> str:
+    """إذا كانت النتيجة محفوظة بصيغة ``` قديمة، حولها إلى <pre> HTML."""
+    raw = str(result_text or "")
+    stripped = raw.strip()
+    if stripped.startswith("<pre>") and stripped.endswith("</pre>"):
+        return raw
+    if stripped.startswith("```") and stripped.endswith("```"):
+        inner = stripped.strip("`").strip()
+        return "<pre>" + html.escape(inner) + "</pre>"
+    return raw
+
+
 def prettify_existing_otc_result_text(result_text: str) -> str:
     """إعادة تنسيق نتائج ليستة OTC لتظهر منظمة في Telegram."""
     try:
@@ -3228,8 +3242,8 @@ def prettify_existing_otc_result_text(result_text: str) -> str:
 
         lines.append("━━━━━━━━━━━━━━━━")
 
-        # code block حتى تظل المسافات ثابتة وتطلع الرموز تحت بعض
-        return "```\n" + "\n".join(lines) + "\n```"
+        # HTML pre يثبت المسافات بدون ظهور علامات ``` في تلجرام.
+        return "<pre>" + html.escape("\n".join(lines)) + "</pre>"
 
     except Exception as e:
         logger.warning("Could not prettify OTC list result text: %s", e)
@@ -5956,7 +5970,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=otc_list_manager_keyboard
                 )
                 return
-            await update.message.reply_text(result_text, reply_markup=otc_list_manager_keyboard)
+            await update.message.reply_text(
+                normalize_pretty_otc_result_for_telegram(result_text),
+                reply_markup=otc_list_manager_keyboard,
+                parse_mode="HTML"
+            )
             return
 
         if text in {"🔙 رجوع", "⬅️ رجوع", "رجوع", "/start"}:
@@ -6589,8 +6607,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["last_otc_list_result_text"] = result_text
 
                 await update.message.reply_text(
-                    result_text,
-                    reply_markup=admin_otc_stats_keyboard
+                    normalize_pretty_otc_result_for_telegram(result_text),
+                    reply_markup=admin_otc_stats_keyboard,
+                    parse_mode="HTML"
                 )
                 return
 
@@ -6607,8 +6626,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result_text, meta = build_otc_list_results_message(raw_list)
             context.user_data["last_otc_list_result_text"] = result_text
             await update.message.reply_text(
-                result_text,
-                reply_markup=admin_otc_stats_keyboard
+                normalize_pretty_otc_result_for_telegram(result_text),
+                reply_markup=admin_otc_stats_keyboard,
+                parse_mode="HTML"
             )
             return
 
