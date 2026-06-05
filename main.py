@@ -401,8 +401,10 @@ admin_otc_stats_keyboard = ReplyKeyboardMarkup(
 
 otc_list_manager_keyboard = ReplyKeyboardMarkup(
     [
+        ["📊 توليد إشارات"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🎥 مشاهدة فيديو شرح البوت"],
+        ["📞 تواصل مع المسؤول"],
     ],
     resize_keyboard=True
 )
@@ -2987,6 +2989,29 @@ def build_otc_list_results_message_from_items(items: list[dict]) -> tuple[str, d
 
 
 
+
+def looks_like_otc_list_text(text: str) -> bool:
+    """فحص سريع هل النص يبدو مثل ليستة OTC.
+    لا يعتمد على دقة كاملة، فقط يمنع التعامل مع أزرار عادية كليستة.
+    """
+    try:
+        raw = str(text or "")
+        if not raw.strip():
+            return False
+
+        # لازم يحتوي على OTC وعلى وقت HH:MM وعلى CALL/PUT.
+        if "OTC" not in raw.upper():
+            return False
+        if not re.search(r"\b\d{1,2}:\d{2}\b", raw):
+            return False
+        if not re.search(r"\b(CALL|PUT|UP|DOWN)\b", raw, re.IGNORECASE):
+            return False
+
+        return True
+    except Exception:
+        return False
+
+
 async def start_otc_list_watch_for_user(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_list: str, reply_markup):
     user = update.effective_user
 
@@ -5553,6 +5578,8 @@ async def send_welcome_flow(update: Update):
 
 
 def build_main_menu_for_user(user_id: int):
+    if is_otc_list_manager(user_id) and not is_admin(user_id):
+        return otc_list_manager_keyboard
     if is_admin(user_id):
         return ReplyKeyboardMarkup(
             [
@@ -5821,8 +5848,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_otc_list_manager_panel(update)
             return
 
-        await update.message.reply_text("🧾 اختر أحد الخيارات من القائمة.", reply_markup=otc_list_manager_keyboard)
-        return
+        # أزرار البوت العادي مسموحة لهذا الشخص أيضًا، لذلك نتركها تكمل للمعالجة العادية.
+        if text in {"📊 توليد إشارات", "📞 تواصل مع المسؤول", "⚡ OTC", "🕒 زمني", "⚡ صفقة مباشرة", "🔎 ابحث عن صفقة الآن"}:
+            pass
+        else:
+            context.user_data["step"] = None
+            await update.message.reply_text("🧾 لوحة فحص ليستات OTC 👇", reply_markup=otc_list_manager_keyboard)
+            return
 
 
     # ===== Absolute cancel guard for admin waiting states =====
@@ -5862,7 +5894,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ===== Non-approved users =====
-    if not is_admin(user.id) and not is_approved(user.id):
+    if not is_admin(user.id) and not is_otc_list_manager(user.id) and not is_approved(user.id):
         current_status = get_user_status(user.id)
 
         # فيديو الشرح مسموح حتى قبل التفعيل
