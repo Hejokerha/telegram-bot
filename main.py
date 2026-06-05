@@ -89,11 +89,19 @@ OTC_LIVE_RESULT_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_DELAY_SECONDS", "
 
 ADMIN_USERNAME = "@coach_WAEL_trading"
 ADMIN_TELEGRAM_ID = 1582593617
-OTC_LIST_MANAGER_IDS = {
-    int(x.strip())
-    for x in os.getenv("OTC_LIST_MANAGER_IDS", "").split(",")
-    if x.strip().lstrip("-").isdigit()
-}
+def parse_id_set_from_env(name: str) -> set[int]:
+    ids = set()
+    raw = os.getenv(name, "") or ""
+    raw = raw.replace(";", ",")
+    raw = raw.replace("\n", ",")
+    for part in raw.split(","):
+        part = part.strip()
+        if part and part.lstrip("-").isdigit():
+            ids.add(int(part))
+    return ids
+
+
+OTC_LIST_MANAGER_IDS = parse_id_set_from_env("OTC_LIST_MANAGER_IDS")
 
 DATABASE_URL = "https://telegram-bot-f0229-default-rtdb.firebaseio.com"
 
@@ -676,7 +684,10 @@ def is_admin(user_id: int) -> bool:
 
 
 def is_otc_list_manager(user_id: int) -> bool:
-    return is_admin(user_id) or int(user_id) in OTC_LIST_MANAGER_IDS
+    try:
+        return is_admin(int(user_id)) or int(user_id) in OTC_LIST_MANAGER_IDS
+    except Exception:
+        return False
 
 
 def get_bot_enabled() -> bool:
@@ -5691,8 +5702,32 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 # ===== Main Handlers =====
+
+async def show_otc_list_manager_panel(update: Update):
+    user = update.effective_user
+    try:
+        save_user_record(user.id, {
+            "telegram_id": user.id,
+            "name": user.full_name,
+            "username": user.username or "",
+            "last_seen": now_iso(),
+            "role": "otc_list_manager",
+        })
+    except Exception:
+        pass
+
+    await update.message.reply_text(
+        "🧾 لوحة فحص ليستات OTC 👇",
+        reply_markup=otc_list_manager_keyboard
+    )
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if (not is_admin(user.id)) and is_otc_list_manager(user.id):
+        await show_otc_list_manager_panel(update)
+        return
+
     if (not is_admin(user.id)) and is_otc_list_manager(user.id):
         save_user_record(user.id, {
             "telegram_id": user.id,
@@ -5746,43 +5781,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     step = context.user_data.get("step")
 
-    # ===== Absolute cancel guard for admin waiting states =====
-    if is_admin(user.id) and text.strip() in {"رجوع", "⬅️ رجوع", "🔙 رجوع"}:
-        if context.user_data.get("step") in {
-            "admin_broadcast_waiting_message",
-            "admin_message_user_waiting_text",
-            "otc_stats_waiting_count",
-            "otc_list_waiting_text",
-            "otc_pair_diagnostics_waiting",
-            "otc_candle_diagnostics_waiting",
-        }:
-            context.user_data["step"] = None
-            context.user_data.pop("target_user_id", None)
-            context.user_data.pop("target_message_user_id", None)
-            await update.message.reply_text("تم إلغاء العملية.", reply_markup=admin_main_keyboard)
-            return
-
-    save_user_record(user.id, {
-        "telegram_id": user.id,
-        "name": user.full_name,
-        "username": user.username or "",
-        "last_seen": now_iso(),
-    })
-
-    # ===== Maintenance mode =====
-    if not is_admin(user.id) and not get_bot_enabled():
-        await send_maintenance_message(update)
-        return
-
-    if text == "🎥 مشاهدة فيديو شرح البوت":
-        await update.message.reply_text(
-            "🎥 فيديو شرح البوت:\n"
-            "https://www.youtube.com/watch?v=YPqgJcgvyFw",
-            reply_markup=build_main_menu_for_user(user.id) if is_approved(user.id) or is_admin(user.id) else welcome_keyboard
-        )
-        return
-
-    # ===== Limited OTC list manager =====
+    # ===== Limited OTC list manager hard gate =====
     if (not is_admin(user.id)) and is_otc_list_manager(user.id):
         if text == "🎥 مشاهدة فيديو شرح البوت":
             await update.message.reply_text(
@@ -5817,12 +5816,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(result_text, reply_markup=otc_list_manager_keyboard)
             return
 
-        if text in {"🔙 رجوع", "⬅️ رجوع", "رجوع"}:
+        if text in {"🔙 رجوع", "⬅️ رجوع", "رجوع", "/start"}:
             context.user_data["step"] = None
-            await update.message.reply_text("🧾 لوحة فحص ليستات OTC 👇", reply_markup=otc_list_manager_keyboard)
+            await show_otc_list_manager_panel(update)
             return
 
         await update.message.reply_text("🧾 اختر أحد الخيارات من القائمة.", reply_markup=otc_list_manager_keyboard)
+        return
+
+
+    # ===== Absolute cancel guard for admin waiting states =====
+    if is_admin(user.id) and text.strip() in {"رجوع", "⬅️ رجوع", "🔙 رجوع"}:
+        if context.user_data.get("step") in {
+            "admin_broadcast_waiting_message",
+            "admin_message_user_waiting_text",
+            "otc_stats_waiting_count",
+            "otc_list_waiting_text",
+            "otc_pair_diagnostics_waiting",
+            "otc_candle_diagnostics_waiting",
+        }:
+            context.user_data["step"] = None
+            context.user_data.pop("target_user_id", None)
+            context.user_data.pop("target_message_user_id", None)
+            await update.message.reply_text("تم إلغاء العملية.", reply_markup=admin_main_keyboard)
+            return
+
+    save_user_record(user.id, {
+        "telegram_id": user.id,
+        "name": user.full_name,
+        "username": user.username or "",
+        "last_seen": now_iso(),
+    })
+
+    # ===== Maintenance mode =====
+    if not is_admin(user.id) and not get_bot_enabled():
+        await send_maintenance_message(update)
+        return
+
+    if text == "🎥 مشاهدة فيديو شرح البوت":
+        await update.message.reply_text(
+            "🎥 فيديو شرح البوت:\n"
+            "https://www.youtube.com/watch?v=YPqgJcgvyFw",
+            reply_markup=build_main_menu_for_user(user.id) if is_approved(user.id) or is_admin(user.id) else welcome_keyboard
+        )
         return
 
     # ===== Non-approved users =====
