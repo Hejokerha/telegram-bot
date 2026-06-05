@@ -2776,7 +2776,7 @@ def format_otc_list_trade_line(item: dict) -> str:
     )
 
 
-def build_otc_list_results_message(raw_text: str) -> tuple[str, dict]:
+def build_otc_list_results_message_legacy(raw_text: str) -> tuple[str, dict]:
     parsed = parse_otc_list_trades(raw_text)
     if not parsed:
         return (
@@ -2848,6 +2848,17 @@ def build_otc_list_results_message(raw_text: str) -> tuple[str, dict]:
     }
 
     return "\n".join(lines), meta
+
+
+def build_otc_list_results_message(*args, **kwargs):
+    legacy_result = build_otc_list_results_message_legacy(*args, **kwargs)
+    try:
+        if isinstance(legacy_result, tuple):
+            result_text, meta = legacy_result
+            return prettify_existing_otc_result_text(result_text), meta
+        return prettify_existing_otc_result_text(legacy_result)
+    except Exception:
+        return legacy_result
 
 
 def get_otc_list_ready_delay_seconds(raw_text: str) -> tuple[float, int]:
@@ -3121,6 +3132,110 @@ async def evaluate_single_otc_list_trade_job(context: ContextTypes.DEFAULT_TYPE)
         )
     except Exception as e:
         logger.exception("Could not evaluate OTC list trade job: %s", e)
+
+
+def otc_list_result_icon_from_line(line: str) -> str:
+    s = str(line or "").lower()
+    raw = str(line or "")
+
+    if "no data" in s or "nodata" in s:
+        return "⚠️"
+    if "doji" in s or "دوجي" in s:
+        return "⚖️"
+    if "loss" in s or "❌" in raw or "↘️" in raw:
+        return "❌"
+    if "win¹" in s or "win1" in s or "✅¹" in raw or "⚠️✅" in raw:
+        return "⚠️✅"
+    if "win" in s or "✅" in raw:
+        return "✅"
+    return "⚠️"
+
+
+def format_otc_result_row_fixed(pair: str, time_str: str, direction: str, icon: str) -> str:
+    pair = str(pair or "").strip().upper()
+    time_str = str(time_str or "").strip()
+    direction = str(direction or "").strip().upper()
+
+    if direction == "CALL":
+        dir_text = "CALL (Up)"
+    elif direction == "PUT":
+        dir_text = "PUT  (Down)"
+    else:
+        dir_text = direction
+
+    # أعمدة ثابتة لحتى الرموز تصير تحت بعض في Telegram.
+    return f"{pair:<15} {time_str:<5} {dir_text:<11} {icon}"
+
+
+def prettify_existing_otc_result_text(result_text: str) -> str:
+    """إعادة تنسيق نتائج ليستة OTC لتظهر منظمة في Telegram."""
+    try:
+        raw = str(result_text or "")
+        rows = []
+
+        wins = losses = doji = nodata = mg = 0
+
+        for line in raw.splitlines():
+            m = re.search(
+                r"([A-Z]{3}/[A-Z]{3}\s*\(OTC\))\s+(\d{1,2}:\d{2})\s+(CALL|PUT)",
+                line,
+                re.IGNORECASE,
+            )
+            if not m:
+                continue
+
+            icon = otc_list_result_icon_from_line(line)
+
+            if icon == "✅":
+                wins += 1
+            elif icon == "⚠️✅":
+                wins += 1
+                mg += 1
+            elif icon == "❌":
+                losses += 1
+            elif icon == "⚖️":
+                doji += 1
+            else:
+                nodata += 1
+
+            rows.append(format_otc_result_row_fixed(
+                pair=m.group(1),
+                time_str=m.group(2),
+                direction=m.group(3),
+                icon=icon,
+            ))
+
+        if not rows:
+            return raw
+
+        lines = [
+            "🟢 Quotex Results 🟢",
+            "━━━━━━━━━━━━━━━━",
+            "",
+            *rows,
+            "",
+            "━━━━━━━━━━━━━━━━",
+            f"{wins} win ✅",
+            f"{losses} loss ❌",
+        ]
+
+        if mg:
+            lines.append(f"{mg} win¹ ⚠️✅")
+        if doji:
+            lines.append(f"{doji} Doji ⚖️")
+        if nodata:
+            lines.append(f"{nodata} No Data ⚠️")
+
+        lines.append("━━━━━━━━━━━━━━━━")
+
+        # code block حتى تظل المسافات ثابتة وتطلع الرموز تحت بعض
+        return "```\n" + "\n".join(lines) + "\n```"
+
+    except Exception as e:
+        logger.warning("Could not prettify OTC list result text: %s", e)
+        return str(result_text or "")
+
+
 
 async def finalize_otc_list_results_job(context: ContextTypes.DEFAULT_TYPE):
     data = dict(context.job.data or {})
@@ -5834,6 +5949,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "📋 عرض نتائج الليستة":
             saved_result = get_ready_otc_list_result(user.id)
             result_text = saved_result.get("result_text")
+            result_text = prettify_existing_otc_result_text(result_text) if result_text else result_text
             if not result_text:
                 await update.message.reply_text(
                     "لا توجد نتيجة جاهزة بعد. أرسل ليستة أولًا أو انتظر رسالة الجاهزية.",
@@ -6453,6 +6569,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if text == "📋 عرض نتائج الليستة":
                 saved_result = get_ready_otc_list_result(user.id)
                 result_text = saved_result.get("result_text")
+                result_text = prettify_existing_otc_result_text(result_text) if result_text else result_text
 
                 if not result_text:
                     raw_list = context.user_data.get("last_otc_list_raw_text")
