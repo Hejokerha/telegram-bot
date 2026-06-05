@@ -89,6 +89,11 @@ OTC_LIVE_RESULT_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_DELAY_SECONDS", "
 
 ADMIN_USERNAME = "@coach_WAEL_trading"
 ADMIN_TELEGRAM_ID = 1582593617
+OTC_LIST_MANAGER_IDS = {
+    int(x.strip())
+    for x in os.getenv("OTC_LIST_MANAGER_IDS", "").split(",")
+    if x.strip().lstrip("-").isdigit()
+}
 
 DATABASE_URL = "https://telegram-bot-f0229-default-rtdb.firebaseio.com"
 
@@ -386,6 +391,14 @@ admin_otc_stats_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+otc_list_manager_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
+        ["🎥 مشاهدة فيديو شرح البوت"],
+    ],
+    resize_keyboard=True
+)
+
 admin_otc_list_ready_keyboard = ReplyKeyboardMarkup(
     [
         ["📋 عرض نتائج الليستة"],
@@ -660,6 +673,10 @@ def get_all_approved_users():
 
 def is_admin(user_id: int) -> bool:
     return user_id == ADMIN_TELEGRAM_ID
+
+
+def is_otc_list_manager(user_id: int) -> bool:
+    return is_admin(user_id) or int(user_id) in OTC_LIST_MANAGER_IDS
 
 
 def get_bot_enabled() -> bool:
@@ -2958,6 +2975,60 @@ def build_otc_list_results_message_from_items(items: list[dict]) -> tuple[str, d
     return "\n".join(lines), meta
 
 
+
+async def start_otc_list_watch_for_user(update: Update, context: ContextTypes.DEFAULT_TYPE, raw_list: str, reply_markup):
+    user = update.effective_user
+
+    context.user_data["last_otc_list_raw_text"] = raw_list
+    context.user_data["last_otc_list_result_text"] = None
+    try:
+        otc_list_results_ref(user.id).delete()
+    except Exception:
+        pass
+
+    list_id = str(int(time_module.time()))
+    parsed_trades = parse_otc_list_trades(raw_list)
+
+    if not parsed_trades:
+        await update.message.reply_text(
+            "❌ لم أستطع قراءة أي صفقة من الليستة. تأكد من صيغة الوقت والزوج والاتجاه.",
+            reply_markup=reply_markup
+        )
+        return
+
+    save_otc_list_job(user.id, list_id, raw_list, parsed_trades)
+
+    latest_delay = 1.0
+    for idx, trade in enumerate(parsed_trades):
+        entry_dt = otc_list_entry_datetime(int(trade["hour"]), int(trade["minute"]))
+        ready_dt = entry_dt + timedelta(seconds=130)
+        trade_delay = max(1.0, (ready_dt - now_utc()).total_seconds())
+        latest_delay = max(latest_delay, trade_delay)
+
+        context.job_queue.run_once(
+            evaluate_single_otc_list_trade_job,
+            when=trade_delay,
+            data={"admin_id": user.id, "list_id": list_id, "index": idx, "trade": trade},
+            name=f"otc_list_trade_{user.id}_{list_id}_{idx}",
+        )
+
+    context.job_queue.run_once(
+        finalize_otc_list_results_job,
+        when=latest_delay + 2,
+        data={"admin_id": user.id, "list_id": list_id},
+        name=f"otc_list_finalize_{user.id}_{list_id}",
+    )
+
+    context.user_data["last_otc_list_id"] = list_id
+
+    ready_minutes = round((latest_delay + 2) / 60, 1)
+    await update.message.reply_text(
+        f"✅ تم استلام الليستة وعدد صفقاتها: {len(parsed_trades)}\n"
+        f"⏳ سأحسب كل صفقة فور انتهائها، وأخبرك عندما تصبح النتيجة النهائية جاهزة تقريبًا بعد {ready_minutes} دقيقة.",
+        reply_markup=reply_markup
+    )
+
+
 async def evaluate_single_otc_list_trade_job(context: ContextTypes.DEFAULT_TYPE):
     data = dict(context.job.data or {})
     admin_id = int(data.get("admin_id"))
@@ -3090,7 +3161,7 @@ async def finalize_otc_list_results_job(context: ContextTypes.DEFAULT_TYPE):
                 "✅ نتائج ليستة OTC جاهزة ومحفوظة.\n\n"
                 "اضغط الزر بالأسفل لعرض النتائج ونسخها بأي وقت."
             ),
-            reply_markup=admin_otc_list_ready_keyboard
+            reply_markup=admin_otc_list_ready_keyboard if is_admin(admin_id) else otc_list_manager_keyboard
         )
 
     except Exception as e:
@@ -5622,6 +5693,20 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
 # ===== Main Handlers =====
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
+    if (not is_admin(user.id)) and is_otc_list_manager(user.id):
+        save_user_record(user.id, {
+            "telegram_id": user.id,
+            "name": user.full_name,
+            "username": user.username or "",
+            "last_seen": now_iso(),
+            "role": "otc_list_manager",
+        })
+        await update.message.reply_text(
+            "🧾 لوحة فحص ليستات OTC 👇",
+            reply_markup=otc_list_manager_keyboard
+        )
+        return
+
     reset_signal_state(context)
 
     save_user_record(user.id, {
@@ -5695,6 +5780,49 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "https://www.youtube.com/watch?v=YPqgJcgvyFw",
             reply_markup=build_main_menu_for_user(user.id) if is_approved(user.id) or is_admin(user.id) else welcome_keyboard
         )
+        return
+
+    # ===== Limited OTC list manager =====
+    if (not is_admin(user.id)) and is_otc_list_manager(user.id):
+        if text == "🎥 مشاهدة فيديو شرح البوت":
+            await update.message.reply_text(
+                "🎥 فيديو شرح البوت:\nhttps://www.youtube.com/watch?v=YPqgJcgvyFw",
+                reply_markup=otc_list_manager_keyboard
+            )
+            return
+
+        if text == "🧾 فحص ليستة OTC":
+            context.user_data["step"] = "otc_list_waiting_text"
+            await update.message.reply_text(
+                "🧾 أرسل الآن ليستة OTC كاملة كما نشرتها بالقناة.\n"
+                "سأراقبها وأخبرك عندما تنتهي آخر صفقة وتصبح النتائج جاهزة.",
+                reply_markup=otc_list_manager_keyboard
+            )
+            return
+
+        if step == "otc_list_waiting_text" or looks_like_otc_list_text(text):
+            context.user_data["step"] = None
+            await start_otc_list_watch_for_user(update, context, text, otc_list_manager_keyboard)
+            return
+
+        if text == "📋 عرض نتائج الليستة":
+            saved_result = get_ready_otc_list_result(user.id)
+            result_text = saved_result.get("result_text")
+            if not result_text:
+                await update.message.reply_text(
+                    "لا توجد نتيجة جاهزة بعد. أرسل ليستة أولًا أو انتظر رسالة الجاهزية.",
+                    reply_markup=otc_list_manager_keyboard
+                )
+                return
+            await update.message.reply_text(result_text, reply_markup=otc_list_manager_keyboard)
+            return
+
+        if text in {"🔙 رجوع", "⬅️ رجوع", "رجوع"}:
+            context.user_data["step"] = None
+            await update.message.reply_text("🧾 لوحة فحص ليستات OTC 👇", reply_markup=otc_list_manager_keyboard)
+            return
+
+        await update.message.reply_text("🧾 اختر أحد الخيارات من القائمة.", reply_markup=otc_list_manager_keyboard)
         return
 
     # ===== Non-approved users =====
@@ -5895,7 +6023,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if is_admin(user.id) and step == "otc_list_waiting_text":
+    if is_otc_list_manager(user.id) and step == "otc_list_waiting_text":
         raw_list = text
         parsed = parse_otc_list_trades(raw_list)
         context.user_data["step"] = None
@@ -6282,7 +6410,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
 
-        if is_admin(user.id) and text == "📋 عرض نتائج الليستة":
+        if is_otc_list_manager(user.id) and text == "📋 عرض نتائج الليستة":
             raw_list = context.user_data.get("last_otc_list_raw_text")
             if not raw_list:
                 await update.message.reply_text(
