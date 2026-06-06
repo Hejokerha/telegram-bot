@@ -658,6 +658,19 @@ def channel_publish_ref():
     return system_ref().child("channel_publish")
 
 
+
+def force_channel_publish_setting(channel_key: str, enabled: bool):
+    try:
+        system_ref().child("channel_publish").child(str(channel_key)).set(bool(enabled))
+        clear_channel_publish_cache()
+        if str(channel_key) == "otc_live":
+            remember_otc_live_enabled_state(bool(enabled))
+        return True
+    except Exception as e:
+        logger.exception("Could not force channel publish setting %s=%s: %s", channel_key, enabled, e)
+        return False
+
+
 def get_channel_publish_settings() -> dict:
     cached = _cache_get("channel_publish:settings", FIREBASE_CHANNEL_SETTINGS_TTL_SECONDS)
     if cached is not None:
@@ -2316,12 +2329,21 @@ def reset_stuck_otc_live_trade_if_needed() -> bool:
 
 
 async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
-    logger.info("OTC LIVE CHANNEL SCAN started | enabled=%s | active=%s | min_quality=%s",
-                OTC_LIVE_CHANNEL_ENABLED, otc_live_channel_state.get("active"), OTC_LIVE_MIN_QUALITY)
+    live_publish_enabled = bool(OTC_LIVE_CHANNEL_ENABLED and is_channel_publish_enabled("otc_live"))
+    remember_otc_live_enabled_state(live_publish_enabled)
 
-    if not OTC_LIVE_CHANNEL_ENABLED or not is_channel_publish_enabled("otc_live"):
-        logger.info("OTC LIVE CHANNEL SCAN skipped: disabled") if should_log_quiet("otc_live_disabled", 300) else None if should_log_quiet("otc_live_disabled", 300) else None
+    if not live_publish_enabled:
+        if should_log_quiet("otc_live_disabled", 300):
+            logger.info("OTC LIVE CHANNEL disabled: hard stop active")
         return
+
+    if should_log_quiet("otc_live_scan_started", 300):
+        logger.info(
+            "OTC LIVE CHANNEL SCAN started | enabled=%s | active=%s | min_quality=%s",
+            live_publish_enabled,
+            otc_live_channel_state.get("active"),
+            OTC_LIVE_MIN_QUALITY
+        )
 
     if otc_live_channel_state.get("active"):
         if reset_stuck_otc_live_trade_if_needed():
@@ -6960,12 +6982,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             if text == "🔥 تشغيل OTC مباشر":
-                set_channel_publish_enabled("otc_live", True)
+                force_channel_publish_setting("otc_live", True)
                 await update.message.reply_text("🔥 تم تشغيل نشر قناة OTC المباشر ✅", reply_markup=admin_channels_keyboard)
                 return
 
             if text == "🔥 إيقاف OTC مباشر":
-                set_channel_publish_enabled("otc_live", False)
+                force_channel_publish_setting("otc_live", False)
                 await update.message.reply_text("🔥 تم إيقاف نشر قناة OTC المباشر ⛔", reply_markup=admin_channels_keyboard)
                 return
 
