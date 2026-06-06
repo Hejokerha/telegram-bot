@@ -6130,6 +6130,13 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def show_otc_list_manager_panel(update: Update):
     user = update.effective_user
+    if is_user_revoked_direct(user.id):
+        await update.message.reply_text(
+            "⛔ حسابك غير مفعّل حاليًا.\n\nاختر من القائمة بالأسفل:",
+            reply_markup=welcome_keyboard
+        )
+        return
+
     try:
         save_user_record(user.id, {
             "telegram_id": user.id,
@@ -6381,43 +6388,31 @@ def is_user_revoked_direct(user_id: int) -> bool:
 
 
 def is_user_currently_allowed(user_id: int) -> bool:
+    """هل المستخدم مفعّل لاستخدام الإشارات؟
+    ملاحظة: OTC_LIST_MANAGER_IDS لا يعني تفعيل إشارات. فقط الأدمن يتجاوز التفعيل.
+    """
     try:
         uid = int(user_id)
-        if is_admin(uid) or is_otc_list_manager(uid):
+
+        if is_admin(uid):
             return True
+
         if is_user_revoked_direct(uid):
             return False
+
         return bool(is_approved(uid))
     except Exception:
         return False
 
 
-async def notify_user_revoked_to_welcome(context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    try:
-        await context.bot.send_message(
-            chat_id=int(user_id),
-            text=(
-                "⛔ تم إلغاء تفعيل حسابك.\n\n"
-                "إذا كنت تريد استخدام البوت مرة أخرى، اختر من القائمة بالأسفل:"
-            ),
-            reply_markup=welcome_keyboard
-        )
-    except Exception as e:
-        logger.warning("Could not notify revoked user with welcome keyboard | user=%s | error=%s", user_id, e)
 
-
-PUBLIC_UNAUTH_TEXTS = {
-    "/start",
-    "✅ نعم، أنا منضم",
-    "❌ لا، لست مشتركًا",
-    "🎥 مشاهدة فيديو شرح البوت",
-    "🎁 الحصول على تجربة مجانية",
-    "✅ شاهدت الفيديو",
-    "📞 تواصل مع المسؤول",
-    "🔙 رجوع",
-    "⬅️ رجوع",
-    "رجوع",
-}
+def is_otc_list_manager_allowed_without_activation(text: str) -> bool:
+    raw = str(text or "").strip()
+    if raw in OTC_LIST_MANAGER_ONLY_TEXTS:
+        return True
+    if looks_like_otc_list_text(raw):
+        return True
+    return False
 
 
 SIGNAL_ACCESS_TEXTS = {
@@ -6445,9 +6440,13 @@ def is_public_unauth_text(text: str) -> bool:
 
 
 def should_block_unapproved_user(user_id: int, text: str) -> bool:
-    """قفل نهائي: أي مستخدم غير مفعّل لا يدخل توليد الإشارات نهائيًا."""
     try:
-        if is_admin(user_id) or is_otc_list_manager(user_id):
+        if is_admin(user_id):
+            return False
+
+        # مشرف الليستات مسموح له فقط بأدوات الليستات بدون تفعيل.
+        # توليد الإشارات لا يمر إلا إذا كان مفعّلًا.
+        if is_otc_list_manager(user_id) and is_otc_list_manager_allowed_without_activation(text):
             return False
 
         if is_user_currently_allowed(user_id):
@@ -6459,6 +6458,7 @@ def should_block_unapproved_user(user_id: int, text: str) -> bool:
         return True
     except Exception:
         return True
+
 
 
 async def block_unapproved_user_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6639,8 +6639,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_otc_list_manager_panel(update)
             return
 
-        # أزرار البوت العادي مسموحة لهذا الشخص أيضًا، لذلك نتركها تكمل للمعالجة العادية.
-        if text in {"📊 توليد إشارات", "📞 تواصل مع المسؤول", "⚡ OTC", "🕒 زمني", "⚡ صفقة مباشرة", "🔎 ابحث عن صفقة الآن"}:
+        # توليد الإشارات لمشرف الليستات يحتاج تفعيل عادي.
+        if text in {"📊 توليد إشارات", "⚡ OTC", "🕒 زمني", "⚡ صفقة مباشرة", "🔎 ابحث عن صفقة الآن", "🌎 سوق عالمي", "🌍 سوق عالمي"}:
+            if not is_user_currently_allowed(user.id):
+                await block_unapproved_user_now(update, context)
+                return
+            pass
+        elif text == "📞 تواصل مع المسؤول":
             pass
         else:
             context.user_data["step"] = None
