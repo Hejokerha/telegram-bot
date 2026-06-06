@@ -6166,24 +6166,6 @@ async def show_otc_list_manager_panel(update: Update):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if (not is_admin(user.id)) and is_otc_list_manager(user.id) and not is_start_flow_button(text):
-        await show_otc_list_manager_panel(update)
-        return
-
-    if (not is_admin(user.id)) and is_otc_list_manager(user.id):
-        save_user_record(user.id, {
-            "telegram_id": user.id,
-            "name": user.full_name,
-            "username": user.username or "",
-            "last_seen": now_iso(),
-            "role": "otc_list_manager",
-        })
-        await update.message.reply_text(
-            "🧾 لوحة فحص ليستات OTC 👇",
-            reply_markup=otc_list_manager_keyboard
-        )
-        return
-
     reset_signal_state(context)
 
     save_user_record(user.id, {
@@ -6205,6 +6187,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_maintenance_message(update)
         return
 
+    # مشرف الليستات: إذا كان مفعّلًا يظهر له كيبورد الليستات+الإشارات، وإذا غير مفعّل يرجع لمسار البداية.
+    if is_otc_list_manager(user.id):
+        if is_approved(user.id):
+            await show_otc_list_manager_panel(update)
+            return
+        await send_welcome_flow(update)
+        return
+
     if is_approved(user.id):
         await update.message.reply_text(
             f"✅ أهلًا {user.first_name}\n"
@@ -6213,7 +6203,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     else:
         await send_welcome_flow(update)
-
 
 
 def get_latest_otc_list_job(user_id: int) -> tuple[str | None, dict]:
@@ -6662,7 +6651,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     # ===== Limited OTC list manager hard gate =====
-    if (not is_admin(user.id)) and is_otc_list_manager(user.id):
+    if (not is_admin(user.id)) and is_otc_list_manager(user.id) and not is_start_flow_button(text):
         if "فيديو شرح" in text:
             await update.message.reply_text(
                 "🎥 فيديو شرح البوت:\nhttps://www.youtube.com/watch?v=YPqgJcgvyFw",
@@ -6756,7 +6745,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # ===== Non-approved users =====
-    if not is_admin(user.id) and not is_otc_list_manager(user.id) and not is_approved(user.id):
+    if not is_admin(user.id) and not is_approved(user.id):
         current_status = get_user_status(user.id)
 
         # فيديو الشرح مسموح حتى قبل التفعيل
