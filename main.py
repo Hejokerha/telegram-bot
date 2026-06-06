@@ -917,7 +917,7 @@ async def send_revoked_welcome_keyboard(context: ContextTypes.DEFAULT_TYPE, user
             chat_id=int(user_id),
             text=(
                 "⛔ تم إلغاء تفعيل حسابك.\n\n"
-                "تمت إعادة حسابك كأنه جديد. إذا كنت تريد استخدام البوت مرة أخرى، اختر من القائمة بالأسفل:"
+                "إذا كنت تعتقد أن هذا حدث عن طريق الخطأ، تواصل مع الأدمن."
             ),
             reply_markup=welcome_keyboard
         )
