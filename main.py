@@ -299,6 +299,7 @@ logging.basicConfig(
     level=os.getenv("LOG_LEVEL", "INFO"),
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
+logging.getLogger("apscheduler").setLevel(logging.WARNING)
 logger = logging.getLogger("trading_time_bot")
 
 # نسب تقريبية حتى لا تكون مسافات الدعم/المقاومة والـ Round Numbers ثابتة لكل الأزواج.
@@ -532,6 +533,56 @@ admin_duration_keyboard = ReplyKeyboardMarkup(
 )
 
 # ===== Firebase refs =====
+
+
+
+# ===== OTC Live hard stop when disabled =====
+OTC_LIVE_DISABLED_CHECK_SECONDS = int(os.getenv("OTC_LIVE_DISABLED_CHECK_SECONDS", "120"))
+_OTC_LIVE_DISABLED_LAST_CHECK = 0.0
+_OTC_LIVE_DISABLED_LAST_ENABLED = None
+
+
+def should_check_otc_live_enabled_when_disabled() -> bool:
+    """عندما تكون قناة OTC Live متوقفة، لا نفحص Firebase كل 5 ثواني.
+    نفحص فقط كل OTC_LIVE_DISABLED_CHECK_SECONDS حتى نعرف إذا تم تشغيلها من الأدمن.
+    """
+    global _OTC_LIVE_DISABLED_LAST_CHECK
+
+    try:
+        now_ts = time_module.time()
+        if now_ts - float(_OTC_LIVE_DISABLED_LAST_CHECK or 0) >= int(OTC_LIVE_DISABLED_CHECK_SECONDS):
+            _OTC_LIVE_DISABLED_LAST_CHECK = now_ts
+            return True
+        return False
+    except Exception:
+        return True
+
+
+def remember_otc_live_enabled_state(enabled: bool):
+    global _OTC_LIVE_DISABLED_LAST_ENABLED
+    _OTC_LIVE_DISABLED_LAST_ENABLED = bool(enabled)
+
+
+def get_remembered_otc_live_enabled_state():
+    return _OTC_LIVE_DISABLED_LAST_ENABLED
+
+
+# ===== Quiet skipped job logging =====
+_QUIET_LOG_TIMERS = {}
+
+
+def should_log_quiet(key: str, every_seconds: int = 300) -> bool:
+    """يمنع تكرار نفس اللوج كل 5 ثواني، ويطبعه مرة كل عدة دقائق فقط."""
+    try:
+        now_ts = time_module.time()
+        last = float(_QUIET_LOG_TIMERS.get(key, 0) or 0)
+        if now_ts - last >= int(every_seconds):
+            _QUIET_LOG_TIMERS[key] = now_ts
+            return True
+        return False
+    except Exception:
+        return True
+
 
 # ===== Firebase read saver cache =====
 FIREBASE_CACHE_TTL_SECONDS = int(os.getenv("FIREBASE_CACHE_TTL_SECONDS", "60"))
@@ -2269,7 +2320,7 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
                 OTC_LIVE_CHANNEL_ENABLED, otc_live_channel_state.get("active"), OTC_LIVE_MIN_QUALITY)
 
     if not OTC_LIVE_CHANNEL_ENABLED or not is_channel_publish_enabled("otc_live"):
-        logger.info("OTC LIVE CHANNEL SCAN skipped: disabled")
+        logger.info("OTC LIVE CHANNEL SCAN skipped: disabled") if should_log_quiet("otc_live_disabled", 300) else None if should_log_quiet("otc_live_disabled", 300) else None
         return
 
     if otc_live_channel_state.get("active"):
@@ -2286,6 +2337,11 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
+        # ===== OTC LIVE HARD STOP disabled gate =====
+        remembered_enabled = get_remembered_otc_live_enabled_state()
+        if remembered_enabled is False and not should_check_otc_live_enabled_when_disabled():
+            return
+
         inside_window, remaining_to_entry = is_inside_otc_entry_scan_window(now_utc())
         if not inside_window:
             logger.info(
