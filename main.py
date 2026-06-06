@@ -6361,6 +6361,51 @@ async def send_video_watched_button_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+def is_user_revoked_direct(user_id: int) -> bool:
+    uid = int(user_id)
+    cached_status = _cache_get(f"user_status:{uid}", 5)
+    if str(cached_status).lower() in {"blocked", "cancelled", "rejected", "disabled", "expired"}:
+        return True
+    try:
+        data = users_ref().child(str(uid)).get() or {}
+        if isinstance(data, dict):
+            status = str(data.get("status") or "").lower()
+            if status in {"blocked", "cancelled", "rejected", "disabled", "expired"}:
+                _cache_set(f"user_status:{uid}", status)
+                _cache_set(f"approved:{uid}", False)
+                return True
+    except Exception as e:
+        logger.exception("Could not check revoked user directly: %s", e)
+    return False
+
+
+def is_user_currently_allowed(user_id: int) -> bool:
+    try:
+        uid = int(user_id)
+        if is_admin(uid) or is_otc_list_manager(uid):
+            return True
+        if is_user_revoked_direct(uid):
+            return False
+        return bool(is_approved(uid))
+    except Exception:
+        return False
+
+
+async def notify_user_revoked_to_welcome(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    try:
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "⛔ تم إلغاء تفعيل حسابك.\n\n"
+                "إذا كنت تريد استخدام البوت مرة أخرى، اختر من القائمة بالأسفل:"
+            ),
+            reply_markup=welcome_keyboard
+        )
+    except Exception as e:
+        logger.warning("Could not notify revoked user with welcome keyboard | user=%s | error=%s", user_id, e)
+
+
 PUBLIC_UNAUTH_TEXTS = {
     "/start",
     "✅ نعم، أنا منضم",
@@ -6405,7 +6450,7 @@ def should_block_unapproved_user(user_id: int, text: str) -> bool:
         if is_admin(user_id) or is_otc_list_manager(user_id):
             return False
 
-        if is_approved(user_id):
+        if is_user_currently_allowed(user_id):
             return False
 
         if is_public_unauth_text(text):
@@ -6417,10 +6462,11 @@ def should_block_unapproved_user(user_id: int, text: str) -> bool:
 
 
 async def block_unapproved_user_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data.clear()
     reset_signal_state(context)
     await update.message.reply_text(
-        "⛔ حسابك غير مفعّل حاليًا.\\n\\n"
-        "إذا كنت ترى أن هذا بالخطأ، تواصل مع الأدمن.",
+        "⛔ حسابك غير مفعّل حاليًا.\n\n"
+        "اختر من القائمة بالأسفل:",
         reply_markup=welcome_keyboard
     )
 
@@ -6433,6 +6479,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
     step = context.user_data.get("step")
+
+    # ===== HARD ACCESS GATE FIRST =====
+    if should_block_unapproved_user(user.id, text):
+        await block_unapproved_user_now(update, context)
+        return
+
 
     if text == "🎁 الحصول على تجربة مجانية":
         if has_used_video_trial(user.id):
@@ -7417,7 +7469,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await context.bot.send_message(
                         chat_id=target_id,
-                        text="⛔ تم إلغاء تفعيل حسابك\n\nإذا كنت ترى أن هذا بالخطأ، تواصل مع الأدمن."
+                        text="⛔ تم إلغاء تفعيل حسابك.\n\nإذا كنت تريد استخدام البوت مرة أخرى، اختر من القائمة بالأسفل:",
+                        reply_markup=welcome_keyboard
                     )
                 except Exception:
                     pass
