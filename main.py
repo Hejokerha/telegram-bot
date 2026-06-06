@@ -427,8 +427,7 @@ admin_otc_list_ready_keyboard = ReplyKeyboardMarkup(
 welcome_keyboard = ReplyKeyboardMarkup(
     [
         ["🎁 الحصول على تجربة مجانية"],
-        ["✅ نعم، أنا منضم",
-    "نعم، أنا منضم ✅", "❌ لا، لست مشتركًا"],
+        ["✅ نعم، أنا منضم", "❌ لا، لست مشتركًا"],
         ["🎥 مشاهدة فيديو شرح البوت"],
     ],
     resize_keyboard=True
@@ -630,11 +629,9 @@ def clear_user_cache(user_id: int):
         _cache_delete_prefix(f"user_status:{uid}")
         _cache_delete_prefix(f"approved:{uid}")
         _cache_delete_prefix(f"approved_data:{uid}")
-        _cache_delete_prefix(f"user_record:{uid}")
         _cache_delete_prefix(f"video_trial:{uid}")
     except Exception:
         pass
-
 
 
 def clear_channel_publish_cache():
@@ -869,43 +866,68 @@ def set_bot_enabled(value: bool):
 
 
 
-def force_revoke_user_access(user_id: int, status: str = "blocked"):
-    """إلغاء تفعيل فوري ومضمون للمستخدم + تنظيف الكاش."""
+def force_revoke_user_access(user_id: int, status: str = "new"):
+    """إلغاء تفعيل المستخدم وإرجاعه كأنه شخص جديد تمامًا."""
     uid = int(user_id)
 
+    preserve_video_trial_used = False
     try:
-        force_revoke_user_access(uid, 'blocked')
+        old_user_data = users_ref().child(str(uid)).get() or {}
+        if isinstance(old_user_data, dict):
+            old_trial = old_user_data.get("video_trial") or {}
+            if isinstance(old_trial, dict) and old_trial.get("used"):
+                preserve_video_trial_used = True
+    except Exception:
+        pass
+
+    if preserve_video_trial_used or has_used_video_trial_permanent(uid):
+        mark_video_trial_used_permanent(uid)
+
+    try:
+        approved_ref().child(str(uid)).delete()
     except Exception:
         pass
 
     try:
-        users_ref().child(str(uid)).update({
-            "status": status,
-            "approved": False,
-            "revoked_at": now_iso(),
-            "updated_at": now_iso(),
-        })
+        pending_ref().child(str(uid)).delete()
+    except Exception:
+        pass
+
+    try:
+        users_ref().child(str(uid)).delete()
     except Exception:
         pass
 
     try:
         clear_user_cache(uid)
         _cache_set(f"approved:{uid}", False)
-        _cache_set(f"user_status:{uid}", status)
+        _cache_set(f"user_status:{uid}", "new")
         _cache_set(f"approved_data:{uid}", None)
+        _cache_set(f"video_trial:{uid}", has_used_video_trial_permanent(uid))
     except Exception:
         pass
 
     return True
 
 
+
+async def send_revoked_welcome_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    try:
+        await context.bot.send_message(
+            chat_id=int(user_id),
+            text=(
+                "⛔ تم إلغاء تفعيل حسابك.\n\n"
+                "تمت إعادة حسابك كأنه جديد. إذا كنت تريد استخدام البوت مرة أخرى، اختر من القائمة بالأسفل:"
+            ),
+            reply_markup=welcome_keyboard
+        )
+    except Exception as e:
+        logger.warning("Could not send revoked welcome keyboard | user=%s | error=%s", user_id, e)
+
+
+
 def is_approved(user_id: int) -> bool:
     uid = int(user_id)
-
-    cached_status = _cache_get(f"user_status:{uid}")
-    if str(cached_status).lower() in {"blocked", "cancelled", "rejected", "disabled", "expired"}:
-        return False
-
     cached = _cache_get(f"approved:{uid}")
     if cached is not None:
         return bool(cached)
@@ -944,12 +966,6 @@ def get_user_status(user_id: int) -> str:
         return str(cached)
 
     try:
-        user_data = users_ref().child(str(uid)).get() or {}
-        if isinstance(user_data, dict):
-            user_status = str(user_data.get("status") or "").lower()
-            if user_status in {"blocked", "cancelled", "rejected", "disabled", "expired"}:
-                return _cache_set(f"user_status:{uid}", user_status)
-
         if is_approved(uid):
             return _cache_set(f"user_status:{uid}", "approved")
 
@@ -6131,13 +6147,6 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
 
 async def show_otc_list_manager_panel(update: Update):
     user = update.effective_user
-    if is_user_revoked_direct(user.id):
-        await update.message.reply_text(
-            "⛔ حسابك غير مفعّل حاليًا.\n\nاختر من القائمة بالأسفل:",
-            reply_markup=welcome_keyboard
-        )
-        return
-
     try:
         save_user_record(user.id, {
             "telegram_id": user.id,
@@ -6280,18 +6289,55 @@ def recover_otc_list_result_now(user_id: int) -> tuple[str | None, dict]:
 
 
 
+
+def video_trial_permanent_ref(user_id: int):
+    """سجل دائم للتجربة المجانية لا يُحذف عند إلغاء التفعيل."""
+    return db.reference("video_trials").child(str(int(user_id)))
+
+
+def has_used_video_trial_permanent(user_id: int) -> bool:
+    try:
+        data = video_trial_permanent_ref(user_id).get() or {}
+        return bool(data.get("used"))
+    except Exception:
+        return False
+
+
+def mark_video_trial_used_permanent(user_id: int, expires_at=None):
+    try:
+        payload = {
+            "used": True,
+            "used_at": now_iso(),
+        }
+        if expires_at:
+            payload["expires_at"] = expires_at.isoformat() if hasattr(expires_at, "isoformat") else str(expires_at)
+        video_trial_permanent_ref(user_id).update(payload)
+    except Exception:
+        pass
+
+
 def video_trial_ref(user_id: int):
     return users_ref().child(str(user_id)).child("video_trial")
 
 
 def has_used_video_trial(user_id: int) -> bool:
     uid = int(user_id)
+
     cached = _cache_get(f"video_trial:{uid}")
     if cached is not None:
         return bool(cached)
+
+    # أولًا افحص السجل الدائم الذي لا يُحذف مع إلغاء التفعيل.
+    if has_used_video_trial_permanent(uid):
+        return _cache_set(f"video_trial:{uid}", True)
+
     try:
         data = video_trial_ref(uid).get() or {}
-        return _cache_set(f"video_trial:{uid}", bool(data.get("used")))
+        used = bool(data.get("used"))
+        if used:
+            # ترحيل تلقائي للسجل القديم إلى السجل الدائم.
+            mark_video_trial_used_permanent(uid, data.get("expires_at"))
+        return _cache_set(f"video_trial:{uid}", used)
     except Exception:
         return _cache_set(f"video_trial:{uid}", False)
 
@@ -6345,6 +6391,9 @@ def activate_video_trial_for_user(user_id: int):
     except Exception:
         pass
 
+    mark_video_trial_used_permanent(user_id, expire_at)
+    clear_user_cache(user_id)
+
     return expire_at
 
 
@@ -6369,103 +6418,45 @@ async def send_video_watched_button_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 
-
-def is_user_revoked_direct(user_id: int) -> bool:
-    uid = int(user_id)
-    cached_status = _cache_get(f"user_status:{uid}", 5)
-    if str(cached_status).lower() in {"blocked", "cancelled", "rejected", "disabled", "expired"}:
-        return True
-    try:
-        data = users_ref().child(str(uid)).get() or {}
-        if isinstance(data, dict):
-            status = str(data.get("status") or "").lower()
-            if status in {"blocked", "cancelled", "rejected", "disabled", "expired"}:
-                _cache_set(f"user_status:{uid}", status)
-                _cache_set(f"approved:{uid}", False)
-                return True
-    except Exception as e:
-        logger.exception("Could not check revoked user directly: %s", e)
-    return False
+SIGNAL_BLOCK_KEYWORDS = [
+    "توليد إشارات",
+    "اختر نوع السوق",
+    "OTC",
+    "صفقة مباشرة",
+    "ابحث عن صفقة",
+    "سوق عالمي",
+]
 
 
-def is_user_currently_allowed(user_id: int) -> bool:
-    """هل المستخدم مفعّل لاستخدام الإشارات؟
-    ملاحظة: OTC_LIST_MANAGER_IDS لا يعني تفعيل إشارات. فقط الأدمن يتجاوز التفعيل.
-    """
-    try:
-        uid = int(user_id)
+PUBLIC_KEYWORDS = [
+    "نعم",
+    "منضم",
+    "لا",
+    "مشترك",
+    "تجربة مجانية",
+    "فيديو شرح",
+    "مشاهدة فيديو",
+    "شاهدت الفيديو",
+    "تواصل",
+    "رجوع",
+    "/start",
+]
 
-        if is_admin(uid):
-            return True
 
-        if is_user_revoked_direct(uid):
-            return False
+def is_public_start_flow_text(text: str) -> bool:
+    raw = str(text or "").strip()
 
-        return bool(is_approved(uid))
-    except Exception:
+    if not raw:
         return False
 
+    # أزرار البداية والتجربة والفيديو والانضمام مسموحة دائمًا لغير المفعّل.
+    if "توليد إشارات" in raw:
+        return False
 
-
-def is_otc_list_manager_allowed_without_activation(text: str) -> bool:
-    raw = str(text or "").strip()
-    if raw in OTC_LIST_MANAGER_ONLY_TEXTS:
-        return True
-    if looks_like_otc_list_text(raw):
-        return True
-    return False
-
-
-SIGNAL_ACCESS_TEXTS = {
-    "📊 توليد إشارات",
-    "⚡ OTC",
-    "⚡ صفقة مباشرة",
-    "🔎 ابحث عن صفقة الآن",
-    "🌎 سوق عالمي",
-    "🌍 سوق عالمي",
-    "سوق عالمي 🌍",
-    "OTC ⚡",
-}
-
-
-def is_public_unauth_text(text: str) -> bool:
-    raw = str(text or "").strip()
-    compact = raw.replace(" ", "")
-
-    # تطابق مباشر
-    if raw in PUBLIC_UNAUTH_TEXTS:
-        return True
-
-    # تيليجرام مع العربية أحيانًا يعرض/يرسل الإيموجي بآخر النص بدل أوله.
-    public_keywords = [
-        "نعم، أنا منضم",
-        "نعم انا منضم",
-        "لا، لست مشترك",
-        "لا لست مشترك",
-        "مشاهدة فيديو شرح البوت",
-        "الحصول على تجربة مجانية",
-        "شاهدت الفيديو",
-        "تواصل مع المسؤول",
-        "رجوع",
-    ]
-
-    for keyword in public_keywords:
+    for keyword in PUBLIC_KEYWORDS:
         if keyword in raw:
             return True
 
-    # نسخ بدون مسافات/فواصل احتياطًا
-    if "الحصولعلىتجربةمجانية" in compact:
-        return True
-    if "مشاهدةفيديوشرحالبوت" in compact:
-        return True
-    if "نعمأنامنضم" in compact or "نعم،أنامنضم" in compact:
-        return True
-    if "لالستمشترك" in compact or "لا،لستمشترك" in compact:
-        return True
-    if "شاهدتالفيديو" in compact:
-        return True
-
-    # السماح برسائل طلب الانضمام/Quotex ID فقط، وليس أزرار الإشارات.
     upper = raw.upper()
     if upper.startswith("ID") or "QUOTEX" in upper:
         return True
@@ -6473,34 +6464,47 @@ def is_public_unauth_text(text: str) -> bool:
     return False
 
 
-def should_block_unapproved_user(user_id: int, text: str) -> bool:
+def is_signal_flow_text(text: str) -> bool:
+    raw = str(text or "").strip()
+
+    # لا تعتبر أزرار البداية إشارات حتى لو فيها كلمات عامة.
+    if is_public_start_flow_text(raw):
+        return False
+
+    for keyword in SIGNAL_BLOCK_KEYWORDS:
+        if keyword in raw:
+            return True
+
+    return False
+
+
+def is_user_revoked_or_not_allowed(user_id: int) -> bool:
+    uid = int(user_id)
+
+    if is_admin(uid):
+        return False
+
+    # مشرف الليستات ليس تفعيل إشارات. يحتاج approved للإشارات.
     try:
-        if is_admin(user_id):
-            return False
-
-        # مشرف الليستات مسموح له فقط بأدوات الليستات بدون تفعيل.
-        # توليد الإشارات لا يمر إلا إذا كان مفعّلًا.
-        if is_otc_list_manager(user_id) and is_otc_list_manager_allowed_without_activation(text):
-            return False
-
-        if is_user_currently_allowed(user_id):
-            return False
-
-        if is_public_unauth_text(text):
-            return False
-
-        return True
+        user_data = users_ref().child(str(uid)).get() or {}
+        if isinstance(user_data, dict):
+            status = str(user_data.get("status") or "").lower()
+            if status in {"blocked", "cancelled", "rejected", "disabled", "expired"}:
+                clear_user_cache(uid)
+                _cache_set(f"approved:{uid}", False)
+                _cache_set(f"user_status:{uid}", status)
+                return True
     except Exception:
-        return True
+        pass
+
+    return not is_approved(uid)
 
 
-
-async def block_unapproved_user_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.user_data.clear()
+async def block_signal_for_unapproved_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reset_signal_state(context)
     await update.message.reply_text(
         "⛔ حسابك غير مفعّل حاليًا.\n\n"
-        "اختر من القائمة بالأسفل:",
+        "يمكنك اختيار أحد خيارات البداية من القائمة بالأسفل:",
         reply_markup=welcome_keyboard
     )
 
@@ -6514,13 +6518,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text
     step = context.user_data.get("step")
 
-    # ===== HARD ACCESS GATE FIRST =====
-    if should_block_unapproved_user(user.id, text):
-        await block_unapproved_user_now(update, context)
+    # ===== SIGNAL-ONLY ACCESS GATE =====
+    # غير المفعّل يُمنع فقط من الإشارات، وليس من أزرار البداية أو التجربة.
+    if is_signal_flow_text(text) and is_user_revoked_or_not_allowed(user.id):
+        await block_signal_for_unapproved_user(update, context)
         return
 
 
-    if "الحصول على تجربة مجانية" in text:
+    if text == "🎁 الحصول على تجربة مجانية":
         if has_used_video_trial(user.id):
             await update.message.reply_text(
                 "ℹ️ لقد استخدمت التجربة المجانية سابقًا.\n\n"
@@ -6555,7 +6560,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     # ===== Video tutorial trial =====
-    if "مشاهدة فيديو شرح البوت" in text:
+    if text == "🎥 مشاهدة فيديو شرح البوت":
         if has_used_video_trial(user.id):
             await update.message.reply_text(
                 "🎥 فيديو شرح البوت:\n"
@@ -6588,7 +6593,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    if "شاهدت الفيديو" in text:
+    if text == "✅ شاهدت الفيديو":
         if has_used_video_trial(user.id):
             await update.message.reply_text(
                 "ℹ️ لقد استخدمت التجربة المجانية سابقًا.",
@@ -6619,14 +6624,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-    # ===== HARD ACCESS GATE for revoked/unapproved users =====
-    if should_block_unapproved_user(user.id, text):
-        await block_unapproved_user_now(update, context)
-        return
-
     # ===== Limited OTC list manager hard gate =====
     if (not is_admin(user.id)) and is_otc_list_manager(user.id):
-        if "مشاهدة فيديو شرح البوت" in text:
+        if text == "🎥 مشاهدة فيديو شرح البوت":
             await update.message.reply_text(
                 "🎥 فيديو شرح البوت:\nhttps://www.youtube.com/watch?v=YPqgJcgvyFw",
                 reply_markup=otc_list_manager_keyboard
@@ -6673,13 +6673,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await show_otc_list_manager_panel(update)
             return
 
-        # توليد الإشارات لمشرف الليستات يحتاج تفعيل عادي.
-        if text in {"📊 توليد إشارات", "⚡ OTC", "🕒 زمني", "⚡ صفقة مباشرة", "🔎 ابحث عن صفقة الآن", "🌎 سوق عالمي", "🌍 سوق عالمي"}:
-            if not is_user_currently_allowed(user.id):
-                await block_unapproved_user_now(update, context)
-                return
-            pass
-        elif text == "📞 تواصل مع المسؤول":
+        # أزرار البوت العادي مسموحة لهذا الشخص أيضًا، لذلك نتركها تكمل للمعالجة العادية.
+        if text in {"📊 توليد إشارات", "📞 تواصل مع المسؤول", "⚡ OTC", "🕒 زمني", "⚡ صفقة مباشرة", "🔎 ابحث عن صفقة الآن"}:
             pass
         else:
             context.user_data["step"] = None
@@ -6715,7 +6710,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_maintenance_message(update)
         return
 
-    if "مشاهدة فيديو شرح البوت" in text:
+    if text == "🎥 مشاهدة فيديو شرح البوت":
         await update.message.reply_text(
             "🎥 فيديو شرح البوت:\n"
             "https://www.youtube.com/watch?v=YPqgJcgvyFw",
@@ -6728,7 +6723,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_status = get_user_status(user.id)
 
         # فيديو الشرح مسموح حتى قبل التفعيل
-        if "مشاهدة فيديو شرح البوت" in text:
+        if text == "🎥 مشاهدة فيديو شرح البوت":
             await update.message.reply_text(
                 "🎥 فيديو شرح البوت:\n"
                 "https://www.youtube.com/watch?v=YPqgJcgvyFw",
@@ -6752,7 +6747,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # نعم أنا منضم: مسموحة للجديد والمرفوض والملغى تفعيله والمنتهي
-        if "نعم" in text and "منضم" in text:
+        if text == "✅ نعم، أنا منضم":
             context.user_data["step"] = "waiting_quotex_id"
             await update.message.reply_text(
                 "📩 أرسل ID الخاص بحسابك على QUOTEX ليتم فحص حسابك.\n"
@@ -6761,7 +6756,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if "لا" in text and "مشترك" in text:
+        if text == "❌ لا، لست مشتركًا":
             await update.message.reply_text(WELCOME_MESSAGE, reply_markup=welcome_keyboard)
             return
 
@@ -7506,11 +7501,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 block_user(target_id)
                 await update.message.reply_text("⛔ تم إلغاء تفعيل المستخدم", reply_markup=admin_main_keyboard)
                 try:
-                    await context.bot.send_message(
-                        chat_id=target_id,
-                        text="⛔ تم إلغاء تفعيل حسابك.\n\nإذا كنت تريد استخدام البوت مرة أخرى، اختر من القائمة بالأسفل:",
-                        reply_markup=welcome_keyboard
-                    )
+                    await send_revoked_welcome_keyboard(context, target_id)
                 except Exception:
                     pass
                 context.user_data["step"] = None
