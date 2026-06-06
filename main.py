@@ -629,9 +629,11 @@ def clear_user_cache(user_id: int):
         _cache_delete_prefix(f"user_status:{uid}")
         _cache_delete_prefix(f"approved:{uid}")
         _cache_delete_prefix(f"approved_data:{uid}")
+        _cache_delete_prefix(f"user_record:{uid}")
         _cache_delete_prefix(f"video_trial:{uid}")
     except Exception:
         pass
+
 
 
 def clear_channel_publish_cache():
@@ -798,7 +800,7 @@ def save_user_record(user_id: int, data: dict):
 def save_pending_user(user_id: int, data: dict):
     # إذا المستخدم كان مرفوضًا/ملغى التفعيل، نزيل حالته القديمة حتى يصبح pending فعليًا.
     try:
-        approved_ref().child(str(user_id)).delete()
+        force_revoke_user_access(user_id, 'blocked')
     except Exception:
         pass
     pending_ref().child(str(user_id)).set(data)
@@ -865,8 +867,44 @@ def set_bot_enabled(value: bool):
     })
 
 
+
+def force_revoke_user_access(user_id: int, status: str = "blocked"):
+    """إلغاء تفعيل فوري ومضمون للمستخدم + تنظيف الكاش."""
+    uid = int(user_id)
+
+    try:
+        force_revoke_user_access(uid, 'blocked')
+    except Exception:
+        pass
+
+    try:
+        users_ref().child(str(uid)).update({
+            "status": status,
+            "approved": False,
+            "revoked_at": now_iso(),
+            "updated_at": now_iso(),
+        })
+    except Exception:
+        pass
+
+    try:
+        clear_user_cache(uid)
+        _cache_set(f"approved:{uid}", False)
+        _cache_set(f"user_status:{uid}", status)
+        _cache_set(f"approved_data:{uid}", None)
+    except Exception:
+        pass
+
+    return True
+
+
 def is_approved(user_id: int) -> bool:
     uid = int(user_id)
+
+    cached_status = _cache_get(f"user_status:{uid}")
+    if str(cached_status).lower() in {"blocked", "cancelled", "rejected", "disabled", "expired"}:
+        return False
+
     cached = _cache_get(f"approved:{uid}")
     if cached is not None:
         return bool(cached)
@@ -905,6 +943,12 @@ def get_user_status(user_id: int) -> str:
         return str(cached)
 
     try:
+        user_data = users_ref().child(str(uid)).get() or {}
+        if isinstance(user_data, dict):
+            user_status = str(user_data.get("status") or "").lower()
+            if user_status in {"blocked", "cancelled", "rejected", "disabled", "expired"}:
+                return _cache_set(f"user_status:{uid}", user_status)
+
         if is_approved(uid):
             return _cache_set(f"user_status:{uid}", "approved")
 
