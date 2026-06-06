@@ -5961,6 +5961,79 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_welcome_flow(update)
 
 
+
+def get_latest_otc_list_job(user_id: int) -> tuple[str | None, dict]:
+    try:
+        raw = otc_list_jobs_ref(user_id).get() or {}
+        if not isinstance(raw, dict) or not raw:
+            return None, {}
+
+        items = []
+        for list_id, job in raw.items():
+            if isinstance(job, dict):
+                created_at = str(job.get("created_at", "") or "")
+                items.append((created_at, str(list_id), job))
+
+        if not items:
+            return None, {}
+
+        items.sort(key=lambda x: x[0])
+        _, list_id, job = items[-1]
+        return list_id, job
+    except Exception as e:
+        logger.exception("Could not read latest OTC list job: %s", e)
+        return None, {}
+
+
+def recover_otc_list_result_now(user_id: int) -> tuple[str | None, dict]:
+    """إذا ضاعت jobs بسبب restart، احسب آخر ليستة فورًا من البيانات المتاحة الآن."""
+    try:
+        list_id, job = get_latest_otc_list_job(user_id)
+        if not list_id or not job:
+            return None, {}
+
+        raw_text = job.get("raw_text") or ""
+        trades = job.get("trades") or parse_otc_list_trades(raw_text)
+
+        if not trades:
+            return None, {}
+
+        items = []
+        for idx, trade in enumerate(trades):
+            item = evaluate_otc_list_trade(trade)
+            item["index"] = idx
+            item["evaluated_at"] = now_iso()
+            item["recovered"] = True
+            items.append(item)
+            try:
+                save_otc_list_trade_result(user_id, list_id, idx, item)
+            except Exception:
+                pass
+
+        items.sort(key=lambda x: int(x.get("index", 0)))
+        result_text, meta = build_otc_list_results_message_from_items(items)
+        result_text = prettify_existing_otc_result_text(result_text)
+
+        save_ready_otc_list_result(user_id, raw_text, result_text, meta)
+
+        try:
+            get_otc_list_job_ref(user_id, list_id).update({
+                "status": "ready",
+                "ready_at": now_iso(),
+                "recovered_at": now_iso(),
+                "meta": meta,
+            })
+        except Exception:
+            pass
+
+        return result_text, meta
+
+    except Exception as e:
+        logger.exception("Could not recover OTC list result now: %s", e)
+        return None, {}
+
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -5995,6 +6068,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "📋 عرض نتائج الليستة":
             saved_result = get_ready_otc_list_result(user.id)
             result_text = saved_result.get("result_text")
+            if not result_text:
+                recovered_text, _meta = recover_otc_list_result_now(user.id)
+                if recovered_text:
+                    result_text = recovered_text
             result_text = prettify_existing_otc_result_text(result_text) if result_text else result_text
             if not result_text:
                 await update.message.reply_text(
@@ -6619,6 +6696,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if text == "📋 عرض نتائج الليستة":
                 saved_result = get_ready_otc_list_result(user.id)
                 result_text = saved_result.get("result_text")
+                if not result_text:
+                    recovered_text, _meta = recover_otc_list_result_now(user.id)
+                    if recovered_text:
+                        result_text = recovered_text
                 result_text = prettify_existing_otc_result_text(result_text) if result_text else result_text
 
                 if not result_text:
