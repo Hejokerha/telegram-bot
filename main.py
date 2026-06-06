@@ -429,6 +429,7 @@ welcome_keyboard = ReplyKeyboardMarkup(
         ["🎁 الحصول على تجربة مجانية"],
         ["✅ نعم، أنا منضم", "❌ لا، لست مشتركًا"],
         ["🎥 مشاهدة فيديو شرح البوت"],
+        ["📞 تواصل مع المسؤول"],
     ],
     resize_keyboard=True
 )
@@ -809,7 +810,7 @@ def save_pending_user(user_id: int, data: dict):
 
 
 def remove_pending_user(user_id: int):
-    pending_ref().child(str(user_id)).delete()
+    force_reject_pending_user(user_id)
 
 
 def set_approved_user(user_id: int, data: dict):
@@ -866,6 +867,38 @@ def set_bot_enabled(value: bool):
 
 
 
+
+def force_reject_pending_user(user_id: int):
+    """رفض الطلب وتنظيف pending/cache فورًا حتى لا يبقى المستخدم عالقًا."""
+    uid = int(user_id)
+
+    try:
+        pending_ref().child(str(uid)).delete()
+    except Exception:
+        pass
+
+    try:
+        # لا نحظر المستخدم؛ فقط نرجعه new ليقدر يقدم طلب جديد إذا أراد.
+        users_ref().child(str(uid)).update({
+            "status": "new",
+            "pending": False,
+            "rejected_at": now_iso(),
+            "updated_at": now_iso(),
+        })
+    except Exception:
+        pass
+
+    try:
+        clear_user_cache(uid)
+        _cache_set(f"user_status:{uid}", "new")
+        _cache_set(f"approved:{uid}", False)
+        _cache_set(f"approved_data:{uid}", None)
+    except Exception:
+        pass
+
+    return True
+
+
 def force_revoke_user_access(user_id: int, status: str = "new"):
     """إلغاء تفعيل المستخدم وإرجاعه كأنه شخص جديد تمامًا."""
     uid = int(user_id)
@@ -889,7 +922,7 @@ def force_revoke_user_access(user_id: int, status: str = "new"):
         pass
 
     try:
-        pending_ref().child(str(uid)).delete()
+        force_reject_pending_user(uid)
     except Exception:
         pass
 
@@ -6127,6 +6160,7 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     if action == "reject":
+        force_reject_pending_user(target_id)
         block_user(target_id)
         await query.edit_message_text(
             f"❌ تم رفض/حظر {target_name}\n"
@@ -6136,7 +6170,8 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         try:
             await context.bot.send_message(
                 chat_id=target_id,
-                text="❌ تم رفض طلبك أو إيقافه\n\nإذا كنت ترى أن هذا بالخطأ، تواصل مع الأدمن."
+                text="❌ تم رفض طلبك أو إيقافه\n\nإذا كنت ترى أن هذا بالخطأ، تواصل مع الأدمن.",
+                reply_markup=welcome_keyboard
             )
         except Exception:
             pass
@@ -6543,6 +6578,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
     step = context.user_data.get("step")
+
+    if "تواصل مع المسؤول" in text:
+        await update.message.reply_text(
+            "📞 للتواصل مع المسؤول:\n@coach_WAEL_trading",
+            reply_markup=welcome_keyboard if not is_approved(user.id) else build_main_menu_for_user(user.id)
+        )
+        return
+
 
     # ===== SIGNAL-ONLY ACCESS GATE =====
     # غير المفعّل يُمنع فقط من الإشارات، وليس من أزرار البداية أو التجربة.
