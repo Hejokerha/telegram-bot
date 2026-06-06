@@ -89,6 +89,10 @@ OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS = float(os.getenv("OTC_LIVE_PAIR_MAX_REC
 OTC_LIVE_RESULT_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_DELAY_SECONDS", "8"))
 
 ADMIN_USERNAME = "@coach_WAEL_trading"
+YOUTUBE_TUTORIAL_URL = "https://www.youtube.com/watch?v=YPqgJcgvyFw"
+VIDEO_TRIAL_DELAY_SECONDS = int(os.getenv("VIDEO_TRIAL_DELAY_SECONDS", "90"))
+VIDEO_TRIAL_DURATION_SECONDS = int(os.getenv("VIDEO_TRIAL_DURATION_SECONDS", "3600"))
+
 ADMIN_TELEGRAM_ID = 1582593617
 def parse_id_set_from_env(name: str) -> set[int]:
     ids = set()
@@ -423,6 +427,14 @@ welcome_keyboard = ReplyKeyboardMarkup(
     [
         ["✅ نعم، أنا منضم", "❌ لا، لست مشتركًا"],
         ["🎥 مشاهدة فيديو شرح البوت"],
+    ],
+    resize_keyboard=True
+)
+
+video_watched_keyboard = ReplyKeyboardMarkup(
+    [
+        ["✅ شاهدت الفيديو"],
+        ["🔙 رجوع"],
     ],
     resize_keyboard=True
 )
@@ -6034,6 +6046,85 @@ def recover_otc_list_result_now(user_id: int) -> tuple[str | None, dict]:
 
 
 
+
+def video_trial_ref(user_id: int):
+    return users_ref().child(str(user_id)).child("video_trial")
+
+
+def has_used_video_trial(user_id: int) -> bool:
+    try:
+        data = video_trial_ref(user_id).get() or {}
+        return bool(data.get("used"))
+    except Exception:
+        return False
+
+
+def mark_video_trial_started(user_id: int):
+    try:
+        video_trial_ref(user_id).update({
+            "started_at": now_iso(),
+            "eligible_after": int(time_module.time()) + int(VIDEO_TRIAL_DELAY_SECONDS),
+        })
+    except Exception:
+        pass
+
+
+def get_video_trial_eligible_after(user_id: int) -> int:
+    try:
+        data = video_trial_ref(user_id).get() or {}
+        return int(data.get("eligible_after") or 0)
+    except Exception:
+        return 0
+
+
+def activate_video_trial_for_user(user_id: int):
+    expire_at = now_utc() + timedelta(seconds=int(VIDEO_TRIAL_DURATION_SECONDS))
+
+    approved_ref().child(str(user_id)).set({
+        "status": "approved",
+        "mode": "video_trial",
+        "expires_at": expire_at.isoformat(),
+        "activated_at": now_iso(),
+        "source": "youtube_video_trial",
+    })
+
+    video_trial_ref(user_id).update({
+        "used": True,
+        "activated_at": now_iso(),
+        "expires_at": expire_at.isoformat(),
+    })
+
+    save_user_record(user_id, {
+        "status": "approved",
+        "trial_source": "youtube_video",
+        "trial_used": True,
+        "expires_at": expire_at.isoformat(),
+        "updated_at": now_iso(),
+    })
+
+    return expire_at
+
+
+async def send_video_watched_button_job(context: ContextTypes.DEFAULT_TYPE):
+    data = dict(context.job.data or {})
+    user_id = int(data.get("user_id"))
+
+    try:
+        if has_used_video_trial(user_id):
+            return
+
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "✅ هل شاهدت فيديو شرح البوت كاملًا؟\n\n"
+                "اضغط الزر بالأسفل للحصول على تجربة مجانية لمدة ساعة كاملة."
+            ),
+            reply_markup=video_watched_keyboard
+        )
+    except Exception as e:
+        logger.exception("Could not send video watched button: %s", e)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -6041,6 +6132,71 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
     step = context.user_data.get("step")
+
+    # ===== Video tutorial trial =====
+    if text == "🎥 مشاهدة فيديو شرح البوت":
+        if has_used_video_trial(user.id):
+            await update.message.reply_text(
+                "🎥 فيديو شرح البوت:\n"
+                f"{YOUTUBE_TUTORIAL_URL}\n\n"
+                "ℹ️ لقد استخدمت التجربة المجانية سابقًا.",
+                reply_markup=build_main_menu_for_user(user.id) if is_approved(user.id) or is_admin(user.id) or is_otc_list_manager(user.id) else welcome_keyboard
+            )
+            return
+
+        mark_video_trial_started(user.id)
+
+        await update.message.reply_text(
+            "🎥 شاهد فيديو شرح البوت كاملًا:\n"
+            f"{YOUTUBE_TUTORIAL_URL}\n\n"
+            "بعد مشاهدة الفيديو سيظهر لك زر:\n"
+            "✅ شاهدت الفيديو\n\n"
+            "عند الضغط عليه ستحصل على تجربة مجانية لمدة ساعة كاملة.",
+            reply_markup=ReplyKeyboardMarkup([["🔙 رجوع"]], resize_keyboard=True)
+        )
+
+        try:
+            context.job_queue.run_once(
+                send_video_watched_button_job,
+                when=VIDEO_TRIAL_DELAY_SECONDS,
+                data={"user_id": user.id},
+                name=f"video_trial_button_{user.id}_{int(time_module.time())}",
+            )
+        except Exception as e:
+            logger.exception("Could not schedule video watched button: %s", e)
+
+        return
+
+    if text == "✅ شاهدت الفيديو":
+        if has_used_video_trial(user.id):
+            await update.message.reply_text(
+                "ℹ️ لقد استخدمت التجربة المجانية سابقًا.",
+                reply_markup=build_main_menu_for_user(user.id) if is_approved(user.id) or is_admin(user.id) or is_otc_list_manager(user.id) else welcome_keyboard
+            )
+            return
+
+        eligible_after = get_video_trial_eligible_after(user.id)
+        now_ts = int(time_module.time())
+
+        if eligible_after and now_ts < eligible_after:
+            remaining = eligible_after - now_ts
+            await update.message.reply_text(
+                f"⏳ انتظر قليلًا، يمكنك تفعيل التجربة بعد حوالي {remaining} ثانية.",
+                reply_markup=video_watched_keyboard
+            )
+            return
+
+        expire_at = activate_video_trial_for_user(user.id)
+        reset_signal_state(context)
+
+        await update.message.reply_text(
+            "✅ تم تفعيل التجربة المجانية لمدة ساعة كاملة.\n\n"
+            f"⏳ تنتهي التجربة عند: {expire_at.strftime('%H:%M')} UTC\n\n"
+            "يمكنك الآن استخدام البوت.",
+            reply_markup=build_main_menu_for_user(user.id)
+        )
+        return
+
 
     # ===== Limited OTC list manager hard gate =====
     if (not is_admin(user.id)) and is_otc_list_manager(user.id):
