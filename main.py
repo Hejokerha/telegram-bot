@@ -532,6 +532,61 @@ admin_duration_keyboard = ReplyKeyboardMarkup(
 )
 
 # ===== Firebase refs =====
+
+# ===== Firebase read saver cache =====
+FIREBASE_CACHE_TTL_SECONDS = int(os.getenv("FIREBASE_CACHE_TTL_SECONDS", "60"))
+FIREBASE_CHANNEL_SETTINGS_TTL_SECONDS = int(os.getenv("FIREBASE_CHANNEL_SETTINGS_TTL_SECONDS", "60"))
+
+_firebase_cache = {}
+
+
+def _cache_get(key: str, ttl: int | None = None):
+    try:
+        ttl = int(ttl or FIREBASE_CACHE_TTL_SECONDS)
+        item = _firebase_cache.get(key)
+        if not item:
+            return None
+        ts, value = item
+        if time_module.time() - float(ts) > ttl:
+            _firebase_cache.pop(key, None)
+            return None
+        return value
+    except Exception:
+        return None
+
+
+def _cache_set(key: str, value):
+    try:
+        _firebase_cache[key] = (time_module.time(), value)
+    except Exception:
+        pass
+    return value
+
+
+def _cache_delete_prefix(prefix: str):
+    try:
+        for key in list(_firebase_cache.keys()):
+            if str(key).startswith(prefix):
+                _firebase_cache.pop(key, None)
+    except Exception:
+        pass
+
+
+def clear_user_cache(user_id: int):
+    try:
+        uid = int(user_id)
+        _cache_delete_prefix(f"user_status:{uid}")
+        _cache_delete_prefix(f"approved:{uid}")
+        _cache_delete_prefix(f"approved_data:{uid}")
+        _cache_delete_prefix(f"video_trial:{uid}")
+    except Exception:
+        pass
+
+
+def clear_channel_publish_cache():
+    _cache_delete_prefix("channel_publish")
+
+
 def users_ref():
     return db.reference("users")
 
@@ -552,13 +607,27 @@ def channel_publish_ref():
     return system_ref().child("channel_publish")
 
 
-def get_channel_publish_settings():
-    data = channel_publish_ref().get() or {}
-    return {
-        "global": bool(data.get("global", True)),
-        "otc": bool(data.get("otc", True)),
-        "otc_live": bool(data.get("otc_live", True)),
-    }
+def get_channel_publish_settings() -> dict:
+    cached = _cache_get("channel_publish:settings", FIREBASE_CHANNEL_SETTINGS_TTL_SECONDS)
+    if cached is not None:
+        return cached
+
+    default = {"real": True, "otc": True, "otc_live": True}
+    try:
+        data = system_ref().child("channel_publish").get() or {}
+        if not isinstance(data, dict):
+            data = {}
+
+        result = {
+            "real": bool(data.get("real", default["real"])),
+            "otc": bool(data.get("otc", default["otc"])),
+            "otc_live": bool(data.get("otc_live", default["otc_live"])),
+        }
+        return _cache_set("channel_publish:settings", result)
+    except Exception as e:
+        logger.exception("Could not read channel publish settings: %s", e)
+        return _cache_set("channel_publish:settings", default)
+
 
 
 def is_channel_publish_enabled(channel_key: str) -> bool:
@@ -669,6 +738,10 @@ def save_pending_user(user_id: int, data: dict):
     except Exception:
         pass
     pending_ref().child(str(user_id)).set(data)
+    try:
+        clear_user_cache(user_id)
+    except Exception:
+        pass
 
 
 def remove_pending_user(user_id: int):
@@ -680,7 +753,17 @@ def set_approved_user(user_id: int, data: dict):
 
 
 def get_approved_user(user_id: int):
-    return approved_ref().child(str(user_id)).get()
+    uid = int(user_id)
+    cached = _cache_get(f"approved_data:{uid}")
+    if cached is not None:
+        return cached
+    try:
+        data = approved_ref().child(str(uid)).get()
+        return _cache_set(f"approved_data:{uid}", data)
+    except Exception as e:
+        logger.exception("Could not get approved user: %s", e)
+        return None
+
 
 
 def get_all_pending_users():
@@ -719,48 +802,63 @@ def set_bot_enabled(value: bool):
 
 
 def is_approved(user_id: int) -> bool:
-    if is_admin(user_id):
-        return True
+    uid = int(user_id)
+    cached = _cache_get(f"approved:{uid}")
+    if cached is not None:
+        return bool(cached)
 
-    data = get_approved_user(user_id)
-    if not data:
-        return False
+    try:
+        data = approved_ref().child(str(uid)).get()
+        if not data:
+            return _cache_set(f"approved:{uid}", False)
 
-    status = data.get("status", "approved")
-    if status != "approved":
-        return False
+        status = data.get("status", "approved") if isinstance(data, dict) else "approved"
+        if status != "approved":
+            return _cache_set(f"approved:{uid}", False)
 
-    expires_at = data.get("expires_at")
-    if not expires_at:
-        return True
-    if expires_at == "forever":
-        return True
+        expires_at = data.get("expires_at") if isinstance(data, dict) else None
+        if expires_at:
+            try:
+                exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                if exp.tzinfo is None:
+                    exp = exp.replace(tzinfo=timezone.utc)
+                if now_utc() > exp:
+                    return _cache_set(f"approved:{uid}", False)
+            except Exception:
+                pass
 
-    exp_dt = parse_iso(expires_at)
-    if not exp_dt:
-        return False
+        return _cache_set(f"approved:{uid}", True)
+    except Exception as e:
+        logger.exception("Could not check approved user: %s", e)
+        return _cache_set(f"approved:{uid}", False)
 
-    return exp_dt > now_utc()
 
 
 def get_user_status(user_id: int) -> str:
-    if is_admin(user_id):
-        return "admin"
+    uid = int(user_id)
+    cached = _cache_get(f"user_status:{uid}")
+    if cached is not None:
+        return str(cached)
 
-    approved_data = get_approved_user(user_id)
-    if approved_data:
-        status = approved_data.get("status", "approved")
-        if status == "blocked":
-            return "blocked"
-        if is_approved(user_id):
-            return "approved"
-        return "expired"
+    try:
+        if is_approved(uid):
+            return _cache_set(f"user_status:{uid}", "approved")
 
-    pending_data = pending_ref().child(str(user_id)).get()
-    if pending_data:
-        return "pending"
+        pending = pending_ref().child(str(uid)).get()
+        if pending:
+            return _cache_set(f"user_status:{uid}", "pending")
 
-    return "new"
+        approved_data = approved_ref().child(str(uid)).get()
+        if isinstance(approved_data, dict):
+            status = str(approved_data.get("status") or "")
+            if status:
+                return _cache_set(f"user_status:{uid}", status)
+
+        return _cache_set(f"user_status:{uid}", "new")
+    except Exception as e:
+        logger.exception("Could not get user status: %s", e)
+        return _cache_set(f"user_status:{uid}", "new")
+
 
 
 def set_user_expiry(user_id: int, mode: str):
@@ -788,6 +886,10 @@ def set_user_expiry(user_id: int, mode: str):
         "expires_at": expires_at,
     })
     remove_pending_user(user_id)
+    try:
+        clear_user_cache(user_id)
+    except Exception:
+        pass
 
 
 def block_user(user_id: int):
@@ -6053,11 +6155,16 @@ def video_trial_ref(user_id: int):
 
 
 def has_used_video_trial(user_id: int) -> bool:
+    uid = int(user_id)
+    cached = _cache_get(f"video_trial:{uid}")
+    if cached is not None:
+        return bool(cached)
     try:
-        data = video_trial_ref(user_id).get() or {}
-        return bool(data.get("used"))
+        data = video_trial_ref(uid).get() or {}
+        return _cache_set(f"video_trial:{uid}", bool(data.get("used")))
     except Exception:
-        return False
+        return _cache_set(f"video_trial:{uid}", False)
+
 
 
 def mark_video_trial_started(user_id: int):
@@ -6102,6 +6209,11 @@ def activate_video_trial_for_user(user_id: int):
         "expires_at": expire_at.isoformat(),
         "updated_at": now_iso(),
     })
+
+    try:
+        clear_user_cache(user_id)
+    except Exception:
+        pass
 
     return expire_at
 
