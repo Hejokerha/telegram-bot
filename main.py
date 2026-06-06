@@ -6360,6 +6360,72 @@ async def send_video_watched_button_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Could not send video watched button: %s", e)
 
 
+
+PUBLIC_UNAUTH_TEXTS = {
+    "/start",
+    "✅ نعم، أنا منضم",
+    "❌ لا، لست مشتركًا",
+    "🎥 مشاهدة فيديو شرح البوت",
+    "🎁 الحصول على تجربة مجانية",
+    "✅ شاهدت الفيديو",
+    "📞 تواصل مع المسؤول",
+    "🔙 رجوع",
+    "⬅️ رجوع",
+    "رجوع",
+}
+
+
+SIGNAL_ACCESS_TEXTS = {
+    "📊 توليد إشارات",
+    "⚡ OTC",
+    "⚡ صفقة مباشرة",
+    "🔎 ابحث عن صفقة الآن",
+    "🌎 سوق عالمي",
+    "🌍 سوق عالمي",
+    "سوق عالمي 🌍",
+    "OTC ⚡",
+}
+
+
+def is_public_unauth_text(text: str) -> bool:
+    raw = str(text or "").strip()
+    if raw in PUBLIC_UNAUTH_TEXTS:
+        return True
+
+    # السماح برسائل طلب الانضمام/Quotex ID فقط، وليس أزرار الإشارات.
+    if raw.upper().startswith("ID") or "QUOTEX" in raw.upper():
+        return True
+
+    return False
+
+
+def should_block_unapproved_user(user_id: int, text: str) -> bool:
+    """قفل نهائي: أي مستخدم غير مفعّل لا يدخل توليد الإشارات نهائيًا."""
+    try:
+        if is_admin(user_id) or is_otc_list_manager(user_id):
+            return False
+
+        if is_approved(user_id):
+            return False
+
+        if is_public_unauth_text(text):
+            return False
+
+        return True
+    except Exception:
+        return True
+
+
+async def block_unapproved_user_now(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    reset_signal_state(context)
+    await update.message.reply_text(
+        "⛔ حسابك غير مفعّل حاليًا.\\n\\n"
+        "إذا كنت ترى أن هذا بالخطأ، تواصل مع الأدمن.",
+        reply_markup=welcome_keyboard
+    )
+
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
@@ -6466,6 +6532,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+
+    # ===== HARD ACCESS GATE for revoked/unapproved users =====
+    if should_block_unapproved_user(user.id, text):
+        await block_unapproved_user_now(update, context)
+        return
 
     # ===== Limited OTC list manager hard gate =====
     if (not is_admin(user.id)) and is_otc_list_manager(user.id):
