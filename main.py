@@ -6166,7 +6166,7 @@ async def show_otc_list_manager_panel(update: Update):
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
-    if (not is_admin(user.id)) and is_otc_list_manager(user.id):
+    if (not is_admin(user.id)) and is_otc_list_manager(user.id) and not is_start_flow_button(text):
         await show_otc_list_manager_panel(update)
         return
 
@@ -6464,6 +6464,43 @@ def is_public_start_flow_text(text: str) -> bool:
     return False
 
 
+
+def is_start_flow_button(text: str) -> bool:
+    raw = str(text or "").strip()
+    compact = raw.replace(" ", "")
+
+    keywords = [
+        "نعم",
+        "منضم",
+        "لا",
+        "مشترك",
+        "الحصول على تجربة مجانية",
+        "تجربة مجانية",
+        "مشاهدة فيديو شرح البوت",
+        "فيديو شرح",
+        "شاهدت الفيديو",
+        "تواصل مع المسؤول",
+    ]
+
+    if raw == "/start":
+        return True
+
+    for k in keywords:
+        if k in raw:
+            return True
+
+    if "نعمأنامنضم" in compact or "نعم،أنامنضم" in compact:
+        return True
+    if "لالستمشترك" in compact or "لا،لستمشترك" in compact:
+        return True
+    if "الحصولعلىتجربةمجانية" in compact:
+        return True
+    if "مشاهدةفيديوشرحالبوت" in compact:
+        return True
+
+    return False
+
+
 def is_signal_flow_text(text: str) -> bool:
     raw = str(text or "").strip()
 
@@ -6525,7 +6562,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-    if text == "🎁 الحصول على تجربة مجانية":
+    if "تجربة مجانية" in text:
         if has_used_video_trial(user.id):
             await update.message.reply_text(
                 "ℹ️ لقد استخدمت التجربة المجانية سابقًا.\n\n"
@@ -6560,7 +6597,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     # ===== Video tutorial trial =====
-    if text == "🎥 مشاهدة فيديو شرح البوت":
+    if "فيديو شرح" in text:
         if has_used_video_trial(user.id):
             await update.message.reply_text(
                 "🎥 فيديو شرح البوت:\n"
@@ -6593,7 +6630,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    if text == "✅ شاهدت الفيديو":
+    if "شاهدت الفيديو" in text:
         if has_used_video_trial(user.id):
             await update.message.reply_text(
                 "ℹ️ لقد استخدمت التجربة المجانية سابقًا.",
@@ -6626,7 +6663,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== Limited OTC list manager hard gate =====
     if (not is_admin(user.id)) and is_otc_list_manager(user.id):
-        if text == "🎥 مشاهدة فيديو شرح البوت":
+        if "فيديو شرح" in text:
             await update.message.reply_text(
                 "🎥 فيديو شرح البوت:\nhttps://www.youtube.com/watch?v=YPqgJcgvyFw",
                 reply_markup=otc_list_manager_keyboard
@@ -6710,7 +6747,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_maintenance_message(update)
         return
 
-    if text == "🎥 مشاهدة فيديو شرح البوت":
+    if "فيديو شرح" in text:
         await update.message.reply_text(
             "🎥 فيديو شرح البوت:\n"
             "https://www.youtube.com/watch?v=YPqgJcgvyFw",
@@ -6723,7 +6760,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_status = get_user_status(user.id)
 
         # فيديو الشرح مسموح حتى قبل التفعيل
-        if text == "🎥 مشاهدة فيديو شرح البوت":
+        if "فيديو شرح" in text:
             await update.message.reply_text(
                 "🎥 فيديو شرح البوت:\n"
                 "https://www.youtube.com/watch?v=YPqgJcgvyFw",
@@ -6747,7 +6784,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # نعم أنا منضم: مسموحة للجديد والمرفوض والملغى تفعيله والمنتهي
-        if text == "✅ نعم، أنا منضم":
+        if "نعم" in text and "منضم" in text:
             context.user_data["step"] = "waiting_quotex_id"
             await update.message.reply_text(
                 "📩 أرسل ID الخاص بحسابك على QUOTEX ليتم فحص حسابك.\n"
@@ -6756,7 +6793,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if text == "❌ لا، لست مشتركًا":
+        if "لا" in text and "مشترك" in text:
             await update.message.reply_text(WELCOME_MESSAGE, reply_markup=welcome_keyboard)
             return
 
