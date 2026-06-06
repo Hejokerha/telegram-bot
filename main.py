@@ -425,6 +425,7 @@ admin_otc_list_ready_keyboard = ReplyKeyboardMarkup(
 
 welcome_keyboard = ReplyKeyboardMarkup(
     [
+        ["🎁 الحصول على تجربة مجانية"],
         ["✅ نعم، أنا منضم", "❌ لا، لست مشتركًا"],
         ["🎥 مشاهدة فيديو شرح البوت"],
     ],
@@ -6132,6 +6133,40 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
     step = context.user_data.get("step")
+
+    if text == "🎁 الحصول على تجربة مجانية":
+        if has_used_video_trial(user.id):
+            await update.message.reply_text(
+                "ℹ️ لقد استخدمت التجربة المجانية سابقًا.\n\n"
+                "يمكنك إرسال طلب تفعيل من القائمة.",
+                reply_markup=welcome_keyboard if not is_approved(user.id) else build_main_menu_for_user(user.id)
+            )
+            return
+
+        mark_video_trial_started(user.id)
+
+        await update.message.reply_text(
+            "🎁 للحصول على تجربة مجانية لمدة ساعة كاملة:\n\n"
+            "1️⃣ شاهد فيديو شرح البوت كاملًا من الرابط التالي:\n"
+            f"{YOUTUBE_TUTORIAL_URL}\n\n"
+            "2️⃣ بعد قليل سيظهر لك زر:\n"
+            "✅ شاهدت الفيديو\n\n"
+            "بعد الضغط عليه سيتم تفعيل التجربة المجانية تلقائيًا.",
+            reply_markup=ReplyKeyboardMarkup([["🔙 رجوع"]], resize_keyboard=True)
+        )
+
+        try:
+            context.job_queue.run_once(
+                send_video_watched_button_job,
+                when=VIDEO_TRIAL_DELAY_SECONDS,
+                data={"user_id": user.id},
+                name=f"video_trial_button_{user.id}_{int(time_module.time())}",
+            )
+        except Exception as e:
+            logger.exception("Could not schedule video watched button: %s", e)
+
+        return
+
 
     # ===== Video tutorial trial =====
     if text == "🎥 مشاهدة فيديو شرح البوت":
