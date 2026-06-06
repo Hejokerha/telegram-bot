@@ -427,7 +427,8 @@ admin_otc_list_ready_keyboard = ReplyKeyboardMarkup(
 welcome_keyboard = ReplyKeyboardMarkup(
     [
         ["🎁 الحصول على تجربة مجانية"],
-        ["✅ نعم، أنا منضم", "❌ لا، لست مشتركًا"],
+        ["✅ نعم، أنا منضم",
+    "نعم، أنا منضم ✅", "❌ لا، لست مشتركًا"],
         ["🎥 مشاهدة فيديو شرح البوت"],
     ],
     resize_keyboard=True
@@ -6429,11 +6430,44 @@ SIGNAL_ACCESS_TEXTS = {
 
 def is_public_unauth_text(text: str) -> bool:
     raw = str(text or "").strip()
+    compact = raw.replace(" ", "")
+
+    # تطابق مباشر
     if raw in PUBLIC_UNAUTH_TEXTS:
         return True
 
+    # تيليجرام مع العربية أحيانًا يعرض/يرسل الإيموجي بآخر النص بدل أوله.
+    public_keywords = [
+        "نعم، أنا منضم",
+        "نعم انا منضم",
+        "لا، لست مشترك",
+        "لا لست مشترك",
+        "مشاهدة فيديو شرح البوت",
+        "الحصول على تجربة مجانية",
+        "شاهدت الفيديو",
+        "تواصل مع المسؤول",
+        "رجوع",
+    ]
+
+    for keyword in public_keywords:
+        if keyword in raw:
+            return True
+
+    # نسخ بدون مسافات/فواصل احتياطًا
+    if "الحصولعلىتجربةمجانية" in compact:
+        return True
+    if "مشاهدةفيديوشرحالبوت" in compact:
+        return True
+    if "نعمأنامنضم" in compact or "نعم،أنامنضم" in compact:
+        return True
+    if "لالستمشترك" in compact or "لا،لستمشترك" in compact:
+        return True
+    if "شاهدتالفيديو" in compact:
+        return True
+
     # السماح برسائل طلب الانضمام/Quotex ID فقط، وليس أزرار الإشارات.
-    if raw.upper().startswith("ID") or "QUOTEX" in raw.upper():
+    upper = raw.upper()
+    if upper.startswith("ID") or "QUOTEX" in upper:
         return True
 
     return False
@@ -6486,7 +6520,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
 
-    if text == "🎁 الحصول على تجربة مجانية":
+    if "الحصول على تجربة مجانية" in text:
         if has_used_video_trial(user.id):
             await update.message.reply_text(
                 "ℹ️ لقد استخدمت التجربة المجانية سابقًا.\n\n"
@@ -6521,7 +6555,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
     # ===== Video tutorial trial =====
-    if text == "🎥 مشاهدة فيديو شرح البوت":
+    if "مشاهدة فيديو شرح البوت" in text:
         if has_used_video_trial(user.id):
             await update.message.reply_text(
                 "🎥 فيديو شرح البوت:\n"
@@ -6554,7 +6588,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         return
 
-    if text == "✅ شاهدت الفيديو":
+    if "شاهدت الفيديو" in text:
         if has_used_video_trial(user.id):
             await update.message.reply_text(
                 "ℹ️ لقد استخدمت التجربة المجانية سابقًا.",
@@ -6592,7 +6626,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== Limited OTC list manager hard gate =====
     if (not is_admin(user.id)) and is_otc_list_manager(user.id):
-        if text == "🎥 مشاهدة فيديو شرح البوت":
+        if "مشاهدة فيديو شرح البوت" in text:
             await update.message.reply_text(
                 "🎥 فيديو شرح البوت:\nhttps://www.youtube.com/watch?v=YPqgJcgvyFw",
                 reply_markup=otc_list_manager_keyboard
@@ -6681,7 +6715,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_maintenance_message(update)
         return
 
-    if text == "🎥 مشاهدة فيديو شرح البوت":
+    if "مشاهدة فيديو شرح البوت" in text:
         await update.message.reply_text(
             "🎥 فيديو شرح البوت:\n"
             "https://www.youtube.com/watch?v=YPqgJcgvyFw",
@@ -6694,7 +6728,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_status = get_user_status(user.id)
 
         # فيديو الشرح مسموح حتى قبل التفعيل
-        if text == "🎥 مشاهدة فيديو شرح البوت":
+        if "مشاهدة فيديو شرح البوت" in text:
             await update.message.reply_text(
                 "🎥 فيديو شرح البوت:\n"
                 "https://www.youtube.com/watch?v=YPqgJcgvyFw",
@@ -6718,7 +6752,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # نعم أنا منضم: مسموحة للجديد والمرفوض والملغى تفعيله والمنتهي
-        if text == "✅ نعم، أنا منضم":
+        if "نعم" in text and "منضم" in text:
             context.user_data["step"] = "waiting_quotex_id"
             await update.message.reply_text(
                 "📩 أرسل ID الخاص بحسابك على QUOTEX ليتم فحص حسابك.\n"
@@ -6727,7 +6761,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if text == "❌ لا، لست مشتركًا":
+        if "لا" in text and "مشترك" in text:
             await update.message.reply_text(WELCOME_MESSAGE, reply_markup=welcome_keyboard)
             return
 
