@@ -2114,6 +2114,60 @@ def get_live_otc_snapshot(pair: str) -> dict:
     return quotex_otc_feed.snapshot(symbol)
 
 
+
+
+def get_stable_direction(candles=None, lookback: int = 5, min_majority: int = 3, *args, **kwargs):
+    """يرجع اتجاه ثابت من آخر الشموع.
+    متوافق مع أي استدعاء قديم أو جديد حتى لا ينهار مسار OTC الزمني.
+    """
+    try:
+        if candles is None:
+            return None
+
+        recent = list(candles)[-int(lookback):]
+        up = 0
+        down = 0
+
+        for c in recent:
+            if not isinstance(c, dict):
+                continue
+
+            o = c.get("open", c.get("o"))
+            close = c.get("close", c.get("c"))
+
+            if o is None or close is None:
+                continue
+
+            o = float(o)
+            close = float(close)
+
+            if close > o:
+                up += 1
+            elif close < o:
+                down += 1
+
+        if up >= int(min_majority) and up > down:
+            return "CALL"
+
+        if down >= int(min_majority) and down > up:
+            return "PUT"
+
+        return None
+
+    except Exception:
+        return None
+
+
+
+# Backward-compatible aliases for older OTC timed signal code
+def stable_direction(candles=None, lookback: int = 5, min_majority: int = 3, *args, **kwargs):
+    return get_stable_direction(candles, lookback, min_majority, *args, **kwargs)
+
+def get_candles_stable_direction(candles=None, lookback: int = 5, min_majority: int = 3, *args, **kwargs):
+    return get_stable_direction(candles, lookback, min_majority, *args, **kwargs)
+
+
+
 def analyze_best_live_otc_now() -> dict:
     """يفحص كل أزواج OTC من بث Quotex live ويختار أفضل فرصة M1 حالية.
     لا يغيّر نظام الليستات الزمني، ويُستخدم فقط في خيار: صفقة مباشرة.
