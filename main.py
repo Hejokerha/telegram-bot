@@ -639,6 +639,134 @@ def clear_channel_publish_cache():
     _cache_delete_prefix("channel_publish")
 
 
+
+# ===== Firebase read diagnostics =====
+FIREBASE_READ_DIAGNOSTICS_ENABLED = os.getenv("FIREBASE_READ_DIAGNOSTICS_ENABLED", "true").lower() == "true"
+FIREBASE_READ_REPORT_SECONDS = int(os.getenv("FIREBASE_READ_REPORT_SECONDS", "300"))
+FIREBASE_READ_TOP_N = int(os.getenv("FIREBASE_READ_TOP_N", "25"))
+
+_firebase_read_stats = {}
+_firebase_write_stats = {}
+_firebase_diag_installed = False
+
+
+def _diag_ref_path(ref) -> str:
+    try:
+        return str(getattr(ref, "_path", None) or getattr(ref, "path", None) or ref)
+    except Exception:
+        return "unknown"
+
+
+def _diag_size(value) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+    except Exception:
+        try:
+            return len(str(value).encode("utf-8"))
+        except Exception:
+            return 0
+
+
+def _diag_add(store: dict, op: str, path: str, size: int = 0):
+    try:
+        key = f"{op} {path}"
+        item = store.setdefault(key, {"count": 0, "bytes": 0})
+        item["count"] += 1
+        item["bytes"] += int(size or 0)
+    except Exception:
+        pass
+
+
+def install_firebase_diagnostics():
+    global _firebase_diag_installed
+    if _firebase_diag_installed or not FIREBASE_READ_DIAGNOSTICS_ENABLED:
+        return
+    try:
+        ref_cls = type(db.reference("/"))
+
+        original_get = ref_cls.get
+        original_set = ref_cls.set
+        original_update = ref_cls.update
+        original_delete = ref_cls.delete
+
+        def patched_get(self, *args, **kwargs):
+            result = original_get(self, *args, **kwargs)
+            _diag_add(_firebase_read_stats, "GET", _diag_ref_path(self), _diag_size(result))
+            return result
+
+        def patched_set(self, value, *args, **kwargs):
+            _diag_add(_firebase_write_stats, "SET", _diag_ref_path(self), _diag_size(value))
+            return original_set(self, value, *args, **kwargs)
+
+        def patched_update(self, value, *args, **kwargs):
+            _diag_add(_firebase_write_stats, "UPDATE", _diag_ref_path(self), _diag_size(value))
+            return original_update(self, value, *args, **kwargs)
+
+        def patched_delete(self, *args, **kwargs):
+            _diag_add(_firebase_write_stats, "DELETE", _diag_ref_path(self), 0)
+            return original_delete(self, *args, **kwargs)
+
+        ref_cls.get = patched_get
+        ref_cls.set = patched_set
+        ref_cls.update = patched_update
+        ref_cls.delete = patched_delete
+        _firebase_diag_installed = True
+        logger.warning("Firebase diagnostics installed successfully")
+    except Exception as e:
+        logger.exception("Could not install Firebase diagnostics: %s", e)
+
+
+def format_firebase_diagnostics_report() -> str:
+    read_items = sorted(
+        _firebase_read_stats.items(),
+        key=lambda kv: (kv[1].get("bytes", 0), kv[1].get("count", 0)),
+        reverse=True
+    )[:FIREBASE_READ_TOP_N]
+    write_items = sorted(
+        _firebase_write_stats.items(),
+        key=lambda kv: (kv[1].get("bytes", 0), kv[1].get("count", 0)),
+        reverse=True
+    )[:FIREBASE_READ_TOP_N]
+
+    total_read_bytes = sum(v.get("bytes", 0) for v in _firebase_read_stats.values())
+    total_read_count = sum(v.get("count", 0) for v in _firebase_read_stats.values())
+    total_write_bytes = sum(v.get("bytes", 0) for v in _firebase_write_stats.values())
+    total_write_count = sum(v.get("count", 0) for v in _firebase_write_stats.values())
+
+    lines = [
+        "========== FIREBASE DIAGNOSTICS REPORT ==========",
+        f"READS: {total_read_count} calls | approx {total_read_bytes / 1024 / 1024:.2f} MB returned",
+        f"WRITES: {total_write_count} calls | approx {total_write_bytes / 1024 / 1024:.2f} MB payload",
+        "",
+        "TOP READ PATHS:",
+    ]
+
+    if not read_items:
+        lines.append("- no reads recorded")
+    else:
+        for key, stat in read_items:
+            lines.append(f"- {key} | calls={stat.get('count', 0)} | approx={stat.get('bytes', 0) / 1024 / 1024:.2f} MB")
+
+    lines.append("")
+    lines.append("TOP WRITE PATHS:")
+    if not write_items:
+        lines.append("- no writes recorded")
+    else:
+        for key, stat in write_items:
+            lines.append(f"- {key} | calls={stat.get('count', 0)} | approx={stat.get('bytes', 0) / 1024 / 1024:.2f} MB")
+
+    lines.append("=================================================")
+    return "\n".join(lines)
+
+
+async def firebase_diagnostics_report_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        logger.warning("\n%s", format_firebase_diagnostics_report())
+    except Exception as e:
+        logger.exception("Firebase diagnostics job error: %s", e)
+
+
+
 def users_ref():
     return db.reference("users")
 
@@ -2163,6 +2291,9 @@ async def send_smart_martingale_advice(context: ContextTypes.DEFAULT_TYPE):
         otc_live_channel_state["martingale_decision_type"] = decision.get("decision_type")
         otc_live_channel_state["martingale_for_message_id"] = signal.get("message_id")
 
+        if not is_otc_live_publish_allowed_now():
+            logger.info("OTC LIVE absolute guard blocked send_message")
+            return
         sent_advice = await context.bot.send_message(
             chat_id=OTC_LIVE_CHANNEL_ID,
             text=build_smart_martingale_message(decision)
@@ -2185,6 +2316,10 @@ async def send_smart_martingale_advice(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def delete_martingale_advice_if_direct_win(context: ContextTypes.DEFAULT_TYPE, signal: dict, result: str, martingale_step: int):
+    # ===== FULL STOP OTC LIVE BEFORE RESULT/STORAGE =====
+    if should_skip_otc_live_work("result_or_storage_disabled"):
+        return
+
     """إذا تم إرسال تنبيه مضاعفة مبكرًا ثم ربحت الصفقة مباشر، نحذف التنبيه لتنظيف القناة.
     مهم: هذه الدالة لا يجب أن توقف إرسال النتيجة حتى لو فشل الحذف.
     """
@@ -2296,6 +2431,9 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
                 # نرسل تنبيه فوري، لكن هذا احتياطي فقط وقد يكون متأخرًا عن بداية شمعة المضاعفة.
                 chosen_martingale_direction = direction
                 try:
+                    if not is_otc_live_publish_allowed_now():
+                        logger.info("OTC LIVE absolute guard blocked send_message")
+                        return
                     await context.bot.send_message(
                         chat_id=OTC_LIVE_CHANNEL_ID,
                         text=(
@@ -2345,6 +2483,9 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
         update_otc_live_learning_after_result(signal, result)
 
         text = build_otc_live_channel_result_message(signal, exit_price, result)
+        if not is_otc_live_publish_allowed_now():
+            logger.info("OTC LIVE absolute guard blocked send_message")
+            return
         await context.bot.send_message(
             chat_id=OTC_LIVE_CHANNEL_ID,
             text=text
@@ -2422,7 +2563,100 @@ def reset_stuck_otc_live_trade_if_needed() -> bool:
     return False
 
 
+
+# ===== Absolute channel publish safety guards =====
+def is_otc_live_publish_allowed_now() -> bool:
+    return is_otc_live_fully_enabled_now()
+
+
+
+def is_otc_timed_publish_allowed_now() -> bool:
+    try:
+        data = system_ref().child("channel_publish").get() or {}
+        if isinstance(data, dict) and data.get("otc") is False:
+            clear_channel_publish_cache()
+            return False
+
+        if not is_channel_publish_enabled("otc"):
+            return False
+
+        return True
+    except Exception as e:
+        logger.exception("OTC timed publish guard error: %s", e)
+        return False
+
+
+def force_channel_publish_setting(channel_key: str, enabled: bool):
+    try:
+        system_ref().child("channel_publish").child(str(channel_key)).set(bool(enabled))
+        clear_channel_publish_cache()
+        if str(channel_key) == "otc_live":
+            try:
+                remember_otc_live_enabled_state(bool(enabled))
+            except Exception:
+                pass
+        return True
+    except Exception as e:
+        logger.exception("Could not force channel publish setting %s=%s: %s", channel_key, enabled, e)
+        return False
+
+
+
+# ===== OTC Live disabled means full stop =====
+def is_otc_live_fully_enabled_now() -> bool:
+    """إذا رجعت False فهذا يعني:
+    لا تحليل، لا نشر، لا تسجيل صفقة، لا نتيجة، لا ملخص يومي.
+    """
+    try:
+        if not bool(OTC_LIVE_CHANNEL_ENABLED):
+            return False
+
+        data = system_ref().child("channel_publish").get() or {}
+        if isinstance(data, dict) and data.get("otc_live") is False:
+            clear_channel_publish_cache()
+            return False
+
+        if not is_channel_publish_enabled("otc_live"):
+            return False
+
+        return True
+    except Exception as e:
+        logger.exception("OTC live full enabled guard error: %s", e)
+        return False
+
+
+def stop_otc_live_runtime_state(reason: str = "disabled"):
+    """إيقاف حالة OTC Live الداخلية حتى لا يبقى البوت يحسب نتائج لصفقات غير منشورة."""
+    try:
+        otc_live_channel_state["active"] = False
+        otc_live_channel_state["current_trade"] = None
+        otc_live_channel_state["martingale_sent"] = False
+        otc_live_channel_state["last_disabled_reason"] = reason
+        otc_live_channel_state["disabled_at"] = now_iso()
+    except Exception:
+        pass
+
+
+def should_skip_otc_live_work(reason: str = "disabled") -> bool:
+    if not is_otc_live_fully_enabled_now():
+        stop_otc_live_runtime_state(reason)
+        if should_log_quiet("otc_live_full_stop", 300):
+            logger.info("OTC LIVE full stop: disabled; skip analysis/results/storage")
+        return True
+    return False
+
+
 async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
+    # ===== FULL STOP OTC LIVE BEFORE ANY WORK =====
+    if should_skip_otc_live_work("auto_publish_disabled"):
+        return
+
+    # ===== ABSOLUTE OTC LIVE PUBLISH GUARD =====
+    if not is_otc_live_publish_allowed_now():
+        if should_log_quiet("otc_live_absolute_guard_blocked", 300):
+            logger.info("OTC LIVE absolute guard: publish disabled, job stopped before scan")
+        return
+
     live_publish_enabled = bool(OTC_LIVE_CHANNEL_ENABLED and is_channel_publish_enabled("otc_live"))
     remember_otc_live_enabled_state(live_publish_enabled)
 
@@ -2514,6 +2748,9 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
 
         text = build_otc_live_channel_signal_message(signal)
 
+        if not is_otc_live_publish_allowed_now():
+            logger.info("OTC LIVE absolute guard blocked send_message")
+            return
         sent = await context.bot.send_message(
             chat_id=OTC_LIVE_CHANNEL_ID,
             text=text,
@@ -4108,6 +4345,10 @@ def get_otc_live_day_key(check_dt: datetime | None = None) -> str:
 
 
 def record_otc_live_channel_result(signal: dict, result: str):
+    # ===== FULL STOP OTC LIVE BEFORE RESULT/STORAGE =====
+    if should_skip_otc_live_work("result_or_storage_disabled"):
+        return
+
     try:
         day_key = get_otc_live_day_key()
         ref = otc_live_stats_ref().child(day_key)
@@ -4214,53 +4455,148 @@ def build_otc_live_stats_message(day_key: str | None = None) -> str:
     return base_message + extra
 
 
-async def publish_daily_otc_live_stats(context: ContextTypes.DEFAULT_TYPE):
+
+def get_utc3_day_key(dt=None) -> str:
     try:
-        yesterday = (now_utc().astimezone(UTC_PLUS_3) - timedelta(days=1)).strftime("%Y-%m-%d")
-        trades = get_otc_live_trades(day_key=yesterday, after_reset=False)
-        stats = calculate_otc_live_trade_stats(trades)
+        if dt is None:
+            dt = now_utc()
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        local_dt = dt.astimezone(UTC_PLUS_3)
+        return local_dt.strftime("%Y-%m-%d")
+    except Exception:
+        return datetime.now(UTC_PLUS_3).strftime("%Y-%m-%d")
 
-        if stats["wins"] >= stats["losses"]:
-            title = "today totally win ✅"
+
+def _extract_trade_day_key(trade: dict) -> str:
+    """يحاول استخراج يوم الصفقة UTC+3 من بيانات الصفقة المخزنة."""
+    if not isinstance(trade, dict):
+        return ""
+
+    for key in ("day_key", "date", "trade_date", "entry_date"):
+        value = trade.get(key)
+        if value:
+            s = str(value)
+            m = re.search(r"\d{4}-\d{2}-\d{2}", s)
+            if m:
+                return m.group(0)
+
+    for key in ("entry_time", "entry_at", "created_at", "published_at", "result_at", "closed_at", "timestamp"):
+        value = trade.get(key)
+        if not value:
+            continue
+        try:
+            if isinstance(value, (int, float)):
+                dt = datetime.fromtimestamp(float(value), tz=timezone.utc)
+            else:
+                s = str(value).replace("Z", "+00:00")
+                dt = datetime.fromisoformat(s)
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=timezone.utc)
+            return get_utc3_day_key(dt)
+        except Exception:
+            continue
+
+    return ""
+
+
+def is_trade_from_today_utc3(trade: dict) -> bool:
+    return _extract_trade_day_key(trade) == get_utc3_day_key()
+
+
+def get_today_otc_live_trade_items() -> list:
+    """يرجع صفقات OTC Live الخاصة باليوم فقط، حتى لا تُحسب الإحصائيات القديمة بنهاية اليوم."""
+    try:
+        raw = otc_live_stats_ref().child("trades").get() or {}
+        if isinstance(raw, dict):
+            items = list(raw.values())
+        elif isinstance(raw, list):
+            items = [x for x in raw if x]
         else:
-            title = "today totally loss 💔"
+            items = []
 
-        text = (
-            "╔══════════════╗\n"
-            f"    {title}\n"
-            "╚══════════════╝\n"
-            "—————————\n"
-            f"{stats['wins']} win\n"
-            "—————————\n"
-            f"{stats['losses']} loss\n"
-            "—————————"
-        )
+        return [x for x in items if isinstance(x, dict) and is_trade_from_today_utc3(x)]
+    except Exception as e:
+        logger.exception("Could not load today OTC live trade items: %s", e)
+        return []
+
+
+def build_today_otc_live_daily_summary_message() -> str | None:
+    """ملخص نهاية اليوم من صفقات اليوم فقط.
+    إذا لا توجد صفقات اليوم، لا يرجع رسالة حتى لا ينشر أرقام قديمة.
+    """
+    trades = get_today_otc_live_trade_items()
+
+    if not trades:
+        return None
+
+    wins = 0
+    losses = 0
+    doji = 0
+
+    for trade in trades:
+        result = str(trade.get("result") or trade.get("final_result") or trade.get("status") or "").lower()
+        if "win" in result or "✅" in result:
+            wins += 1
+        elif "loss" in result or "lose" in result or "❌" in result:
+            losses += 1
+        elif "doji" in result or "draw" in result or "⚖️" in result:
+            doji += 1
+
+    total = wins + losses + doji
+    if total <= 0:
+        return None
+
+    lines = [
+        "╔════════════════╗",
+        " today totally win ✅",
+        "╚════════════════╝",
+        "",
+        "━━━━━━━━━━━━",
+        f"{wins} win",
+        "━━━━━━━━━━━━",
+        f"{losses} loss",
+        "━━━━━━━━━━━━",
+    ]
+
+    if doji:
+        lines.append(f"{doji} doji")
+        lines.append("━━━━━━━━━━━━")
+
+    return "\n".join(lines)
+
+
+async def publish_daily_otc_live_stats(context: ContextTypes.DEFAULT_TYPE):
+    if should_skip_otc_live_work("daily_summary_disabled"):
+        logger.info("Daily OTC Live stats skipped: otc_live disabled full stop")
+        return
+
+    # ===== FULL STOP OTC LIVE BEFORE RESULT/STORAGE =====
+    if should_skip_otc_live_work("result_or_storage_disabled"):
+        return
+
+    """نشر ملخص نهاية اليوم لقناة OTC Live من صفقات اليوم فقط."""
+    try:
+        # لا تنشر ملخص إذا القناة متوقفة من الأدمن.
+        if not is_otc_live_publish_allowed_now():
+            logger.info("Daily OTC Live stats skipped: otc_live publish disabled")
+            return
+
+        message = build_today_otc_live_daily_summary_message()
+
+        # إذا لا توجد صفقات اليوم، لا تنشر شيئًا حتى لا تظهر أرقام قديمة.
+        if not message:
+            logger.info("Daily OTC Live stats skipped: no trades for today")
+            return
 
         await context.bot.send_message(
             chat_id=OTC_LIVE_CHANNEL_ID,
-            text=text
+            text=message
         )
+
     except Exception as e:
-        logger.exception("Daily OTC live stats publish error: %s", e)
+        logger.exception("Daily OTC Live stats publish error: %s", e)
 
-
-# ===== OTC ENGINE =====
-def get_stable_direction(pair: str, dt: datetime) -> str:
-    dt_plus_3 = dt.astimezone(UTC_PLUS_3)
-
-    key = (
-        f"{pair}|"
-        f"{dt_plus_3.year}-"
-        f"{dt_plus_3.month:02d}-"
-        f"{dt_plus_3.day:02d}|"
-        f"H{dt_plus_3.hour:02d}|"
-        f"M{dt_plus_3.minute:02d}"
-    )
-
-    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
-    value = int(digest[:8], 16)
-
-    return "CALL" if value % 2 == 0 else "PUT"
 
 
 async def publish_otc_list(context: ContextTypes.DEFAULT_TYPE):
@@ -7242,12 +7578,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if step == "admin_channel_controls":
 
             if text == "⚡ تشغيل نشر OTC":
-                set_channel_publish_enabled("otc", True)
+                force_channel_publish_setting("otc", True)
                 await update.message.reply_text("✅ تم تشغيل النشر في قناة OTC", reply_markup=admin_channels_keyboard)
                 return
 
             if text == "⚡ إيقاف نشر OTC":
-                set_channel_publish_enabled("otc", False)
+                force_channel_publish_setting("otc", False)
                 await update.message.reply_text("⛔ تم إيقاف النشر في قناة OTC", reply_markup=admin_channels_keyboard)
                 return
 
@@ -7257,7 +7593,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
             if text == "🔥 إيقاف OTC مباشر":
-                force_channel_publish_setting("otc_live", False)
+                force_channel_publish_setting("otc_live", False); stop_otc_live_runtime_state("admin_disabled")
                 await update.message.reply_text("🔥 تم إيقاف نشر قناة OTC المباشر ⛔", reply_markup=admin_channels_keyboard)
                 return
 
@@ -7751,6 +8087,14 @@ def main():
     )
 
     job_queue = app.job_queue
+    if FIREBASE_READ_DIAGNOSTICS_ENABLED:
+        job_queue.run_repeating(
+            firebase_diagnostics_report_job,
+            interval=FIREBASE_READ_REPORT_SECONDS,
+            first=FIREBASE_READ_REPORT_SECONDS,
+            name="firebase_diagnostics_report",
+        )
+
 
     # نشر تلقائي مرة واحدة يوميًا:
     # يتم اختيار وقت عشوائي للنشر بين 12:00 و 20:00 بتوقيت سوريا.
@@ -7771,6 +8115,8 @@ def main():
         publish_daily_otc_live_stats,
         time=time(hour=23, minute=59, tzinfo=UTC_PLUS_3)
     )
+
+    install_firebase_diagnostics()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_admin_buttons))
