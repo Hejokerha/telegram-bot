@@ -1079,6 +1079,191 @@ def get_otc_feed_diagnostics_for_pair(pair_text: str) -> str:
 
 
 
+
+# ===== 24h Firebase usage monitor =====
+FIREBASE_24H_MONITOR_ENABLED = os.getenv("FIREBASE_24H_MONITOR_ENABLED", "true").lower() == "true"
+FIREBASE_24H_REPORT_SECONDS = int(os.getenv("FIREBASE_24H_REPORT_SECONDS", "86400"))
+FIREBASE_24H_TOP_N = int(os.getenv("FIREBASE_24H_TOP_N", "25"))
+
+_firebase_24h_read_stats = {}
+_firebase_24h_write_stats = {}
+_firebase_24h_monitor_installed = False
+_firebase_24h_started_at = None
+
+
+def _fb24_ref_path(ref) -> str:
+    try:
+        return str(getattr(ref, "_path", None) or getattr(ref, "path", None) or ref)
+    except Exception:
+        return "unknown"
+
+
+def _fb24_size(value) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False, default=str).encode("utf-8"))
+    except Exception:
+        try:
+            return len(str(value).encode("utf-8"))
+        except Exception:
+            return 0
+
+
+def _fb24_add(store: dict, op: str, path: str, size: int = 0):
+    try:
+        key = f"{op} {path}"
+        item = store.setdefault(key, {"count": 0, "bytes": 0})
+        item["count"] += 1
+        item["bytes"] += int(size or 0)
+    except Exception:
+        pass
+
+
+def install_firebase_24h_monitor():
+    """يراقب Firebase Admin SDK reads/writes ويرسل ملخص كل 24 ساعة للأدمن."""
+    global _firebase_24h_monitor_installed, _firebase_24h_started_at
+
+    if _firebase_24h_monitor_installed or not FIREBASE_24H_MONITOR_ENABLED:
+        return
+
+    try:
+        ref_cls = type(db.reference("/"))
+
+        # إذا كان في تشخيص سابق مركب، لا نركب فوقه مرتين.
+        if getattr(ref_cls, "_trading_time_fb24_wrapped", False):
+            _firebase_24h_monitor_installed = True
+            return
+
+        original_get = ref_cls.get
+        original_set = ref_cls.set
+        original_update = ref_cls.update
+        original_delete = ref_cls.delete
+
+        def patched_get(self, *args, **kwargs):
+            result = original_get(self, *args, **kwargs)
+            _fb24_add(_firebase_24h_read_stats, "GET", _fb24_ref_path(self), _fb24_size(result))
+            return result
+
+        def patched_set(self, value, *args, **kwargs):
+            _fb24_add(_firebase_24h_write_stats, "SET", _fb24_ref_path(self), _fb24_size(value))
+            return original_set(self, value, *args, **kwargs)
+
+        def patched_update(self, value, *args, **kwargs):
+            _fb24_add(_firebase_24h_write_stats, "UPDATE", _fb24_ref_path(self), _fb24_size(value))
+            return original_update(self, value, *args, **kwargs)
+
+        def patched_delete(self, *args, **kwargs):
+            _fb24_add(_firebase_24h_write_stats, "DELETE", _fb24_ref_path(self), 0)
+            return original_delete(self, *args, **kwargs)
+
+        ref_cls.get = patched_get
+        ref_cls.set = patched_set
+        ref_cls.update = patched_update
+        ref_cls.delete = patched_delete
+        ref_cls._trading_time_fb24_wrapped = True
+
+        _firebase_24h_started_at = now_iso()
+        _firebase_24h_monitor_installed = True
+        logger.warning("Firebase 24h monitor installed successfully")
+
+    except Exception as e:
+        logger.exception("Could not install Firebase 24h monitor: %s", e)
+
+
+def build_firebase_24h_report_text() -> str:
+    read_items = sorted(
+        _firebase_24h_read_stats.items(),
+        key=lambda kv: (kv[1].get("bytes", 0), kv[1].get("count", 0)),
+        reverse=True
+    )[:FIREBASE_24H_TOP_N]
+
+    write_items = sorted(
+        _firebase_24h_write_stats.items(),
+        key=lambda kv: (kv[1].get("bytes", 0), kv[1].get("count", 0)),
+        reverse=True
+    )[:FIREBASE_24H_TOP_N]
+
+    total_read_bytes = sum(v.get("bytes", 0) for v in _firebase_24h_read_stats.values())
+    total_read_count = sum(v.get("count", 0) for v in _firebase_24h_read_stats.values())
+    total_write_bytes = sum(v.get("bytes", 0) for v in _firebase_24h_write_stats.values())
+    total_write_count = sum(v.get("count", 0) for v in _firebase_24h_write_stats.values())
+
+    lines = []
+    lines.append("📊 Firebase 24h Usage Monitor")
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append(f"بدأت المراقبة: {_firebase_24h_started_at or 'unknown'}")
+    lines.append(f"مدة التقرير: {int(FIREBASE_24H_REPORT_SECONDS / 3600)} ساعة")
+    lines.append("")
+    lines.append(f"📥 READS: {total_read_count} calls")
+    lines.append(f"📦 Approx read size: {total_read_bytes / 1024 / 1024:.2f} MB")
+    lines.append("")
+    lines.append(f"📤 WRITES: {total_write_count} calls")
+    lines.append(f"📦 Approx write payload: {total_write_bytes / 1024 / 1024:.2f} MB")
+    lines.append("")
+    lines.append("TOP READ PATHS:")
+
+    if not read_items:
+        lines.append("- لا يوجد قراءات مسجلة")
+    else:
+        for key, stat in read_items:
+            lines.append(
+                f"- {key} | {stat.get('count', 0)} calls | {stat.get('bytes', 0) / 1024 / 1024:.2f} MB"
+            )
+
+    lines.append("")
+    lines.append("TOP WRITE PATHS:")
+    if not write_items:
+        lines.append("- لا يوجد كتابات مسجلة")
+    else:
+        for key, stat in write_items:
+            lines.append(
+                f"- {key} | {stat.get('count', 0)} calls | {stat.get('bytes', 0) / 1024 / 1024:.2f} MB"
+            )
+
+    lines.append("━━━━━━━━━━━━━━")
+    lines.append("ملاحظة: الحجم تقريبي من داخل البوت، وقيمة Firebase الرسمية قد تتأخر أو تختلف قليلًا.")
+    return "\n".join(lines)
+
+
+def reset_firebase_24h_stats():
+    global _firebase_24h_started_at
+    try:
+        _firebase_24h_read_stats.clear()
+        _firebase_24h_write_stats.clear()
+        _firebase_24h_started_at = now_iso()
+    except Exception:
+        pass
+
+
+async def send_firebase_24h_report_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not FIREBASE_24H_MONITOR_ENABLED:
+            return
+
+        report = build_firebase_24h_report_text()
+
+        # إرسال التقرير للأدمن على الخاص
+        await context.bot.send_message(
+            chat_id=ADMIN_TELEGRAM_ID,
+            text=report[:3900]
+        )
+
+        # إذا التقرير طويل، أرسل الباقي برسالة ثانية
+        if len(report) > 3900:
+            await context.bot.send_message(
+                chat_id=ADMIN_TELEGRAM_ID,
+                text=report[3900:7800]
+            )
+
+        logger.warning("\n%s", report)
+
+        # نبدأ عدّاد جديد لليوم التالي
+        reset_firebase_24h_stats()
+
+    except Exception as e:
+        logger.exception("Firebase 24h report job error: %s", e)
+
+
+
 def users_ref():
     return db.reference("users")
 
@@ -8571,6 +8756,14 @@ def main():
     )
 
     job_queue = app.job_queue
+    if FIREBASE_24H_MONITOR_ENABLED:
+        job_queue.run_repeating(
+            send_firebase_24h_report_job,
+            interval=FIREBASE_24H_REPORT_SECONDS,
+            first=FIREBASE_24H_REPORT_SECONDS,
+            name="firebase_24h_usage_report",
+        )
+
     if FIREBASE_READ_DIAGNOSTICS_ENABLED:
         job_queue.run_repeating(
             firebase_diagnostics_report_job,
@@ -8601,6 +8794,8 @@ def main():
     )
 
     install_firebase_diagnostics()
+
+    install_firebase_24h_monitor()
 
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(handle_admin_buttons))
