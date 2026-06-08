@@ -1,3 +1,4 @@
+from urllib.parse import urlparse
 import os
 import html
 import json
@@ -716,6 +717,113 @@ def install_firebase_diagnostics():
         logger.exception("Could not install Firebase diagnostics: %s", e)
 
 
+
+# ===== Firebase HTTP diagnostics =====
+_firebase_http_stats = {}
+_firebase_http_diag_installed = False
+
+
+def _is_firebase_url(url: str) -> bool:
+    try:
+        parsed = urlparse(str(url))
+        host = parsed.netloc.lower()
+        return (
+            "firebaseio.com" in host
+            or "firebasedatabase.app" in host
+            or "/firebaseio.com/" in str(url)
+            or "/firebasedatabase.app/" in str(url)
+        )
+    except Exception:
+        return False
+
+
+def _clean_firebase_url_path(url: str) -> str:
+    try:
+        parsed = urlparse(str(url))
+        path = parsed.path or "/"
+        # اخفِ query/auth
+        return f"{parsed.netloc}{path}"
+    except Exception:
+        return str(url).split("?")[0]
+
+
+def _http_stat_add(method: str, url: str, response_size: int = 0):
+    try:
+        key = f"{str(method).upper()} {_clean_firebase_url_path(url)}"
+        item = _firebase_http_stats.setdefault(key, {"count": 0, "bytes": 0})
+        item["count"] += 1
+        item["bytes"] += int(response_size or 0)
+    except Exception:
+        pass
+
+
+def install_firebase_http_diagnostics():
+    global _firebase_http_diag_installed
+    if _firebase_http_diag_installed or not FIREBASE_READ_DIAGNOSTICS_ENABLED:
+        return
+
+    try:
+        import requests
+
+        original_request = requests.sessions.Session.request
+
+        def patched_request(self, method, url, *args, **kwargs):
+            response = original_request(self, method, url, *args, **kwargs)
+
+            try:
+                if _is_firebase_url(url):
+                    size = 0
+                    try:
+                        content = getattr(response, "content", b"") or b""
+                        size = len(content)
+                    except Exception:
+                        pass
+                    _http_stat_add(method, url, size)
+            except Exception:
+                pass
+
+            return response
+
+        requests.sessions.Session.request = patched_request
+        _firebase_http_diag_installed = True
+        logger.warning("Firebase HTTP diagnostics installed successfully")
+    except Exception as e:
+        logger.exception("Could not install Firebase HTTP diagnostics: %s", e)
+
+
+def format_firebase_http_diagnostics_report() -> str:
+    try:
+        items = sorted(
+            _firebase_http_stats.items(),
+            key=lambda kv: (kv[1].get("bytes", 0), kv[1].get("count", 0)),
+            reverse=True
+        )[:FIREBASE_READ_TOP_N]
+
+        total_bytes = sum(v.get("bytes", 0) for v in _firebase_http_stats.values())
+        total_count = sum(v.get("count", 0) for v in _firebase_http_stats.values())
+
+        lines = [
+            "========== FIREBASE HTTP DIAGNOSTICS ==========",
+            f"HTTP FIREBASE CALLS: {total_count} calls | approx {total_bytes / 1024 / 1024:.2f} MB response",
+            "",
+            "TOP FIREBASE HTTP PATHS:",
+        ]
+
+        if not items:
+            lines.append("- no firebase http calls recorded")
+        else:
+            for key, stat in items:
+                lines.append(
+                    f"- {key} | calls={stat.get('count', 0)} | approx={stat.get('bytes', 0) / 1024 / 1024:.2f} MB"
+                )
+
+        lines.append("===============================================")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Firebase HTTP diagnostics report error: {e}"
+
+
+
 def format_firebase_diagnostics_report() -> str:
     read_items = sorted(
         _firebase_read_stats.items(),
@@ -762,6 +870,7 @@ def format_firebase_diagnostics_report() -> str:
 async def firebase_diagnostics_report_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         logger.warning("\n%s", format_firebase_diagnostics_report())
+        logger.warning("\n%s", format_firebase_http_diagnostics_report())
     except Exception as e:
         logger.exception("Firebase diagnostics job error: %s", e)
 
