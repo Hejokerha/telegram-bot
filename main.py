@@ -589,6 +589,12 @@ def should_log_quiet(key: str, every_seconds: int = 300) -> bool:
 # ===== Firebase read saver cache =====
 FIREBASE_CACHE_TTL_SECONDS = int(os.getenv("FIREBASE_CACHE_TTL_SECONDS", "60"))
 FIREBASE_CHANNEL_SETTINGS_TTL_SECONDS = int(os.getenv("FIREBASE_CHANNEL_SETTINGS_TTL_SECONDS", "60"))
+FIREBASE_USER_CACHE_TTL_SECONDS = int(os.getenv("FIREBASE_USER_CACHE_TTL_SECONDS", "300"))
+FIREBASE_APPROVED_CACHE_TTL_SECONDS = int(os.getenv("FIREBASE_APPROVED_CACHE_TTL_SECONDS", "300"))
+FIREBASE_PENDING_CACHE_TTL_SECONDS = int(os.getenv("FIREBASE_PENDING_CACHE_TTL_SECONDS", "60"))
+FIREBASE_FULL_LIST_CACHE_TTL_SECONDS = int(os.getenv("FIREBASE_FULL_LIST_CACHE_TTL_SECONDS", "30"))
+FIREBASE_BOT_SETTINGS_TTL_SECONDS = int(os.getenv("FIREBASE_BOT_SETTINGS_TTL_SECONDS", "60"))
+SAVE_USER_LAST_SEEN_THROTTLE_SECONDS = int(os.getenv("SAVE_USER_LAST_SEEN_THROTTLE_SECONDS", "300"))
 
 _firebase_cache = {}
 
@@ -631,9 +637,27 @@ def clear_user_cache(user_id: int):
         _cache_delete_prefix(f"user_status:{uid}")
         _cache_delete_prefix(f"approved:{uid}")
         _cache_delete_prefix(f"approved_data:{uid}")
+        _cache_delete_prefix(f"user_record:{uid}")
+        _cache_delete_prefix(f"pending:{uid}")
         _cache_delete_prefix(f"video_trial:{uid}")
+        _cache_delete_prefix(f"last_seen_write:{uid}")
     except Exception:
         pass
+
+
+def clear_users_list_cache():
+    _cache_delete_prefix("all_users")
+    _cache_delete_prefix("recent_active_approved")
+
+
+def clear_approved_list_cache():
+    _cache_delete_prefix("all_approved_users")
+    _cache_delete_prefix("recent_active_approved")
+
+
+def clear_pending_list_cache():
+    _cache_delete_prefix("all_pending_users")
+
 
 
 def clear_channel_publish_cache():
@@ -642,7 +666,7 @@ def clear_channel_publish_cache():
 
 
 # ===== Firebase read diagnostics =====
-FIREBASE_READ_DIAGNOSTICS_ENABLED = os.getenv("FIREBASE_READ_DIAGNOSTICS_ENABLED", "true").lower() == "true"
+FIREBASE_READ_DIAGNOSTICS_ENABLED = os.getenv("FIREBASE_READ_DIAGNOSTICS_ENABLED", "false").lower() == "true"
 FIREBASE_READ_REPORT_SECONDS = int(os.getenv("FIREBASE_READ_REPORT_SECONDS", "300"))
 FIREBASE_READ_TOP_N = int(os.getenv("FIREBASE_READ_TOP_N", "25"))
 
@@ -984,6 +1008,77 @@ async def firebase_diagnostics_report_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 
+
+def safe_key(value) -> str:
+    """Firebase-safe key."""
+    try:
+        s = str(value or "").strip()
+        s = s.replace(".", "_").replace("#", "_").replace("$", "_").replace("[", "_").replace("]", "_").replace("/", "_")
+        s = re.sub(r"[^A-Za-z0-9_\-]+", "_", s)
+        s = re.sub(r"_+", "_", s).strip("_")
+        return s or "unknown"
+    except Exception:
+        return "unknown"
+
+
+def normalize_otc_pair_input(pair_text: str) -> str:
+    """Normalize display OTC pair text to internal symbol style."""
+    raw = str(pair_text or "").strip()
+    raw = raw.replace("(OTC)", "").replace("OTC", "").strip()
+    raw = raw.replace(" ", "")
+    if "/" in raw:
+        a, b = raw.split("/", 1)
+        return f"{a.upper()}{b.upper()}_otc"
+    if raw.lower().endswith("_otc"):
+        return raw
+    return f"{raw.upper()}_otc"
+
+
+def otc_list_jobs_ref(user_id: int):
+    """Reference for saved OTC list jobs per user/admin."""
+    return system_ref().child("otc_list_jobs").child(str(int(user_id)))
+
+
+def get_otc_feed_diagnostics_for_pair(pair_text: str) -> str:
+    """Safe diagnostics message for OTC pair feed status."""
+    try:
+        symbol = normalize_otc_pair_input(pair_text)
+        ticks = OTC_TICKS_CACHE.get(symbol, []) if "OTC_TICKS_CACHE" in globals() else []
+        candles = OTC_CANDLES_CACHE.get(symbol, []) if "OTC_CANDLES_CACHE" in globals() else []
+
+        last_tick = ticks[-1] if ticks else None
+        last_candle = candles[-1] if candles else None
+
+        lines = [
+            "فحص بيانات زوج OTC",
+            "",
+            f"الزوج: {pair_text}",
+            f"الرمز: {symbol}",
+            "",
+            f"عدد ticks بالكاش: {len(ticks)}",
+            f"عدد الشموع بالكاش: {len(candles)}",
+        ]
+
+        if isinstance(last_tick, dict):
+            lines.append(f"آخر tick: {last_tick}")
+        elif last_tick is not None:
+            lines.append(f"آخر tick: {last_tick}")
+        else:
+            lines.append("آخر tick: لا يوجد")
+
+        if isinstance(last_candle, dict):
+            lines.append(f"آخر شمعة: {last_candle}")
+        elif last_candle is not None:
+            lines.append(f"آخر شمعة: {last_candle}")
+        else:
+            lines.append("آخر شمعة: لا يوجد")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"تعذر فحص بيانات الزوج: {e}"
+
+
+
 def users_ref():
     return db.reference("users")
 
@@ -1045,10 +1140,8 @@ def is_channel_publish_enabled(channel_key: str) -> bool:
 
 
 def set_channel_publish_enabled(channel_key: str, enabled: bool):
-    channel_publish_ref().update({
-        channel_key: bool(enabled),
-        f"{channel_key}_updated_at": now_iso(),
-    })
+    force_channel_publish_setting(channel_key, enabled)
+
 
 
 def format_channel_publish_status() -> str:
@@ -1134,37 +1227,110 @@ def format_dt_ar(iso_value: str):
 
 
 def get_user_record(user_id: int):
-    return users_ref().child(str(user_id)).get()
+    uid = int(user_id)
+    cached = _cache_get(f"user_record:{uid}", FIREBASE_USER_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return cached
+    data = users_ref().child(str(uid)).get()
+    return _cache_set(f"user_record:{uid}", data)
+
 
 
 def save_user_record(user_id: int, data: dict):
-    users_ref().child(str(user_id)).update(data)
+    uid = int(user_id)
+    data = dict(data or {})
+
+    # لا نكتب last_seen على Firebase مع كل رسالة؛ هذا كان يسبب writes كثيرة بلا فائدة.
+    critical_keys = {
+        "status", "quotex_id", "expires_at", "trial_used", "trial_source",
+        "approved", "pending", "role", "rejected_at", "revoked_at", "blocked_at",
+        "updated_at",
+    }
+    has_critical_update = any(k in data for k in critical_keys)
+
+    if not has_critical_update and set(data.keys()).issubset({"telegram_id", "name", "username", "last_seen"}):
+        last_key = f"last_seen_write:{uid}"
+        last_write = _cache_get(last_key, SAVE_USER_LAST_SEEN_THROTTLE_SECONDS)
+        if last_write is not None:
+            # حدّث الكاش فقط، لا تكتب Firebase.
+            cached = _cache_get(f"user_record:{uid}", FIREBASE_USER_CACHE_TTL_SECONDS) or {}
+            if isinstance(cached, dict):
+                cached.update(data)
+                _cache_set(f"user_record:{uid}", cached)
+            return
+        _cache_set(last_key, True)
+
+    users_ref().child(str(uid)).update(data)
+
+    cached = _cache_get(f"user_record:{uid}", FIREBASE_USER_CACHE_TTL_SECONDS) or {}
+    if isinstance(cached, dict):
+        cached.update(data)
+        _cache_set(f"user_record:{uid}", cached)
+    else:
+        _cache_set(f"user_record:{uid}", data)
+
+    clear_users_list_cache()
+
 
 
 def save_pending_user(user_id: int, data: dict):
-    # إذا المستخدم كان مرفوضًا/ملغى التفعيل، نزيل حالته القديمة حتى يصبح pending فعليًا.
+    uid = int(user_id)
+    data = dict(data or {})
+
+    # لا نحذف سجل التجربة ولا نمسح المستخدم بالكامل عند تقديم طلب جديد.
+    # فقط نلغي أي تفعيل قديم ونحفظ الطلب المعلق.
     try:
-        force_revoke_user_access(user_id, 'blocked')
+        approved_ref().child(str(uid)).delete()
     except Exception:
         pass
-    pending_ref().child(str(user_id)).set(data)
-    try:
-        clear_user_cache(user_id)
-    except Exception:
-        pass
+
+    pending_ref().child(str(uid)).set(data)
+    users_ref().child(str(uid)).update({
+        "telegram_id": uid,
+        "name": data.get("name", ""),
+        "username": data.get("username", ""),
+        "quotex_id": data.get("quotex_id", ""),
+        "status": "pending",
+        "pending": True,
+        "updated_at": now_iso(),
+    })
+
+    clear_user_cache(uid)
+    clear_pending_list_cache()
+    clear_approved_list_cache()
+    clear_users_list_cache()
+    _cache_set(f"user_status:{uid}", "pending")
+    _cache_set(f"approved:{uid}", False)
+
 
 
 def remove_pending_user(user_id: int):
-    force_reject_pending_user(user_id)
+    uid = int(user_id)
+    try:
+        pending_ref().child(str(uid)).delete()
+    except Exception:
+        pass
+    clear_pending_list_cache()
+    clear_user_cache(uid)
+
 
 
 def set_approved_user(user_id: int, data: dict):
-    approved_ref().child(str(user_id)).set(data)
+    uid = int(user_id)
+    data = dict(data or {})
+    approved_ref().child(str(uid)).set(data)
+    clear_user_cache(uid)
+    clear_approved_list_cache()
+    _cache_set(f"approved_data:{uid}", data)
+    _cache_set(f"approved:{uid}", str(data.get("status", "approved")) == "approved")
+    if str(data.get("status", "approved")) == "approved":
+        _cache_set(f"user_status:{uid}", "approved")
+
 
 
 def get_approved_user(user_id: int):
     uid = int(user_id)
-    cached = _cache_get(f"approved_data:{uid}")
+    cached = _cache_get(f"approved_data:{uid}", FIREBASE_APPROVED_CACHE_TTL_SECONDS)
     if cached is not None:
         return cached
     try:
@@ -1177,15 +1343,30 @@ def get_approved_user(user_id: int):
 
 
 def get_all_pending_users():
-    return pending_ref().get() or {}
+    cached = _cache_get("all_pending_users", FIREBASE_FULL_LIST_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return cached
+    data = pending_ref().get() or {}
+    return _cache_set("all_pending_users", data)
+
 
 
 def get_all_users():
-    return users_ref().get() or {}
+    cached = _cache_get("all_users", FIREBASE_FULL_LIST_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return cached
+    data = users_ref().get() or {}
+    return _cache_set("all_users", data)
+
 
 
 def get_all_approved_users():
-    return approved_ref().get() or {}
+    cached = _cache_get("all_approved_users", FIREBASE_FULL_LIST_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return cached
+    data = approved_ref().get() or {}
+    return _cache_set("all_approved_users", data)
+
 
 
 def is_admin(user_id: int) -> bool:
@@ -1200,16 +1381,26 @@ def is_otc_list_manager(user_id: int) -> bool:
 
 
 def get_bot_enabled() -> bool:
-    data = system_ref().get() or {}
-    return bool(data.get("bot_enabled", True))
+    cached = _cache_get("system:bot_enabled", FIREBASE_BOT_SETTINGS_TTL_SECONDS)
+    if cached is not None:
+        return bool(cached)
+    try:
+        value = system_ref().child("bot_enabled").get()
+        if value is None:
+            value = True
+        return bool(_cache_set("system:bot_enabled", bool(value)))
+    except Exception as e:
+        logger.exception("Could not read bot_enabled: %s", e)
+        return True
+
 
 
 def set_bot_enabled(value: bool):
     system_ref().update({
-        "bot_enabled": value,
+        "bot_enabled": bool(value),
         "updated_at": now_iso(),
     })
-
+    _cache_set("system:bot_enabled", bool(value))
 
 
 
@@ -1223,7 +1414,6 @@ def force_reject_pending_user(user_id: int):
         pass
 
     try:
-        # لا نحظر المستخدم؛ فقط نرجعه new ليقدر يقدم طلب جديد إذا أراد.
         users_ref().child(str(uid)).update({
             "status": "new",
             "pending": False,
@@ -1233,15 +1423,14 @@ def force_reject_pending_user(user_id: int):
     except Exception:
         pass
 
-    try:
-        clear_user_cache(uid)
-        _cache_set(f"user_status:{uid}", "new")
-        _cache_set(f"approved:{uid}", False)
-        _cache_set(f"approved_data:{uid}", None)
-    except Exception:
-        pass
-
+    clear_user_cache(uid)
+    clear_pending_list_cache()
+    clear_users_list_cache()
+    _cache_set(f"user_status:{uid}", "new")
+    _cache_set(f"approved:{uid}", False)
+    _cache_set(f"approved_data:{uid}", None)
     return True
+
 
 
 def force_revoke_user_access(user_id: int, status: str = "new"):
@@ -1306,12 +1495,12 @@ async def send_revoked_welcome_keyboard(context: ContextTypes.DEFAULT_TYPE, user
 
 def is_approved(user_id: int) -> bool:
     uid = int(user_id)
-    cached = _cache_get(f"approved:{uid}")
+    cached = _cache_get(f"approved:{uid}", FIREBASE_APPROVED_CACHE_TTL_SECONDS)
     if cached is not None:
         return bool(cached)
 
     try:
-        data = approved_ref().child(str(uid)).get()
+        data = get_approved_user(uid)
         if not data:
             return _cache_set(f"approved:{uid}", False)
 
@@ -1320,7 +1509,7 @@ def is_approved(user_id: int) -> bool:
             return _cache_set(f"approved:{uid}", False)
 
         expires_at = data.get("expires_at") if isinstance(data, dict) else None
-        if expires_at:
+        if expires_at and expires_at != "forever":
             try:
                 exp = datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
                 if exp.tzinfo is None:
@@ -1339,7 +1528,7 @@ def is_approved(user_id: int) -> bool:
 
 def get_user_status(user_id: int) -> str:
     uid = int(user_id)
-    cached = _cache_get(f"user_status:{uid}")
+    cached = _cache_get(f"user_status:{uid}", FIREBASE_USER_CACHE_TTL_SECONDS)
     if cached is not None:
         return str(cached)
 
@@ -1347,11 +1536,16 @@ def get_user_status(user_id: int) -> str:
         if is_approved(uid):
             return _cache_set(f"user_status:{uid}", "approved")
 
+        pending_cached = _cache_get(f"pending:{uid}", FIREBASE_PENDING_CACHE_TTL_SECONDS)
+        if pending_cached is not None:
+            return _cache_set(f"user_status:{uid}", "pending" if pending_cached else "new")
+
         pending = pending_ref().child(str(uid)).get()
+        _cache_set(f"pending:{uid}", bool(pending))
         if pending:
             return _cache_set(f"user_status:{uid}", "pending")
 
-        approved_data = approved_ref().child(str(uid)).get()
+        approved_data = get_approved_user(uid)
         if isinstance(approved_data, dict):
             status = str(approved_data.get("status") or "")
             if status:
@@ -1410,31 +1604,45 @@ def block_user(user_id: int):
 
 
 def get_recent_active_approved_users(minutes: int = ONLINE_MINUTES_WINDOW):
+    cache_key = f"recent_active_approved:{int(minutes)}"
+    cached = _cache_get(cache_key, 60)
+    if cached is not None:
+        return cached
+
     approved_users = get_all_approved_users()
     all_users = get_all_users()
 
     result = []
     cutoff = now_utc() - timedelta(minutes=minutes)
 
-    for user_id_str in approved_users.keys():
+    for user_id_str, approved_data in (approved_users or {}).items():
         try:
-            user_id = int(user_id_str)
-        except ValueError:
+            if isinstance(approved_data, dict):
+                if approved_data.get("status", "approved") != "approved":
+                    continue
+                expires_at = approved_data.get("expires_at")
+                if expires_at and expires_at != "forever":
+                    exp = parse_iso(str(expires_at).replace("Z", "+00:00"))
+                    if exp:
+                        if exp.tzinfo is None:
+                            exp = exp.replace(tzinfo=timezone.utc)
+                        if now_utc() > exp:
+                            continue
+            user_data = all_users.get(user_id_str)
+            if not user_data:
+                continue
+            last_seen = parse_iso(user_data.get("last_seen", ""))
+            if last_seen:
+                if last_seen.tzinfo is None:
+                    last_seen = last_seen.replace(tzinfo=timezone.utc)
+                if last_seen >= cutoff:
+                    result.append((user_id_str, user_data))
+        except Exception:
             continue
-
-        if not is_approved(user_id):
-            continue
-
-        user_data = all_users.get(user_id_str)
-        if not user_data:
-            continue
-
-        last_seen = parse_iso(user_data.get("last_seen", ""))
-        if last_seen and last_seen >= cutoff:
-            result.append((user_id_str, user_data))
 
     result.sort(key=lambda x: x[1].get("last_seen", ""), reverse=True)
-    return result
+    return _cache_set(cache_key, result)
+
 
 
 def format_utc_plus_3(dt: datetime) -> str:
@@ -2202,9 +2410,6 @@ def get_candles_stable_direction(*args, **kwargs):
 
 
 
-def get_candles_stable_direction(candles=None, lookback: int = 5, min_majority: int = 3, *args, **kwargs):
-    return get_stable_direction(candles, lookback, min_majority, *args, **kwargs)
-
 
 
 def analyze_best_live_otc_now() -> dict:
@@ -2882,57 +3087,26 @@ def is_otc_live_publish_allowed_now() -> bool:
 
 def is_otc_timed_publish_allowed_now() -> bool:
     try:
-        data = system_ref().child("channel_publish").get() or {}
-        if isinstance(data, dict) and data.get("otc") is False:
-            clear_channel_publish_cache()
-            return False
-
-        if not is_channel_publish_enabled("otc"):
-            return False
-
-        return True
+        return bool(get_channel_publish_settings().get("otc", True))
     except Exception as e:
         logger.exception("OTC timed publish guard error: %s", e)
         return False
 
 
-def force_channel_publish_setting(channel_key: str, enabled: bool):
-    try:
-        system_ref().child("channel_publish").child(str(channel_key)).set(bool(enabled))
-        clear_channel_publish_cache()
-        if str(channel_key) == "otc_live":
-            try:
-                remember_otc_live_enabled_state(bool(enabled))
-            except Exception:
-                pass
-        return True
-    except Exception as e:
-        logger.exception("Could not force channel publish setting %s=%s: %s", channel_key, enabled, e)
-        return False
 
 
 
 # ===== OTC Live disabled means full stop =====
 def is_otc_live_fully_enabled_now() -> bool:
-    """إذا رجعت False فهذا يعني:
-    لا تحليل، لا نشر، لا تسجيل صفقة، لا نتيجة، لا ملخص يومي.
-    """
+    """إذا رجعت False: لا تحليل، لا نشر، لا تسجيل، لا نتيجة، لا ملخص."""
     try:
         if not bool(OTC_LIVE_CHANNEL_ENABLED):
             return False
-
-        data = system_ref().child("channel_publish").get() or {}
-        if isinstance(data, dict) and data.get("otc_live") is False:
-            clear_channel_publish_cache()
-            return False
-
-        if not is_channel_publish_enabled("otc_live"):
-            return False
-
-        return True
+        return bool(get_channel_publish_settings().get("otc_live", True))
     except Exception as e:
         logger.exception("OTC live full enabled guard error: %s", e)
         return False
+
 
 
 def stop_otc_live_runtime_state(reason: str = "disabled"):
@@ -3979,7 +4153,7 @@ def otc_list_result_icon_from_line(line: str) -> str:
         return "⚖️"
     if "loss" in s or "❌" in raw or "↘️" in raw:
         return "❌"
-    if "win¹" in s or "win1" in s or "✅¹" in raw or "✅¹" in raw or "⚠️✅" in raw:
+    if "win¹" in s or "win1" in s or "✅¹" in raw or "✅¹" in raw or "✅¹" in raw:
         return "✅¹"
     if "win" in s or "✅" in raw:
         return "✅"
@@ -3992,7 +4166,7 @@ def otc_list_is_violation_from_line(line: str) -> bool:
     s = raw.lower()
 
     # ✅¹ كان تنسيق قديم للربح بالمضاعفة، وليس مخالفة.
-    if "⚠️✅" in raw or "✅¹" in raw:
+    if "✅¹" in raw or "✅¹" in raw:
         return False
 
     return any(token in s or token in raw for token in [
