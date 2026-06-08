@@ -2116,13 +2116,42 @@ def get_live_otc_snapshot(pair: str) -> dict:
 
 
 
-def get_stable_direction(candles=None, lookback: int = 5, min_majority: int = 3, *args, **kwargs):
-    """يرجع اتجاه ثابت من آخر الشموع.
-    متوافق مع أي استدعاء قديم أو جديد حتى لا ينهار مسار OTC الزمني.
+def get_stable_direction(pair_or_candles=None, dt=None, lookback: int = 5, min_majority: int = 3, *args, **kwargs):
+    """اتجاه ثابت لقسم OTC الزمني.
+
+    الاستخدام الأصلي:
+        get_stable_direction(pair: str, dt: datetime) -> "CALL"/"PUT"
+
+    دعم احتياطي:
+        get_stable_direction(candles, lookback=5) -> "CALL"/"PUT"/None
     """
     try:
+        # المسار الأصلي لقسم OTC الزمني: اتجاه ثابت حسب الزوج والوقت.
+        if isinstance(pair_or_candles, str) and isinstance(dt, datetime):
+            pair = pair_or_candles
+            dt_plus_3 = dt.astimezone(UTC_PLUS_3)
+
+            key = (
+                f"{pair}|"
+                f"{dt_plus_3.year}-"
+                f"{dt_plus_3.month:02d}-"
+                f"{dt_plus_3.day:02d}|"
+                f"H{dt_plus_3.hour:02d}|"
+                f"M{dt_plus_3.minute:02d}"
+            )
+
+            digest = hashlib.sha256(key.encode("utf-8")).hexdigest()
+            value = int(digest[:8], 16)
+            return "CALL" if value % 2 == 0 else "PUT"
+
+        # دعم احتياطي إذا استدعيت الدالة على شموع.
+        candles = pair_or_candles
         if candles is None:
             return None
+
+        # إذا ثاني باراميتر رقم، اعتبره lookback.
+        if isinstance(dt, int):
+            lookback = dt
 
         recent = list(candles)[-int(lookback):]
         up = 0
@@ -2154,14 +2183,24 @@ def get_stable_direction(candles=None, lookback: int = 5, min_majority: int = 3,
 
         return None
 
-    except Exception:
+    except Exception as e:
+        try:
+            logger.warning("get_stable_direction failed: %s", e)
+        except Exception:
+            pass
         return None
 
 
 
-# Backward-compatible aliases for older OTC timed signal code
-def stable_direction(candles=None, lookback: int = 5, min_majority: int = 3, *args, **kwargs):
-    return get_stable_direction(candles, lookback, min_majority, *args, **kwargs)
+def stable_direction(*args, **kwargs):
+    return get_stable_direction(*args, **kwargs)
+
+
+def get_candles_stable_direction(*args, **kwargs):
+    return get_stable_direction(*args, **kwargs)
+
+
+
 
 def get_candles_stable_direction(candles=None, lookback: int = 5, min_majority: int = 3, *args, **kwargs):
     return get_stable_direction(candles, lookback, min_majority, *args, **kwargs)
