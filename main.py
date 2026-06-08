@@ -791,6 +791,113 @@ def install_firebase_http_diagnostics():
         logger.exception("Could not install Firebase HTTP diagnostics: %s", e)
 
 
+
+# ===== Firebase urllib3 diagnostics =====
+_firebase_urllib3_stats = {}
+_firebase_urllib3_diag_installed = False
+
+
+def _urllib3_build_url(pool, url: str) -> str:
+    try:
+        host = getattr(pool, "host", "") or ""
+        scheme = getattr(pool, "scheme", "https") or "https"
+        if str(url).startswith("http://") or str(url).startswith("https://"):
+            return str(url)
+        return f"{scheme}://{host}{url}"
+    except Exception:
+        return str(url)
+
+
+def _urllib3_stat_add(method: str, url: str, response_size: int = 0):
+    try:
+        key = f"{str(method).upper()} {_clean_firebase_url_path(url)}"
+        item = _firebase_urllib3_stats.setdefault(key, {"count": 0, "bytes": 0})
+        item["count"] += 1
+        item["bytes"] += int(response_size or 0)
+    except Exception:
+        pass
+
+
+def install_firebase_urllib3_diagnostics():
+    global _firebase_urllib3_diag_installed
+
+    if _firebase_urllib3_diag_installed or not FIREBASE_READ_DIAGNOSTICS_ENABLED:
+        return
+
+    try:
+        import urllib3
+
+        original_urlopen = urllib3.connectionpool.HTTPConnectionPool.urlopen
+
+        def patched_urlopen(self, method, url, *args, **kwargs):
+            full_url = _urllib3_build_url(self, url)
+            response = original_urlopen(self, method, url, *args, **kwargs)
+
+            try:
+                if _is_firebase_url(full_url):
+                    size = 0
+
+                    try:
+                        data = getattr(response, "data", None)
+                        if data is not None:
+                            size = len(data)
+                    except Exception:
+                        pass
+
+                    if not size:
+                        try:
+                            cl = response.headers.get("Content-Length")
+                            if cl:
+                                size = int(cl)
+                        except Exception:
+                            pass
+
+                    _urllib3_stat_add(method, full_url, size)
+            except Exception:
+                pass
+
+            return response
+
+        urllib3.connectionpool.HTTPConnectionPool.urlopen = patched_urlopen
+        _firebase_urllib3_diag_installed = True
+        logger.warning("Firebase urllib3 diagnostics installed successfully")
+    except Exception as e:
+        logger.exception("Could not install Firebase urllib3 diagnostics: %s", e)
+
+
+def format_firebase_urllib3_diagnostics_report() -> str:
+    try:
+        items = sorted(
+            _firebase_urllib3_stats.items(),
+            key=lambda kv: (kv[1].get("bytes", 0), kv[1].get("count", 0)),
+            reverse=True
+        )[:FIREBASE_READ_TOP_N]
+
+        total_bytes = sum(v.get("bytes", 0) for v in _firebase_urllib3_stats.values())
+        total_count = sum(v.get("count", 0) for v in _firebase_urllib3_stats.values())
+
+        lines = [
+            "========== FIREBASE URLLIB3 DIAGNOSTICS ==========",
+            f"URLLIB3 FIREBASE CALLS: {total_count} calls | approx {total_bytes / 1024 / 1024:.2f} MB response",
+            "",
+            "TOP FIREBASE URLLIB3 PATHS:",
+        ]
+
+        if not items:
+            lines.append("- no firebase urllib3 calls recorded")
+        else:
+            for key, stat in items:
+                lines.append(
+                    f"- {key} | calls={stat.get('count', 0)} | approx={stat.get('bytes', 0) / 1024 / 1024:.2f} MB"
+                )
+
+        lines.append("===================================================")
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Firebase urllib3 diagnostics report error: {e}"
+
+
+
 def format_firebase_http_diagnostics_report() -> str:
     try:
         items = sorted(
@@ -871,6 +978,7 @@ async def firebase_diagnostics_report_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         logger.warning("\n%s", format_firebase_diagnostics_report())
         logger.warning("\n%s", format_firebase_http_diagnostics_report())
+        logger.warning("\n%s", format_firebase_urllib3_diagnostics_report())
     except Exception as e:
         logger.exception("Firebase diagnostics job error: %s", e)
 
