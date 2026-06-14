@@ -78,7 +78,7 @@ OTC_LIVE_CAUTION_LOOKBACK = int(os.getenv("OTC_LIVE_CAUTION_LOOKBACK", "15"))
 OTC_LIVE_CAUTION_MIN_QUALITY_BOOST = int(os.getenv("OTC_LIVE_CAUTION_MIN_QUALITY_BOOST", "8"))
 OTC_LIST_NO_DATA_RETRY_SECONDS = int(os.getenv("OTC_LIST_NO_DATA_RETRY_SECONDS", "15"))
 OTC_LIST_NO_DATA_MAX_RETRIES = int(os.getenv("OTC_LIST_NO_DATA_MAX_RETRIES", "6"))
-OTC_LIVE_SMART_MARTINGALE_ENABLED = os.getenv("OTC_LIVE_SMART_MARTINGALE_ENABLED", "true").lower() == "true"
+OTC_LIVE_SMART_MARTINGALE_ENABLED = os.getenv("OTC_LIVE_SMART_MARTINGALE_ENABLED", "false").lower() == "true"
 OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE = int(os.getenv("OTC_LIVE_MARTINGALE_DECISION_SECONDS_BEFORE_CLOSE", "8"))
 OTC_LIVE_MARTINGALE_ADVICE_CHECK_SECONDS = [12, 8, 5, 3]
 OTC_LIVE_ADAPTIVE_FILTER_ENABLED = os.getenv("OTC_LIVE_ADAPTIVE_FILTER_ENABLED", "true").lower() == "true"
@@ -88,6 +88,11 @@ OTC_LIVE_DIRECTION_RECENT_LIMIT = int(os.getenv("OTC_LIVE_DIRECTION_RECENT_LIMIT
 OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES = int(os.getenv("OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES", "4"))
 OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS = float(os.getenv("OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS", "-8.0"))
 OTC_LIVE_RESULT_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_DELAY_SECONDS", "8"))
+OTC_LIVE_HEALTH_CHECK_ENABLED = os.getenv("OTC_LIVE_HEALTH_CHECK_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+OTC_LIVE_NO_TICKS_ALERT_SECONDS = int(os.getenv("OTC_LIVE_NO_TICKS_ALERT_SECONDS", "180"))
+OTC_LIVE_HEALTH_CHECK_INTERVAL_SECONDS = int(os.getenv("OTC_LIVE_HEALTH_CHECK_INTERVAL_SECONDS", "60"))
+OTC_LIVE_HEALTH_ALERT_COOLDOWN_SECONDS = int(os.getenv("OTC_LIVE_HEALTH_ALERT_COOLDOWN_SECONDS", "600"))
+
 
 ADMIN_USERNAME = "@coach_WAEL_trading"
 YOUTUBE_TUTORIAL_URL = "https://www.youtube.com/watch?v=YPqgJcgvyFw"
@@ -390,6 +395,7 @@ admin_channels_keyboard = ReplyKeyboardMarkup(
     [
         ["⚡ تشغيل نشر OTC", "⚡ إيقاف نشر OTC"],
         ["🔥 تشغيل OTC مباشر", "🔥 إيقاف OTC مباشر"],
+        ["🩺 حالة OTC Live", "📊 حالة النشر"],
         ["📊 إحصائيات قناة OTC"],
         ["⬅️ رجوع"],
     ],
@@ -399,7 +405,7 @@ admin_channels_keyboard = ReplyKeyboardMarkup(
 admin_otc_stats_keyboard = ReplyKeyboardMarkup(
     [
         ["📈 إحصائيات OTC مباشر", "🔢 إحصائيات آخر عدد صفقات"],
-        ["🧹 تصفير إحصائيات OTC"],
+        ["🩺 حالة OTC Live", "🧹 تصفير إحصائيات OTC"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["⬅️ رجوع"],
     ],
@@ -2780,6 +2786,165 @@ otc_live_channel_state = {
 }
 
 
+otc_live_health_state = {
+    "last_alert_at": 0.0,
+    "last_ok": None,
+    "last_reason": "unknown",
+}
+
+
+def get_otc_live_feed_health() -> dict:
+    """حالة بث Quotex OTC Live من داخل البوت للأدمن والتنبيهات."""
+    try:
+        enabled = bool(OTC_LIVE_CHANNEL_ENABLED and is_channel_publish_enabled("otc_live"))
+        connected = bool(getattr(quotex_otc_feed, "connected", False)) if "quotex_otc_feed" in globals() else False
+
+        latest_tick = None
+        latest_symbol = None
+        tick_count = 0
+        instruments_count = 0
+        followed_count = 0
+
+        if "quotex_otc_feed" in globals():
+            try:
+                followed_count = len(getattr(quotex_otc_feed, "symbols", []) or [])
+                with quotex_otc_feed.lock:
+                    ticks_map = dict(getattr(quotex_otc_feed, "last_tick", {}) or {})
+                    instruments_count = len(getattr(quotex_otc_feed, "instruments", {}) or {})
+                tick_count = len(ticks_map)
+
+                for symbol, tick in ticks_map.items():
+                    if not isinstance(tick, dict):
+                        continue
+                    received = parse_iso(str(tick.get("received_at") or ""))
+                    if received and (latest_tick is None or received > latest_tick):
+                        latest_tick = received
+                        latest_symbol = symbol
+            except Exception:
+                pass
+
+        age_seconds = None
+        if latest_tick:
+            if latest_tick.tzinfo is None:
+                latest_tick = latest_tick.replace(tzinfo=UTC)
+            age_seconds = max(0, int((now_utc() - latest_tick.astimezone(UTC)).total_seconds()))
+
+        if not enabled:
+            ok = True
+            reason = "disabled"
+            title = "متوقف من الإعدادات"
+        elif not connected:
+            ok = False
+            reason = "disconnected"
+            title = "WebSocket مفصول"
+        elif latest_tick is None:
+            ok = False
+            reason = "no_ticks"
+            title = "لا يوجد ticks"
+        elif age_seconds is not None and age_seconds > OTC_LIVE_NO_TICKS_ALERT_SECONDS:
+            ok = False
+            reason = "stale_ticks"
+            title = f"آخر tick قديم منذ {age_seconds} ثانية"
+        else:
+            ok = True
+            reason = "ok"
+            title = "شغال"
+
+        return {
+            "ok": ok,
+            "reason": reason,
+            "title": title,
+            "enabled": enabled,
+            "connected": connected,
+            "age_seconds": age_seconds,
+            "latest_symbol": latest_symbol,
+            "tick_count": tick_count,
+            "instruments_count": instruments_count,
+            "followed_count": followed_count,
+        }
+    except Exception as e:
+        logger.exception("OTC live health check error: %s", e)
+        return {
+            "ok": False,
+            "reason": "health_error",
+            "title": f"خطأ فحص الحالة: {e}",
+            "enabled": False,
+            "connected": False,
+            "age_seconds": None,
+            "latest_symbol": None,
+            "tick_count": 0,
+            "instruments_count": 0,
+            "followed_count": 0,
+        }
+
+
+def build_otc_live_health_message() -> str:
+    health = get_otc_live_feed_health()
+    ok_text = "شغال ✅" if health.get("ok") else "في مشكلة ⚠️"
+    connected_text = "نعم ✅" if health.get("connected") else "لا ❌"
+    enabled_text = "نعم ✅" if health.get("enabled") else "لا ⛔"
+
+    age = health.get("age_seconds")
+    if age is None:
+        last_tick_text = "لا يوجد"
+    elif age < 60:
+        last_tick_text = f"منذ {age} ثانية"
+    else:
+        last_tick_text = f"منذ {age // 60} دقيقة و {age % 60} ثانية"
+
+    return (
+        "🩺 حالة OTC Live\n"
+        "━━━━━━━━━━━━━━\n"
+        f"الحالة: {ok_text}\n"
+        f"السبب: {health.get('title')}\n"
+        f"النشر مفعّل: {enabled_text}\n"
+        f"WebSocket متصل: {connected_text}\n"
+        f"آخر tick: {last_tick_text}\n"
+        f"آخر زوج وصل منه tick: {health.get('latest_symbol') or 'لا يوجد'}\n"
+        f"أزواج لديها ticks: {health.get('tick_count', 0)}\n"
+        f"الأزواج المتابعة: {health.get('followed_count', 0)}\n"
+        f"الأدوات/الـ payout بالكاش: {health.get('instruments_count', 0)}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"حد التنبيه: لا ticks لأكثر من {OTC_LIVE_NO_TICKS_ALERT_SECONDS} ثانية"
+    )
+
+
+async def otc_live_feed_health_check_job(context: ContextTypes.DEFAULT_TYPE):
+    """يرسل تنبيه للأدمن إذا قناة OTC Live مفعلة لكن WebSocket أو ticks متوقفة."""
+    try:
+        if not OTC_LIVE_HEALTH_CHECK_ENABLED:
+            return
+
+        health = get_otc_live_feed_health()
+        previous_ok = otc_live_health_state.get("last_ok")
+        otc_live_health_state["last_ok"] = bool(health.get("ok"))
+        otc_live_health_state["last_reason"] = str(health.get("reason") or "unknown")
+
+        # لا نرسل إنذار إذا القناة متوقفة يدويًا من الإعدادات.
+        if str(health.get("reason")) == "disabled":
+            return
+
+        if not health.get("ok"):
+            now_ts = time_module.time()
+            last_alert_at = float(otc_live_health_state.get("last_alert_at") or 0)
+            if now_ts - last_alert_at >= OTC_LIVE_HEALTH_ALERT_COOLDOWN_SECONDS:
+                otc_live_health_state["last_alert_at"] = now_ts
+                await context.bot.send_message(
+                    chat_id=ADMIN_TELEGRAM_ID,
+                    text="⚠️ تنبيه OTC Live\n\n" + build_otc_live_health_message(),
+                )
+            return
+
+        # عند رجوع البث بعد مشكلة، نرسل رسالة رجوع مرة واحدة.
+        if previous_ok is False and health.get("ok"):
+            await context.bot.send_message(
+                chat_id=ADMIN_TELEGRAM_ID,
+                text="✅ عاد بث OTC Live للعمل\n\n" + build_otc_live_health_message(),
+            )
+    except Exception as e:
+        logger.exception("OTC live feed health alert job error: %s", e)
+
+
 def format_otc_live_price(pair: str, value: float) -> str:
     return f"{value:.3f}" if "JPY" in pair else f"{value:.5f}"
 
@@ -2946,72 +3111,17 @@ def build_smart_martingale_message(decision: dict) -> str:
     )
 
 async def send_smart_martingale_advice(context: ContextTypes.DEFAULT_TYPE):
-    signal = dict(context.job.data or {})
+    """المضاعفة الذكية ملغاة عمدًا.
 
+    لم نعد نرسل أي رسالة مضاعفة في القناة قبل نهاية الصفقة.
+    إذا خسرت الصفقة الأساسية، يتم حساب شمعة مضاعفة واحدة تلقائيًا
+    بنفس اتجاه الصفقة الأصلية فقط، ثم تُنشر النتيجة النهائية WIN¹ أو Loss.
+    """
     try:
-        if not OTC_LIVE_SMART_MARTINGALE_ENABLED:
-            return
-
-        if int(signal.get("martingale_advice_sent", 0) or 0) == 1:
-            return
-
-        if otc_live_channel_state.get("martingale_for_message_id") == signal.get("message_id"):
-            return
-
-        pair = signal.get("pair")
-        symbol = signal.get("symbol") or get_otc_symbol_for_pair(pair)
-        entry_ts = float(signal.get("entry_ts") or 0)
-
-        candle = quotex_otc_feed.candle(symbol, entry_ts) if symbol else {}
-        open_price = candle.get("open") if candle else None
-
-        snapshot = get_live_otc_snapshot(pair)
-        current_price = snapshot.get("price") if snapshot else None
-
-        if open_price is None or current_price is None:
-            return
-
-        decision = build_smart_martingale_decision(signal, float(open_price), float(current_price))
-
-        if not decision.get("needed"):
-            logger.info(
-                "Smart martingale advice skipped | pair=%s | reason=%s | current_result=%s",
-                pair,
-                decision.get("reason"),
-                decision.get("current_result"),
-            )
-            return
-
-        signal["martingale_direction"] = decision.get("martingale_direction")
-        signal["martingale_decision_type"] = decision.get("decision_type")
-        signal["martingale_advice_sent"] = 1
-
-        # نخزن القرار بحالة الصفقة الحالية حتى يستخدمه resolve عند الخسارة
-        otc_live_channel_state["martingale_direction"] = decision.get("martingale_direction")
-        otc_live_channel_state["martingale_decision_type"] = decision.get("decision_type")
-        otc_live_channel_state["martingale_for_message_id"] = signal.get("message_id")
-
-        if not is_otc_live_publish_allowed_now():
-            logger.info("OTC LIVE absolute guard blocked send_message")
-            return
-        sent_advice = await context.bot.send_message(
-            chat_id=OTC_LIVE_CHANNEL_ID,
-            text=build_smart_martingale_message(decision)
-        )
-        otc_live_channel_state["martingale_advice_message_id"] = sent_advice.message_id
-
-        logger.info(
-            "Smart martingale advice sent | pair=%s | original=%s | martingale=%s | type=%s | open=%s | current=%s",
-            pair,
-            signal.get("direction"),
-            decision.get("martingale_direction"),
-            decision.get("decision_type"),
-            decision.get("open_price"),
-            decision.get("current_price"),
-        )
-
-    except Exception as e:
-        logger.exception("Smart martingale advice error: %s", e)
+        logger.info("Smart martingale advice disabled: no advice message will be sent")
+    except Exception:
+        pass
+    return
 
 
 
@@ -3116,40 +3226,20 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             signal["first_candle_open"] = actual_entry_price
             signal["first_candle_close"] = exit_price
 
-        # مضاعفة واحدة ذكية:
-        # إذا خسرت الصفقة الأساسية، نستخدم قرار آخر ثانيتين إن وجد:
-        # نفس اتجاه الصفقة أو عكس اتجاه الصفقة.
+        # مضاعفة واحدة فقط بنفس اتجاه الصفقة الأصلية:
+        # لا يوجد مضاعفة ذكية ولا عكس اتجاه ولا رسالة تنبيه مضاعفة بالقناة.
+        # إذا خسرت الشمعة الأولى، نحسب نتيجة الشمعة التالية بنفس CALL/PUT الأصلي فقط.
         if result == "loss" and martingale_step == 0:
             next_entry_dt = datetime.fromtimestamp(close_ts, tz=UTC)
             next_close_dt = next_entry_dt + timedelta(seconds=OTC_LIVE_TRADE_DURATION_SECONDS)
 
-            chosen_martingale_direction = otc_live_channel_state.get("martingale_direction")
-            decision_msg_id = otc_live_channel_state.get("martingale_for_message_id")
-
-            if decision_msg_id != message_id or chosen_martingale_direction not in {"CALL", "PUT"}:
-                # fallback إذا لم يصل قرار التنبيه المبكر لأي سبب.
-                # نرسل تنبيه فوري، لكن هذا احتياطي فقط وقد يكون متأخرًا عن بداية شمعة المضاعفة.
-                chosen_martingale_direction = direction
-                try:
-                    if not is_otc_live_publish_allowed_now():
-                        logger.info("OTC LIVE absolute guard blocked send_message")
-                        return
-                    await context.bot.send_message(
-                        chat_id=OTC_LIVE_CHANNEL_ID,
-                        text=(
-                            "⚠️ تنبيه مضاعفة\n\n"
-                            "ضاعف بنفس اتجاه الصفقة\n"
-                            f"{'🟢 CALL' if chosen_martingale_direction == 'CALL' else '🔴 PUT'}"
-                        )
-                    )
-                except Exception as e:
-                    logger.warning("Could not send fallback martingale advice: %s", e)
+            chosen_martingale_direction = direction
 
             signal["martingale_step"] = 1
             signal["martingale_base_direction"] = direction
             signal["direction"] = chosen_martingale_direction
             signal["martingale_direction"] = chosen_martingale_direction
-            signal["martingale_decision_type"] = otc_live_channel_state.get("martingale_decision_type", "same")
+            signal["martingale_decision_type"] = "same"
             signal["entry_ts"] = next_entry_dt.timestamp()
             signal["close_ts"] = next_close_dt.timestamp()
             signal["entry_time"] = next_entry_dt.isoformat()
@@ -3164,7 +3254,7 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
             )
 
             logger.info(
-                "OTC live trade lost first candle, waiting smart martingale candle | pair=%s | original=%s | martingale=%s | result_in=%.1fs",
+                "OTC live trade lost first candle, waiting same-direction martingale candle | pair=%s | original=%s | martingale=%s | result_in=%.1fs",
                 pair, direction, chosen_martingale_direction, delay
             )
             return
@@ -3433,17 +3523,9 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
         otc_live_channel_state["active_since"] = time_module.time()
 
         resolve_delay = seconds_until_dt(close_dt) + OTC_LIVE_RESULT_EXTRA_DELAY_SECONDS
-        if OTC_LIVE_SMART_MARTINGALE_ENABLED:
-            for check_seconds in OTC_LIVE_MARTINGALE_ADVICE_CHECK_SECONDS:
-                advice_dt = close_dt - timedelta(seconds=check_seconds)
-                advice_delay = max(0.1, seconds_until_dt(advice_dt))
-
-                context.job_queue.run_once(
-                    send_smart_martingale_advice,
-                    when=advice_delay,
-                    data=signal,
-                    name=f"otc_live_martingale_advice_{sent.message_id}_{check_seconds}s",
-                )
+        # المضاعفة الذكية ورسائل تنبيه المضاعفة ملغاة.
+        # إذا خسرت الصفقة الأساسية، سيتم حساب مضاعفة واحدة تلقائيًا بنفس الاتجاه فقط
+        # داخل resolve_otc_live_channel_trade بدون نشر رسالة مضاعفة منفصلة.
 
         context.job_queue.run_once(
             resolve_otc_live_channel_trade,
@@ -8275,6 +8357,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
 
         if is_admin(user.id):
+            if text == "🩺 حالة OTC Live":
+                await update.message.reply_text(build_otc_live_health_message(), reply_markup=admin_otc_stats_keyboard)
+                return
+
             if text == "📈 إحصائيات OTC مباشر":
                 await update.message.reply_text(build_otc_live_stats_message(), reply_markup=admin_otc_stats_keyboard)
                 return
@@ -8754,6 +8840,14 @@ def main():
         interval=OTC_LIVE_SCAN_INTERVAL_SECONDS,
         first=25
     )
+
+    if OTC_LIVE_HEALTH_CHECK_ENABLED:
+        app.job_queue.run_repeating(
+            otc_live_feed_health_check_job,
+            interval=OTC_LIVE_HEALTH_CHECK_INTERVAL_SECONDS,
+            first=90,
+            name="otc_live_feed_health_check",
+        )
 
     job_queue = app.job_queue
     if FIREBASE_24H_MONITOR_ENABLED:
