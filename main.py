@@ -51,7 +51,10 @@ GLOBAL_CHANNEL_ID = -1003918647685
 
 # قناة الصفقات المباشرة الجديدة الخاصة بـ OTC Live
 OTC_LIVE_CHANNEL_ID = int(os.getenv("OTC_LIVE_CHANNEL_ID", "-1003880574173"))
-OTC_LIVE_CHANNEL_ENABLED = os.getenv("OTC_LIVE_CHANNEL_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+# قناة النشر التلقائي OTC Live تم إلغاؤها نهائيًا بناءً على طلب الأدمن.
+# يبقى بث Quotex والوظائف اليدوية كما هي، لكن لا يوجد نشر تلقائي على قناة OTC Live.
+OTC_AUTO_PUBLISH_CHANNEL_REMOVED = True
+OTC_LIVE_CHANNEL_ENABLED = False
 OTC_LIVE_MIN_QUALITY = int(os.getenv("OTC_LIVE_MIN_QUALITY", "65"))
 OTC_LIVE_MIN_PAYOUT = int(os.getenv("OTC_LIVE_MIN_PAYOUT", "80"))
 OTC_LIVE_DYNAMIC_PAIRS_ENABLED = os.getenv("OTC_LIVE_DYNAMIC_PAIRS_ENABLED", "true").lower() == "true"
@@ -88,15 +91,6 @@ OTC_LIVE_DIRECTION_RECENT_LIMIT = int(os.getenv("OTC_LIVE_DIRECTION_RECENT_LIMIT
 OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES = int(os.getenv("OTC_LIVE_DIRECTION_MAX_RECENT_LOSSES", "4"))
 OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS = float(os.getenv("OTC_LIVE_PAIR_MAX_RECENT_NEGATIVE_UNITS", "-8.0"))
 OTC_LIVE_RESULT_DELAY_SECONDS = int(os.getenv("OTC_LIVE_RESULT_DELAY_SECONDS", "8"))
-
-# ===== OTC auto channel analyzer V2 (channel-only) =====
-# هذه الإعدادات تخص قناة النشر التلقائي فقط، ولا تلمس التوليد اليدوي داخل البوت.
-OTC_AUTO_CHANNEL_ANALYZER_V2_ENABLED = os.getenv("OTC_AUTO_CHANNEL_ANALYZER_V2_ENABLED", "true").lower() == "true"
-OTC_AUTO_CHANNEL_MIN_FORMING_TICKS = int(os.getenv("OTC_AUTO_CHANNEL_MIN_FORMING_TICKS", "6"))
-OTC_AUTO_CHANNEL_MIN_CLOSED_TICKS = int(os.getenv("OTC_AUTO_CHANNEL_MIN_CLOSED_TICKS", "5"))
-OTC_AUTO_CHANNEL_MIN_BODY_RATIO = float(os.getenv("OTC_AUTO_CHANNEL_MIN_BODY_RATIO", "0.30"))
-OTC_AUTO_CHANNEL_MIN_REJECTION_WICK_RATIO = float(os.getenv("OTC_AUTO_CHANNEL_MIN_REJECTION_WICK_RATIO", "0.48"))
-
 OTC_LIVE_HEALTH_CHECK_ENABLED = os.getenv("OTC_LIVE_HEALTH_CHECK_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 OTC_LIVE_NO_TICKS_ALERT_SECONDS = int(os.getenv("OTC_LIVE_NO_TICKS_ALERT_SECONDS", "180"))
 OTC_LIVE_HEALTH_CHECK_INTERVAL_SECONDS = int(os.getenv("OTC_LIVE_HEALTH_CHECK_INTERVAL_SECONDS", "60"))
@@ -180,6 +174,11 @@ CHANNEL_OTC_PAIRS = [
 ]
 CHANNEL_DAILY_SIGNAL_COUNT = 35
 CHANNEL_SIGNAL_INTERVAL_MINUTES = 3
+
+# ===== Auto publishing hard switch =====
+# بناءً على طلب الأدمن: لا يوجد أي نشر تلقائي على أي قناة.
+# التوليد اليدوي داخل البوت يبقى كما هو.
+AUTO_PUBLISHING_DISABLED = True
 
 
 # ===== Quotex OTC live websocket settings =====
@@ -402,9 +401,6 @@ admin_main_keyboard = ReplyKeyboardMarkup(
 
 admin_channels_keyboard = ReplyKeyboardMarkup(
     [
-        ["⚡ تشغيل نشر OTC", "⚡ إيقاف نشر OTC"],
-        ["🔥 تشغيل OTC مباشر", "🔥 إيقاف OTC مباشر"],
-        ["🩺 حالة OTC Live", "📊 حالة النشر"],
         ["📊 إحصائيات قناة OTC"],
         ["⬅️ رجوع"],
     ],
@@ -413,8 +409,6 @@ admin_channels_keyboard = ReplyKeyboardMarkup(
 
 admin_otc_stats_keyboard = ReplyKeyboardMarkup(
     [
-        ["📈 إحصائيات OTC مباشر", "🔢 إحصائيات آخر عدد صفقات"],
-        ["🩺 حالة OTC Live", "🧹 تصفير إحصائيات OTC"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["⬅️ رجوع"],
     ],
@@ -1317,7 +1311,7 @@ def get_channel_publish_settings() -> dict:
     if cached is not None:
         return cached
 
-    default = {"real": True, "otc": True, "otc_live": True}
+    default = {"real": True, "otc": True, "otc_live": False}
     try:
         data = system_ref().child("channel_publish").get() or {}
         if not isinstance(data, dict):
@@ -1326,7 +1320,7 @@ def get_channel_publish_settings() -> dict:
         result = {
             "real": bool(data.get("real", default["real"])),
             "otc": bool(data.get("otc", default["otc"])),
-            "otc_live": bool(data.get("otc_live", default["otc_live"])),
+            "otc_live": False,
         }
         return _cache_set("channel_publish:settings", result)
     except Exception as e:
@@ -1344,15 +1338,6 @@ def set_channel_publish_enabled(channel_key: str, enabled: bool):
 
 
 
-def format_channel_publish_status() -> str:
-    settings = get_channel_publish_settings()
-    otc_status = "شغال ✅" if settings.get("otc", True) else "متوقف ⛔"
-    otc_live_status = "شغال ✅" if settings.get("otc_live", True) else "متوقف ⛔"
-    return (
-        "📊 حالة نشر القنوات\n\n"
-        f"⚡ قناة OTC الزمني: {otc_status}\n"
-        f"🔥 قناة OTC المباشر: {otc_live_status}"
-    )
 
 # ===== Helpers =====
 def now_utc():
@@ -2783,393 +2768,6 @@ def analyze_best_live_otc_now() -> dict:
     }
 
 
-# ===== OTC LIVE AUTO CHANNEL ANALYZER V2 =====
-# مهم: هذه الدوال خاصة بقناة النشر التلقائي فقط.
-# لا يتم استخدامها داخل زر التوليد اليدوي أو صفقة مباشرة للمستخدم.
-def get_otc_auto_channel_recent_candles(symbol: str, limit: int = 8) -> list[dict]:
-    """يرجع آخر شموع M1 من كاش Quotex Live لقناة النشر التلقائي فقط."""
-    try:
-        with quotex_otc_feed.lock:
-            candle_map = dict(quotex_otc_feed.candles.get(symbol) or {})
-
-        candles = []
-        for bucket_ts in sorted(candle_map.keys())[-int(limit):]:
-            candle = dict(candle_map.get(bucket_ts) or {})
-            if candle:
-                candles.append(candle)
-        return candles
-    except Exception:
-        return []
-
-
-def otc_auto_channel_candle_features(candle: dict) -> dict:
-    """ميزات شمعة بسيطة وقابلة للفهم لمحرك القناة فقط."""
-    try:
-        open_price = float(candle.get("open"))
-        high_price = float(candle.get("high"))
-        low_price = float(candle.get("low"))
-        close_price = float(candle.get("close"))
-    except Exception:
-        return {"valid": False}
-
-    candle_range = max(0.0, high_price - low_price)
-    body = close_price - open_price
-    abs_body = abs(body)
-
-    if candle_range <= 0:
-        return {
-            "valid": False,
-            "open": open_price,
-            "high": high_price,
-            "low": low_price,
-            "close": close_price,
-            "range": candle_range,
-        }
-
-    upper_wick = max(0.0, high_price - max(open_price, close_price))
-    lower_wick = max(0.0, min(open_price, close_price) - low_price)
-    close_pos = (close_price - low_price) / candle_range
-
-    if body > 0:
-        color = "CALL"
-    elif body < 0:
-        color = "PUT"
-    else:
-        color = "DOJI"
-
-    return {
-        "valid": True,
-        "open": open_price,
-        "high": high_price,
-        "low": low_price,
-        "close": close_price,
-        "range": candle_range,
-        "body": body,
-        "abs_body": abs_body,
-        "body_ratio": abs_body / candle_range,
-        "upper_wick": upper_wick,
-        "lower_wick": lower_wick,
-        "upper_wick_ratio": upper_wick / candle_range,
-        "lower_wick_ratio": lower_wick / candle_range,
-        "close_pos": close_pos,
-        "color": color,
-        "ticks": int(candle.get("ticks", 0) or 0),
-        "bucket_ts": int(candle.get("bucket_ts", 0) or 0),
-    }
-
-
-def otc_auto_channel_tick_pressure(rows: list[tuple], bucket_ts: int | None = None, limit: int = 40) -> dict:
-    """ضغط آخر ticks داخل الشمعة الحالية: صعود/هبوط/تذبذب."""
-    try:
-        filtered = []
-        for row in rows:
-            if len(row) < 2:
-                continue
-            ts = float(row[0])
-            if bucket_ts is not None and int(ts // 60) * 60 != int(bucket_ts):
-                continue
-            filtered.append((ts, float(row[1])))
-
-        sample = filtered[-int(limit):]
-        if len(sample) < 4:
-            return {"valid": False, "up": 0, "down": 0, "flat": 0, "pressure": 0.0, "change": 0.0, "sample_size": len(sample)}
-
-        prices = [p for _, p in sample]
-        up = sum(1 for a, b in zip(prices, prices[1:]) if b > a)
-        down = sum(1 for a, b in zip(prices, prices[1:]) if b < a)
-        flat = max(0, len(prices) - 1 - up - down)
-        total = max(1, up + down + flat)
-        pressure = (up - down) / total
-        change = prices[-1] - prices[0]
-
-        return {
-            "valid": True,
-            "up": up,
-            "down": down,
-            "flat": flat,
-            "pressure": pressure,
-            "change": change,
-            "sample_size": len(sample),
-        }
-    except Exception:
-        return {"valid": False, "up": 0, "down": 0, "flat": 0, "pressure": 0.0, "change": 0.0, "sample_size": 0}
-
-
-def otc_auto_channel_clamp_quality(value: float) -> int:
-    try:
-        return int(max(50, min(88, round(float(value)))))
-    except Exception:
-        return 0
-
-
-def analyze_otc_auto_channel_symbol_v2(pair: str, symbol: str) -> dict | None:
-    """محرك قرار CALL/PUT الجديد لقناة النشر التلقائي فقط.
-
-    الفكرة:
-    - لا يعتمد على آخر 12 tick فقط.
-    - يقرأ آخر شمعة مغلقة + الشمعة الحالية قبل الدخول.
-    - يقرر استمرار أو انعكاس حسب جسم الشمعة والذيل وضغط ticks.
-    - لا يستخدم خيار reverse العام؛ القرار النهائي يخرج من هذه الدالة.
-    """
-    try:
-        with quotex_otc_feed.lock:
-            rows = list(quotex_otc_feed.prices.get(symbol, []))
-            tick = dict(quotex_otc_feed.last_tick.get(symbol) or {})
-            candle_map = dict(quotex_otc_feed.candles.get(symbol) or {})
-
-        if len(rows) < 20 or not tick or not candle_map:
-            return None
-
-        try:
-            last_exchange_ts = float(tick.get("time", 0))
-            current_price = float(tick.get("price"))
-        except Exception:
-            return None
-
-        instrument = quotex_otc_feed.instrument(symbol)
-        payout = int(instrument.get("payout", 0) or 0)
-        is_otc = bool(instrument.get("is_otc", True))
-
-        if instrument and (not is_otc or payout < OTC_LIVE_MIN_PAYOUT):
-            return None
-
-        current_bucket = int(last_exchange_ts // 60) * 60
-        forming_candle = dict(candle_map.get(current_bucket) or {})
-        closed_candles = [dict(candle_map[k]) for k in sorted(candle_map.keys()) if int(k) < current_bucket]
-
-        if not forming_candle or len(closed_candles) < 2:
-            return None
-
-        forming = otc_auto_channel_candle_features(forming_candle)
-        last_closed = otc_auto_channel_candle_features(closed_candles[-1])
-        prev_closed = otc_auto_channel_candle_features(closed_candles[-2])
-
-        if not forming.get("valid") or not last_closed.get("valid") or not prev_closed.get("valid"):
-            return None
-
-        if forming.get("ticks", 0) < OTC_AUTO_CHANNEL_MIN_FORMING_TICKS:
-            return None
-
-        if last_closed.get("ticks", 0) < OTC_AUTO_CHANNEL_MIN_CLOSED_TICKS:
-            return None
-
-        recent_closed_ranges = [
-            otc_auto_channel_candle_features(c).get("range", 0)
-            for c in closed_candles[-5:]
-        ]
-        recent_closed_ranges = [float(x) for x in recent_closed_ranges if float(x or 0) > 0]
-        median_range = median(recent_closed_ranges) if recent_closed_ranges else 0.0
-        if median_range <= 0:
-            return None
-
-        pressure = otc_auto_channel_tick_pressure(rows, current_bucket, limit=45)
-        if not pressure.get("valid"):
-            return None
-
-        setups = []
-        min_body_ratio = float(OTC_AUTO_CHANNEL_MIN_BODY_RATIO)
-        min_rejection_ratio = float(OTC_AUTO_CHANNEL_MIN_REJECTION_WICK_RATIO)
-
-        # 1) استمرار الاتجاه: آخر شمعة مغلقة قوية + الشمعة الحالية تؤكد نفس الاتجاه.
-        if last_closed.get("color") == "CALL" and forming.get("color") == "CALL":
-            if (
-                last_closed.get("body_ratio", 0) >= min_body_ratio
-                and forming.get("body_ratio", 0) >= 0.18
-                and forming.get("upper_wick_ratio", 1) <= 0.45
-                and forming.get("close_pos", 0) >= 0.55
-                and pressure.get("pressure", 0) >= -0.15
-            ):
-                quality = 58
-                quality += last_closed.get("body_ratio", 0) * 12
-                quality += forming.get("body_ratio", 0) * 12
-                quality += max(0.0, pressure.get("pressure", 0)) * 16
-                quality += min(8.0, (forming.get("range", 0) / median_range) * 4)
-                quality += min(4.0, max(0, payout - OTC_LIVE_MIN_PAYOUT) / 5)
-                setups.append({
-                    "direction": "CALL",
-                    "setup": "continuation_call",
-                    "score": otc_auto_channel_clamp_quality(quality),
-                    "strength": float(forming.get("body_ratio", 0) + last_closed.get("body_ratio", 0) + max(0.0, pressure.get("pressure", 0))),
-                    "reason": "استمرار صاعد: شمعة مغلقة صاعدة والشمعة الحالية تؤكد الصعود بدون رفض علوي قوي",
-                })
-
-        if last_closed.get("color") == "PUT" and forming.get("color") == "PUT":
-            if (
-                last_closed.get("body_ratio", 0) >= min_body_ratio
-                and forming.get("body_ratio", 0) >= 0.18
-                and forming.get("lower_wick_ratio", 1) <= 0.45
-                and forming.get("close_pos", 1) <= 0.45
-                and pressure.get("pressure", 0) <= 0.15
-            ):
-                quality = 58
-                quality += last_closed.get("body_ratio", 0) * 12
-                quality += forming.get("body_ratio", 0) * 12
-                quality += max(0.0, -pressure.get("pressure", 0)) * 16
-                quality += min(8.0, (forming.get("range", 0) / median_range) * 4)
-                quality += min(4.0, max(0, payout - OTC_LIVE_MIN_PAYOUT) / 5)
-                setups.append({
-                    "direction": "PUT",
-                    "setup": "continuation_put",
-                    "score": otc_auto_channel_clamp_quality(quality),
-                    "strength": float(forming.get("body_ratio", 0) + last_closed.get("body_ratio", 0) + max(0.0, -pressure.get("pressure", 0))),
-                    "reason": "استمرار هابط: شمعة مغلقة هابطة والشمعة الحالية تؤكد الهبوط بدون رفض سفلي قوي",
-                })
-
-        # 2) انعكاس رفض سعري: ذيل واضح + إغلاق بعيد عن منطقة الرفض.
-        if forming.get("upper_wick_ratio", 0) >= min_rejection_ratio and forming.get("close_pos", 1) <= 0.48:
-            if pressure.get("pressure", 0) <= 0.15:
-                quality = 60
-                quality += forming.get("upper_wick_ratio", 0) * 18
-                quality += (1.0 - forming.get("close_pos", 0.5)) * 12
-                quality += max(0.0, -pressure.get("pressure", 0)) * 12
-                quality += min(6.0, (forming.get("range", 0) / median_range) * 3)
-                quality += min(4.0, max(0, payout - OTC_LIVE_MIN_PAYOUT) / 5)
-                setups.append({
-                    "direction": "PUT",
-                    "setup": "upper_rejection_put",
-                    "score": otc_auto_channel_clamp_quality(quality),
-                    "strength": float(forming.get("upper_wick_ratio", 0) + (1.0 - forming.get("close_pos", 0.5)) + max(0.0, -pressure.get("pressure", 0))),
-                    "reason": "انعكاس هابط: رفض علوي واضح والشمعة الحالية أغلقت بعيدًا عن القمة",
-                })
-
-        if forming.get("lower_wick_ratio", 0) >= min_rejection_ratio and forming.get("close_pos", 0) >= 0.52:
-            if pressure.get("pressure", 0) >= -0.15:
-                quality = 60
-                quality += forming.get("lower_wick_ratio", 0) * 18
-                quality += forming.get("close_pos", 0.5) * 12
-                quality += max(0.0, pressure.get("pressure", 0)) * 12
-                quality += min(6.0, (forming.get("range", 0) / median_range) * 3)
-                quality += min(4.0, max(0, payout - OTC_LIVE_MIN_PAYOUT) / 5)
-                setups.append({
-                    "direction": "CALL",
-                    "setup": "lower_rejection_call",
-                    "score": otc_auto_channel_clamp_quality(quality),
-                    "strength": float(forming.get("lower_wick_ratio", 0) + forming.get("close_pos", 0.5) + max(0.0, pressure.get("pressure", 0))),
-                    "reason": "انعكاس صاعد: رفض سفلي واضح والشمعة الحالية أغلقت بعيدًا عن القاع",
-                })
-
-        if not setups:
-            return None
-
-        best_setup = sorted(setups, key=lambda x: (x.get("score", 0), x.get("strength", 0)), reverse=True)[0]
-
-        # لا نسمح بقرار ضعيف يظهر كأنه قوي.
-        if int(best_setup.get("score", 0) or 0) < 62:
-            return None
-
-        return {
-            "pair": pair,
-            "symbol": symbol,
-            "direction": best_setup["direction"],
-            "score": int(best_setup["score"]),
-            "quality": int(best_setup["score"]),
-            "price": current_price,
-            "exchange_time": last_exchange_ts,
-            "payout": payout,
-            "setup": best_setup.get("setup"),
-            "analysis_reason": best_setup.get("reason"),
-            "strength": float(best_setup.get("strength", 0) or 0),
-            "sample_size": int(pressure.get("sample_size", 0) or 0),
-            "moves": {"up": pressure.get("up", 0), "down": pressure.get("down", 0), "flat": pressure.get("flat", 0)},
-            "change": float(pressure.get("change", 0) or 0),
-            "forming_body_ratio": float(forming.get("body_ratio", 0) or 0),
-            "forming_upper_wick_ratio": float(forming.get("upper_wick_ratio", 0) or 0),
-            "forming_lower_wick_ratio": float(forming.get("lower_wick_ratio", 0) or 0),
-            "last_closed_color": last_closed.get("color"),
-            "last_closed_body_ratio": float(last_closed.get("body_ratio", 0) or 0),
-            "channel_analyzer_v2": True,
-        }
-
-    except Exception as e:
-        logger.warning("OTC auto channel analyzer v2 symbol failed | pair=%s | symbol=%s | error=%s", pair, symbol, e)
-        return None
-
-
-def analyze_best_otc_auto_channel_now_v2() -> dict:
-    """اختيار أفضل صفقة لقناة النشر التلقائي فقط.
-    التوليد اليدوي يبقى على analyze_best_live_otc_now كما هو.
-    """
-    candidates = []
-    pair_map = get_otc_analysis_pair_map()
-
-    for pair, symbol in pair_map.items():
-        normalized_pair = normalize_otc_currency_pair_name(pair, symbol)
-        if not normalized_pair or not is_valid_otc_currency_pair_name(normalized_pair):
-            continue
-
-        candidate = analyze_otc_auto_channel_symbol_v2(normalized_pair, symbol)
-        if not candidate:
-            continue
-
-        blocked, reason = is_otc_live_candidate_blocked(candidate.get("pair"), candidate.get("direction"))
-        if blocked:
-            logger.info(
-                "OTC AUTO CHANNEL V2 adaptive filter skipped | pair=%s | direction=%s | reason=%s",
-                candidate.get("pair"),
-                candidate.get("direction"),
-                reason,
-            )
-            continue
-
-        candidates.append(candidate)
-
-    if not candidates:
-        logger.info("OTC AUTO CHANNEL V2 no candidates | pair_map_count=%s", len(pair_map))
-        return {"ok": False, "message": "لا توجد فرصة واضحة لقناة OTC Live الآن", "channel_analyzer_v2": True}
-
-    ranked = sorted(
-        candidates,
-        key=lambda x: (int(x.get("score", 0) or 0), float(x.get("strength", 0) or 0), int(x.get("payout", 0) or 0)),
-        reverse=True,
-    )
-
-    top_pool = ranked[:max(1, int(OTC_LIVE_TOP_CANDIDATES_POOL))]
-    last_pair = otc_live_channel_state.get("last_pair") if "otc_live_channel_state" in globals() else None
-
-    best = None
-    for candidate in top_pool:
-        if last_pair and candidate.get("pair") == last_pair and len(top_pool) > 1:
-            continue
-        best = candidate
-        break
-
-    if best is None:
-        best = ranked[0]
-
-    entry_dt = next_full_minute(now_utc())
-
-    logger.info(
-        "OTC AUTO CHANNEL V2 selected | pair=%s | direction=%s | quality=%s | setup=%s | reason=%s",
-        best.get("pair"),
-        best.get("direction"),
-        best.get("score"),
-        best.get("setup"),
-        best.get("analysis_reason"),
-    )
-
-    return {
-        "ok": True,
-        "pair": best["pair"],
-        "symbol": best["symbol"],
-        "direction": best["direction"],
-        "quality": int(best.get("score", 0) or 0),
-        "entry_price": best.get("price"),
-        "payout": best.get("payout", 80),
-        "entry_time": entry_dt.isoformat(),
-        "setup": best.get("setup"),
-        "analysis_reason": best.get("analysis_reason"),
-        "channel_analyzer_v2": True,
-        "analysis_debug": {
-            "forming_body_ratio": best.get("forming_body_ratio"),
-            "forming_upper_wick_ratio": best.get("forming_upper_wick_ratio"),
-            "forming_lower_wick_ratio": best.get("forming_lower_wick_ratio"),
-            "last_closed_color": best.get("last_closed_color"),
-            "last_closed_body_ratio": best.get("last_closed_body_ratio"),
-            "moves": best.get("moves"),
-        },
-    }
-
-
 # ===== OTC LIVE CHANNEL AUTOPUBLISH =====
 otc_live_channel_state = {
     "active": False,
@@ -3307,6 +2905,8 @@ def build_otc_live_health_message() -> str:
 
 async def otc_live_feed_health_check_job(context: ContextTypes.DEFAULT_TYPE):
     """يرسل تنبيه للأدمن إذا قناة OTC Live مفعلة لكن WebSocket أو ticks متوقفة."""
+    # تنبيهات قناة OTC Live التلقائية ملغاة مع إلغاء القناة.
+    return
     try:
         if not OTC_LIVE_HEALTH_CHECK_ENABLED:
             return
@@ -3752,31 +3352,17 @@ def reset_stuck_otc_live_trade_if_needed() -> bool:
 
 # ===== Absolute channel publish safety guards =====
 def is_otc_live_publish_allowed_now() -> bool:
-    return is_otc_live_fully_enabled_now()
-
-
-
-def is_otc_timed_publish_allowed_now() -> bool:
-    try:
-        return bool(get_channel_publish_settings().get("otc", True))
-    except Exception as e:
-        logger.exception("OTC timed publish guard error: %s", e)
-        return False
-
-
-
+    # قناة OTC Live التلقائية ملغاة نهائيًا.
+    return False
 
 
 # ===== OTC Live disabled means full stop =====
 def is_otc_live_fully_enabled_now() -> bool:
-    """إذا رجعت False: لا تحليل، لا نشر، لا تسجيل، لا نتيجة، لا ملخص."""
-    try:
-        if not bool(OTC_LIVE_CHANNEL_ENABLED):
-            return False
-        return bool(get_channel_publish_settings().get("otc_live", True))
-    except Exception as e:
-        logger.exception("OTC live full enabled guard error: %s", e)
-        return False
+    """حارس نهائي لقناة OTC Live التلقائية.
+    القناة أُلغيت بالكامل من النشر التلقائي، لذلك ترجع False دائمًا.
+    هذا لا يوقف بث Quotex المستخدم للأقسام اليدوية.
+    """
+    return False
 
 
 
@@ -3802,6 +3388,9 @@ def should_skip_otc_live_work(reason: str = "disabled") -> bool:
 
 
 async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
+    # قناة النشر التلقائي OTC Live ملغاة بالكامل.
+    # لا تنشر أي صفقة ولا تسجل أي نتيجة، مع إبقاء التوليد اليدوي كما هو.
+    return
     # ===== FULL STOP OTC LIVE BEFORE ANY WORK =====
     if should_skip_otc_live_work("auto_publish_disabled"):
         return
@@ -3858,11 +3447,7 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
             return
 
         # مهم: لا يتم تحليل واختيار الصفقة إلا الآن، بعد التأكد أننا داخل نافذة 20–15 ثانية.
-        # قناة النشر التلقائي تستخدم محرك V2 مستقل؛ التوليد اليدوي يبقى كما هو.
-        if OTC_AUTO_CHANNEL_ANALYZER_V2_ENABLED:
-            signal = analyze_best_otc_auto_channel_now_v2()
-        else:
-            signal = analyze_best_live_otc_now()
+        signal = analyze_best_live_otc_now()
         if not signal.get("ok"):
             logger.info("OTC LIVE CHANNEL SCAN result: no clear opportunity")
             return
@@ -3870,15 +3455,8 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
         quality = int(signal.get("quality", 0) or 0)
         effective_min_quality, quality_reason = get_otc_live_effective_min_quality()
 
-        logger.info(
-            "OTC LIVE CHANNEL SCAN best | pair=%s | direction=%s | quality=%s | min=%s | learning=%s | setup=%s",
-            signal.get("pair"),
-            signal.get("direction"),
-            quality,
-            effective_min_quality,
-            quality_reason,
-            signal.get("setup"),
-        )
+        logger.info("OTC LIVE CHANNEL SCAN best | pair=%s | direction=%s | quality=%s | min=%s | learning=%s",
+                    signal.get("pair"), signal.get("direction"), quality, effective_min_quality, quality_reason)
 
         pair_blocked, block_reason = is_otc_live_pair_blocked_by_learning(signal.get("pair"))
         if pair_blocked:
@@ -3890,7 +3468,7 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
             logger.info("OTC LIVE CHANNEL SCAN skipped: quality below effective minimum | %s", quality_reason)
             return
 
-        if OTC_LIVE_REVERSE_AUTOPUBLISH and not signal.get("channel_analyzer_v2"):
+        if OTC_LIVE_REVERSE_AUTOPUBLISH:
             original_direction = signal.get("direction")
             if original_direction == "CALL":
                 signal["direction"] = "PUT"
@@ -5725,6 +5303,8 @@ def build_today_otc_live_daily_summary_message() -> str | None:
 
 
 async def publish_daily_otc_live_stats(context: ContextTypes.DEFAULT_TYPE):
+    # الملخص اليومي لقناة OTC Live التلقائية ملغى مع إلغاء القناة.
+    return
     if should_skip_otc_live_work("daily_summary_disabled"):
         logger.info("Daily OTC Live stats skipped: otc_live disabled full stop")
         return
@@ -5758,6 +5338,9 @@ async def publish_daily_otc_live_stats(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def publish_otc_list(context: ContextTypes.DEFAULT_TYPE):
+    # النشر التلقائي للـ OTC الزمني ملغى بالكامل بناءً على طلب الأدمن.
+    # لا يؤثر هذا على توليد الإشارات اليدوي داخل البوت.
+    return
     try:
         if not is_channel_publish_enabled("otc"):
             return
@@ -5787,7 +5370,8 @@ async def publish_otc_list(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def schedule_random_daily_otc_list(context: ContextTypes.DEFAULT_TYPE):
-    """يحدد وقت نشر عشوائي كل يوم بين 12:00 و 20:00 بتوقيت سوريا."""
+    """النشر التلقائي ملغى بالكامل. الدالة باقية فقط لمنع كسر أي مراجع قديمة."""
+    return
     try:
         now_local = now_utc().astimezone(UTC_PLUS_3)
 
@@ -7352,6 +6936,9 @@ async def resolve_global_active_trade_if_due(context: ContextTypes.DEFAULT_TYPE)
 
 
 async def auto_publish_real_market(context: ContextTypes.DEFAULT_TYPE):
+    # النشر التلقائي للسوق العالمي ملغى بالكامل بناءً على طلب الأدمن.
+    # تبقى الدالة فقط حتى لا تنكسر أي مراجع قديمة.
+    return
     try:
         # أولًا: إذا في صفقة منشورة سابقًا، لا ننشر صفقة جديدة قبل انتهائها.
         active_still_running = await resolve_global_active_trade_if_due(context)
@@ -8728,7 +8315,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "📡 قنوات البوت":
             context.user_data["step"] = "admin_channel_controls"
             await update.message.reply_text(
-                format_channel_publish_status() + "\n\nاختر القناة التي تريد تشغيل أو إيقاف النشر فيها 👇",
+                "📡 قسم القنوات\n\nالنشر التلقائي ملغى من الملف. المتاح هنا فقط إحصائيات/إدارة قناة OTC.",
                 reply_markup=admin_channels_keyboard
             )
             return
@@ -8736,40 +8323,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if step == "admin_channel_controls":
 
             if text == "⚡ تشغيل نشر OTC":
-                force_channel_publish_setting("otc", True)
-                await update.message.reply_text("✅ تم تشغيل النشر في قناة OTC", reply_markup=admin_channels_keyboard)
+                force_channel_publish_setting("otc", False)
+                await update.message.reply_text("⛔ النشر التلقائي لقناة OTC ملغى من الملف ولا يمكن تشغيله من لوحة الأدمن.", reply_markup=admin_channels_keyboard)
                 return
 
             if text == "⚡ إيقاف نشر OTC":
                 force_channel_publish_setting("otc", False)
-                await update.message.reply_text("⛔ تم إيقاف النشر في قناة OTC", reply_markup=admin_channels_keyboard)
+                await update.message.reply_text("✅ النشر التلقائي لقناة OTC ملغى مسبقًا من الملف.", reply_markup=admin_channels_keyboard)
                 return
 
             if text == "🔥 تشغيل OTC مباشر":
-                force_channel_publish_setting("otc_live", True)
-                await update.message.reply_text("🔥 تم تشغيل نشر قناة OTC المباشر ✅", reply_markup=admin_channels_keyboard)
+                force_channel_publish_setting("otc_live", False)
+                stop_otc_live_runtime_state("auto_channel_removed")
+                await update.message.reply_text("⛔ قناة OTC Live التلقائية ملغاة من الملف ولا يمكن تشغيلها من لوحة الأدمن.", reply_markup=admin_channels_keyboard)
                 return
 
             if text == "🔥 إيقاف OTC مباشر":
-                force_channel_publish_setting("otc_live", False); stop_otc_live_runtime_state("admin_disabled")
-                await update.message.reply_text("🔥 تم إيقاف نشر قناة OTC المباشر ⛔", reply_markup=admin_channels_keyboard)
+                force_channel_publish_setting("otc_live", False)
+                stop_otc_live_runtime_state("auto_channel_removed")
+                await update.message.reply_text("✅ قناة OTC Live التلقائية ملغاة مسبقًا من الملف.", reply_markup=admin_channels_keyboard)
                 return
 
             if text == "📊 إحصائيات قناة OTC":
                 await update.message.reply_text("📊 قسم إحصائيات قناة OTC 👇", reply_markup=admin_otc_stats_keyboard)
                 return
 
-            if text == "📊 حالة النشر":
-                await update.message.reply_text(format_channel_publish_status(), reply_markup=admin_channels_keyboard)
-                return
 
         if is_admin(user.id):
             if text == "🩺 حالة OTC Live":
-                await update.message.reply_text(build_otc_live_health_message(), reply_markup=admin_otc_stats_keyboard)
+                await update.message.reply_text("⛔ قناة OTC Live التلقائية ملغاة من الملف. بث Quotex قد يبقى مستخدمًا للأقسام اليدوية فقط.", reply_markup=admin_otc_stats_keyboard)
                 return
 
             if text == "📈 إحصائيات OTC مباشر":
-                await update.message.reply_text(build_otc_live_stats_message(), reply_markup=admin_otc_stats_keyboard)
+                await update.message.reply_text("⛔ إحصائيات قناة OTC Live التلقائية ملغاة لأن القناة أُزيلت من النشر.", reply_markup=admin_otc_stats_keyboard)
                 return
 
             if text == "🔢 إحصائيات آخر عدد صفقات":
@@ -9241,20 +8827,8 @@ def main():
     start_quotex_otc_feed()
     # Auto publish global market disabled: global channel removed from bot.
 
-    # Auto publish OTC live direct trades to the new private channel
-    app.job_queue.run_repeating(
-        auto_publish_otc_live_channel,
-        interval=OTC_LIVE_SCAN_INTERVAL_SECONDS,
-        first=25
-    )
-
-    if OTC_LIVE_HEALTH_CHECK_ENABLED:
-        app.job_queue.run_repeating(
-            otc_live_feed_health_check_job,
-            interval=OTC_LIVE_HEALTH_CHECK_INTERVAL_SECONDS,
-            first=90,
-            name="otc_live_feed_health_check",
-        )
+    # قناة OTC Live التلقائية ملغاة بالكامل: لا جدولة نشر تلقائي ولا تنبيهات قناة.
+    logger.info("OTC Live auto publish channel is removed/disabled by owner request.")
 
     job_queue = app.job_queue
     if FIREBASE_24H_MONITOR_ENABLED:
@@ -9274,25 +8848,12 @@ def main():
         )
 
 
-    # نشر تلقائي مرة واحدة يوميًا:
-    # يتم اختيار وقت عشوائي للنشر بين 12:00 و 20:00 بتوقيت سوريا.
-    job_queue.run_daily(
-        schedule_random_daily_otc_list,
-        time=time(hour=0, minute=5, tzinfo=UTC_PLUS_3)
-    )
-
-    # جدولة أول ليستة عند تشغيل البوت، حتى لو تم إعادة التشغيل بعد منتصف الليل.
-    job_queue.run_once(
-        schedule_random_daily_otc_list,
-        when=5
-    )
+    # كل أنواع النشر التلقائي ملغاة بناءً على طلب الأدمن.
+    # لا يتم جدولة OTC الزمني ولا OTC Live ولا Global.
+    logger.info("All auto publishing jobs are disabled by owner request.")
 
 
-    # نشر إحصائيات OTC Live اليومية بنهاية اليوم بتوقيت UTC+3
-    job_queue.run_daily(
-        publish_daily_otc_live_stats,
-        time=time(hour=23, minute=59, tzinfo=UTC_PLUS_3)
-    )
+    # ملخص OTC Live اليومي ملغى لأن قناة النشر التلقائي أُلغيت.
 
     install_firebase_diagnostics()
 
