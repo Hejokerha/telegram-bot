@@ -2,6 +2,8 @@ from urllib.parse import urlparse
 import os
 import html
 import json
+import csv
+import io
 import hashlib
 import asyncio
 import random
@@ -381,7 +383,7 @@ if not firebase_admin._apps:
 # ===== Keyboards =====
 main_keyboard = ReplyKeyboardMarkup(
     [
-        ["📊 توليد إشارات"],
+        ["📊 توليد إشارات", "👤 حالة حسابي"],
         ["🎥 مشاهدة فيديو شرح البوت"],
         ["📞 تواصل مع المسؤول"],
     ],
@@ -392,16 +394,19 @@ admin_main_keyboard = ReplyKeyboardMarkup(
     [
         ["📥 الطلبات المعلقة", "📋 كافة المستخدمين"],
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
+        ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
+        ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
-        ["📡 قنوات البوت", "📢 رسالة جماعية"],
+        ["📢 رسالة جماعية"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
 )
 
+# بقي هذا الكيبورد فقط كمرجع داخلي لقسم فحص الليستات، وليس لقنوات نشر تلقائي.
 admin_channels_keyboard = ReplyKeyboardMarkup(
     [
-        ["📊 إحصائيات قناة OTC"],
+        ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -417,7 +422,7 @@ admin_otc_stats_keyboard = ReplyKeyboardMarkup(
 
 otc_list_manager_keyboard = ReplyKeyboardMarkup(
     [
-        ["📊 توليد إشارات"],
+        ["📊 توليد إشارات", "👤 حالة حسابي"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🎥 مشاهدة فيديو شرح البوت"],
         ["📞 تواصل مع المسؤول"],
@@ -427,8 +432,7 @@ otc_list_manager_keyboard = ReplyKeyboardMarkup(
 
 admin_otc_list_ready_keyboard = ReplyKeyboardMarkup(
     [
-        ["📋 عرض نتائج الليستة"],
-        ["📊 إحصائيات قناة OTC"],
+        ["📋 عرض نتائج الليستة", "🧾 فحص ليستة OTC"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -448,6 +452,117 @@ video_watched_keyboard = ReplyKeyboardMarkup(
     [
         ["✅ شاهدت الفيديو"],
         ["🔙 رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+
+# ===== Language / English UI keyboards =====
+language_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🇸🇦 العربية", "🇬🇧 English"],
+    ],
+    resize_keyboard=True,
+    one_time_keyboard=True,
+)
+
+main_keyboard_en = ReplyKeyboardMarkup(
+    [
+        ["📊 Generate Signals", "👤 My Account"],
+        ["🎥 Watch Bot Tutorial"],
+        ["📞 Contact Support"],
+    ],
+    resize_keyboard=True
+)
+
+welcome_keyboard_en = ReplyKeyboardMarkup(
+    [
+        ["🎁 Get Free Trial"],
+        ["✅ Yes, I Joined", "❌ No, I Haven't Joined"],
+        ["🎥 Watch Bot Tutorial"],
+        ["📞 Contact Support"],
+    ],
+    resize_keyboard=True
+)
+
+video_watched_keyboard_en = ReplyKeyboardMarkup(
+    [
+        ["✅ I Watched the Video"],
+        ["🔙 Back"],
+    ],
+    resize_keyboard=True
+)
+
+market_mode_keyboard_en = ReplyKeyboardMarkup(
+    [
+        ["⚡ OTC", "🌍 Global Market"],
+        ["🔙 Back"],
+    ],
+    resize_keyboard=True
+)
+
+otc_mode_keyboard_en = ReplyKeyboardMarkup(
+    [
+        ["🕒 Timed List", "⚡ Live Trade"],
+        ["🔙 Back"],
+    ],
+    resize_keyboard=True
+)
+
+otc_live_search_keyboard_en = ReplyKeyboardMarkup(
+    [
+        ["🔎 Find a Trade Now"],
+        ["🔙 Back"],
+    ],
+    resize_keyboard=True
+)
+
+real_interval_keyboard_en = ReplyKeyboardMarkup(
+    [
+        ["1 minute", "5 minutes"],
+        ["10 minutes", "🔥 Best Opportunity"],
+        ["🔙 Back"],
+    ],
+    resize_keyboard=True
+)
+
+
+otc_pairs_keyboard_en = ReplyKeyboardMarkup(
+    [
+        ["USD/BRL (OTC)", "USD/ARS (OTC)"],
+        ["USD/BDT (OTC)", "USD/NGN (OTC)"],
+        ["USD/PKR (OTC)", "USD/DZD (OTC)"],
+        ["USD/MXN (OTC)", "USD/INR (OTC)"],
+        ["USD/IDR (OTC)", "USD/EGP (OTC)"],
+        ["USD/TRY (OTC)", "USD/COP (OTC)"],
+        ["EUR/JPY (OTC)", "EUR/USD (OTC)"],
+        ["CAD/CHF (OTC)", "CAD/JPY (OTC)"],
+        ["AUD/CHF (OTC)", "AUD/CAD (OTC)"],
+        ["🔙 Back"],
+    ],
+    resize_keyboard=True
+)
+
+real_pairs_keyboard_en = ReplyKeyboardMarkup(
+    [
+        ["EUR/USD", "GBP/USD"],
+        ["USD/JPY", "USD/CHF"],
+        ["USD/CAD", "AUD/USD"],
+        ["NZD/USD", "EUR/JPY"],
+        ["AUD/JPY", "EUR/GBP"],
+        ["CAD/JPY", "EUR/CAD"],
+        ["AUD/CHF", "CHF/CAD"],
+        ["AUD/CAD", "GBP/AUD"],
+        ["🔙 Back"],
+    ],
+    resize_keyboard=True
+)
+
+count_keyboard_en = ReplyKeyboardMarkup(
+    [
+        ["3", "5", "10"],
+        ["15", "20"],
+        ["🔙 Back"],
     ],
     resize_keyboard=True
 )
@@ -604,6 +719,14 @@ FIREBASE_PENDING_CACHE_TTL_SECONDS = int(os.getenv("FIREBASE_PENDING_CACHE_TTL_S
 FIREBASE_FULL_LIST_CACHE_TTL_SECONDS = int(os.getenv("FIREBASE_FULL_LIST_CACHE_TTL_SECONDS", "30"))
 FIREBASE_BOT_SETTINGS_TTL_SECONDS = int(os.getenv("FIREBASE_BOT_SETTINGS_TTL_SECONDS", "60"))
 SAVE_USER_LAST_SEEN_THROTTLE_SECONDS = int(os.getenv("SAVE_USER_LAST_SEEN_THROTTLE_SECONDS", "300"))
+
+# ===== Signal usage limits =====
+# هذه الحدود تطبق على توليد الإشارات اليدوي فقط، ولا علاقة لها بأي نشر تلقائي.
+FREE_TRIAL_SIGNAL_TOTAL_LIMIT = int(os.getenv("FREE_TRIAL_SIGNAL_TOTAL_LIMIT", "10"))
+WEEKLY_SIGNAL_DAILY_LIMIT = int(os.getenv("WEEKLY_SIGNAL_DAILY_LIMIT", "30"))
+MONTHLY_SIGNAL_DAILY_LIMIT = int(os.getenv("MONTHLY_SIGNAL_DAILY_LIMIT", "50"))
+SIGNAL_USAGE_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_USAGE_COOLDOWN_SECONDS", "3"))
+ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_SECONDS", "300"))
 
 _firebase_cache = {}
 
@@ -1758,6 +1881,8 @@ def set_user_expiry(user_id: int, mode: str):
     approved_data.update({
         "telegram_id": user_id,
         "status": "approved",
+        "mode": mode,
+        "plan": mode,
         "approved_at": now_iso(),
         "expires_at": expires_at,
     })
@@ -1765,6 +1890,7 @@ def set_user_expiry(user_id: int, mode: str):
     set_approved_user(user_id, approved_data)
     save_user_record(user_id, {
         "status": "approved",
+        "plan": mode,
         "expires_at": expires_at,
     })
     remove_pending_user(user_id)
@@ -2597,7 +2723,7 @@ def get_candles_stable_direction(*args, **kwargs):
 
 
 
-def analyze_best_live_otc_now() -> dict:
+def analyze_best_live_otc_now(lang: str = "ar") -> dict:
     """يفحص كل أزواج OTC من بث Quotex live ويختار أفضل فرصة M1 حالية.
     لا يغيّر نظام الليستات الزمني، ويُستخدم فقط في خيار: صفقة مباشرة.
     """
@@ -2685,15 +2811,21 @@ def analyze_best_live_otc_now() -> dict:
         except Exception:
             pass
 
-        return {
-            "ok": False,
-            "message": (
+        if str(lang).lower() == "en":
+            no_msg = (
+                "⚡ OTC Live Trade\n\n"
+                "❌ No clear M1 opportunity right now.\n\n"
+                "Wait 30-60 seconds, then press:\n"
+                "🔎 Find a Trade Now"
+            )
+        else:
+            no_msg = (
                 "⚡ صفقة مباشرة OTC\n\n"
                 "❌ لا توجد فرصة واضحة الآن على فريم الدقيقة.\n\n"
                 "انتظر 30-60 ثانية ثم اضغط:\n"
                 "🔎 ابحث عن صفقة الآن"
             )
-        }
+        return {"ok": False, "message": no_msg}
 
     ranked_candidates = sorted(candidates, key=lambda x: (x["score"], abs(x["change"]), int(x.get("payout", 0) or 0)), reverse=True)
 
@@ -2741,19 +2873,29 @@ def analyze_best_live_otc_now() -> dict:
     direction_line = "🟢 CALL" if best["direction"] == "CALL" else "🔴 PUT"
     price_text = f"{best['price']:.5f}" if "JPY" not in best["pair"] else f"{best['price']:.3f}"
 
-    msg = (
-        "⚡ صفقة مباشرة OTC\n\n"
-        f"💱 الزوج: {best['pair']}\n"
-        "🧭 الفريم: M1\n"
-        f"⏰ وقت الدخول: {format_utc_plus_3(entry_dt)}\n"
-        f"📌 الاتجاه: {direction_line}\n"
-        f"💵 السعر الحالي: {price_text}\n"
-        f"📊 قوة الفرصة: {best['score']}%\n\n"
-        "📌 سبب الاختيار:\n"
-        f"• تم فحص {len(pair_map)} زوج OTC حي، وظهرت {len(candidates)} فرصة مرشحة.\n"
-        f"• هذا الزوج كان الأقوى حسب آخر {best['sample_size']} تحديثات سعرية مباشرة من Quotex.\n\n"
-        "⚠️ التزم بإدارة رأس المال، وادخل فقط إذا بقي الاتجاه بنفس الشكل عند وقت الدخول."
-    )
+    if str(lang).lower() == "en":
+        direction_line = "🟢 CALL" if best["direction"] == "CALL" else "🔴 PUT"
+        msg = (
+            "⚡ OTC Live Trade\n\n"
+            f"💱 Pair: {best['pair']}\n"
+            "🧭 Timeframe: M1\n"
+            f"⏰ Entry Time: {format_utc_plus_3(entry_dt)}\n"
+            f"📌 Direction: {direction_line}\n"
+            f"💵 Current Price: {price_text}\n"
+            f"📊 Opportunity Strength: {best['score']}%\n\n"
+            "⚠️ Follow proper risk management. Enter only if the direction still looks the same at entry time."
+        )
+    else:
+        msg = (
+            "⚡ صفقة مباشرة OTC\n\n"
+            f"💱 الزوج: {best['pair']}\n"
+            "🧭 الفريم: M1\n"
+            f"⏰ وقت الدخول: {format_utc_plus_3(entry_dt)}\n"
+            f"📌 الاتجاه: {direction_line}\n"
+            f"💵 السعر الحالي: {price_text}\n"
+            f"📊 قوة الفرصة: {best['score']}%\n\n"
+            "⚠️ التزم بإدارة رأس المال، وادخل فقط إذا بقي الاتجاه بنفس الشكل عند وقت الدخول."
+        )
 
     return {
         "ok": True,
@@ -5477,25 +5619,41 @@ def build_live_otc_signals_message(pair: str, count: int, interval_minutes: int,
     return header + "\n".join(formatted_signals)
 
 
-def build_signals_message(pair: str, count: int, interval_minutes: int, signals: list[str]) -> str:
+def build_signals_message(pair: str, count: int, interval_minutes: int, signals: list[str], lang: str = "ar") -> str:
     
-    header = (
-        "╔══════════════╗\n"
-        "   📊 Quotex Signals - OTC\n"
-        "╚══════════════╝\n\n"
+    if str(lang).lower() == "en":
+        header = (
+            "╔══════════════╗\n"
+            "   📊 Quotex Signals - OTC\n"
+            "╚══════════════╝\n\n"
+            "⏰ Platform Time\n"
+            "UTC / GMT +3.00\n\n"
+            "⚠️ Important Notes:\n"
+            "• Each trade duration: 1M\n"
+            "• Avoid trading against strong momentum\n"
+            "• Avoid entering after a doji candle\n"
+            "• Avoid trading against a strong trend\n"
+            "• Use only one martingale after a loss\n\n"
+            "📍 Signals:\n\n"
+        )
+    else:
+        header = (
+            "╔══════════════╗\n"
+            "   📊 Quotex Signals - OTC\n"
+            "╚══════════════╝\n\n"
 
-        "⏰ توقيت المنصة\n"
-        "UTC / GMT +3.00\n\n"
+            "⏰ توقيت المنصة\n"
+            "UTC / GMT +3.00\n\n"
 
-        "⚠️ ملاحظات مهمة:\n"
-        "• مدة كل صفقة: 1M\n"
-        "• تجنب صفقة عكس مومنتم\n"
-        "• تجنب دخول الصفقة بعد شمعة دوجي\n"
-        "• تجنب صفقة عكس تريند قوي\n"
-        "• استخدم مضاعفة واحدة عند الخسارة\n\n"
+            "⚠️ ملاحظات مهمة:\n"
+            "• مدة كل صفقة: 1M\n"
+            "• تجنب صفقة عكس مومنتم\n"
+            "• تجنب دخول الصفقة بعد شمعة دوجي\n"
+            "• تجنب صفقة عكس تريند قوي\n"
+            "• استخدم مضاعفة واحدة عند الخسارة\n\n"
 
-        "📍 الإشارات:\n\n"
-    )
+            "📍 الإشارات:\n\n"
+        )
 
     formatted_signals = []
 
@@ -7095,10 +7253,70 @@ def build_user_admin_inline_keyboard(user_id: int) -> InlineKeyboardMarkup:
     ])
 
 
+def get_user_language(user_id: int, context: ContextTypes.DEFAULT_TYPE | None = None, default: str = "ar") -> str:
+    try:
+        if context is not None:
+            cached = context.user_data.get("language")
+            if cached in {"ar", "en"}:
+                return cached
+        data = get_user_record(int(user_id)) or {}
+        lang = str(data.get("language") or "").lower()
+        if lang in {"ar", "en"}:
+            if context is not None:
+                context.user_data["language"] = lang
+            return lang
+    except Exception:
+        pass
+    return default
+
+
+def has_selected_language(user_id: int, context: ContextTypes.DEFAULT_TYPE | None = None) -> bool:
+    try:
+        if context is not None and context.user_data.get("language") in {"ar", "en"}:
+            return True
+        data = get_user_record(int(user_id)) or {}
+        return str(data.get("language") or "").lower() in {"ar", "en"}
+    except Exception:
+        return False
+
+
+def set_user_language(user_id: int, lang: str, context: ContextTypes.DEFAULT_TYPE | None = None):
+    lang = "en" if str(lang).lower().startswith("en") else "ar"
+    if context is not None:
+        context.user_data["language"] = lang
+    try:
+        save_user_record(int(user_id), {"language": lang, "updated_at": now_iso()})
+    except Exception:
+        pass
+    return lang
+
+
+def is_english_user(user_id: int, context: ContextTypes.DEFAULT_TYPE | None = None) -> bool:
+    return get_user_language(user_id, context) == "en"
+
+
 def build_user_video_keyboard() -> ReplyKeyboardMarkup:
     return main_keyboard
 
-async def send_welcome_flow(update: Update):
+
+async def ask_language(update: Update):
+    await update.message.reply_text(
+        "🌐 اختر اللغة / Choose your language",
+        reply_markup=language_keyboard
+    )
+
+
+async def send_welcome_flow(update: Update, lang: str | None = None):
+    if lang is None:
+        lang = get_user_language(update.effective_user.id)
+    if lang == "en":
+        await update.message.reply_text(
+            "👋 Welcome to TRADING TIME Bot\n\n"
+            "Are you a member of TRADING TIME?",
+            reply_markup=welcome_keyboard_en
+        )
+        return
+
     await update.message.reply_text(
         "👋 أهلًا بك في بوت TRADING TIME\n\n"
         "هل أنت منضم لفريق TRADING TIME؟",
@@ -7106,18 +7324,397 @@ async def send_welcome_flow(update: Update):
     )
 
 
-def build_main_menu_for_user(user_id: int):
+def build_main_menu_for_user(user_id: int, lang: str | None = None):
+    if lang is None:
+        lang = get_user_language(user_id)
+
     if is_otc_list_manager(user_id) and not is_admin(user_id):
-        return otc_list_manager_keyboard
+        return otc_list_manager_keyboard if lang != "en" else main_keyboard_en
     if is_admin(user_id):
         return ReplyKeyboardMarkup(
             [
-                ["📊 توليد إشارات", "👤 حسابي"],
+                ["📊 توليد إشارات", "👤 حالة حسابي"],
                 ["📞 تواصل مع المسؤول", "🛠 لوحة الأدمن"],
             ],
             resize_keyboard=True
         )
-    return main_keyboard
+    return main_keyboard_en if lang == "en" else main_keyboard
+
+
+# ===== Signal usage / account status helpers =====
+def signal_usage_ref(user_id: int):
+    return system_ref().child("signal_usage").child(str(int(user_id)))
+
+
+def get_signal_usage_data(user_id: int) -> dict:
+    try:
+        data = signal_usage_ref(user_id).get() or {}
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.exception("Could not read signal usage for %s: %s", user_id, e)
+        return {}
+
+
+def get_signal_day_key(dt: datetime | None = None) -> str:
+    return get_utc3_day_key(dt or now_utc())
+
+
+def get_signal_plan_info(user_id: int) -> dict:
+    uid = int(user_id)
+
+    if is_admin(uid):
+        return {"key": "admin", "label": "أدمن", "limit_type": "unlimited", "limit": None}
+
+    approved_data = get_approved_user(uid) or {}
+    user_data = get_user_record(uid) or {}
+
+    mode = str(approved_data.get("mode") or approved_data.get("plan") or user_data.get("plan") or "").lower()
+    expires_at = approved_data.get("expires_at") or user_data.get("expires_at")
+
+    source = str(approved_data.get("source") or user_data.get("trial_source") or "").lower()
+    if mode == "video_trial" or source == "youtube_video_trial":
+        return {
+            "key": "trial",
+            "label": "تجربة مجانية",
+            "limit_type": "total",
+            "limit": FREE_TRIAL_SIGNAL_TOTAL_LIMIT,
+        }
+
+    if expires_at == "forever" or mode == "forever":
+        return {"key": "forever", "label": "VIP دائم", "limit_type": "unlimited", "limit": None}
+
+    if mode == "week":
+        return {"key": "week", "label": "اشتراك أسبوع", "limit_type": "daily", "limit": WEEKLY_SIGNAL_DAILY_LIMIT}
+
+    if mode == "month":
+        return {"key": "month", "label": "اشتراك شهر", "limit_type": "daily", "limit": MONTHLY_SIGNAL_DAILY_LIMIT}
+
+    # دعم المستخدمين القدامى الذين لا يملكون plan مخزن.
+    if expires_at and expires_at != "forever":
+        exp = parse_iso(str(expires_at).replace("Z", "+00:00"))
+        if exp:
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            remaining_days = (exp - now_utc()).total_seconds() / 86400
+            if remaining_days <= 10:
+                return {"key": "week", "label": "اشتراك أسبوع", "limit_type": "daily", "limit": WEEKLY_SIGNAL_DAILY_LIMIT}
+            return {"key": "month", "label": "اشتراك شهر", "limit_type": "daily", "limit": MONTHLY_SIGNAL_DAILY_LIMIT}
+
+    return {"key": "week", "label": "اشتراك أسبوع", "limit_type": "daily", "limit": WEEKLY_SIGNAL_DAILY_LIMIT}
+
+
+def get_signal_usage_summary(user_id: int) -> dict:
+    data = get_signal_usage_data(user_id)
+    day_key = get_signal_day_key()
+    daily = data.get("daily") or {}
+    today = daily.get(day_key) or {}
+    return {
+        "day_key": day_key,
+        "total": safe_int(data.get("total"), 0),
+        "today": safe_int(today.get("count"), 0),
+        "last_at": float(data.get("last_at") or 0),
+    }
+
+
+def check_signal_usage_allowed(user_id: int, amount: int = 1) -> tuple[bool, str]:
+    uid = int(user_id)
+    amount = max(1, int(amount or 1))
+
+    if is_admin(uid):
+        return True, ""
+
+    plan = get_signal_plan_info(uid)
+    usage = get_signal_usage_summary(uid)
+
+    last_at = float(usage.get("last_at") or 0)
+    now_ts = time_module.time()
+    if SIGNAL_USAGE_COOLDOWN_SECONDS > 0 and last_at and now_ts - last_at < SIGNAL_USAGE_COOLDOWN_SECONDS:
+        wait = int(max(1, SIGNAL_USAGE_COOLDOWN_SECONDS - (now_ts - last_at)))
+        return False, f"⏳ انتظر {wait} ثانية قبل طلب إشارة جديدة."
+
+    if plan["limit_type"] == "unlimited":
+        return True, ""
+
+    limit = int(plan.get("limit") or 0)
+    used = int(usage["total"] if plan["limit_type"] == "total" else usage["today"])
+    remaining = max(0, limit - used)
+
+    if amount > remaining:
+        if remaining <= 0:
+            if plan["limit_type"] == "total":
+                return False, (
+                    "⛔ انتهى حد التجربة المجانية.\n\n"
+                    f"استخدمت {used}/{limit} إشارات.\n"
+                    "للاستمرار تواصل مع الأدمن لتفعيل اشتراكك."
+                )
+            return False, (
+                "⛔ وصلت للحد اليومي لتوليد الإشارات.\n\n"
+                f"الخطة: {plan['label']}\n"
+                f"استخدمت اليوم: {used}/{limit}\n"
+                "يرجع العداد من جديد مع بداية اليوم بتوقيت UTC+3."
+            )
+
+        return False, (
+            f"⚠️ المتبقي لك حاليًا {remaining} إشارات فقط.\n"
+            f"طلبك الحالي يحتاج {amount} إشارات.\n"
+            "اختر عددًا أقل أو انتظر تجدد الحد اليومي إذا كان اشتراكك يوميًا."
+        )
+
+    return True, ""
+
+
+def record_signal_usage(user_id: int, amount: int = 1, source: str = "manual_signal"):
+    uid = int(user_id)
+    amount = max(1, int(amount or 1))
+
+    if is_admin(uid):
+        return
+
+    try:
+        ref = signal_usage_ref(uid)
+        data = ref.get() or {}
+        if not isinstance(data, dict):
+            data = {}
+
+        day_key = get_signal_day_key()
+        total = safe_int(data.get("total"), 0) + amount
+        daily = data.get("daily") or {}
+        today = daily.get(day_key) or {}
+        today_count = safe_int(today.get("count"), 0) + amount
+
+        ref.update({
+            "total": total,
+            "last_at": time_module.time(),
+            "last_source": source,
+            "updated_at": now_iso(),
+        })
+        ref.child("daily").child(day_key).update({
+            "count": today_count,
+            "updated_at": now_iso(),
+        })
+    except Exception as e:
+        logger.exception("Could not record signal usage for %s: %s", uid, e)
+
+
+def format_expiry_for_account(expires_at, lang: str = "ar") -> str:
+    if not expires_at:
+        return "Not specified" if lang == "en" else "غير محدد"
+    if expires_at == "forever":
+        return "Forever" if lang == "en" else "دائم"
+    try:
+        return format_dt_ar(str(expires_at))
+    except Exception:
+        return str(expires_at)
+
+
+def build_account_status_message(user, lang: str = "ar") -> str:
+    uid = int(user.id)
+    data = get_user_record(uid) or {}
+    approved_data = get_approved_user(uid) or {}
+    status = get_user_status(uid)
+    plan = get_signal_plan_info(uid) if is_approved(uid) or is_admin(uid) else {"label": "غير مفعل", "limit_type": "none", "limit": 0}
+    usage = get_signal_usage_summary(uid)
+
+    if lang == "en":
+        plan_labels = {
+            "admin": "Admin",
+            "trial": "Free Trial",
+            "forever": "VIP Forever",
+            "week": "Weekly Subscription",
+            "month": "Monthly Subscription",
+        }
+        username = f"@{user.username}" if getattr(user, "username", None) else "None"
+        quotex_id = data.get("quotex_id") or approved_data.get("quotex_id") or "Not registered"
+        expires_at = approved_data.get("expires_at") or data.get("expires_at")
+        trial_used = "Yes" if has_used_video_trial(uid) else "No"
+        plan_label = plan_labels.get(str(plan.get("key") or ""), "Not active" if not is_approved(uid) else str(plan.get("label", "Not specified")))
+
+        if plan.get("limit_type") == "unlimited":
+            usage_line = "Usage: Unlimited ♾"
+        elif plan.get("limit_type") == "total":
+            limit = int(plan.get("limit") or 0)
+            used = safe_int(usage.get("total"), 0)
+            usage_line = f"Usage: {used}/{limit} total | Remaining: {max(0, limit - used)}"
+        elif plan.get("limit_type") == "daily":
+            limit = int(plan.get("limit") or 0)
+            used = safe_int(usage.get("today"), 0)
+            usage_line = f"Today usage: {used}/{limit} | Remaining today: {max(0, limit - used)}"
+        else:
+            usage_line = "Usage: Not available before activation"
+
+        return (
+            "👤 My Account\n\n"
+            f"• Name: {html.escape(user.full_name or '')}\n"
+            f"• Username: {html.escape(username)}\n"
+            f"• Telegram ID: <code>{uid}</code>\n"
+            f"• Quotex ID: <code>{html.escape(str(quotex_id))}</code>\n"
+            f"• Status: {html.escape(str(status))}\n"
+            f"• Plan: {html.escape(str(plan_label))}\n"
+            f"• Expiration: {html.escape(format_expiry_for_account(expires_at, lang='en'))}\n"
+            f"• Free trial used: {trial_used}\n"
+            f"• {html.escape(usage_line)}"
+        )
+
+    username = f"@{user.username}" if getattr(user, "username", None) else "لا يوجد"
+    quotex_id = data.get("quotex_id") or approved_data.get("quotex_id") or "غير مسجل"
+    expires_at = approved_data.get("expires_at") or data.get("expires_at")
+    trial_used = "نعم" if has_used_video_trial(uid) else "لا"
+
+    if plan.get("limit_type") == "unlimited":
+        usage_line = "الاستخدام: غير محدود ♾"
+    elif plan.get("limit_type") == "total":
+        limit = int(plan.get("limit") or 0)
+        used = safe_int(usage.get("total"), 0)
+        usage_line = f"الاستخدام: {used}/{limit} إجماليًا | المتبقي: {max(0, limit - used)}"
+    elif plan.get("limit_type") == "daily":
+        limit = int(plan.get("limit") or 0)
+        used = safe_int(usage.get("today"), 0)
+        usage_line = f"الاستخدام اليوم: {used}/{limit} | المتبقي اليوم: {max(0, limit - used)}"
+    else:
+        usage_line = "الاستخدام: غير متاح قبل التفعيل"
+
+    return (
+        "👤 حالة حسابي\n\n"
+        f"• الاسم: {html.escape(user.full_name or '')}\n"
+        f"• اليوزر: {html.escape(username)}\n"
+        f"• Telegram ID: <code>{uid}</code>\n"
+        f"• Quotex ID: <code>{html.escape(str(quotex_id))}</code>\n"
+        f"• الحالة: {html.escape(str(status))}\n"
+        f"• نوع الاشتراك: {html.escape(str(plan.get('label', 'غير محدد')))}\n"
+        f"• انتهاء الصلاحية: {html.escape(format_expiry_for_account(expires_at))}\n"
+        f"• التجربة المجانية مستخدمة: {trial_used}\n"
+        f"• {html.escape(usage_line)}"
+    )
+
+
+def build_bot_stats_message() -> str:
+    all_users = get_all_users() or {}
+    approved_users = get_all_approved_users() or {}
+    pending_users = get_all_pending_users() or {}
+
+    active_approved = 0
+    expired_or_blocked = 0
+    for uid in list(approved_users.keys()):
+        try:
+            if is_approved(int(uid)):
+                active_approved += 1
+            else:
+                expired_or_blocked += 1
+        except Exception:
+            pass
+
+    day_key = get_signal_day_key()
+    try:
+        usage_data = system_ref().child("signal_usage").get() or {}
+    except Exception:
+        usage_data = {}
+
+    today_signals = 0
+    total_signals = 0
+    top_user = None
+    top_today = -1
+    if isinstance(usage_data, dict):
+        for uid, item in usage_data.items():
+            if not isinstance(item, dict):
+                continue
+            total_signals += safe_int(item.get("total"), 0)
+            today_count = safe_int(((item.get("daily") or {}).get(day_key) or {}).get("count"), 0)
+            today_signals += today_count
+            if today_count > top_today:
+                top_today = today_count
+                top_user = str(uid)
+
+    try:
+        video_trials = db.reference("video_trials").get() or {}
+        trial_used_count = sum(1 for x in (video_trials or {}).values() if isinstance(x, dict) and x.get("used"))
+    except Exception:
+        trial_used_count = 0
+
+    active_today = 0
+    cutoff = now_utc() - timedelta(hours=24)
+    for item in all_users.values():
+        if not isinstance(item, dict):
+            continue
+        last_seen = parse_iso(str(item.get("last_seen", "")))
+        if last_seen:
+            if last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
+            if last_seen >= cutoff:
+                active_today += 1
+
+    top_user_line = "لا يوجد"
+    if top_user and top_today > 0:
+        user_data = all_users.get(top_user, {}) if isinstance(all_users, dict) else {}
+        top_name = user_data.get("name", "غير معروف") if isinstance(user_data, dict) else "غير معروف"
+        top_user_line = f"{top_name} | <code>{top_user}</code> | {top_today} إشارات اليوم"
+
+    return (
+        "📊 إحصائيات البوت\n"
+        "━━━━━━━━━━━━━━\n"
+        f"👥 إجمالي المستخدمين: {len(all_users)}\n"
+        f"✅ المفعّلون حاليًا: {active_approved}\n"
+        f"📥 الطلبات المعلقة: {len(pending_users)}\n"
+        f"⛔ منتهون/محظورون: {expired_or_blocked}\n"
+        f"🟢 نشطوا آخر 24 ساعة: {active_today}\n"
+        f"🎁 مستخدمو التجربة: {trial_used_count}\n\n"
+        f"📌 إشارات اليوم: {today_signals}\n"
+        f"📌 إجمالي الإشارات المسجلة: {total_signals}\n"
+        f"🏆 أعلى مستخدم اليوم: {top_user_line}\n"
+        "━━━━━━━━━━━━━━"
+    )
+
+
+def build_users_export_csv_bytes() -> bytes:
+    all_users = get_all_users() or {}
+    approved_users = get_all_approved_users() or {}
+    pending_users = get_all_pending_users() or {}
+
+    try:
+        usage_data = system_ref().child("signal_usage").get() or {}
+    except Exception:
+        usage_data = {}
+
+    day_key = get_signal_day_key()
+    ids = set(str(x) for x in all_users.keys()) | set(str(x) for x in approved_users.keys()) | set(str(x) for x in pending_users.keys())
+
+    output = io.StringIO()
+    writer = csv.writer(output)
+    writer.writerow([
+        "telegram_id", "name", "username", "quotex_id", "status", "plan",
+        "expires_at", "approved_at", "pending", "trial_used",
+        "signals_today", "signals_total", "last_seen"
+    ])
+
+    for uid in sorted(ids, key=lambda x: int(x) if str(x).lstrip('-').isdigit() else 0):
+        user_data = all_users.get(uid, {}) if isinstance(all_users, dict) else {}
+        approved_data = approved_users.get(uid, {}) if isinstance(approved_users, dict) else {}
+        pending_data = pending_users.get(uid, {}) if isinstance(pending_users, dict) else {}
+        merged = {}
+        for source in (user_data, approved_data, pending_data):
+            if isinstance(source, dict):
+                merged.update({k: v for k, v in source.items() if v not in {None, ""}})
+
+        usage = usage_data.get(uid, {}) if isinstance(usage_data, dict) else {}
+        signals_today = safe_int(((usage.get("daily") or {}).get(day_key) or {}).get("count"), 0) if isinstance(usage, dict) else 0
+        signals_total = safe_int(usage.get("total"), 0) if isinstance(usage, dict) else 0
+
+        writer.writerow([
+            uid,
+            merged.get("name", ""),
+            merged.get("username", ""),
+            merged.get("quotex_id", ""),
+            get_user_status(int(uid)) if str(uid).lstrip('-').isdigit() else merged.get("status", ""),
+            merged.get("plan") or merged.get("mode", ""),
+            merged.get("expires_at", ""),
+            merged.get("approved_at") or merged.get("activated_at", ""),
+            "yes" if uid in pending_users else "no",
+            "yes" if (str(uid).lstrip('-').isdigit() and has_used_video_trial(int(uid))) else "",
+            signals_today,
+            signals_total,
+            merged.get("last_seen", ""),
+        ])
+
+    return output.getvalue().encode("utf-8-sig")
 
 
 async def send_user_details(update: Update, target_id: int, show_admin_actions: bool = False):
@@ -7299,8 +7896,22 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if not has_selected_language(user.id, context):
+        await ask_language(update)
+        return
+
+    lang = get_user_language(user.id, context)
+
     if not get_bot_enabled():
-        await send_maintenance_message(update)
+        if lang == "en":
+            await update.message.reply_text(
+                "🛠 The bot is currently under maintenance.\n\n"
+                "We are making some updates and improvements.\n"
+                "Please try again later.\n\n"
+                "Thank you for understanding 🤍"
+            )
+        else:
+            await send_maintenance_message(update)
         return
 
     # مشرف الليستات: إذا كان مفعّلًا يظهر له كيبورد الليستات+الإشارات، وإذا غير مفعّل يرجع لمسار البداية.
@@ -7308,17 +7919,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if is_approved(user.id):
             await show_otc_list_manager_panel(update)
             return
-        await send_welcome_flow(update)
+        await send_welcome_flow(update, lang)
         return
 
     if is_approved(user.id):
-        await update.message.reply_text(
-            f"✅ أهلًا {user.first_name}\n"
-            "مرحبًا بك من جديد في بوت TRADING TIME.",
-            reply_markup=build_main_menu_for_user(user.id)
-        )
+        if lang == "en":
+            await update.message.reply_text(
+                f"✅ Welcome {user.first_name}\n"
+                "Welcome back to TRADING TIME Bot.",
+                reply_markup=build_main_menu_for_user(user.id, "en")
+            )
+        else:
+            await update.message.reply_text(
+                f"✅ أهلًا {user.first_name}\n"
+                "مرحبًا بك من جديد في بوت TRADING TIME.",
+                reply_markup=build_main_menu_for_user(user.id)
+            )
     else:
-        await send_welcome_flow(update)
+        await send_welcome_flow(update, lang)
 
 
 def get_latest_otc_list_job(user_id: int) -> tuple[str | None, dict]:
@@ -7502,6 +8120,476 @@ def activate_video_trial_for_user(user_id: int):
     return expire_at
 
 
+
+def check_signal_usage_allowed_lang(user_id: int, amount: int = 1, lang: str = "ar") -> tuple[bool, str]:
+    allowed, msg = check_signal_usage_allowed(user_id, amount)
+    if allowed or lang != "en":
+        return allowed, msg
+
+    uid = int(user_id)
+    amount = max(1, int(amount or 1))
+    plan = get_signal_plan_info(uid)
+    usage = get_signal_usage_summary(uid)
+
+    last_at = float(usage.get("last_at") or 0)
+    now_ts = time_module.time()
+    if SIGNAL_USAGE_COOLDOWN_SECONDS > 0 and last_at and now_ts - last_at < SIGNAL_USAGE_COOLDOWN_SECONDS:
+        wait = int(max(1, SIGNAL_USAGE_COOLDOWN_SECONDS - (now_ts - last_at)))
+        return False, f"⏳ Please wait {wait} seconds before requesting a new signal."
+
+    limit = int(plan.get("limit") or 0)
+    used = int(usage["total"] if plan["limit_type"] == "total" else usage["today"])
+    remaining = max(0, limit - used)
+    plan_names = {"trial": "Free Trial", "week": "Weekly Subscription", "month": "Monthly Subscription", "forever": "VIP Forever"}
+    plan_label = plan_names.get(str(plan.get("key") or ""), str(plan.get("label") or "Subscription"))
+
+    if remaining <= 0:
+        if plan["limit_type"] == "total":
+            return False, (
+                "⛔ Your free trial signal limit has ended.\n\n"
+                f"You used {used}/{limit} signals.\n"
+                "To continue, contact the admin to activate your subscription."
+            )
+        return False, (
+            "⛔ You reached your daily signal limit.\n\n"
+            f"Plan: {plan_label}\n"
+            f"Used today: {used}/{limit}\n"
+            "The counter resets at the start of the day, UTC+3."
+        )
+
+    return False, (
+        f"⚠️ You currently have only {remaining} signals remaining.\n"
+        f"Your request needs {amount} signals.\n"
+        "Choose a smaller count or wait for the daily limit to reset."
+    )
+
+
+def build_signals_message_en(pair: str, count: int, interval_minutes: int, signals: list[str]) -> str:
+    return build_signals_message(pair, count, interval_minutes, signals, lang="en")
+
+
+def translate_real_signal_message_to_en(msg: str) -> str:
+    replacements = [
+        ("🌍 السوق العالمي", "🌍 Global Market"),
+        ("💱 الزوج:", "💱 Pair:"),
+        ("🕒 الجلسة:", "🕒 Session:"),
+        ("🧭 الفريم:", "🧭 Timeframe:"),
+        ("📊 الثقة:", "📊 Confidence:"),
+        ("📌 الإشارة:", "📌 Signal:"),
+        ("⏰ وقت الدخول:", "⏰ Entry Time:"),
+        ("💵 السعر الحالي:", "💵 Current Price:"),
+        ("⏳ مدة الصفقة المقترحة:", "⏳ Suggested Trade Duration:"),
+        ("⚠️ تنبيهات إضافية:", "⚠️ Additional Alerts:"),
+        ("❌ لا توجد صفقة مباشرة الآن", "❌ No direct trade right now"),
+        ("❌ لا توجد فرصة واضحة الآن", "❌ No clear opportunity right now"),
+        ("السبب: شروط الدخول غير مكتملة بعد", "Reason: Entry conditions are not complete yet"),
+        ("السبب: آخر شمعة مغلقة حيادية وتحتاج تأكيد", "Reason: The last closed candle is neutral and needs confirmation"),
+        ("السبب: السوق متذبذب ولا توجد منطقة تأكيد واضحة", "Reason: The market is ranging and there is no clear confirmation area"),
+        ("⚠️ لكن توجد فرص قريبة للمراقبة:", "⚠️ But there are nearby scenarios to watch:"),
+        ("⚠️ فرصة مشروطة — لا تدخل مباشرة الآن", "⚠️ Conditional opportunity — do not enter directly now"),
+        ("السبب:", "Reason:"),
+        ("⏰ وقت المراقبة:", "⏰ Watch Time:"),
+        ("📋 الخطة المقترحة:", "📋 Suggested Plan:"),
+        ("📌 ملاحظات التحليل:", "📌 Analysis Notes:"),
+        ("⚠️ السوق متذبذب — الأفضل انتظار رد فعل من المنطقة", "⚠️ The market is ranging — better wait for a reaction from the area"),
+        ("السعر قريب من دعم", "price is near support"),
+        ("السعر قريب من مقاومة", "price is near resistance"),
+        ("ظهر رفض صاعد من دعم", "bullish rejection appeared from support"),
+        ("ظهر رفض هابط من مقاومة", "bearish rejection appeared from resistance"),
+        ("📈 الترند العام صاعد (EMA 9 فوق EMA 21)", "📈 The general trend is bullish (EMA 9 above EMA 21)"),
+        ("📉 الترند العام هابط (EMA 9 تحت EMA 21)", "📉 The general trend is bearish (EMA 9 below EMA 21)"),
+        ("🏗 بنية السوق صاعدة (قمم وقيعان أعلى)", "🏗 Market structure is bullish (higher highs and higher lows)"),
+        ("🏗 بنية السوق هابطة (قمم وقيعان أدنى)", "🏗 Market structure is bearish (lower highs and lower lows)"),
+        ("⚠️ بنية السوق متذبذبة — لا نعتمد على الترند وحده", "⚠️ Market structure is ranging — trend alone is not enough"),
+        ("⚠️ آخر شمعة مغلقة قريبة من الدوجي — يلزم تأكيد إضافي", "⚠️ The last closed candle is close to a doji — extra confirmation is needed"),
+        ("لا تطارد PUT بدون كسر واضح", "do not chase PUT without a clear break"),
+        ("لا تطارد CALL بدون كسر واضح", "do not chase CALL without a clear break"),
+        ("غير متاح الآن", "is not available now"),
+        ("السوق مغلق", "market is closed"),
+        ("فشل جلب بيانات السوق", "failed to fetch market data"),
+        ("📋 سيناريوهات المراقبة:", "📋 Watch Scenarios:"),
+        ("🔥 تم اختيار هذه الصفقة لأنها الأقوى بين 1M / 5M / 10M", "🔥 This trade was selected because it is the strongest among 1M / 5M / 10M"),
+        ("🔥 لا توجد صفقة مباشرة قوية، لذلك تم عرض أفضل فرصة مشروطة بين 1M / 5M / 10M", "🔥 No strong direct trade is available, so the best conditional opportunity among 1M / 5M / 10M is shown"),
+        ("📋 ملخص الفريمات المفحوصة:", "📋 Checked Timeframes Summary:"),
+        ("جاهزة", "Ready"),
+        ("لا", "No"),
+        ("CALL", "CALL"),
+        ("PUT", "PUT"),
+        ("الترند العام صاعد", "The general trend is bullish"),
+        ("الترند العام هابط", "The general trend is bearish"),
+        ("بنية السوق صاعدة", "Market structure is bullish"),
+        ("بنية السوق هابطة", "Market structure is bearish"),
+        ("الزخم الأخير لصالح الصعود", "Recent momentum favors upside"),
+        ("الزخم الأخير لصالح الهبوط", "Recent momentum favors downside"),
+        ("آخر شمعة مغلقة قوية صاعدة", "The last closed candle is strongly bullish"),
+        ("آخر شمعة مغلقة قوية هابطة", "The last closed candle is strongly bearish"),
+        ("إذا كسر الدعم بإغلاق واضح → خذ PUT", "If support breaks with a clear close → take PUT"),
+        ("إذا ظهر رفض صاعد من الدعم → خذ CALL", "If bullish rejection appears from support → take CALL"),
+        ("لا تدخل PUT مباشرة قبل تأكيد الكسر", "Do not enter PUT directly before break confirmation"),
+        ("إذا كسر المقاومة بإغلاق واضح → خذ CALL", "If resistance breaks with a clear close → take CALL"),
+        ("إذا ظهر رفض هابط من المقاومة → خذ PUT", "If bearish rejection appears from resistance → take PUT"),
+        ("لا تدخل CALL مباشرة قبل تأكيد الكسر", "Do not enter CALL directly before break confirmation"),
+    ]
+    out = str(msg or "")
+    for ar, en in replacements:
+        out = out.replace(ar, en)
+
+    # Extra cleanup for common Arabic words that may appear inside dynamic global-market notes.
+    cleanup = [
+        ("دعم", "support"),
+        ("مقاومة", "resistance"),
+        ("كسر واضح", "clear break"),
+        ("إغلاق واضح", "clear close"),
+        ("رفض صاعد", "bullish rejection"),
+        ("رفض هابط", "bearish rejection"),
+        ("المنطقة", "the zone"),
+        ("تأكيد", "confirmation"),
+        ("السعر", "price"),
+        ("قريب من", "near"),
+        ("فوق", "above"),
+        ("تحت", "below"),
+    ]
+    for ar, en in cleanup:
+        out = out.replace(ar, en)
+    return out
+
+
+async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    text = update.message.text.strip()
+    step = context.user_data.get("step")
+
+    # Contact / tutorial / free trial public actions
+    if text in {"📞 Contact Support", "Contact Support"}:
+        await update.message.reply_text(
+            f"📞 Contact support here:\n{ADMIN_USERNAME}",
+            reply_markup=welcome_keyboard_en if not is_approved(user.id) else build_main_menu_for_user(user.id, "en")
+        )
+        return
+
+    if text in {"🔙 Back", "⬅️ Back", "Back"}:
+        reset_signal_state(context)
+        await update.message.reply_text(
+            "Back to menu.",
+            reply_markup=build_main_menu_for_user(user.id, "en") if is_approved(user.id) else welcome_keyboard_en
+        )
+        return
+
+    if text in {"🎁 Get Free Trial", "Get Free Trial"}:
+        if has_used_video_trial(user.id):
+            await update.message.reply_text(
+                "ℹ️ You have already used the free trial before.\n\nYou can send an activation request from the menu.",
+                reply_markup=welcome_keyboard_en if not is_approved(user.id) else build_main_menu_for_user(user.id, "en")
+            )
+            return
+        mark_video_trial_started(user.id)
+        await update.message.reply_text(
+            "🎁 To get a full 1-hour free trial:\n\n"
+            "1️⃣ Watch the full bot tutorial video here:\n"
+            f"{YOUTUBE_TUTORIAL_URL}\n\n"
+            "2️⃣ After a short time, this button will appear:\n"
+            "✅ I Watched the Video\n\n"
+            "Press it to activate your free trial automatically.",
+            reply_markup=ReplyKeyboardMarkup([["🔙 Back"]], resize_keyboard=True)
+        )
+        try:
+            context.job_queue.run_once(
+                send_video_watched_button_job,
+                when=VIDEO_TRIAL_DELAY_SECONDS,
+                data={"user_id": user.id},
+                name=f"video_trial_button_{user.id}_{int(time_module.time())}",
+            )
+        except Exception as e:
+            logger.exception("Could not schedule video watched button: %s", e)
+        return
+
+    if text in {"🎥 Watch Bot Tutorial", "Watch Bot Tutorial"}:
+        if has_used_video_trial(user.id):
+            await update.message.reply_text(
+                "🎥 Bot tutorial video:\n"
+                f"{YOUTUBE_TUTORIAL_URL}\n\n"
+                "ℹ️ You have already used the free trial before.",
+                reply_markup=build_main_menu_for_user(user.id, "en") if is_approved(user.id) else welcome_keyboard_en
+            )
+            return
+        mark_video_trial_started(user.id)
+        await update.message.reply_text(
+            "🎥 Watch the full bot tutorial video:\n"
+            f"{YOUTUBE_TUTORIAL_URL}\n\n"
+            "After watching, this button will appear:\n"
+            "✅ I Watched the Video\n\n"
+            "When you press it, you will get a full 1-hour free trial.",
+            reply_markup=ReplyKeyboardMarkup([["🔙 Back"]], resize_keyboard=True)
+        )
+        try:
+            context.job_queue.run_once(
+                send_video_watched_button_job,
+                when=VIDEO_TRIAL_DELAY_SECONDS,
+                data={"user_id": user.id},
+                name=f"video_trial_button_{user.id}_{int(time_module.time())}",
+            )
+        except Exception as e:
+            logger.exception("Could not schedule video watched button: %s", e)
+        return
+
+    if text in {"✅ I Watched the Video", "I Watched the Video"}:
+        if has_used_video_trial(user.id):
+            await update.message.reply_text(
+                "ℹ️ You have already used the free trial before.",
+                reply_markup=build_main_menu_for_user(user.id, "en") if is_approved(user.id) else welcome_keyboard_en
+            )
+            return
+        eligible_after = get_video_trial_eligible_after(user.id)
+        now_ts = int(time_module.time())
+        if eligible_after and now_ts < eligible_after:
+            remaining = eligible_after - now_ts
+            await update.message.reply_text(
+                f"⏳ Please wait a little. You can activate the trial after about {remaining} seconds.",
+                reply_markup=video_watched_keyboard_en
+            )
+            return
+        expire_at = activate_video_trial_for_user(user.id)
+        reset_signal_state(context)
+        await update.message.reply_text(
+            "✅ Your free trial has been activated for one full hour.\n\n"
+            f"⏳ Trial ends at: {expire_at.strftime('%H:%M')} UTC\n\n"
+            "You can now use the bot.",
+            reply_markup=build_main_menu_for_user(user.id, "en")
+        )
+        return
+
+    # Non-approved English start flow
+    if not is_admin(user.id) and not is_approved(user.id):
+        current_status = get_user_status(user.id)
+        if current_status == "pending":
+            await update.message.reply_text(
+                "⏳ Your activation request is already under review.\n\nYou cannot send a new request before the current one is accepted or rejected.",
+                reply_markup=welcome_keyboard_en
+            )
+            return
+        if text in {"✅ Yes, I Joined", "Yes, I Joined"}:
+            context.user_data["step"] = "waiting_quotex_id_en"
+            await update.message.reply_text(
+                "📩 Send your QUOTEX account ID so your account can be checked.\nAfter verification, the bot will be enabled for you for free.",
+                reply_markup=ReplyKeyboardMarkup([["🔙 Back"]], resize_keyboard=True)
+            )
+            return
+        if text in {"❌ No, I Haven't Joined", "No, I Haven't Joined"}:
+            await update.message.reply_text(
+                "📌 How to register and activate TRADING TIME Bot 👇\n\n"
+                "1️⃣ Create a new Quotex account using the official team link.\n"
+                "2️⃣ Send your account ID to the admin.\n"
+                "3️⃣ After review and verification, your bot access will be activated.\n\n"
+                f"📞 Admin: {ADMIN_USERNAME}\n"
+                f"🎥 Tutorial: {YOUTUBE_TUTORIAL_URL}",
+                reply_markup=welcome_keyboard_en
+            )
+            return
+        if step == "waiting_quotex_id_en":
+            quotex_id = text.strip()
+            if not quotex_id or quotex_id in {"✅ Yes, I Joined", "❌ No, I Haven't Joined"}:
+                await update.message.reply_text(
+                    "📩 Send only your Quotex account ID.",
+                    reply_markup=ReplyKeyboardMarkup([["🔙 Back"]], resize_keyboard=True)
+                )
+                return
+            pending_data = {
+                "telegram_id": user.id,
+                "name": user.full_name,
+                "username": user.username or "",
+                "quotex_id": quotex_id,
+                "status": "pending",
+                "created_at": now_iso(),
+                "language": "en",
+            }
+            save_pending_user(user.id, pending_data)
+            save_user_record(user.id, {
+                "quotex_id": quotex_id,
+                "status": "pending",
+                "name": user.full_name,
+                "username": user.username or "",
+                "language": "en",
+                "updated_at": now_iso(),
+            })
+            await update.message.reply_text(
+                "📩 Your request has been received successfully.\n\n"
+                "Your Quotex ID was saved and sent to the admin for review.\n"
+                "Please wait for admin approval ✅",
+                reply_markup=welcome_keyboard_en
+            )
+            username_text = f"@{user.username}" if user.username else "no username"
+            admin_message = (
+                "📥 New activation request\n\n"
+                f"👤 Name: {user.full_name}\n"
+                f"🔗 Username: {username_text}\n"
+                f"🆔 Telegram ID: <code>{user.id}</code>\n"
+                f"💱 Quotex ID: <code>{quotex_id}</code>\n"
+                "🌐 Language: English\n\n"
+                "──────────────"
+            )
+            try:
+                await context.bot.send_message(
+                    chat_id=ADMIN_TELEGRAM_ID,
+                    text=admin_message,
+                    parse_mode="HTML",
+                    reply_markup=build_pending_request_keyboard(user.id)
+                )
+            except Exception as e:
+                logger.exception("Could not notify admin about pending user: %s", e)
+            context.user_data["step"] = None
+            return
+
+        await send_welcome_flow(update, "en")
+        return
+
+    # Approved English user flow
+    if text in {"📊 Generate Signals", "Generate Signals"}:
+        allowed, limit_msg = check_signal_usage_allowed_lang(user.id, 1, "en")
+        if not allowed:
+            reset_signal_state(context)
+            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id, "en"))
+            return
+        reset_signal_state(context)
+        context.user_data["step"] = "choose_market_mode_en"
+        await update.message.reply_text("📊 Choose market type 👇", reply_markup=market_mode_keyboard_en)
+        return
+
+    if text in {"👤 My Account", "My Account"}:
+        await update.message.reply_text(
+            build_account_status_message(user, lang="en"),
+            parse_mode="HTML",
+            reply_markup=build_main_menu_for_user(user.id, "en")
+        )
+        return
+
+    if step == "choose_market_mode_en":
+        if text == "⚡ OTC":
+            context.user_data["mode"] = "otc"
+            context.user_data["step"] = "choose_otc_mode_en"
+            await update.message.reply_text("⚡ Choose OTC signal type 👇", reply_markup=otc_mode_keyboard_en)
+            return
+        if text in {"🌍 Global Market", "Global Market"}:
+            context.user_data["mode"] = "real"
+            context.user_data["step"] = "choose_real_pair_en"
+            await update.message.reply_text("🌍 Choose a global market pair 👇", reply_markup=real_pairs_keyboard_en)
+            return
+        await update.message.reply_text("📌 Choose a market type from the buttons 👇", reply_markup=market_mode_keyboard_en)
+        return
+
+    if step == "choose_otc_mode_en" and context.user_data.get("mode") == "otc":
+        if text in {"🕒 Timed List", "Timed List"}:
+            context.user_data["otc_submode"] = "timed"
+            context.user_data["step"] = "choose_pair_en"
+            await update.message.reply_text("💱 Choose an OTC pair for the timed list 👇", reply_markup=otc_pairs_keyboard_en)
+            return
+        if text in {"⚡ Live Trade", "Live Trade"}:
+            context.user_data["otc_submode"] = "live_now"
+            context.user_data["step"] = "choose_live_otc_action_en"
+            await update.message.reply_text(
+                "⚡ OTC Live Trade\n\nPress the button and the bot will search for the best M1 opportunity among all live OTC pairs.",
+                reply_markup=otc_live_search_keyboard_en
+            )
+            return
+        await update.message.reply_text("⚡ Choose an OTC signal type from the buttons 👇", reply_markup=otc_mode_keyboard_en)
+        return
+
+    if step == "choose_pair_en" and context.user_data.get("mode") == "otc":
+        if text not in OTC_PAIRS:
+            await update.message.reply_text("💱 Choose a pair from the buttons 👇", reply_markup=otc_pairs_keyboard_en)
+            return
+        context.user_data["pair"] = text
+        context.user_data["step"] = "choose_count_en"
+        await update.message.reply_text("📈 Choose the number of trades 👇", reply_markup=count_keyboard_en)
+        return
+
+    if step == "choose_count_en" and context.user_data.get("mode") == "otc":
+        if text not in [str(x) for x in TRADE_COUNTS]:
+            await update.message.reply_text("📈 Choose the number of trades from the buttons 👇", reply_markup=count_keyboard_en)
+            return
+        count = int(text)
+        allowed, limit_msg = check_signal_usage_allowed_lang(user.id, count, "en")
+        if not allowed:
+            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id, "en"))
+            reset_signal_state(context)
+            return
+        interval_minutes = 3
+        pair = context.user_data["pair"]
+        start_dt = next_full_minute(now_utc())
+        signals = generate_signals(pair, count, interval_minutes, start_dt)
+        message_text = build_signals_message(pair, count, interval_minutes, signals, lang="en")
+        await update.message.reply_text(
+            message_text,
+            reply_markup=build_main_menu_for_user(user.id, "en"),
+            parse_mode="Markdown"
+        )
+        record_signal_usage(user.id, count, "otc_timed")
+        reset_signal_state(context)
+        return
+
+    if step == "choose_live_otc_action_en" and context.user_data.get("mode") == "otc":
+        if text != "🔎 Find a Trade Now":
+            await update.message.reply_text(
+                "Press the button and the bot will search for the best live trade right now 👇",
+                reply_markup=otc_live_search_keyboard_en
+            )
+            return
+        allowed, limit_msg = check_signal_usage_allowed_lang(user.id, 1, "en")
+        if not allowed:
+            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id, "en"))
+            reset_signal_state(context)
+            return
+        await update.message.reply_text("🔎 Checking live OTC pairs on M1...")
+        result = analyze_best_live_otc_now(lang="en")
+        await update.message.reply_text(
+            result["message"],
+            reply_markup=build_main_menu_for_user(user.id, "en"),
+            parse_mode="Markdown"
+        )
+        if result.get("ok"):
+            record_signal_usage(user.id, 1, "otc_live_now")
+        reset_signal_state(context)
+        return
+
+    if step == "choose_real_pair_en":
+        if text not in REAL_PAIRS:
+            await update.message.reply_text("🌍 Choose a pair from the buttons 👇", reply_markup=real_pairs_keyboard_en)
+            return
+        context.user_data["pair"] = text
+        context.user_data["step"] = "choose_interval_real_en"
+        await update.message.reply_text("⏳ Choose timeframe, or let the bot find the best opportunity 👇", reply_markup=real_interval_keyboard_en)
+        return
+
+    if step == "choose_interval_real_en":
+        interval_map = {"1 minute": 1, "5 minutes": 5, "10 minutes": 10}
+        if text not in interval_map and text != "🔥 Best Opportunity":
+            await update.message.reply_text("⏳ Choose the timeframe from the buttons 👇", reply_markup=real_interval_keyboard_en)
+            return
+        allowed, limit_msg = check_signal_usage_allowed_lang(user.id, 1, "en")
+        if not allowed:
+            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id, "en"))
+            reset_signal_state(context)
+            return
+        pair = context.user_data["pair"]
+        if text == "🔥 Best Opportunity":
+            result = analyze_real_market_best(pair)
+        else:
+            result = analyze_real_market(pair, interval_map[text])
+        result_msg = translate_real_signal_message_to_en(result.get("message", ""))
+        await update.message.reply_text(
+            result_msg,
+            reply_markup=build_main_menu_for_user(user.id, "en")
+        )
+        if result.get("ok"):
+            record_signal_usage(user.id, 1, "real_market")
+        reset_signal_state(context)
+        return
+
+    await update.message.reply_text(
+        "📌 Choose an option from the menu.",
+        reply_markup=build_main_menu_for_user(user.id, "en")
+    )
+
+
 async def send_video_watched_button_job(context: ContextTypes.DEFAULT_TYPE):
     data = dict(context.job.data or {})
     user_id = int(data.get("user_id"))
@@ -7510,14 +8598,24 @@ async def send_video_watched_button_job(context: ContextTypes.DEFAULT_TYPE):
         if has_used_video_trial(user_id):
             return
 
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                "✅ هل شاهدت فيديو شرح البوت كاملًا؟\n\n"
-                "اضغط الزر بالأسفل للحصول على تجربة مجانية لمدة ساعة كاملة."
-            ),
-            reply_markup=video_watched_keyboard
-        )
+        if get_user_language(user_id) == "en":
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "✅ Did you watch the full bot tutorial video?\n\n"
+                    "Press the button below to get a full 1-hour free trial."
+                ),
+                reply_markup=video_watched_keyboard_en
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "✅ هل شاهدت فيديو شرح البوت كاملًا؟\n\n"
+                    "اضغط الزر بالأسفل للحصول على تجربة مجانية لمدة ساعة كاملة."
+                ),
+                reply_markup=video_watched_keyboard
+            )
     except Exception as e:
         logger.exception("Could not send video watched button: %s", e)
 
@@ -7659,6 +8757,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text
     step = context.user_data.get("step")
+
+    # ===== Language selection gate =====
+    if text in {"🇸🇦 العربية", "العربية", "Arabic"}:
+        set_user_language(user.id, "ar", context)
+        reset_signal_state(context)
+        if is_approved(user.id):
+            await update.message.reply_text(
+                "✅ تم اختيار اللغة العربية.\nمرحبًا بك في بوت TRADING TIME.",
+                reply_markup=build_main_menu_for_user(user.id, "ar")
+            )
+        else:
+            await send_welcome_flow(update, "ar")
+        return
+
+    if text in {"🇬🇧 English", "English", "الإنجليزية"}:
+        set_user_language(user.id, "en", context)
+        reset_signal_state(context)
+        if is_approved(user.id):
+            await update.message.reply_text(
+                "✅ English language selected.\nWelcome to TRADING TIME Bot.",
+                reply_markup=build_main_menu_for_user(user.id, "en")
+            )
+        else:
+            await send_welcome_flow(update, "en")
+        return
+
+    if (not is_admin(user.id)) and (not has_selected_language(user.id, context)):
+        await ask_language(update)
+        return
+
+    if (not is_admin(user.id)) and get_user_language(user.id, context) == "en":
+        await handle_message_en(update, context)
+        return
 
     if "تواصل مع المسؤول" in text:
         await update.message.reply_text(
@@ -8267,19 +9398,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "📊 توليد إشارات":
+        allowed, limit_msg = check_signal_usage_allowed(user.id, 1)
+        if not allowed:
+            reset_signal_state(context)
+            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id))
+            return
+
         reset_signal_state(context)
         context.user_data["step"] = "choose_market_mode"
         await update.message.reply_text("📊 اختر نوع السوق 👇", reply_markup=market_mode_keyboard)
         return
 
-    if text == "👤 حسابي":
-        username = f"@{user.username}" if user.username else "ما عنده username"
+    if text in {"👤 حسابي", "👤 حالة حسابي"}:
         await update.message.reply_text(
-            "👤 معلومات حسابك\n\n"
-            f"• الاسم: {user.full_name}\n"
-            f"• اليوزر: {username}\n"
-            f"• الآيدي: <code>{user.id}</code>\n"
-            f"• الحالة: {get_user_status(user.id)}",
+            build_account_status_message(user),
             parse_mode="HTML",
             reply_markup=build_main_menu_for_user(user.id)
         )
@@ -8312,41 +9444,37 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🛠 تم إيقاف البوت للعامة", reply_markup=admin_main_keyboard)
             return
 
-        if text == "📡 قنوات البوت":
-            context.user_data["step"] = "admin_channel_controls"
+        if text == "📊 إحصائيات البوت":
             await update.message.reply_text(
-                "📡 قسم القنوات\n\nالنشر التلقائي ملغى من الملف. المتاح هنا فقط إحصائيات/إدارة قناة OTC.",
-                reply_markup=admin_channels_keyboard
+                build_bot_stats_message(),
+                parse_mode="HTML",
+                reply_markup=admin_main_keyboard
             )
             return
 
-        if step == "admin_channel_controls":
+        if text == "📤 تصدير المستخدمين":
+            try:
+                csv_bytes = build_users_export_csv_bytes()
+                bio = io.BytesIO(csv_bytes)
+                bio.name = f"trading_time_users_{get_signal_day_key()}.csv"
+                await update.message.reply_document(
+                    document=bio,
+                    filename=bio.name,
+                    caption="📤 نسخة احتياطية من المستخدمين وحالة الاستخدام.",
+                    reply_markup=admin_main_keyboard
+                )
+            except Exception as e:
+                logger.exception("Users export failed: %s", e)
+                await update.message.reply_text("❌ تعذر تصدير المستخدمين. راجع اللوج.", reply_markup=admin_main_keyboard)
+            return
 
-            if text == "⚡ تشغيل نشر OTC":
-                force_channel_publish_setting("otc", False)
-                await update.message.reply_text("⛔ النشر التلقائي لقناة OTC ملغى من الملف ولا يمكن تشغيله من لوحة الأدمن.", reply_markup=admin_channels_keyboard)
-                return
-
-            if text == "⚡ إيقاف نشر OTC":
-                force_channel_publish_setting("otc", False)
-                await update.message.reply_text("✅ النشر التلقائي لقناة OTC ملغى مسبقًا من الملف.", reply_markup=admin_channels_keyboard)
-                return
-
-            if text == "🔥 تشغيل OTC مباشر":
-                force_channel_publish_setting("otc_live", False)
-                stop_otc_live_runtime_state("auto_channel_removed")
-                await update.message.reply_text("⛔ قناة OTC Live التلقائية ملغاة من الملف ولا يمكن تشغيلها من لوحة الأدمن.", reply_markup=admin_channels_keyboard)
-                return
-
-            if text == "🔥 إيقاف OTC مباشر":
-                force_channel_publish_setting("otc_live", False)
-                stop_otc_live_runtime_state("auto_channel_removed")
-                await update.message.reply_text("✅ قناة OTC Live التلقائية ملغاة مسبقًا من الملف.", reply_markup=admin_channels_keyboard)
-                return
-
-            if text == "📊 إحصائيات قناة OTC":
-                await update.message.reply_text("📊 قسم إحصائيات قناة OTC 👇", reply_markup=admin_otc_stats_keyboard)
-                return
+        if text == "📡 قنوات البوت":
+            await update.message.reply_text(
+                "ℹ️ تم حذف قسم قنوات النشر التلقائي من البوت.\n"
+                "الخيارات الحالية موجودة في لوحة الأدمن الرئيسية.",
+                reply_markup=admin_main_keyboard
+            )
+            return
 
 
         if is_admin(user.id):
@@ -8730,6 +9858,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = context.user_data["count"]
         start_dt = next_full_minute(now_utc())
 
+        allowed, limit_msg = check_signal_usage_allowed(user.id, count)
+        if not allowed:
+            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id))
+            reset_signal_state(context)
+            return
+
         signals = generate_signals(pair, count, interval_minutes, start_dt)
         message_text = build_signals_message(pair, count, interval_minutes, signals)
 
@@ -8738,6 +9872,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_main_menu_for_user(user.id),
             parse_mode="Markdown"
         )
+        record_signal_usage(user.id, count, "otc_timed")
 
         reset_signal_state(context)
         return
@@ -8751,6 +9886,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        allowed, limit_msg = check_signal_usage_allowed(user.id, 1)
+        if not allowed:
+            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id))
+            reset_signal_state(context)
+            return
+
         await update.message.reply_text("🔎 جاري فحص أزواج OTC الحية على فريم الدقيقة...")
         result = analyze_best_live_otc_now()
 
@@ -8759,6 +9900,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_main_menu_for_user(user.id),
             parse_mode="Markdown"
         )
+        if result.get("ok"):
+            record_signal_usage(user.id, 1, "otc_live_now")
 
         reset_signal_state(context)
         return
@@ -8785,6 +9928,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⏳ اختر الفريم من الأزرار 👇", reply_markup=real_interval_keyboard)
             return
 
+        allowed, limit_msg = check_signal_usage_allowed(user.id, 1)
+        if not allowed:
+            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id))
+            reset_signal_state(context)
+            return
+
         pair = context.user_data["pair"]
 
         if text == "🔥 أفضل فرصة":
@@ -8797,6 +9946,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             result["message"],
             reply_markup=build_main_menu_for_user(user.id)
         )
+        if result.get("ok"):
+            record_signal_usage(user.id, 1, "real_market")
 
         reset_signal_state(context)
         return
@@ -8809,13 +9960,44 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ===== App Runner =====
 
+_last_admin_error_alert_at = 0.0
+
+
+def should_send_admin_error_alert() -> bool:
+    global _last_admin_error_alert_at
+    try:
+        now_ts = time_module.time()
+        if now_ts - float(_last_admin_error_alert_at or 0) >= ADMIN_ERROR_ALERT_COOLDOWN_SECONDS:
+            _last_admin_error_alert_at = now_ts
+            return True
+        return False
+    except Exception:
+        return True
+
+
 async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    error_text = "".join(traceback.format_exception(None, context.error, context.error.__traceback__)) if context.error else ""
     logger.error(
         "Telegram handler error | update=%s | error=%s\n%s",
         update,
         context.error,
-        "".join(traceback.format_exception(None, context.error, context.error.__traceback__)) if context.error else "",
+        error_text,
     )
+
+    if should_send_admin_error_alert():
+        try:
+            msg = (
+                "⚠️ Bot Error Alert\n\n"
+                f"الخطأ: {html.escape(str(context.error))}\n\n"
+                f"تفاصيل مختصرة:\n<code>{html.escape(error_text[-2500:] if error_text else 'no traceback')}</code>"
+            )
+            await context.bot.send_message(
+                chat_id=ADMIN_TELEGRAM_ID,
+                text=msg[:3900],
+                parse_mode="HTML"
+            )
+        except Exception:
+            pass
 
 def main():
     if not BOT_TOKEN:
