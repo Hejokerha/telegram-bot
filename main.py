@@ -395,7 +395,7 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["📥 الطلبات المعلقة", "📋 كافة المستخدمين"],
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
-        ["🎯 OTC Sniper Pro"],
+        ["🧠 غرفة جلسة تداول"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
         ["📢 رسالة جماعية"],
@@ -421,17 +421,6 @@ admin_otc_stats_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-
-sniper_pro_keyboard = ReplyKeyboardMarkup(
-    [
-        ["🔍 افحص السوق"],
-        ["🎯 الوضع الذكي", "⚡ دخول مباشر"],
-        ["🕯 الشمعة القادمة", "📊 حالة البحث"],
-        ["🛑 إيقاف البحث", "⬅️ رجوع"],
-    ],
-    resize_keyboard=True
-)
-
 otc_list_manager_keyboard = ReplyKeyboardMarkup(
     [
         ["📊 توليد إشارات"],
@@ -445,6 +434,15 @@ otc_list_manager_keyboard = ReplyKeyboardMarkup(
 admin_otc_list_ready_keyboard = ReplyKeyboardMarkup(
     [
         ["📋 عرض نتائج الليستة", "🧾 فحص ليستة OTC"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+trading_room_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🚀 بدء جلسة تداول"],
+        ["📊 حالة الجلسة", "🛑 إيقاف الجلسة"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -2812,821 +2810,6 @@ def get_stable_direction(pair_or_candles=None, dt=None, lookback: int = 5, min_m
 
 
 
-# ===== OTC Sniper Pro (Admin-only experimental scanner) =====
-SNIPER_SEARCH_DURATION_SECONDS = int(os.getenv("SNIPER_SEARCH_DURATION_SECONDS", "300"))
-SNIPER_SCAN_INTERVAL_SECONDS = int(os.getenv("SNIPER_SCAN_INTERVAL_SECONDS", "5"))
-SNIPER_MIN_SIGNAL_SCORE = int(os.getenv("SNIPER_MIN_SIGNAL_SCORE", "92"))
-SNIPER_MIN_WATCH_SCORE = int(os.getenv("SNIPER_MIN_WATCH_SCORE", "88"))
-SNIPER_MIN_TICKS = int(os.getenv("SNIPER_MIN_TICKS", "45"))
-SNIPER_MIN_CANDLES = int(os.getenv("SNIPER_MIN_CANDLES", "8"))
-SNIPER_CONFIRMATION_REQUIRED = int(os.getenv("SNIPER_CONFIRMATION_REQUIRED", "3"))
-SNIPER_MIN_SECONDS_BEFORE_SIGNAL = int(os.getenv("SNIPER_MIN_SECONDS_BEFORE_SIGNAL", "20"))
-SNIPER_MAX_PREPARE_ALERTS = int(os.getenv("SNIPER_MAX_PREPARE_ALERTS", "1"))
-# دخول الملامسة السريع: خاص بفرص الدعم/المقاومة/Round Number.
-# الفكرة: بعد رسالة "جهّز الزوج" لا ننتظر تأكيدات ثقيلة إذا كانت الفرصة عبارة عن لمس منطقة وارتداد سريع.
-SNIPER_ZONE_FAST_ENTRY_ENABLED = os.getenv("SNIPER_ZONE_FAST_ENTRY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-SNIPER_ZONE_FAST_MIN_SCORE = int(os.getenv("SNIPER_ZONE_FAST_MIN_SCORE", "86"))
-SNIPER_ZONE_FAST_MIN_GAP = int(os.getenv("SNIPER_ZONE_FAST_MIN_GAP", "12"))
-SNIPER_ZONE_FAST_MIN_SECONDS_AFTER_WATCH = float(os.getenv("SNIPER_ZONE_FAST_MIN_SECONDS_AFTER_WATCH", "3"))
-SNIPER_ZONE_FAST_MAX_SECONDS_AFTER_WATCH = float(os.getenv("SNIPER_ZONE_FAST_MAX_SECONDS_AFTER_WATCH", "45"))
-
-# توقيت Quotex للدقيقة المتحركة:
-# حسب التجربة على المنصة: إذا دخلنا خلال أول 30 ثانية من شمعة M1، تكون الصفقة دقيقة متحركة وتنتهي مع نهاية الشمعة الحالية.
-# بعد 30 ثانية غالبًا تتحول مدة الصفقة إلى 1:30، لذلك لا نرسل دخول مباشر متحرك بعد هذا الحد.
-SNIPER_DIRECT_CURRENT_CANDLE_MAX_ELAPSED_SECONDS = float(os.getenv("SNIPER_DIRECT_CURRENT_CANDLE_MAX_ELAPSED_SECONDS", "30"))
-# صفقات الشمعة القادمة: نرسل التأكيد قرب نهاية الشمعة الحالية فقط حتى تكون جاهز للدخول مع بداية الجديدة.
-SNIPER_NEXT_ENTRY_LEAD_SECONDS = float(os.getenv("SNIPER_NEXT_ENTRY_LEAD_SECONDS", "18"))
-SNIPER_NEXT_CONFIRMATION_REQUIRED = int(os.getenv("SNIPER_NEXT_CONFIRMATION_REQUIRED", "1"))
-SNIPER_NEXT_WATCH_MIN_SCORE = int(os.getenv("SNIPER_NEXT_WATCH_MIN_SCORE", "84"))
-SNIPER_NEXT_SIGNAL_MIN_SCORE = int(os.getenv("SNIPER_NEXT_SIGNAL_MIN_SCORE", "88"))
-# إذا أرسلنا تنبيه تجهيز للشمعة القادمة ثم تغيّر وقت الدخول المتوقع، نلغي الفرصة بدل أن يبقى البحث صافن لعدة شموع.
-SNIPER_NEXT_ENTRY_MAX_WATCH_SECONDS = float(os.getenv("SNIPER_NEXT_ENTRY_MAX_WATCH_SECONDS", "70"))
-SNIPER_SEARCH_TASKS: dict[int, dict] = {}
-
-
-def sniper_get_live_candles(symbol: str, limit: int = 20) -> list[dict]:
-    """Returns live M1 OTC candles from the Quotex feed cache."""
-    try:
-        with quotex_otc_feed.lock:
-            candle_map = dict(quotex_otc_feed.candles.get(symbol, {}) or {})
-        result = []
-        for bucket in sorted(candle_map.keys())[-limit:]:
-            c = dict(candle_map.get(bucket) or {})
-            if not c:
-                continue
-            result.append({
-                "time": datetime.fromtimestamp(float(c.get("bucket_ts", bucket)), tz=UTC),
-                "bucket_ts": float(c.get("bucket_ts", bucket)),
-                "open": float(c.get("open")),
-                "high": float(c.get("high")),
-                "low": float(c.get("low")),
-                "close": float(c.get("close")),
-                "ticks": int(c.get("ticks", 0) or 0),
-            })
-        return result
-    except Exception:
-        return []
-
-
-def sniper_price_round_step(price: float) -> float:
-    """Dynamic round-number step suitable for mixed OTC symbols."""
-    price = abs(float(price or 0))
-    if price >= 200:
-        return 0.5
-    if price >= 50:
-        return 0.25
-    if price >= 10:
-        return 0.10
-    if price >= 1:
-        return 0.01
-    if price >= 0.1:
-        return 0.001
-    return 0.0001
-
-
-def sniper_nearest_round(price: float) -> float:
-    step = sniper_price_round_step(price)
-    return round(float(price) / step) * step
-
-
-def sniper_price_fmt(value: float) -> str:
-    try:
-        value = float(value)
-        if abs(value) >= 100:
-            return f"{value:.5f}"
-        if abs(value) >= 1:
-            return f"{value:.5f}"
-        return f"{value:.6f}"
-    except Exception:
-        return str(value)
-
-
-def sniper_current_m1_timing() -> dict:
-    """يرجع توقيتنا داخل شمعة M1 الحالية حسب UTC+3.
-    direct_current_candle_ok=True فقط خلال أول 30 ثانية، لأن Quotex بعدها قد يحسب الصفقة 1:30 بدل انتهاء الشمعة.
-    next_entry_window=True قرب نهاية الشمعة الحالية لإشارات الشمعة القادمة.
-    """
-    try:
-        now_local = now_utc().astimezone(UTC_PLUS_3)
-        elapsed = float(now_local.second) + (float(now_local.microsecond) / 1_000_000.0)
-        remaining = max(0.0, 60.0 - elapsed)
-        return {
-            "elapsed": elapsed,
-            "remaining": remaining,
-            "direct_current_candle_ok": elapsed <= float(SNIPER_DIRECT_CURRENT_CANDLE_MAX_ELAPSED_SECONDS),
-            "next_entry_window": remaining <= float(SNIPER_NEXT_ENTRY_LEAD_SECONDS),
-            "next_entry_time": next_full_minute(now_utc()).astimezone(UTC_PLUS_3).strftime("%H:%M"),
-        }
-    except Exception:
-        return {
-            "elapsed": 999.0,
-            "remaining": 0.0,
-            "direct_current_candle_ok": False,
-            "next_entry_window": True,
-            "next_entry_time": next_full_minute(now_utc()).astimezone(UTC_PLUS_3).strftime("%H:%M"),
-        }
-
-
-def sniper_candle_metrics(candle: dict) -> dict:
-    o = float(candle.get("open"))
-    h = float(candle.get("high"))
-    l = float(candle.get("low"))
-    c = float(candle.get("close"))
-    rng = max(h - l, 1e-12)
-    body = abs(c - o)
-    upper = h - max(o, c)
-    lower = min(o, c) - l
-    return {
-        "range": rng,
-        "body": body,
-        "upper": upper,
-        "lower": lower,
-        "body_ratio": body / rng,
-        "upper_ratio": upper / rng,
-        "lower_ratio": lower / rng,
-        "bullish": c > o,
-        "bearish": c < o,
-    }
-
-
-def sniper_detect_levels(candles: list[dict], price: float) -> dict:
-    """Lightweight support/resistance and round-number detection for live OTC candles."""
-    closed = candles[:-1] if len(candles) > 1 else candles
-    recent = closed[-12:] if len(closed) >= 12 else closed
-    lows = [float(c["low"]) for c in recent]
-    highs = [float(c["high"]) for c in recent]
-    support = min(lows) if lows else None
-    resistance = max(highs) if highs else None
-    ranges = [max(float(c["high"]) - float(c["low"]), 1e-12) for c in recent]
-    avg_range = median(ranges) if ranges else max(abs(float(price)) * 0.0007, 1e-6)
-    touch = max(avg_range * 0.35, abs(float(price)) * 0.00005, 1e-7)
-    near = max(avg_range * 0.75, touch * 1.8)
-    rnd = sniper_nearest_round(price)
-    def state(level):
-        if level is None:
-            return "none", None
-        dist = abs(float(price) - float(level))
-        if dist <= touch:
-            return "touch", dist
-        if dist <= near:
-            return "near", dist
-        return "far", dist
-    support_state, support_dist = state(support)
-    resistance_state, resistance_dist = state(resistance)
-    round_state, round_dist = state(rnd)
-    return {
-        "support": support,
-        "resistance": resistance,
-        "round": rnd,
-        "avg_range": avg_range,
-        "touch": touch,
-        "near": near,
-        "support_state": support_state,
-        "support_dist": support_dist,
-        "resistance_state": resistance_state,
-        "resistance_dist": resistance_dist,
-        "round_state": round_state,
-        "round_dist": round_dist,
-    }
-
-
-def sniper_tick_pressure(rows: list[tuple]) -> dict:
-    sample = list(rows[-32:]) if len(rows) >= 32 else list(rows)
-    if len(sample) < 6:
-        return {"ok": False}
-    prices = [float(r[1]) for r in sample]
-    change = prices[-1] - prices[0]
-    rng = max(max(prices) - min(prices), 1e-12)
-    ups = sum(1 for a, b in zip(prices, prices[1:]) if b > a)
-    downs = sum(1 for a, b in zip(prices, prices[1:]) if b < a)
-    flats = max(0, len(prices) - 1 - ups - downs)
-    bias = "CALL" if change > 0 and ups >= downs else "PUT" if change < 0 and downs >= ups else "NONE"
-    consistency = max(ups, downs) / max(1, ups + downs + flats)
-    momentum = min(abs(change) / rng, 1.0)
-    return {
-        "ok": True,
-        "bias": bias,
-        "change": change,
-        "range": rng,
-        "ups": ups,
-        "downs": downs,
-        "flats": flats,
-        "consistency": consistency,
-        "momentum": momentum,
-    }
-
-
-def sniper_analyze_pair(pair: str, symbol: str, mode: str = "smart") -> dict | None:
-    """Deep OTC Sniper Pro scoring for a single live pair. Admin-only and independent from manual signals."""
-    try:
-        with quotex_otc_feed.lock:
-            rows = list(quotex_otc_feed.prices.get(symbol, []))
-            tick = dict(quotex_otc_feed.last_tick.get(symbol) or {})
-        if len(rows) < SNIPER_MIN_TICKS or not tick:
-            return None
-        price = float(tick.get("price"))
-        candles = sniper_get_live_candles(symbol, 20)
-        if len(candles) < SNIPER_MIN_CANDLES:
-            return None
-        current = candles[-1]
-        previous = candles[-2]
-        closed = candles[:-1]
-        levels = sniper_detect_levels(candles, price)
-        tickp = sniper_tick_pressure(rows)
-        if not tickp.get("ok"):
-            return None
-        timing = sniper_current_m1_timing()
-
-        recent_closed = closed[-6:] if len(closed) >= 6 else closed
-        first_close = float(recent_closed[0]["close"])
-        last_close = float(recent_closed[-1]["close"])
-        higher_closes = sum(1 for a, b in zip(recent_closed, recent_closed[1:]) if float(b["close"]) > float(a["close"]))
-        lower_closes = sum(1 for a, b in zip(recent_closed, recent_closed[1:]) if float(b["close"]) < float(a["close"]))
-        if last_close > first_close and higher_closes >= lower_closes:
-            trend = "CALL"
-        elif last_close < first_close and lower_closes >= higher_closes:
-            trend = "PUT"
-        else:
-            trend = "RANGE"
-
-        cur_m = sniper_candle_metrics(current)
-        prev_m = sniper_candle_metrics(previous)
-
-        call_score = 0
-        put_score = 0
-        call_reasons = []
-        put_reasons = []
-        blockers = []
-        entry_type = "next"
-        watch_hint = False
-
-        # Trend layer
-        if trend == "CALL":
-            call_score += 18
-            call_reasons.append("اتجاه قصير صاعد")
-        elif trend == "PUT":
-            put_score += 18
-            put_reasons.append("اتجاه قصير هابط")
-        else:
-            blockers.append("الاتجاه العام غير حاسم")
-
-        # Tick momentum layer
-        if tickp["bias"] == "CALL":
-            pts = 10 + int(tickp["momentum"] * 10) + int(tickp["consistency"] * 8)
-            call_score += pts
-            call_reasons.append("ضغط شرائي حي من آخر ticks")
-        elif tickp["bias"] == "PUT":
-            pts = 10 + int(tickp["momentum"] * 10) + int(tickp["consistency"] * 8)
-            put_score += pts
-            put_reasons.append("ضغط بيعي حي من آخر ticks")
-
-        # Candle psychology layer
-        if cur_m["lower_ratio"] >= 0.42 and price > float(current["open"]):
-            call_score += 20
-            call_reasons.append("رفض سفلي واضح من الشمعة الحالية")
-            entry_type = "direct"
-        if cur_m["upper_ratio"] >= 0.42 and price < float(current["open"]):
-            put_score += 20
-            put_reasons.append("رفض علوي واضح من الشمعة الحالية")
-            entry_type = "direct"
-        if prev_m["body_ratio"] >= 0.55 and prev_m["bullish"]:
-            call_score += 10
-            call_reasons.append("آخر شمعة مغلقة صاعدة ومتماسكة")
-        if prev_m["body_ratio"] >= 0.55 and prev_m["bearish"]:
-            put_score += 10
-            put_reasons.append("آخر شمعة مغلقة هابطة ومتماسكة")
-        if cur_m["body_ratio"] < 0.12 and max(cur_m["upper_ratio"], cur_m["lower_ratio"]) < 0.55:
-            blockers.append("شمعة حالية مترددة / دوجي")
-
-        # Support / resistance / round-number layer
-        support_touch = levels["support_state"] in {"touch", "near"}
-        resistance_touch = levels["resistance_state"] in {"touch", "near"}
-        round_touch = levels["round_state"] in {"touch", "near"}
-        zone_type = None
-        zone_side = None
-        zone_reversal_confirmed = False
-        if support_touch:
-            watch_hint = True
-            zone_type = zone_type or "support"
-            zone_side = zone_side or "CALL"
-            if cur_m["lower_ratio"] >= 0.35 or tickp["bias"] == "CALL":
-                call_score += 22
-                call_reasons.append("ارتداد/ملامسة دعم قريب")
-                entry_type = "direct"
-                # لمس دعم + أول ارتداد أو ضغط شرائي = فرصة ملامسة سريعة.
-                zone_reversal_confirmed = bool(tickp["bias"] == "CALL" or (cur_m["lower_ratio"] >= 0.30 and price >= float(current["open"])))
-            else:
-                put_score -= 12
-                blockers.append("PUT قريب من دعم حساس")
-        if resistance_touch:
-            watch_hint = True
-            zone_type = zone_type or "resistance"
-            zone_side = zone_side or "PUT"
-            if cur_m["upper_ratio"] >= 0.35 or tickp["bias"] == "PUT":
-                put_score += 22
-                put_reasons.append("رفض/ملامسة مقاومة قريبة")
-                entry_type = "direct"
-                # لمس مقاومة + أول رفض أو ضغط بيعي = فرصة ملامسة سريعة.
-                zone_reversal_confirmed = bool(tickp["bias"] == "PUT" or (cur_m["upper_ratio"] >= 0.30 and price <= float(current["open"])))
-            else:
-                call_score -= 12
-                blockers.append("CALL قريب من مقاومة حساسة")
-        if round_touch:
-            watch_hint = True
-            if zone_type is None:
-                zone_type = "round"
-            if cur_m["lower_ratio"] > cur_m["upper_ratio"] and tickp["bias"] == "CALL":
-                call_score += 10
-                call_reasons.append("تفاعل إيجابي قرب Round Number")
-                zone_side = zone_side or "CALL"
-                entry_type = "direct"
-                zone_reversal_confirmed = True
-            elif cur_m["upper_ratio"] > cur_m["lower_ratio"] and tickp["bias"] == "PUT":
-                put_score += 10
-                put_reasons.append("تفاعل سلبي قرب Round Number")
-                zone_side = zone_side or "PUT"
-                entry_type = "direct"
-                zone_reversal_confirmed = True
-            else:
-                call_score += 3
-                put_score += 3
-
-        # Next-candle continuation layer
-        # هذا يعطي Sniper Pro فرصة حقيقية لإشارات "الشمعة القادمة"، بدل أن تبقى كل الإشارات دخول مباشر فقط.
-        # نستخدمها عندما يكون الاتجاه + الشمعة المغلقة + ضغط ticks متوافقة بنفس الاتجاه.
-        if entry_type != "direct":
-            if trend == "CALL" and prev_m["bullish"] and tickp["bias"] == "CALL" and cur_m["upper_ratio"] < 0.45:
-                call_score += 14
-                call_reasons.append("استمرار صاعد مناسب للشمعة القادمة")
-                entry_type = "next"
-            elif trend == "PUT" and prev_m["bearish"] and tickp["bias"] == "PUT" and cur_m["lower_ratio"] < 0.45:
-                put_score += 14
-                put_reasons.append("استمرار هابط مناسب للشمعة القادمة")
-                entry_type = "next"
-
-        # Noise and volatility checks
-        severe_blockers = []
-        if tickp["consistency"] < 0.56 or tickp["momentum"] < 0.22:
-            blockers.append("الحركة الحية ضعيفة أو متقطعة")
-            severe_blockers.append("ضعف الحركة الحية")
-        if cur_m["body_ratio"] < 0.12 and max(cur_m["upper_ratio"], cur_m["lower_ratio"]) < 0.55:
-            severe_blockers.append("شمعة تردد")
-        if levels["avg_range"] <= 0:
-            blockers.append("التذبذب غير صالح")
-            severe_blockers.append("تذبذب غير صالح")
-
-        direction = "CALL" if call_score > put_score else "PUT"
-        raw_score = max(call_score, put_score)
-        opposite = min(call_score, put_score)
-        gap = raw_score - opposite
-        reasons = call_reasons if direction == "CALL" else put_reasons
-
-        # Score is intentionally strict: 99% should be rare and never appear with negative notes.
-        confluence = 55 + int(raw_score * 0.35) + int(min(35, gap) * 0.25)
-
-        # Mode and platform timing restrictions
-        # دخول مباشر متحرك فقط في أول 30 ثانية من الشمعة الحالية.
-        if entry_type == "direct" and not timing.get("direct_current_candle_ok", False):
-            if mode in {"smart", "next"}:
-                entry_type = "next"
-                blockers.append("انتهت نافذة الدخول المباشر لهذه الشمعة، التحويل للشمعة القادمة")
-                # لا نجعلها ملاحظة قاتلة؛ فقط نحولها لتوقيت الشمعة القادمة.
-                confluence -= 3
-            else:
-                blockers.append("توقيت الدخول المباشر غير مناسب الآن")
-                severe_blockers.append("توقيت دخول مباشر غير مناسب")
-                confluence -= 20
-
-        if mode == "direct" and entry_type != "direct":
-            confluence -= 12
-        if mode == "next" and entry_type == "direct":
-            confluence -= 10
-            entry_type = "next"
-
-        if gap < 18:
-            blockers.append("تعارض بين CALL و PUT")
-            severe_blockers.append("تعارض الاتجاهات")
-            confluence -= 14
-        if len(reasons) < 3:
-            blockers.append("التوافق التحليلي غير كافٍ")
-            confluence -= 10
-        if not reasons:
-            return None
-
-        confluence = int(max(0, min(97, confluence)))
-
-        # A normal signal must be clean. Negative notes become rejection/watch, not a high-confidence trade.
-        fatal_blockers = {"شمعة تردد", "تذبذب غير صالح", "تعارض الاتجاهات", "توقيت دخول مباشر غير مناسب"}
-        next_entry_window = bool(timing.get("next_entry_window", False))
-
-        clean_next_signal = (
-            entry_type == "next"
-            and next_entry_window
-            and confluence >= SNIPER_NEXT_SIGNAL_MIN_SCORE
-            and not any(b in fatal_blockers for b in severe_blockers)
-            and gap >= 18
-            and len(reasons) >= 3
-        )
-        clean_direct_signal = (
-            entry_type == "direct"
-            and bool(timing.get("direct_current_candle_ok", False))
-            and confluence >= SNIPER_MIN_SIGNAL_SCORE
-            and not severe_blockers
-            and len(blockers) == 0
-            and gap >= 20
-            and len(reasons) >= 3
-        )
-        clean_signal = clean_direct_signal or clean_next_signal
-
-        # Fast zone-touch signal: for دعم/مقاومة/Round Number touches.
-        # This is intentionally faster than normal confirmation because the entry may disappear within seconds.
-        # It still requires the direction to match the zone logic and enough analytical agreement.
-        fast_touch_signal = (
-            SNIPER_ZONE_FAST_ENTRY_ENABLED
-            and entry_type == "direct"
-            and bool(timing.get("direct_current_candle_ok", False))
-            and bool(watch_hint)
-            and bool(zone_reversal_confirmed)
-            and (zone_side in {None, direction})
-            and confluence >= SNIPER_ZONE_FAST_MIN_SCORE
-            and gap >= SNIPER_ZONE_FAST_MIN_GAP
-            and len(reasons) >= 2
-            and not any(b in fatal_blockers for b in severe_blockers)
-        )
-
-        zone_watch_ok = bool(watch_hint and confluence >= SNIPER_MIN_WATCH_SCORE)
-        next_watch_ok = bool(
-            entry_type == "next"
-            and confluence >= SNIPER_NEXT_WATCH_MIN_SCORE
-            and gap >= 15
-            and len(reasons) >= 3
-            and not any(b in fatal_blockers for b in severe_blockers)
-        )
-        watch_ok = zone_watch_ok or next_watch_ok
-        status = "signal" if (clean_signal or fast_touch_signal) else "watch" if watch_ok else "none"
-        if status == "none":
-            return None
-
-        entry_time = None
-        if entry_type == "next":
-            entry_time = timing.get("next_entry_time") or next_full_minute(now_utc()).astimezone(UTC_PLUS_3).strftime("%H:%M")
-
-        return {
-            "status": status,
-            "pair": pair,
-            "symbol": symbol,
-            "direction": direction,
-            "score": int(max(0, min(99, confluence))),
-            "price": price,
-            "entry_type": entry_type,
-            "entry_time": entry_time,
-            "reasons": reasons[:5],
-            "blockers": blockers[:3],
-            "levels": levels,
-            "setup_type": "zone_touch" if bool(watch_hint) and entry_type == "direct" else "normal",
-            "zone_type": zone_type,
-            "fast_touch": bool(fast_touch_signal),
-            "next_entry_window": bool(next_entry_window),
-            "direct_current_candle_ok": bool(timing.get("direct_current_candle_ok", False)),
-            "seconds_elapsed": float(timing.get("elapsed", 0.0) or 0.0),
-            "seconds_remaining": float(timing.get("remaining", 0.0) or 0.0),
-            "payout": int((quotex_otc_feed.instrument(symbol) or {}).get("payout", 0) or 0),
-        }
-    except Exception as e:
-        logger.exception("OTC Sniper pair analysis error | pair=%s symbol=%s: %s", pair, symbol, e)
-        return None
-
-
-def sniper_scan_market(mode: str = "smart") -> dict:
-    pair_map = get_otc_analysis_pair_map()
-    best_signal = None
-    best_watch = None
-    checked = 0
-    for pair, symbol in pair_map.items():
-        pair = normalize_otc_currency_pair_name(pair, symbol) or pair
-        if not is_valid_otc_currency_pair_name(pair):
-            continue
-        checked += 1
-        result = sniper_analyze_pair(pair, symbol, mode=mode)
-        if not result:
-            continue
-        if result.get("status") == "signal":
-            if best_signal is None or result["score"] > best_signal["score"]:
-                best_signal = result
-        elif result.get("status") == "watch":
-            if best_watch is None or result["score"] > best_watch["score"]:
-                best_watch = result
-    if best_signal:
-        best_signal["checked"] = checked
-        return best_signal
-    if best_watch:
-        best_watch["checked"] = checked
-        return best_watch
-    return {"status": "none", "checked": checked}
-
-
-def format_sniper_signal(result: dict) -> str:
-    direction = result.get("direction")
-    direction_icon = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
-    if result.get("entry_type") == "direct":
-        entry_title = "⚡ دخول مباشر الآن"
-        if result.get("fast_touch"):
-            entry_line = "⏱ الدخول: الآن لمدة دقيقة متحركة فقط إذا أنت ضمن أول 30 ثانية من الشمعة والسعر ما زال قريبًا من منطقة الارتداد"
-        else:
-            entry_line = "⏱ الدخول: الآن لمدة دقيقة متحركة فقط ضمن أول 30 ثانية من الشمعة الحالية"
-    else:
-        entry_title = "🕯 دخول الشمعة القادمة"
-        entry_line = f"⏱ الدخول: مع بداية الشمعة القادمة {result.get('entry_time') or ''} — جهّز الدخول عند افتتاح الشمعة".strip()
-    reasons = "\n".join(f"✅ {r}" for r in result.get("reasons", [])[:5]) or "✅ توافق تحليلي قوي"
-    blockers = ""
-    if result.get("blockers"):
-        blockers = "\n\n⚠️ ملاحظات:\n" + "\n".join(f"• {b}" for b in result.get("blockers", [])[:2])
-    return (
-        "🎯 OTC SNIPER PRO\n\n"
-        f"{entry_title}\n\n"
-        f"💱 الزوج: {result.get('pair')}\n"
-        "🧭 الفريم: M1\n"
-        f"📌 الاتجاه: {direction_icon}\n"
-        f"💵 السعر الحالي: {sniper_price_fmt(result.get('price'))}\n"
-        f"📊 قوة التوافق: {result.get('score')}%\n\n"
-        "🧠 التحليل:\n"
-        f"{reasons}"
-        f"{blockers}\n\n"
-        f"{entry_line}\n\n"
-        "🧪 وضع تجريبي للأدمن فقط"
-    )
-
-
-def format_sniper_watch(result: dict) -> str:
-    levels = result.get("levels") or {}
-    zone = "منطقة مهمة"
-    if levels.get("support_state") in {"touch", "near"}:
-        zone = f"دعم قريب {sniper_price_fmt(levels.get('support'))}"
-    elif levels.get("resistance_state") in {"touch", "near"}:
-        zone = f"مقاومة قريبة {sniper_price_fmt(levels.get('resistance'))}"
-    elif levels.get("round_state") in {"touch", "near"}:
-        zone = f"Round Number {sniper_price_fmt(levels.get('round'))}"
-    likely = "🟢 CALL" if result.get("direction") == "CALL" else "🔴 PUT"
-    if result.get("entry_type") == "next":
-        return (
-            "🎯 OTC Sniper Pro\n\n"
-            "⚠️ جهّز الزوج للشمعة القادمة:\n"
-            f"💱 {result.get('pair')}\n\n"
-            f"الاتجاه المحتمل إذا ثبت التوافق: {likely}\n"
-            f"وقت الدخول المتوقع: {result.get('entry_time') or 'بداية الشمعة القادمة'}\n"
-            f"قوة المراقبة الحالية: {result.get('score')}%\n\n"
-            "⏳ انتظر التأكيد في آخر ثواني قبل وقت الدخول...\n"
-            "إذا لم تكتمل الشروط قبل هذا الوقت سألغي الفرصة ولن أرسل دخولًا متأخرًا."
-        )
-    return (
-        "🎯 OTC Sniper Pro\n\n"
-        "⚠️ جهّز الزوج:\n"
-        f"💱 {result.get('pair')}\n\n"
-        f"السعر قريب من {zone}.\n"
-        f"الاتجاه المحتمل إذا اكتمل التوافق: {likely}\n"
-        f"قوة المراقبة الحالية: {result.get('score')}%\n\n"
-        "⏳ انتظر التأكيد...\n"
-        "إذا اكتملت شروط اللمسة ضمن توقيت المنصة سأرسل الدخول مباشرة."
-    )
-
-
-def build_sniper_intro_message() -> str:
-    return (
-        "🎯 OTC Sniper Pro\n\n"
-        "قسم تجريبي للأدمن فقط يبحث عن فرص OTC قوية عبر توافق عدة عوامل:\n"
-        "• دعم ومقاومة و Round Numbers\n"
-        "• شموع ورفض سعري\n"
-        "• ضغط ticks حي من Quotex\n"
-        "• استمرار أو دخول مباشر عند الملامسة\n"
-        "• توقيت منصة Quotex: الدخول المتحرك فقط ضمن أول 30 ثانية، وبعدها يتحول للشمعة القادمة\n\n"
-        "اختر طريقة البحث من الأزرار بالأسفل."
-    )
-
-
-def get_sniper_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
-    mode = str(context.user_data.get("sniper_mode") or "smart")
-    return mode if mode in {"smart", "direct", "next"} else "smart"
-
-
-def sniper_mode_label(mode: str) -> str:
-    return {"smart": "الوضع الذكي", "direct": "دخول مباشر", "next": "الشمعة القادمة"}.get(mode, "الوضع الذكي")
-
-
-async def sniper_search_worker(context: ContextTypes.DEFAULT_TYPE, user_id: int, mode: str = "smart"):
-    started_at = time_module.time()
-    expires_at = started_at + SNIPER_SEARCH_DURATION_SECONDS
-    active_key = None
-    active_pair = None
-    active_symbol = None
-    active_result = None
-    active_watch_started_at = None
-    prepare_alerts_sent = 0
-    confirmation_count = 0
-    try:
-        while time_module.time() < expires_at:
-            # إذا كنا نراقب فرصة "الشمعة القادمة" وانتهى وقتها أو تغيّر وقت الدخول المتوقع، لا ننتظر شمعتين وثلاث.
-            # نلغيها مباشرة حتى يكون سلوك Sniper Pro واضح وسريع.
-            if active_result and active_result.get("entry_type") == "next":
-                try:
-                    watch_age = time_module.time() - float(active_watch_started_at or started_at)
-                    current_next_time = sniper_current_m1_timing().get("next_entry_time")
-                    expected_time = active_result.get("entry_time")
-                    if (expected_time and current_next_time and current_next_time != expected_time) or watch_age > SNIPER_NEXT_ENTRY_MAX_WATCH_SECONDS:
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text=(
-                                "🎯 OTC Sniper Pro\n\n"
-                                "❌ انتهت فرصة الشمعة القادمة ولم تكتمل الشروط.\n\n"
-                                f"الزوج الذي تمت مراقبته: {active_result.get('pair') or 'غير معروف'}\n"
-                                f"وقت الدخول المتوقع كان: {expected_time or 'غير محدد'}\n\n"
-                                "لن أرسل دخولًا متأخرًا بعد مرور وقت الصفقة."
-                            ),
-                            reply_markup=sniper_pro_keyboard,
-                        )
-                        return
-                except Exception:
-                    pass
-
-            if active_key and active_pair and active_symbol:
-                # بعد تنبيه "جهّز الزوج" نراقب نفس الزوج فقط.
-                # هذا يمنع التشتت، والأهم يسمح بدخول الملامسة السريع قبل أن تهرب الحركة.
-                result = sniper_analyze_pair(active_pair, active_symbol, mode=mode) or {"status": "none"}
-            else:
-                result = sniper_scan_market(mode=mode)
-
-            status = result.get("status")
-
-            # IMPORTANT:
-            # Sniper Pro must not spam many "prepare pair" messages.
-            # It locks on ONE candidate per search. If that candidate fails to confirm,
-            # the search ends with "no strong opportunity" instead of switching between pairs.
-            if status in {"signal", "watch"}:
-                key = (result.get("symbol"), result.get("direction"), result.get("entry_type"))
-
-                if active_key is None:
-                    # إذا ظهرت فرصة الشمعة القادمة مكتملة فعلًا ونحن داخل نافذة آخر الثواني،
-                    # لا نرسل "جهّز" ثم نضيّع وقت الدخول؛ نرسل الصفقة مباشرة.
-                    if status == "signal" and result.get("entry_type") == "next" and result.get("next_entry_window"):
-                        await context.bot.send_message(
-                            chat_id=user_id,
-                            text=format_sniper_signal(result),
-                            reply_markup=sniper_pro_keyboard,
-                        )
-                        return
-
-                    active_key = key
-                    active_pair = result.get("pair")
-                    active_symbol = result.get("symbol")
-                    active_result = result
-                    active_watch_started_at = time_module.time()
-                    prepare_alerts_sent += 1
-                    confirmation_count = 1 if status == "signal" else 0
-                    await context.bot.send_message(
-                        chat_id=user_id,
-                        text=format_sniper_watch(result),
-                        reply_markup=sniper_pro_keyboard,
-                    )
-
-                elif key == active_key:
-                    active_result = result
-                    if status == "signal":
-                        confirmation_count += 1
-                        watch_age = time_module.time() - float(active_watch_started_at or started_at)
-
-                        # فرص ملامسة الدعم/المقاومة لازم تدخل بسرعة، لأن التأكيد الطويل يضيع الارتداد.
-                        if result.get("fast_touch"):
-                            enough_time_for_touch = watch_age >= SNIPER_ZONE_FAST_MIN_SECONDS_AFTER_WATCH
-                            still_fresh_touch = watch_age <= SNIPER_ZONE_FAST_MAX_SECONDS_AFTER_WATCH
-                            if enough_time_for_touch and still_fresh_touch:
-                                await context.bot.send_message(
-                                    chat_id=user_id,
-                                    text=format_sniper_signal(result),
-                                    reply_markup=sniper_pro_keyboard,
-                                )
-                                return
-
-                        # صفقات الشمعة القادمة لا يجوز أن تتأخر: إذا اكتملت داخل نافذة آخر الثواني نرسلها فورًا.
-                        if result.get("entry_type") == "next" and result.get("next_entry_window"):
-                            await context.bot.send_message(
-                                chat_id=user_id,
-                                text=format_sniper_signal(result),
-                                reply_markup=sniper_pro_keyboard,
-                            )
-                            return
-
-                        # الفرص العادية تبقى تحتاج تأكيدات أكثر.
-                        enough_confirmations = confirmation_count >= SNIPER_CONFIRMATION_REQUIRED
-                        enough_time = (time_module.time() - started_at) >= SNIPER_MIN_SECONDS_BEFORE_SIGNAL
-                        if enough_confirmations and enough_time:
-                            await context.bot.send_message(
-                                chat_id=user_id,
-                                text=format_sniper_signal(result),
-                                reply_markup=sniper_pro_keyboard,
-                            )
-                            return
-
-                else:
-                    # A different pair may look interesting, but we don't alert it in the same run.
-                    # This keeps the admin experience clean: one candidate, then confirm or fail.
-                    pass
-
-            await asyncio.sleep(SNIPER_SCAN_INTERVAL_SECONDS)
-
-        if active_result:
-            pair = active_result.get("pair") or "غير معروف"
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=(
-                    "🎯 OTC Sniper Pro\n\n"
-                    "❌ لم تكتمل فرصة الدخول.\n\n"
-                    f"تمت مراقبة الزوج: {pair}\n"
-                    "لكن الشروط لم تثبت بشكل كافٍ، لذلك لم يتم إرسال صفقة.\n"
-                    "الأفضل الانتظار بدل الدخول العشوائي."
-                ),
-                reply_markup=sniper_pro_keyboard,
-            )
-        else:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text=(
-                    "🎯 OTC Sniper Pro\n\n"
-                    "❌ لم تظهر فرصة قوية خلال مدة البحث.\n\n"
-                    "السوق الحالي غير واضح أو الشروط لم تكتمل.\n"
-                    "الأفضل الانتظار بدل الدخول العشوائي."
-                ),
-                reply_markup=sniper_pro_keyboard,
-            )
-    except asyncio.CancelledError:
-        try:
-            await context.bot.send_message(chat_id=user_id, text="🛑 تم إيقاف بحث OTC Sniper Pro.", reply_markup=sniper_pro_keyboard)
-        except Exception:
-            pass
-        raise
-    except Exception as e:
-        logger.exception("OTC Sniper search worker error: %s", e)
-        try:
-            await context.bot.send_message(chat_id=user_id, text=f"❌ حدث خطأ في OTC Sniper Pro:\n{e}", reply_markup=sniper_pro_keyboard)
-        except Exception:
-            pass
-    finally:
-        try:
-            item = SNIPER_SEARCH_TASKS.get(int(user_id)) or {}
-            task = item.get("task")
-            if task is asyncio.current_task():
-                SNIPER_SEARCH_TASKS.pop(int(user_id), None)
-        except Exception:
-            pass
-
-async def start_sniper_search(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str | None = None):
-    user_id = int(update.effective_user.id)
-    mode = mode or get_sniper_mode(context)
-    old = SNIPER_SEARCH_TASKS.get(user_id) or {}
-    old_task = old.get("task")
-    if old_task and not old_task.done():
-        await update.message.reply_text("ℹ️ يوجد بحث Sniper Pro نشط بالفعل. أوقفه أولًا أو انتظر النتيجة.", reply_markup=sniper_pro_keyboard)
-        return
-    task = asyncio.create_task(sniper_search_worker(context, user_id, mode=mode))
-    SNIPER_SEARCH_TASKS[user_id] = {"task": task, "started_at": time_module.time(), "mode": mode}
-    await update.message.reply_text(
-        "🎯 OTC Sniper Pro\n\n"
-        f"جاري فحص سوق OTC...\n"
-        f"وضع البحث: {sniper_mode_label(mode)}\n\n"
-        "يتم الآن مراقبة الأزواج الحية والبحث عن فرصة قوية.\n"
-        "إذا ظهرت فرصة مناسبة سأرسل لك تنبيه تجهيز أولًا، ثم صفقة الدخول بعد التأكيد.",
-        reply_markup=sniper_pro_keyboard,
-    )
-
-
-async def stop_sniper_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = int(update.effective_user.id)
-    item = SNIPER_SEARCH_TASKS.pop(user_id, None)
-    task = (item or {}).get("task")
-    if task and not task.done():
-        task.cancel()
-        await update.message.reply_text("🛑 تم طلب إيقاف البحث.", reply_markup=sniper_pro_keyboard)
-    else:
-        await update.message.reply_text("ℹ️ لا يوجد بحث Sniper Pro نشط حاليًا.", reply_markup=sniper_pro_keyboard)
-
-
-def format_sniper_status(user_id: int) -> str:
-    item = SNIPER_SEARCH_TASKS.get(int(user_id)) or {}
-    task = item.get("task")
-    if not task or task.done():
-        return "🎯 OTC Sniper Pro\n\nالحالة: لا يوجد بحث نشط حاليًا."
-    started = float(item.get("started_at") or time_module.time())
-    elapsed = int(time_module.time() - started)
-    remaining = max(0, int(SNIPER_SEARCH_DURATION_SECONDS - elapsed))
-    return (
-        "🎯 OTC Sniper Pro\n\n"
-        "الحالة: بحث نشط ✅\n"
-        f"الوضع: {sniper_mode_label(item.get('mode', 'smart'))}\n"
-        f"المدة المتبقية: {remaining // 60:02d}:{remaining % 60:02d}\n"
-        f"الفحص كل: {SNIPER_SCAN_INTERVAL_SECONDS} ثواني\n"
-        f"حد الفرصة: {SNIPER_MIN_SIGNAL_SCORE}%"
-    )
-
-
-
 def stable_direction(*args, **kwargs):
     return get_stable_direction(*args, **kwargs)
 
@@ -3824,6 +3007,526 @@ def analyze_best_live_otc_now(lang: str = "ar") -> dict:
         "entry_time": entry_dt.isoformat(),
         "message": msg,
     }
+
+
+# ===== Admin Experimental Trading Session Room =====
+TRADING_ROOM_ADMIN_ONLY = True
+TRADING_ROOM_SCAN_SECONDS = int(os.getenv("TRADING_ROOM_SCAN_SECONDS", "300"))
+TRADING_ROOM_SCAN_INTERVAL_SECONDS = int(os.getenv("TRADING_ROOM_SCAN_INTERVAL_SECONDS", "5"))
+TRADING_ROOM_RESULT_DELAY_SECONDS = int(os.getenv("TRADING_ROOM_RESULT_DELAY_SECONDS", "70"))
+TRADING_ROOM_MIN_PAIR_SCORE = int(os.getenv("TRADING_ROOM_MIN_PAIR_SCORE", "62"))
+TRADING_ROOM_MIN_ENTRY_SCORE = int(os.getenv("TRADING_ROOM_MIN_ENTRY_SCORE", "68"))
+TRADING_ROOM_MAX_EXTRA_RECOVERY = int(os.getenv("TRADING_ROOM_MAX_EXTRA_RECOVERY", "1"))
+TRADING_ROOM_MIN_TICKS = int(os.getenv("TRADING_ROOM_MIN_TICKS", "35"))
+TRADING_ROOM_MIN_CANDLES = int(os.getenv("TRADING_ROOM_MIN_CANDLES", "4"))
+TRADING_ROOM_DIRECT_ENTRY_MAX_SECOND = int(os.getenv("TRADING_ROOM_DIRECT_ENTRY_MAX_SECOND", "30"))
+
+
+def trading_room_key(admin_id: int) -> str:
+    return f"trading_room:{int(admin_id)}"
+
+
+def get_trading_room_state(context: ContextTypes.DEFAULT_TYPE, admin_id: int) -> dict:
+    return context.bot_data.setdefault(trading_room_key(admin_id), {})
+
+
+def clear_trading_room_state(context: ContextTypes.DEFAULT_TYPE, admin_id: int):
+    try:
+        context.bot_data.pop(trading_room_key(admin_id), None)
+    except Exception:
+        pass
+
+
+def parse_balance_amount(text: str) -> float | None:
+    try:
+        cleaned = str(text or "").strip().replace("$", "").replace(",", ".")
+        cleaned = re.sub(r"[^0-9\.]", "", cleaned)
+        if not cleaned:
+            return None
+        value = float(cleaned)
+        if value <= 0:
+            return None
+        return value
+    except Exception:
+        return None
+
+
+def build_session_money_plan(balance: float) -> dict:
+    balance = float(balance)
+    # إدارة مالية بسيطة وآمنة للجلسة التجريبية: 2% من الرصيد، مع حد أدنى عملي.
+    risk_percent = 0.02
+    trade_amount = max(1.0, round(balance * risk_percent, 2))
+    if balance < 50:
+        max_trades = 3
+    elif balance < 200:
+        max_trades = 4
+    else:
+        max_trades = 5
+    return {
+        "balance": balance,
+        "risk_percent": risk_percent,
+        "trade_amount": trade_amount,
+        "max_trades": max_trades,
+        "max_planned_risk": round(trade_amount * max_trades, 2),
+    }
+
+
+def _safe_price_text(pair: str, price: float) -> str:
+    try:
+        return f"{float(price):.5f}" if "JPY" not in str(pair) else f"{float(price):.3f}"
+    except Exception:
+        return str(price)
+
+
+def _get_otc_rows_and_candles(symbol: str):
+    try:
+        with quotex_otc_feed.lock:
+            rows = list(quotex_otc_feed.prices.get(symbol, []))
+            last_tick = dict(quotex_otc_feed.last_tick.get(symbol) or {})
+            candles_map = dict((quotex_otc_feed.candles.get(symbol) or {}))
+        candles = [dict(c) for _, c in sorted(candles_map.items())]
+        return rows, last_tick, candles
+    except Exception:
+        return [], {}, []
+
+
+def analyze_pair_for_trading_room(pair: str, symbol: str) -> dict | None:
+    """قراءة خفيفة لاختيار زوج مناسب لجلسة واحدة، وليس لتوليد إشارات المستخدمين."""
+    rows, last_tick, candles = _get_otc_rows_and_candles(symbol)
+    if len(rows) < TRADING_ROOM_MIN_TICKS or not last_tick or len(candles) < TRADING_ROOM_MIN_CANDLES:
+        return None
+
+    try:
+        current_price = float(last_tick.get("price"))
+    except Exception:
+        return None
+
+    instrument = quotex_otc_feed.instrument(symbol)
+    payout = int(instrument.get("payout", 0) or 0) if instrument else 0
+    if instrument and payout and payout < OTC_LIVE_MIN_PAYOUT:
+        return None
+
+    recent_ticks = rows[-45:] if len(rows) >= 45 else rows
+    prices = [float(r[1]) for r in recent_ticks]
+    if len(prices) < 12:
+        return None
+
+    tick_range = max(prices) - min(prices)
+    if tick_range <= 0:
+        return None
+    tick_change = prices[-1] - prices[0]
+    up_moves = sum(1 for a, b in zip(prices, prices[1:]) if b > a)
+    down_moves = sum(1 for a, b in zip(prices, prices[1:]) if b < a)
+    total_moves = max(1, up_moves + down_moves)
+    pressure = (up_moves - down_moves) / total_moves
+    direction = "CALL" if tick_change > 0 and pressure > 0.08 else "PUT" if tick_change < 0 and pressure < -0.08 else None
+
+    recent_closed = candles[-7:-1] if len(candles) >= 7 else candles[:-1]
+    if len(recent_closed) < 3:
+        return None
+
+    bodies = []
+    ranges = []
+    candle_dirs = []
+    for c in recent_closed[-6:]:
+        try:
+            o = float(c.get("open")); h = float(c.get("high")); l = float(c.get("low")); cl = float(c.get("close"))
+        except Exception:
+            continue
+        rng = max(h - l, 0.0)
+        body = abs(cl - o)
+        if rng > 0:
+            ranges.append(rng)
+            bodies.append(body / rng)
+        candle_dirs.append(1 if cl > o else -1 if cl < o else 0)
+
+    if not ranges:
+        return None
+
+    avg_body = sum(bodies) / max(1, len(bodies))
+    rhythm = abs(sum(candle_dirs[-4:])) / max(1, len(candle_dirs[-4:]))
+    noise = 1.0 - min(abs(pressure), 1.0)
+    momentum = min(abs(tick_change) / tick_range, 1.0)
+
+    # استراتيجية الجلسة: إذا السوق ناعم وواضح نختار استمرار، وإذا فيه تبادل شموع نراقب رد الفعل.
+    if direction and rhythm >= 0.50 and avg_body >= 0.38:
+        strategy = "استمرار زخم قصير"
+        strategy_type = "continuation"
+    elif rhythm < 0.50 and avg_body >= 0.28 and direction:
+        strategy = "اقتناص ارتداد قصير"
+        strategy_type = "reaction"
+    else:
+        strategy = "مراقبة فقط"
+        strategy_type = "watch"
+
+    score = int(round(momentum * 35 + abs(pressure) * 30 + avg_body * 20 + rhythm * 10 + min(payout or 80, 95) / 95 * 5))
+    if strategy_type == "watch":
+        score -= 8
+    score = max(0, min(100, score))
+
+    if score < TRADING_ROOM_MIN_PAIR_SCORE or not direction:
+        return None
+
+    return {
+        "pair": pair,
+        "symbol": symbol,
+        "score": score,
+        "price": current_price,
+        "direction_hint": direction,
+        "payout": payout,
+        "strategy": strategy,
+        "strategy_type": strategy_type,
+        "momentum": round(momentum, 2),
+        "pressure": round(pressure, 2),
+        "avg_body": round(avg_body, 2),
+        "rhythm": round(rhythm, 2),
+        "noise": round(noise, 2),
+    }
+
+
+def select_trading_room_pair() -> dict | None:
+    pair_map = get_otc_analysis_pair_map()
+    candidates = []
+    for pair, symbol in pair_map.items():
+        normalized = normalize_otc_currency_pair_name(pair, symbol)
+        if not normalized or not is_valid_otc_currency_pair_name(normalized):
+            continue
+        result = analyze_pair_for_trading_room(normalized, symbol)
+        if result:
+            candidates.append(result)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x.get("score", 0), int(x.get("payout", 0) or 0)), reverse=True)
+    return candidates[0]
+
+
+def analyze_trading_room_entry(state: dict) -> dict:
+    pair = state.get("pair")
+    symbol = state.get("symbol")
+    strategy_type = state.get("strategy_type") or "continuation"
+    if not pair or not symbol:
+        return {"ok": False, "reason": "لم يتم اختيار زوج للجلسة"}
+
+    rows, last_tick, candles = _get_otc_rows_and_candles(symbol)
+    if len(rows) < 20 or not last_tick or len(candles) < 3:
+        return {"ok": False, "reason": "بيانات الزوج غير كافية الآن"}
+
+    try:
+        price = float(last_tick.get("price"))
+    except Exception:
+        return {"ok": False, "reason": "تعذر قراءة السعر الحالي"}
+
+    sample = rows[-20:]
+    prices = [float(r[1]) for r in sample]
+    rng = max(prices) - min(prices)
+    if rng <= 0:
+        return {"ok": False, "reason": "الحركة ثابتة جدًا"}
+    change = prices[-1] - prices[0]
+    up = sum(1 for a, b in zip(prices, prices[1:]) if b > a)
+    down = sum(1 for a, b in zip(prices, prices[1:]) if b < a)
+    total = max(1, up + down)
+    pressure = (up - down) / total
+    momentum = min(abs(change) / rng, 1.0)
+
+    candle = candles[-1] if candles else {}
+    try:
+        o = float(candle.get("open")); h = float(candle.get("high")); l = float(candle.get("low")); cl = float(candle.get("close"))
+        crange = max(h - l, 0.0)
+        body_ratio = abs(cl - o) / crange if crange > 0 else 0.0
+        upper_wick = (h - max(o, cl)) / crange if crange > 0 else 0.0
+        lower_wick = (min(o, cl) - l) / crange if crange > 0 else 0.0
+    except Exception:
+        body_ratio = upper_wick = lower_wick = 0.0
+
+    direction = None
+    setup = ""
+    entry_mode = "next_candle"
+    seconds = now_utc().astimezone(UTC_PLUS_3).second
+
+    # المنصة: الدخول المتحرك M1 صالح فقط في أول 30 ثانية من الشمعة.
+    direct_allowed = seconds <= TRADING_ROOM_DIRECT_ENTRY_MAX_SECOND
+
+    if strategy_type == "reaction" and direct_allowed:
+        # رد فعل سريع: ذيل أو ضغط عكسي داخل أول نصف الشمعة.
+        if lower_wick >= 0.34 and pressure > 0.10:
+            direction = "CALL"; setup = "ارتداد سريع داخل الشمعة"; entry_mode = "direct"
+        elif upper_wick >= 0.34 and pressure < -0.10:
+            direction = "PUT"; setup = "رفض سريع داخل الشمعة"; entry_mode = "direct"
+    
+    if direction is None:
+        # استمرار أو دخول الشمعة القادمة: نفضل قرب نهاية الشمعة.
+        if change > 0 and pressure > 0.16 and momentum >= 0.45 and upper_wick < 0.45:
+            direction = "CALL"; setup = "استمرار زخم صاعد"; entry_mode = "next_candle" if seconds >= 38 else "wait"
+        elif change < 0 and pressure < -0.16 and momentum >= 0.45 and lower_wick < 0.45:
+            direction = "PUT"; setup = "استمرار زخم هابط"; entry_mode = "next_candle" if seconds >= 38 else "wait"
+
+    if direction is None:
+        return {"ok": False, "reason": "لا يوجد نمط دخول واضح الآن"}
+
+    score = int(round(momentum * 35 + abs(pressure) * 35 + body_ratio * 20 + 10))
+    if entry_mode == "wait":
+        return {"ok": False, "watch": True, "reason": "النمط موجود لكن ننتظر توقيت الدخول المناسب", "score": score, "direction": direction}
+    if score < TRADING_ROOM_MIN_ENTRY_SCORE:
+        return {"ok": False, "reason": f"قوة النمط غير كافية الآن ({score}%)"}
+
+    entry_dt = now_utc() if entry_mode == "direct" else next_full_minute(now_utc())
+    return {
+        "ok": True,
+        "pair": pair,
+        "symbol": symbol,
+        "direction": direction,
+        "entry_mode": entry_mode,
+        "setup": setup,
+        "score": min(score, 94),
+        "price": price,
+        "entry_ts": entry_dt.timestamp(),
+        "entry_time_text": format_utc_plus_3(entry_dt),
+    }
+
+
+def build_trading_room_intro(plan: dict) -> str:
+    return (
+        "🧠 غرفة جلسة تداول\n\n"
+        f"💰 الرصيد المسجل: {plan['balance']:.2f}$\n"
+        f"📌 دخول الصفقة المقترح: {plan['trade_amount']:.2f}$\n"
+        f"📊 عدد صفقات الجلسة: {plan['max_trades']} صفقات\n"
+        f"🛡 الخطر المخطط للجلسة: {plan['max_planned_risk']:.2f}$ تقريبًا\n\n"
+        "سأفحص أزواج OTC الحية، أختار زوجًا مناسبًا للجلسة، ثم أراقبه فقط خلال الجلسة.\n"
+        "هذه الميزة تجريبية للأدمن فقط الآن."
+    )
+
+
+def build_trading_room_state_message(state: dict) -> str:
+    if not state or not state.get("active"):
+        return "📊 لا توجد جلسة تداول نشطة الآن."
+    lines = [
+        "📊 حالة غرفة جلسة التداول",
+        "━━━━━━━━━━━━━━",
+        f"الحالة: {'بانتظار نتيجة صفقة' if state.get('waiting_result') else 'تبحث عن دخول'}",
+        f"الزوج: {state.get('pair') or 'لم يحدد بعد'}",
+        f"الاستراتيجية الحالية: {state.get('strategy') or 'قيد القراءة'}",
+        f"الرصيد: {float(state.get('balance', 0) or 0):.2f}$",
+        f"دخول الصفقة: {float(state.get('trade_amount', 0) or 0):.2f}$",
+        f"الصفقات المنفذة: {int(state.get('trades_done', 0) or 0)} / {int(state.get('max_trades', 0) or 0)}",
+        f"النتائج: {int(state.get('wins', 0) or 0)} ربح / {int(state.get('losses', 0) or 0)} خسارة",
+    ]
+    if state.get("last_reason"):
+        lines.append(f"آخر قراءة: {state.get('last_reason')}")
+    return "\n".join(lines)
+
+
+async def start_trading_room_session(update: Update, context: ContextTypes.DEFAULT_TYPE, balance: float):
+    admin_id = int(update.effective_user.id)
+    plan = build_session_money_plan(balance)
+    state = {
+        "active": True,
+        "admin_id": admin_id,
+        "balance": plan["balance"],
+        "trade_amount": plan["trade_amount"],
+        "max_trades": plan["max_trades"],
+        "wins": 0,
+        "losses": 0,
+        "trades_done": 0,
+        "extra_recovery_used": 0,
+        "waiting_result": False,
+        "started_at": time_module.time(),
+        "expires_at": time_module.time() + TRADING_ROOM_SCAN_SECONDS,
+    }
+    context.bot_data[trading_room_key(admin_id)] = state
+    await update.message.reply_text(build_trading_room_intro(plan), reply_markup=trading_room_keyboard)
+
+    selected = select_trading_room_pair()
+    if not selected:
+        state["active"] = False
+        await update.message.reply_text(
+            "❌ لم أجد زوجًا مناسبًا للجلسة الآن.\n\nالبيانات الحية غير كافية أو السوق غير واضح. جرّب بعد قليل.",
+            reply_markup=trading_room_keyboard
+        )
+        return
+
+    state.update(selected)
+    state["last_reason"] = "تم اختيار زوج الجلسة"
+    await update.message.reply_text(
+        "🎯 تم اختيار زوج الجلسة\n\n"
+        f"💱 الزوج: {selected['pair']}\n"
+        f"📊 قوة قراءة الزوج: {selected['score']}%\n"
+        f"🧠 نمط الجلسة: {selected['strategy']}\n"
+        f"💵 السعر الحالي: {_safe_price_text(selected['pair'], selected['price'])}\n\n"
+        "افتح هذا الزوج وجهّزه. سأراقبه وأرسل لك الدخول عند ظهور نمط مناسب.",
+        reply_markup=trading_room_keyboard
+    )
+    try:
+        context.job_queue.run_repeating(
+            trading_room_scan_job,
+            interval=TRADING_ROOM_SCAN_INTERVAL_SECONDS,
+            first=2,
+            data={"admin_id": admin_id},
+            name=f"trading_room_scan_{admin_id}_{int(time_module.time())}",
+        )
+    except Exception as e:
+        logger.exception("Could not start trading room scan job: %s", e)
+
+
+async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data or {}
+    admin_id = int(data.get("admin_id") or 0)
+    state = get_trading_room_state(context, admin_id)
+    if not state or not state.get("active"):
+        try:
+            context.job.schedule_removal()
+        except Exception:
+            pass
+        return
+
+    if state.get("waiting_result"):
+        return
+
+    if time_module.time() > float(state.get("expires_at", 0) or 0):
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text="⌛ انتهى وقت مراقبة الجلسة بدون ظهور دخول مناسب.\n\nالأفضل نوقف هنا بدل الدخول العشوائي.",
+            reply_markup=trading_room_keyboard
+        )
+        state["active"] = False
+        try:
+            context.job.schedule_removal()
+        except Exception:
+            pass
+        return
+
+    analysis = analyze_trading_room_entry(state)
+    if not analysis.get("ok"):
+        state["last_reason"] = analysis.get("reason", "لا يوجد دخول الآن")
+        return
+
+    direction = analysis["direction"]
+    entry_mode = analysis["entry_mode"]
+    entry_text = "⚡ دخول مباشر الآن لمدة دقيقة متحركة" if entry_mode == "direct" else f"🕯 دخول الشمعة القادمة عند {analysis['entry_time_text']}"
+    dir_line = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
+    state.update({
+        "waiting_result": True,
+        "current_trade": analysis,
+        "trades_done": int(state.get("trades_done", 0) or 0) + 1,
+    })
+
+    await context.bot.send_message(
+        chat_id=admin_id,
+        text=(
+            "🧠 غرفة جلسة تداول\n\n"
+            f"{entry_text}\n\n"
+            f"💱 الزوج: {analysis['pair']}\n"
+            "🧭 المدة: M1\n"
+            f"📌 الاتجاه: {dir_line}\n"
+            f"💵 السعر الحالي: {_safe_price_text(analysis['pair'], analysis['price'])}\n"
+            f"📊 قوة النمط: {analysis['score']}%\n"
+            f"📌 نمط الدخول: {analysis['setup']}\n\n"
+            f"💰 دخول الصفقة المقترح: {float(state.get('trade_amount', 0) or 0):.2f}$\n"
+            "⚠️ تجريبي للأدمن فقط. التزم بإدارة رأس المال."
+        ),
+        reply_markup=trading_room_keyboard
+    )
+
+    try:
+        context.job_queue.run_once(
+            trading_room_result_job,
+            when=TRADING_ROOM_RESULT_DELAY_SECONDS,
+            data={"admin_id": admin_id, "trade": analysis},
+            name=f"trading_room_result_{admin_id}_{int(time_module.time())}",
+        )
+    except Exception as e:
+        logger.exception("Could not schedule trading room result job: %s", e)
+
+
+async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data or {}
+    admin_id = int(data.get("admin_id") or 0)
+    trade = data.get("trade") or {}
+    state = get_trading_room_state(context, admin_id)
+    if not state or not state.get("active"):
+        return
+
+    symbol = trade.get("symbol")
+    pair = trade.get("pair")
+    direction = trade.get("direction")
+    try:
+        entry_price = float(trade.get("price"))
+    except Exception:
+        entry_price = None
+
+    last_price = None
+    try:
+        tick = quotex_otc_feed.snapshot(symbol)
+        last_price = float(tick.get("price"))
+    except Exception:
+        pass
+
+    if entry_price is None or last_price is None:
+        state["waiting_result"] = False
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text="⚠️ تعذر حساب نتيجة الصفقة بسبب نقص بيانات السعر. سنكمل مراقبة الجلسة.",
+            reply_markup=trading_room_keyboard
+        )
+        return
+
+    eps = OTC_LIVE_TIE_EPSILON
+    win = (last_price > entry_price + eps) if direction == "CALL" else (last_price < entry_price - eps)
+    state["waiting_result"] = False
+
+    if win:
+        state["wins"] = int(state.get("wins", 0) or 0) + 1
+        result_line = "✅ مبروك، الصفقة ربحت"
+    else:
+        state["losses"] = int(state.get("losses", 0) or 0) + 1
+        result_line = "❌ معوضة، الصفقة خسرت"
+
+    net = int(state.get("wins", 0) or 0) - int(state.get("losses", 0) or 0)
+    trades_done = int(state.get("trades_done", 0) or 0)
+    max_trades = int(state.get("max_trades", 0) or 0)
+
+    await context.bot.send_message(
+        chat_id=admin_id,
+        text=(
+            f"{result_line}\n\n"
+            f"💱 الزوج: {pair}\n"
+            f"📌 الاتجاه: {'🟢 CALL' if direction == 'CALL' else '🔴 PUT'}\n"
+            f"سعر الدخول: {_safe_price_text(str(pair), entry_price)}\n"
+            f"سعر الإغلاق التقريبي: {_safe_price_text(str(pair), last_price)}\n\n"
+            f"📊 نتيجة الجلسة الآن: {state.get('wins', 0)} ربح / {state.get('losses', 0)} خسارة"
+        ),
+        reply_markup=trading_room_keyboard
+    )
+
+    should_finish = False
+    finish_reason = ""
+    if trades_done >= max_trades:
+        if net < 0 and int(state.get("extra_recovery_used", 0) or 0) < TRADING_ROOM_MAX_EXTRA_RECOVERY:
+            state["extra_recovery_used"] = int(state.get("extra_recovery_used", 0) or 0) + 1
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    "🔁 الجلسة فيها خسارة غير معوضة.\n"
+                    "سأسمح بمحاولة تعويض واحدة إضافية فقط إذا ظهرت فرصة قوية، بدون تهور."
+                ),
+                reply_markup=trading_room_keyboard
+            )
+        else:
+            should_finish = True
+            finish_reason = "وصلنا لعدد صفقات الجلسة المحدد."
+
+    if should_finish:
+        state["active"] = False
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=(
+                "🏁 انتهت جلسة التداول\n\n"
+                f"السبب: {finish_reason}\n"
+                f"النتيجة النهائية: {state.get('wins', 0)} ربح / {state.get('losses', 0)} خسارة\n\n"
+                "الأفضل نرتاح الآن. إذا بدك جلسة جديدة، خليها بعد 3 ساعات على الأقل."
+            ),
+            reply_markup=trading_room_keyboard
+        )
+
 
 
 # ===== OTC LIVE CHANNEL AUTOPUBLISH =====
@@ -8260,7 +7963,6 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
             [
                 ["📊 توليد إشارات"],
                 ["👤 حالة حسابي", "📞 تواصل مع المسؤول"],
-                ["🎯 OTC Sniper Pro"],
                 ["🌐 تغيير اللغة", "🛠 لوحة الأدمن"],
             ],
             resize_keyboard=True
@@ -10299,9 +10001,56 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+
+    # ===== Admin experimental trading session room =====
+    if is_admin(user.id) and text == "🧠 غرفة جلسة تداول":
+        reset_signal_state(context)
+        await update.message.reply_text(
+            "🧠 غرفة جلسة تداول\n\n"
+            "قسم تجريبي للأدمن فقط.\n"
+            "البوت يجهز جلسة تداول OTC كاملة: يسجل الرصيد، يقترح دخول الصفقة، يختار زوجًا للجلسة، ثم يراقب ويعطي صفقات الجلسة حسب نمط السوق الحالي.",
+            reply_markup=trading_room_keyboard
+        )
+        return
+
+    if is_admin(user.id) and text == "🚀 بدء جلسة تداول":
+        context.user_data["step"] = "trading_room_waiting_balance"
+        await update.message.reply_text(
+            "💰 اكتب رصيد الحساب الحالي بالدولار.\n\nمثال: 50 أو 120.5",
+            reply_markup=trading_room_keyboard
+        )
+        return
+
+    if is_admin(user.id) and text == "📊 حالة الجلسة":
+        await update.message.reply_text(
+            build_trading_room_state_message(get_trading_room_state(context, user.id)),
+            reply_markup=trading_room_keyboard
+        )
+        return
+
+    if is_admin(user.id) and text == "🛑 إيقاف الجلسة":
+        clear_trading_room_state(context, user.id)
+        await update.message.reply_text(
+            "🛑 تم إيقاف جلسة التداول التجريبية.",
+            reply_markup=trading_room_keyboard
+        )
+        return
+
+    if is_admin(user.id) and step == "trading_room_waiting_balance":
+        balance = parse_balance_amount(text)
+        if balance is None:
+            await update.message.reply_text(
+                "❌ لم أفهم الرصيد. اكتب رقم فقط، مثال: 50 أو 120.5",
+                reply_markup=trading_room_keyboard
+            )
+            return
+        context.user_data["step"] = None
+        await start_trading_room_session(update, context, balance)
+        return
+
     # ===== Common buttons =====
     if text == "🔙 رجوع":
-        if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message", "otc_list_waiting_text", "otc_pair_diagnostics_waiting", "otc_candle_diagnostics_waiting"}:
+        if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message", "otc_list_waiting_text", "otc_pair_diagnostics_waiting", "otc_candle_diagnostics_waiting", "trading_room_waiting_balance"}:
             context.user_data["step"] = None
             await update.message.reply_text("تم الرجوع.", reply_markup=admin_main_keyboard)
             return
@@ -10384,41 +10133,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🛠 مرحبًا بك في لوحة الأدمن",
                 reply_markup=admin_main_keyboard
             )
-            return
-
-        if text == "🎯 OTC Sniper Pro":
-            reset_signal_state(context)
-            await update.message.reply_text(
-                build_sniper_intro_message(),
-                reply_markup=sniper_pro_keyboard
-            )
-            return
-
-        if text in {"🎯 الوضع الذكي", "الوضع الذكي"}:
-            context.user_data["sniper_mode"] = "smart"
-            await update.message.reply_text("✅ تم اختيار الوضع الذكي.\nالبوت سيقرر دخول مباشر أو شمعة قادمة حسب الفرصة.", reply_markup=sniper_pro_keyboard)
-            return
-
-        if text in {"⚡ دخول مباشر", "دخول مباشر"}:
-            context.user_data["sniper_mode"] = "direct"
-            await update.message.reply_text("✅ تم اختيار وضع الدخول المباشر.\nمناسب لملامسة دعم/مقاومة/Round Number مع تأكيد لحظي.", reply_markup=sniper_pro_keyboard)
-            return
-
-        if text in {"🕯 الشمعة القادمة", "الشمعة القادمة"}:
-            context.user_data["sniper_mode"] = "next"
-            await update.message.reply_text("✅ تم اختيار وضع الشمعة القادمة.\nمناسب للكسر/التثبيت والاستمرار مع بداية شمعة M1 جديدة.", reply_markup=sniper_pro_keyboard)
-            return
-
-        if text in {"🔍 افحص السوق", "🎯 افحص السوق عن صفقة", "افحص السوق"}:
-            await start_sniper_search(update, context)
-            return
-
-        if text in {"🛑 إيقاف البحث", "إيقاف البحث"}:
-            await stop_sniper_search(update, context)
-            return
-
-        if text in {"📊 حالة البحث", "حالة البحث"}:
-            await update.message.reply_text(format_sniper_status(user.id), reply_markup=sniper_pro_keyboard)
             return
 
         if text == "🟢 تشغيل البوت":
