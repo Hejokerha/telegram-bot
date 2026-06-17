@@ -395,6 +395,7 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["📥 الطلبات المعلقة", "📋 كافة المستخدمين"],
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
+        ["🎯 OTC Sniper Pro"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
         ["📢 رسالة جماعية"],
@@ -416,6 +417,17 @@ admin_otc_stats_keyboard = ReplyKeyboardMarkup(
     [
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+
+sniper_pro_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🔍 افحص السوق"],
+        ["🎯 الوضع الذكي", "⚡ دخول مباشر"],
+        ["🕯 الشمعة القادمة", "📊 حالة البحث"],
+        ["🛑 إيقاف البحث", "⬅️ رجوع"],
     ],
     resize_keyboard=True
 )
@@ -2797,6 +2809,528 @@ def get_stable_direction(pair_or_candles=None, dt=None, lookback: int = 5, min_m
         except Exception:
             pass
         return None
+
+
+
+# ===== OTC Sniper Pro (Admin-only experimental scanner) =====
+SNIPER_SEARCH_DURATION_SECONDS = int(os.getenv("SNIPER_SEARCH_DURATION_SECONDS", "300"))
+SNIPER_SCAN_INTERVAL_SECONDS = int(os.getenv("SNIPER_SCAN_INTERVAL_SECONDS", "5"))
+SNIPER_MIN_SIGNAL_SCORE = int(os.getenv("SNIPER_MIN_SIGNAL_SCORE", "88"))
+SNIPER_MIN_WATCH_SCORE = int(os.getenv("SNIPER_MIN_WATCH_SCORE", "72"))
+SNIPER_MIN_TICKS = int(os.getenv("SNIPER_MIN_TICKS", "30"))
+SNIPER_MIN_CANDLES = int(os.getenv("SNIPER_MIN_CANDLES", "7"))
+SNIPER_SEARCH_TASKS: dict[int, dict] = {}
+
+
+def sniper_get_live_candles(symbol: str, limit: int = 20) -> list[dict]:
+    """Returns live M1 OTC candles from the Quotex feed cache."""
+    try:
+        with quotex_otc_feed.lock:
+            candle_map = dict(quotex_otc_feed.candles.get(symbol, {}) or {})
+        result = []
+        for bucket in sorted(candle_map.keys())[-limit:]:
+            c = dict(candle_map.get(bucket) or {})
+            if not c:
+                continue
+            result.append({
+                "time": datetime.fromtimestamp(float(c.get("bucket_ts", bucket)), tz=UTC),
+                "bucket_ts": float(c.get("bucket_ts", bucket)),
+                "open": float(c.get("open")),
+                "high": float(c.get("high")),
+                "low": float(c.get("low")),
+                "close": float(c.get("close")),
+                "ticks": int(c.get("ticks", 0) or 0),
+            })
+        return result
+    except Exception:
+        return []
+
+
+def sniper_price_round_step(price: float) -> float:
+    """Dynamic round-number step suitable for mixed OTC symbols."""
+    price = abs(float(price or 0))
+    if price >= 200:
+        return 0.5
+    if price >= 50:
+        return 0.25
+    if price >= 10:
+        return 0.10
+    if price >= 1:
+        return 0.01
+    if price >= 0.1:
+        return 0.001
+    return 0.0001
+
+
+def sniper_nearest_round(price: float) -> float:
+    step = sniper_price_round_step(price)
+    return round(float(price) / step) * step
+
+
+def sniper_price_fmt(value: float) -> str:
+    try:
+        value = float(value)
+        if abs(value) >= 100:
+            return f"{value:.5f}"
+        if abs(value) >= 1:
+            return f"{value:.5f}"
+        return f"{value:.6f}"
+    except Exception:
+        return str(value)
+
+
+def sniper_candle_metrics(candle: dict) -> dict:
+    o = float(candle.get("open"))
+    h = float(candle.get("high"))
+    l = float(candle.get("low"))
+    c = float(candle.get("close"))
+    rng = max(h - l, 1e-12)
+    body = abs(c - o)
+    upper = h - max(o, c)
+    lower = min(o, c) - l
+    return {
+        "range": rng,
+        "body": body,
+        "upper": upper,
+        "lower": lower,
+        "body_ratio": body / rng,
+        "upper_ratio": upper / rng,
+        "lower_ratio": lower / rng,
+        "bullish": c > o,
+        "bearish": c < o,
+    }
+
+
+def sniper_detect_levels(candles: list[dict], price: float) -> dict:
+    """Lightweight support/resistance and round-number detection for live OTC candles."""
+    closed = candles[:-1] if len(candles) > 1 else candles
+    recent = closed[-12:] if len(closed) >= 12 else closed
+    lows = [float(c["low"]) for c in recent]
+    highs = [float(c["high"]) for c in recent]
+    support = min(lows) if lows else None
+    resistance = max(highs) if highs else None
+    ranges = [max(float(c["high"]) - float(c["low"]), 1e-12) for c in recent]
+    avg_range = median(ranges) if ranges else max(abs(float(price)) * 0.0007, 1e-6)
+    touch = max(avg_range * 0.35, abs(float(price)) * 0.00005, 1e-7)
+    near = max(avg_range * 0.75, touch * 1.8)
+    rnd = sniper_nearest_round(price)
+    def state(level):
+        if level is None:
+            return "none", None
+        dist = abs(float(price) - float(level))
+        if dist <= touch:
+            return "touch", dist
+        if dist <= near:
+            return "near", dist
+        return "far", dist
+    support_state, support_dist = state(support)
+    resistance_state, resistance_dist = state(resistance)
+    round_state, round_dist = state(rnd)
+    return {
+        "support": support,
+        "resistance": resistance,
+        "round": rnd,
+        "avg_range": avg_range,
+        "touch": touch,
+        "near": near,
+        "support_state": support_state,
+        "support_dist": support_dist,
+        "resistance_state": resistance_state,
+        "resistance_dist": resistance_dist,
+        "round_state": round_state,
+        "round_dist": round_dist,
+    }
+
+
+def sniper_tick_pressure(rows: list[tuple]) -> dict:
+    sample = list(rows[-32:]) if len(rows) >= 32 else list(rows)
+    if len(sample) < 6:
+        return {"ok": False}
+    prices = [float(r[1]) for r in sample]
+    change = prices[-1] - prices[0]
+    rng = max(max(prices) - min(prices), 1e-12)
+    ups = sum(1 for a, b in zip(prices, prices[1:]) if b > a)
+    downs = sum(1 for a, b in zip(prices, prices[1:]) if b < a)
+    flats = max(0, len(prices) - 1 - ups - downs)
+    bias = "CALL" if change > 0 and ups >= downs else "PUT" if change < 0 and downs >= ups else "NONE"
+    consistency = max(ups, downs) / max(1, ups + downs + flats)
+    momentum = min(abs(change) / rng, 1.0)
+    return {
+        "ok": True,
+        "bias": bias,
+        "change": change,
+        "range": rng,
+        "ups": ups,
+        "downs": downs,
+        "flats": flats,
+        "consistency": consistency,
+        "momentum": momentum,
+    }
+
+
+def sniper_analyze_pair(pair: str, symbol: str, mode: str = "smart") -> dict | None:
+    """Deep OTC Sniper Pro scoring for a single live pair. Admin-only and independent from manual signals."""
+    try:
+        with quotex_otc_feed.lock:
+            rows = list(quotex_otc_feed.prices.get(symbol, []))
+            tick = dict(quotex_otc_feed.last_tick.get(symbol) or {})
+        if len(rows) < SNIPER_MIN_TICKS or not tick:
+            return None
+        price = float(tick.get("price"))
+        candles = sniper_get_live_candles(symbol, 20)
+        if len(candles) < SNIPER_MIN_CANDLES:
+            return None
+        current = candles[-1]
+        previous = candles[-2]
+        closed = candles[:-1]
+        levels = sniper_detect_levels(candles, price)
+        tickp = sniper_tick_pressure(rows)
+        if not tickp.get("ok"):
+            return None
+
+        recent_closed = closed[-6:] if len(closed) >= 6 else closed
+        first_close = float(recent_closed[0]["close"])
+        last_close = float(recent_closed[-1]["close"])
+        higher_closes = sum(1 for a, b in zip(recent_closed, recent_closed[1:]) if float(b["close"]) > float(a["close"]))
+        lower_closes = sum(1 for a, b in zip(recent_closed, recent_closed[1:]) if float(b["close"]) < float(a["close"]))
+        if last_close > first_close and higher_closes >= lower_closes:
+            trend = "CALL"
+        elif last_close < first_close and lower_closes >= higher_closes:
+            trend = "PUT"
+        else:
+            trend = "RANGE"
+
+        cur_m = sniper_candle_metrics(current)
+        prev_m = sniper_candle_metrics(previous)
+
+        call_score = 0
+        put_score = 0
+        call_reasons = []
+        put_reasons = []
+        blockers = []
+        entry_type = "next"
+        watch_hint = False
+
+        # Trend layer
+        if trend == "CALL":
+            call_score += 18
+            call_reasons.append("اتجاه قصير صاعد")
+        elif trend == "PUT":
+            put_score += 18
+            put_reasons.append("اتجاه قصير هابط")
+        else:
+            blockers.append("الاتجاه العام غير حاسم")
+
+        # Tick momentum layer
+        if tickp["bias"] == "CALL":
+            pts = 10 + int(tickp["momentum"] * 10) + int(tickp["consistency"] * 8)
+            call_score += pts
+            call_reasons.append("ضغط شرائي حي من آخر ticks")
+        elif tickp["bias"] == "PUT":
+            pts = 10 + int(tickp["momentum"] * 10) + int(tickp["consistency"] * 8)
+            put_score += pts
+            put_reasons.append("ضغط بيعي حي من آخر ticks")
+
+        # Candle psychology layer
+        if cur_m["lower_ratio"] >= 0.42 and price > float(current["open"]):
+            call_score += 20
+            call_reasons.append("رفض سفلي واضح من الشمعة الحالية")
+            entry_type = "direct"
+        if cur_m["upper_ratio"] >= 0.42 and price < float(current["open"]):
+            put_score += 20
+            put_reasons.append("رفض علوي واضح من الشمعة الحالية")
+            entry_type = "direct"
+        if prev_m["body_ratio"] >= 0.55 and prev_m["bullish"]:
+            call_score += 10
+            call_reasons.append("آخر شمعة مغلقة صاعدة ومتماسكة")
+        if prev_m["body_ratio"] >= 0.55 and prev_m["bearish"]:
+            put_score += 10
+            put_reasons.append("آخر شمعة مغلقة هابطة ومتماسكة")
+        if cur_m["body_ratio"] < 0.12 and max(cur_m["upper_ratio"], cur_m["lower_ratio"]) < 0.55:
+            blockers.append("شمعة حالية مترددة / دوجي")
+
+        # Support / resistance / round-number layer
+        support_touch = levels["support_state"] in {"touch", "near"}
+        resistance_touch = levels["resistance_state"] in {"touch", "near"}
+        round_touch = levels["round_state"] in {"touch", "near"}
+        if support_touch:
+            watch_hint = True
+            if cur_m["lower_ratio"] >= 0.35 or tickp["bias"] == "CALL":
+                call_score += 22
+                call_reasons.append("ارتداد/ملامسة دعم قريب")
+                entry_type = "direct"
+            else:
+                put_score -= 12
+                blockers.append("PUT قريب من دعم حساس")
+        if resistance_touch:
+            watch_hint = True
+            if cur_m["upper_ratio"] >= 0.35 or tickp["bias"] == "PUT":
+                put_score += 22
+                put_reasons.append("رفض/ملامسة مقاومة قريبة")
+                entry_type = "direct"
+            else:
+                call_score -= 12
+                blockers.append("CALL قريب من مقاومة حساسة")
+        if round_touch:
+            watch_hint = True
+            if cur_m["lower_ratio"] > cur_m["upper_ratio"] and tickp["bias"] == "CALL":
+                call_score += 10
+                call_reasons.append("تفاعل إيجابي قرب Round Number")
+            elif cur_m["upper_ratio"] > cur_m["lower_ratio"] and tickp["bias"] == "PUT":
+                put_score += 10
+                put_reasons.append("تفاعل سلبي قرب Round Number")
+            else:
+                call_score += 3
+                put_score += 3
+
+        # Noise and volatility checks
+        if tickp["consistency"] < 0.50 or tickp["momentum"] < 0.18:
+            blockers.append("الحركة الحية ضعيفة أو متقطعة")
+        if levels["avg_range"] <= 0:
+            blockers.append("التذبذب غير صالح")
+
+        direction = "CALL" if call_score > put_score else "PUT"
+        raw_score = max(call_score, put_score)
+        opposite = min(call_score, put_score)
+        gap = raw_score - opposite
+        reasons = call_reasons if direction == "CALL" else put_reasons
+        confluence = max(0, min(99, 45 + raw_score + min(12, gap)))
+
+        # Mode restrictions
+        if mode == "direct" and entry_type != "direct":
+            confluence -= 10
+        if mode == "next" and entry_type == "direct":
+            confluence -= 8
+            entry_type = "next"
+
+        if gap < 14:
+            blockers.append("تعارض بين CALL و PUT")
+            confluence -= 12
+        if not reasons:
+            return None
+
+        status = "signal" if confluence >= SNIPER_MIN_SIGNAL_SCORE and len(blockers) <= 1 else "watch" if (watch_hint and confluence >= SNIPER_MIN_WATCH_SCORE) else "none"
+        if status == "none":
+            return None
+
+        entry_time = None
+        if entry_type == "next":
+            entry_time = next_full_minute(now_utc()).astimezone(UTC_PLUS_3).strftime("%H:%M")
+
+        return {
+            "status": status,
+            "pair": pair,
+            "symbol": symbol,
+            "direction": direction,
+            "score": int(max(0, min(99, confluence))),
+            "price": price,
+            "entry_type": entry_type,
+            "entry_time": entry_time,
+            "reasons": reasons[:5],
+            "blockers": blockers[:3],
+            "levels": levels,
+            "payout": int((quotex_otc_feed.instrument(symbol) or {}).get("payout", 0) or 0),
+        }
+    except Exception as e:
+        logger.exception("OTC Sniper pair analysis error | pair=%s symbol=%s: %s", pair, symbol, e)
+        return None
+
+
+def sniper_scan_market(mode: str = "smart") -> dict:
+    pair_map = get_otc_analysis_pair_map()
+    best_signal = None
+    best_watch = None
+    checked = 0
+    for pair, symbol in pair_map.items():
+        pair = normalize_otc_currency_pair_name(pair, symbol) or pair
+        if not is_valid_otc_currency_pair_name(pair):
+            continue
+        checked += 1
+        result = sniper_analyze_pair(pair, symbol, mode=mode)
+        if not result:
+            continue
+        if result.get("status") == "signal":
+            if best_signal is None or result["score"] > best_signal["score"]:
+                best_signal = result
+        elif result.get("status") == "watch":
+            if best_watch is None or result["score"] > best_watch["score"]:
+                best_watch = result
+    if best_signal:
+        best_signal["checked"] = checked
+        return best_signal
+    if best_watch:
+        best_watch["checked"] = checked
+        return best_watch
+    return {"status": "none", "checked": checked}
+
+
+def format_sniper_signal(result: dict) -> str:
+    direction = result.get("direction")
+    direction_icon = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
+    if result.get("entry_type") == "direct":
+        entry_title = "⚡ دخول مباشر الآن"
+        entry_line = "⏱ الدخول: الآن لمدة دقيقة متحركة"
+    else:
+        entry_title = "🕯 دخول الشمعة القادمة"
+        entry_line = f"⏱ الدخول: مع بداية الشمعة القادمة {result.get('entry_time') or ''}".strip()
+    reasons = "\n".join(f"✅ {r}" for r in result.get("reasons", [])[:5]) or "✅ توافق تحليلي قوي"
+    blockers = ""
+    if result.get("blockers"):
+        blockers = "\n\n⚠️ ملاحظات:\n" + "\n".join(f"• {b}" for b in result.get("blockers", [])[:2])
+    return (
+        "🎯 OTC SNIPER PRO\n\n"
+        f"{entry_title}\n\n"
+        f"💱 الزوج: {result.get('pair')}\n"
+        "🧭 الفريم: M1\n"
+        f"📌 الاتجاه: {direction_icon}\n"
+        f"💵 السعر الحالي: {sniper_price_fmt(result.get('price'))}\n"
+        f"📊 قوة التوافق: {result.get('score')}%\n\n"
+        "🧠 التحليل:\n"
+        f"{reasons}"
+        f"{blockers}\n\n"
+        f"{entry_line}\n\n"
+        "🧪 وضع تجريبي للأدمن فقط"
+    )
+
+
+def format_sniper_watch(result: dict) -> str:
+    levels = result.get("levels") or {}
+    zone = "منطقة مهمة"
+    if levels.get("support_state") in {"touch", "near"}:
+        zone = f"دعم قريب {sniper_price_fmt(levels.get('support'))}"
+    elif levels.get("resistance_state") in {"touch", "near"}:
+        zone = f"مقاومة قريبة {sniper_price_fmt(levels.get('resistance'))}"
+    elif levels.get("round_state") in {"touch", "near"}:
+        zone = f"Round Number {sniper_price_fmt(levels.get('round'))}"
+    likely = "🟢 CALL" if result.get("direction") == "CALL" else "🔴 PUT"
+    return (
+        "🎯 OTC Sniper Pro\n\n"
+        "⚠️ جهّز الزوج:\n"
+        f"💱 {result.get('pair')}\n\n"
+        f"السعر قريب من {zone}.\n"
+        f"الاتجاه المحتمل إذا اكتمل التوافق: {likely}\n"
+        f"قوة المراقبة الحالية: {result.get('score')}%\n\n"
+        "⏳ انتظر التأكيد...\n"
+        "إذا اكتملت الشروط سأرسل الدخول مباشرة."
+    )
+
+
+def build_sniper_intro_message() -> str:
+    return (
+        "🎯 OTC Sniper Pro\n\n"
+        "قسم تجريبي للأدمن فقط يبحث عن فرص OTC قوية عبر توافق عدة عوامل:\n"
+        "• دعم ومقاومة و Round Numbers\n"
+        "• شموع ورفض سعري\n"
+        "• ضغط ticks حي من Quotex\n"
+        "• استمرار أو دخول مباشر عند الملامسة\n\n"
+        "اختر طريقة البحث من الأزرار بالأسفل."
+    )
+
+
+def get_sniper_mode(context: ContextTypes.DEFAULT_TYPE) -> str:
+    mode = str(context.user_data.get("sniper_mode") or "smart")
+    return mode if mode in {"smart", "direct", "next"} else "smart"
+
+
+def sniper_mode_label(mode: str) -> str:
+    return {"smart": "الوضع الذكي", "direct": "دخول مباشر", "next": "الشمعة القادمة"}.get(mode, "الوضع الذكي")
+
+
+async def sniper_search_worker(context: ContextTypes.DEFAULT_TYPE, user_id: int, mode: str = "smart"):
+    started_at = time_module.time()
+    expires_at = started_at + SNIPER_SEARCH_DURATION_SECONDS
+    sent_watch_symbols = set()
+    try:
+        while time_module.time() < expires_at:
+            result = sniper_scan_market(mode=mode)
+            if result.get("status") == "signal":
+                await context.bot.send_message(chat_id=user_id, text=format_sniper_signal(result), reply_markup=sniper_pro_keyboard)
+                return
+            if result.get("status") == "watch":
+                symbol = result.get("symbol")
+                if symbol not in sent_watch_symbols:
+                    sent_watch_symbols.add(symbol)
+                    await context.bot.send_message(chat_id=user_id, text=format_sniper_watch(result), reply_markup=sniper_pro_keyboard)
+            await asyncio.sleep(SNIPER_SCAN_INTERVAL_SECONDS)
+        await context.bot.send_message(
+            chat_id=user_id,
+            text=(
+                "🎯 OTC Sniper Pro\n\n"
+                "❌ لم تظهر فرصة قوية خلال مدة البحث.\n\n"
+                "السوق الحالي غير واضح أو الشروط لم تكتمل.\n"
+                "الأفضل الانتظار بدل الدخول العشوائي."
+            ),
+            reply_markup=sniper_pro_keyboard,
+        )
+    except asyncio.CancelledError:
+        try:
+            await context.bot.send_message(chat_id=user_id, text="🛑 تم إيقاف بحث OTC Sniper Pro.", reply_markup=sniper_pro_keyboard)
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        logger.exception("OTC Sniper search worker error: %s", e)
+        try:
+            await context.bot.send_message(chat_id=user_id, text=f"❌ حدث خطأ في OTC Sniper Pro:\n{e}", reply_markup=sniper_pro_keyboard)
+        except Exception:
+            pass
+    finally:
+        try:
+            item = SNIPER_SEARCH_TASKS.get(int(user_id)) or {}
+            task = item.get("task")
+            if task is asyncio.current_task():
+                SNIPER_SEARCH_TASKS.pop(int(user_id), None)
+        except Exception:
+            pass
+
+
+async def start_sniper_search(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str | None = None):
+    user_id = int(update.effective_user.id)
+    mode = mode or get_sniper_mode(context)
+    old = SNIPER_SEARCH_TASKS.get(user_id) or {}
+    old_task = old.get("task")
+    if old_task and not old_task.done():
+        await update.message.reply_text("ℹ️ يوجد بحث Sniper Pro نشط بالفعل. أوقفه أولًا أو انتظر النتيجة.", reply_markup=sniper_pro_keyboard)
+        return
+    task = asyncio.create_task(sniper_search_worker(context, user_id, mode=mode))
+    SNIPER_SEARCH_TASKS[user_id] = {"task": task, "started_at": time_module.time(), "mode": mode}
+    await update.message.reply_text(
+        "🎯 OTC Sniper Pro\n\n"
+        f"جاري فحص سوق OTC...\n"
+        f"وضع البحث: {sniper_mode_label(mode)}\n\n"
+        "يتم الآن مراقبة الأزواج الحية والبحث عن فرصة قوية.\n"
+        "إذا ظهرت فرصة مناسبة سأرسلها لك مباشرة.",
+        reply_markup=sniper_pro_keyboard,
+    )
+
+
+async def stop_sniper_search(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = int(update.effective_user.id)
+    item = SNIPER_SEARCH_TASKS.pop(user_id, None)
+    task = (item or {}).get("task")
+    if task and not task.done():
+        task.cancel()
+        await update.message.reply_text("🛑 تم طلب إيقاف البحث.", reply_markup=sniper_pro_keyboard)
+    else:
+        await update.message.reply_text("ℹ️ لا يوجد بحث Sniper Pro نشط حاليًا.", reply_markup=sniper_pro_keyboard)
+
+
+def format_sniper_status(user_id: int) -> str:
+    item = SNIPER_SEARCH_TASKS.get(int(user_id)) or {}
+    task = item.get("task")
+    if not task or task.done():
+        return "🎯 OTC Sniper Pro\n\nالحالة: لا يوجد بحث نشط حاليًا."
+    started = float(item.get("started_at") or time_module.time())
+    elapsed = int(time_module.time() - started)
+    remaining = max(0, int(SNIPER_SEARCH_DURATION_SECONDS - elapsed))
+    return (
+        "🎯 OTC Sniper Pro\n\n"
+        "الحالة: بحث نشط ✅\n"
+        f"الوضع: {sniper_mode_label(item.get('mode', 'smart'))}\n"
+        f"المدة المتبقية: {remaining // 60:02d}:{remaining % 60:02d}\n"
+        f"الفحص كل: {SNIPER_SCAN_INTERVAL_SECONDS} ثواني\n"
+        f"حد الفرصة: {SNIPER_MIN_SIGNAL_SCORE}%"
+    )
 
 
 
@@ -7433,6 +7967,7 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
             [
                 ["📊 توليد إشارات"],
                 ["👤 حالة حسابي", "📞 تواصل مع المسؤول"],
+                ["🎯 OTC Sniper Pro"],
                 ["🌐 تغيير اللغة", "🛠 لوحة الأدمن"],
             ],
             resize_keyboard=True
@@ -9556,6 +10091,41 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "🛠 مرحبًا بك في لوحة الأدمن",
                 reply_markup=admin_main_keyboard
             )
+            return
+
+        if text == "🎯 OTC Sniper Pro":
+            reset_signal_state(context)
+            await update.message.reply_text(
+                build_sniper_intro_message(),
+                reply_markup=sniper_pro_keyboard
+            )
+            return
+
+        if text in {"🎯 الوضع الذكي", "الوضع الذكي"}:
+            context.user_data["sniper_mode"] = "smart"
+            await update.message.reply_text("✅ تم اختيار الوضع الذكي.\nالبوت سيقرر دخول مباشر أو شمعة قادمة حسب الفرصة.", reply_markup=sniper_pro_keyboard)
+            return
+
+        if text in {"⚡ دخول مباشر", "دخول مباشر"}:
+            context.user_data["sniper_mode"] = "direct"
+            await update.message.reply_text("✅ تم اختيار وضع الدخول المباشر.\nمناسب لملامسة دعم/مقاومة/Round Number مع تأكيد لحظي.", reply_markup=sniper_pro_keyboard)
+            return
+
+        if text in {"🕯 الشمعة القادمة", "الشمعة القادمة"}:
+            context.user_data["sniper_mode"] = "next"
+            await update.message.reply_text("✅ تم اختيار وضع الشمعة القادمة.\nمناسب للكسر/التثبيت والاستمرار مع بداية شمعة M1 جديدة.", reply_markup=sniper_pro_keyboard)
+            return
+
+        if text in {"🔍 افحص السوق", "🎯 افحص السوق عن صفقة", "افحص السوق"}:
+            await start_sniper_search(update, context)
+            return
+
+        if text in {"🛑 إيقاف البحث", "إيقاف البحث"}:
+            await stop_sniper_search(update, context)
+            return
+
+        if text in {"📊 حالة البحث", "حالة البحث"}:
+            await update.message.reply_text(format_sniper_status(user.id), reply_markup=sniper_pro_keyboard)
             return
 
         if text == "🟢 تشغيل البوت":
