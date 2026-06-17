@@ -383,8 +383,8 @@ if not firebase_admin._apps:
 # ===== Keyboards =====
 main_keyboard = ReplyKeyboardMarkup(
     [
-        ["📊 توليد إشارات", "👤 حالة حسابي"],
-        ["🎥 مشاهدة فيديو شرح البوت"],
+        ["📊 توليد إشارات"],
+        ["👤 حالة حسابي", "🎥 مشاهدة فيديو شرح البوت"],
         ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
     ],
     resize_keyboard=True
@@ -422,10 +422,10 @@ admin_otc_stats_keyboard = ReplyKeyboardMarkup(
 
 otc_list_manager_keyboard = ReplyKeyboardMarkup(
     [
-        ["📊 توليد إشارات", "👤 حالة حسابي"],
-        ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
-        ["🎥 مشاهدة فيديو شرح البوت"],
+        ["📊 توليد إشارات"],
+        ["👤 حالة حسابي", "🎥 مشاهدة فيديو شرح البوت"],
         ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
+        ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
     ],
     resize_keyboard=True
 )
@@ -468,8 +468,8 @@ language_keyboard = ReplyKeyboardMarkup(
 
 main_keyboard_en = ReplyKeyboardMarkup(
     [
-        ["📊 Generate Signals", "👤 My Account"],
-        ["🎥 Watch Bot Tutorial"],
+        ["📊 Generate Signals"],
+        ["👤 My Account", "🎥 Watch Bot Tutorial"],
         ["📞 Contact Support", "🌐 Change Language"],
     ],
     resize_keyboard=True
@@ -7423,17 +7423,17 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
         if lang == "en":
             return ReplyKeyboardMarkup(
                 [
-                    ["📊 Generate Signals", "👤 My Account"],
-                    ["📞 Contact Support", "🌐 Change Language"],
-                    ["🛠 Admin Panel"],
+                    ["📊 Generate Signals"],
+                    ["👤 My Account", "📞 Contact Support"],
+                    ["🌐 Change Language", "🛠 Admin Panel"],
                 ],
                 resize_keyboard=True
             )
         return ReplyKeyboardMarkup(
             [
-                ["📊 توليد إشارات", "👤 حالة حسابي"],
-                ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
-                ["🛠 لوحة الأدمن"],
+                ["📊 توليد إشارات"],
+                ["👤 حالة حسابي", "📞 تواصل مع المسؤول"],
+                ["🌐 تغيير اللغة", "🛠 لوحة الأدمن"],
             ],
             resize_keyboard=True
         )
