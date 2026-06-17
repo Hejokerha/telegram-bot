@@ -2829,6 +2829,16 @@ SNIPER_ZONE_FAST_MIN_SCORE = int(os.getenv("SNIPER_ZONE_FAST_MIN_SCORE", "86"))
 SNIPER_ZONE_FAST_MIN_GAP = int(os.getenv("SNIPER_ZONE_FAST_MIN_GAP", "12"))
 SNIPER_ZONE_FAST_MIN_SECONDS_AFTER_WATCH = float(os.getenv("SNIPER_ZONE_FAST_MIN_SECONDS_AFTER_WATCH", "3"))
 SNIPER_ZONE_FAST_MAX_SECONDS_AFTER_WATCH = float(os.getenv("SNIPER_ZONE_FAST_MAX_SECONDS_AFTER_WATCH", "45"))
+
+# توقيت Quotex للدقيقة المتحركة:
+# حسب التجربة على المنصة: إذا دخلنا خلال أول 30 ثانية من شمعة M1، تكون الصفقة دقيقة متحركة وتنتهي مع نهاية الشمعة الحالية.
+# بعد 30 ثانية غالبًا تتحول مدة الصفقة إلى 1:30، لذلك لا نرسل دخول مباشر متحرك بعد هذا الحد.
+SNIPER_DIRECT_CURRENT_CANDLE_MAX_ELAPSED_SECONDS = float(os.getenv("SNIPER_DIRECT_CURRENT_CANDLE_MAX_ELAPSED_SECONDS", "30"))
+# صفقات الشمعة القادمة: نرسل التأكيد قرب نهاية الشمعة الحالية فقط حتى تكون جاهز للدخول مع بداية الجديدة.
+SNIPER_NEXT_ENTRY_LEAD_SECONDS = float(os.getenv("SNIPER_NEXT_ENTRY_LEAD_SECONDS", "18"))
+SNIPER_NEXT_CONFIRMATION_REQUIRED = int(os.getenv("SNIPER_NEXT_CONFIRMATION_REQUIRED", "2"))
+SNIPER_NEXT_WATCH_MIN_SCORE = int(os.getenv("SNIPER_NEXT_WATCH_MIN_SCORE", "84"))
+SNIPER_NEXT_SIGNAL_MIN_SCORE = int(os.getenv("SNIPER_NEXT_SIGNAL_MIN_SCORE", "88"))
 SNIPER_SEARCH_TASKS: dict[int, dict] = {}
 
 
@@ -2887,6 +2897,32 @@ def sniper_price_fmt(value: float) -> str:
         return f"{value:.6f}"
     except Exception:
         return str(value)
+
+
+def sniper_current_m1_timing() -> dict:
+    """يرجع توقيتنا داخل شمعة M1 الحالية حسب UTC+3.
+    direct_current_candle_ok=True فقط خلال أول 30 ثانية، لأن Quotex بعدها قد يحسب الصفقة 1:30 بدل انتهاء الشمعة.
+    next_entry_window=True قرب نهاية الشمعة الحالية لإشارات الشمعة القادمة.
+    """
+    try:
+        now_local = now_utc().astimezone(UTC_PLUS_3)
+        elapsed = float(now_local.second) + (float(now_local.microsecond) / 1_000_000.0)
+        remaining = max(0.0, 60.0 - elapsed)
+        return {
+            "elapsed": elapsed,
+            "remaining": remaining,
+            "direct_current_candle_ok": elapsed <= float(SNIPER_DIRECT_CURRENT_CANDLE_MAX_ELAPSED_SECONDS),
+            "next_entry_window": remaining <= float(SNIPER_NEXT_ENTRY_LEAD_SECONDS),
+            "next_entry_time": next_full_minute(now_utc()).astimezone(UTC_PLUS_3).strftime("%H:%M"),
+        }
+    except Exception:
+        return {
+            "elapsed": 999.0,
+            "remaining": 0.0,
+            "direct_current_candle_ok": False,
+            "next_entry_window": True,
+            "next_entry_time": next_full_minute(now_utc()).astimezone(UTC_PLUS_3).strftime("%H:%M"),
+        }
 
 
 def sniper_candle_metrics(candle: dict) -> dict:
@@ -2997,6 +3033,7 @@ def sniper_analyze_pair(pair: str, symbol: str, mode: str = "smart") -> dict | N
         tickp = sniper_tick_pressure(rows)
         if not tickp.get("ok"):
             return None
+        timing = sniper_current_m1_timing()
 
         recent_closed = closed[-6:] if len(closed) >= 6 else closed
         first_close = float(recent_closed[0]["close"])
@@ -3112,6 +3149,19 @@ def sniper_analyze_pair(pair: str, symbol: str, mode: str = "smart") -> dict | N
                 call_score += 3
                 put_score += 3
 
+        # Next-candle continuation layer
+        # هذا يعطي Sniper Pro فرصة حقيقية لإشارات "الشمعة القادمة"، بدل أن تبقى كل الإشارات دخول مباشر فقط.
+        # نستخدمها عندما يكون الاتجاه + الشمعة المغلقة + ضغط ticks متوافقة بنفس الاتجاه.
+        if entry_type != "direct":
+            if trend == "CALL" and prev_m["bullish"] and tickp["bias"] == "CALL" and cur_m["upper_ratio"] < 0.45:
+                call_score += 14
+                call_reasons.append("استمرار صاعد مناسب للشمعة القادمة")
+                entry_type = "next"
+            elif trend == "PUT" and prev_m["bearish"] and tickp["bias"] == "PUT" and cur_m["lower_ratio"] < 0.45:
+                put_score += 14
+                put_reasons.append("استمرار هابط مناسب للشمعة القادمة")
+                entry_type = "next"
+
         # Noise and volatility checks
         severe_blockers = []
         if tickp["consistency"] < 0.56 or tickp["momentum"] < 0.22:
@@ -3132,7 +3182,19 @@ def sniper_analyze_pair(pair: str, symbol: str, mode: str = "smart") -> dict | N
         # Score is intentionally strict: 99% should be rare and never appear with negative notes.
         confluence = 55 + int(raw_score * 0.35) + int(min(35, gap) * 0.25)
 
-        # Mode restrictions
+        # Mode and platform timing restrictions
+        # دخول مباشر متحرك فقط في أول 30 ثانية من الشمعة الحالية.
+        if entry_type == "direct" and not timing.get("direct_current_candle_ok", False):
+            if mode in {"smart", "next"}:
+                entry_type = "next"
+                blockers.append("انتهت نافذة الدخول المباشر لهذه الشمعة، التحويل للشمعة القادمة")
+                # لا نجعلها ملاحظة قاتلة؛ فقط نحولها لتوقيت الشمعة القادمة.
+                confluence -= 3
+            else:
+                blockers.append("توقيت الدخول المباشر غير مناسب الآن")
+                severe_blockers.append("توقيت دخول مباشر غير مناسب")
+                confluence -= 20
+
         if mode == "direct" and entry_type != "direct":
             confluence -= 12
         if mode == "next" and entry_type == "direct":
@@ -3152,21 +3214,35 @@ def sniper_analyze_pair(pair: str, symbol: str, mode: str = "smart") -> dict | N
         confluence = int(max(0, min(97, confluence)))
 
         # A normal signal must be clean. Negative notes become rejection/watch, not a high-confidence trade.
-        clean_signal = (
-            confluence >= SNIPER_MIN_SIGNAL_SCORE
+        fatal_blockers = {"شمعة تردد", "تذبذب غير صالح", "تعارض الاتجاهات", "توقيت دخول مباشر غير مناسب"}
+        next_entry_window = bool(timing.get("next_entry_window", False))
+
+        clean_next_signal = (
+            entry_type == "next"
+            and next_entry_window
+            and confluence >= SNIPER_NEXT_SIGNAL_MIN_SCORE
+            and not any(b in fatal_blockers for b in severe_blockers)
+            and gap >= 18
+            and len(reasons) >= 3
+        )
+        clean_direct_signal = (
+            entry_type == "direct"
+            and bool(timing.get("direct_current_candle_ok", False))
+            and confluence >= SNIPER_MIN_SIGNAL_SCORE
             and not severe_blockers
             and len(blockers) == 0
             and gap >= 20
             and len(reasons) >= 3
         )
+        clean_signal = clean_direct_signal or clean_next_signal
 
         # Fast zone-touch signal: for دعم/مقاومة/Round Number touches.
         # This is intentionally faster than normal confirmation because the entry may disappear within seconds.
         # It still requires the direction to match the zone logic and enough analytical agreement.
-        fatal_blockers = {"شمعة تردد", "تذبذب غير صالح", "تعارض الاتجاهات"}
         fast_touch_signal = (
             SNIPER_ZONE_FAST_ENTRY_ENABLED
             and entry_type == "direct"
+            and bool(timing.get("direct_current_candle_ok", False))
             and bool(watch_hint)
             and bool(zone_reversal_confirmed)
             and (zone_side in {None, direction})
@@ -3176,14 +3252,22 @@ def sniper_analyze_pair(pair: str, symbol: str, mode: str = "smart") -> dict | N
             and not any(b in fatal_blockers for b in severe_blockers)
         )
 
-        watch_ok = bool(watch_hint and confluence >= SNIPER_MIN_WATCH_SCORE)
+        zone_watch_ok = bool(watch_hint and confluence >= SNIPER_MIN_WATCH_SCORE)
+        next_watch_ok = bool(
+            entry_type == "next"
+            and confluence >= SNIPER_NEXT_WATCH_MIN_SCORE
+            and gap >= 15
+            and len(reasons) >= 3
+            and not any(b in fatal_blockers for b in severe_blockers)
+        )
+        watch_ok = zone_watch_ok or next_watch_ok
         status = "signal" if (clean_signal or fast_touch_signal) else "watch" if watch_ok else "none"
         if status == "none":
             return None
 
         entry_time = None
         if entry_type == "next":
-            entry_time = next_full_minute(now_utc()).astimezone(UTC_PLUS_3).strftime("%H:%M")
+            entry_time = timing.get("next_entry_time") or next_full_minute(now_utc()).astimezone(UTC_PLUS_3).strftime("%H:%M")
 
         return {
             "status": status,
@@ -3200,6 +3284,10 @@ def sniper_analyze_pair(pair: str, symbol: str, mode: str = "smart") -> dict | N
             "setup_type": "zone_touch" if bool(watch_hint) and entry_type == "direct" else "normal",
             "zone_type": zone_type,
             "fast_touch": bool(fast_touch_signal),
+            "next_entry_window": bool(next_entry_window),
+            "direct_current_candle_ok": bool(timing.get("direct_current_candle_ok", False)),
+            "seconds_elapsed": float(timing.get("elapsed", 0.0) or 0.0),
+            "seconds_remaining": float(timing.get("remaining", 0.0) or 0.0),
             "payout": int((quotex_otc_feed.instrument(symbol) or {}).get("payout", 0) or 0),
         }
     except Exception as e:
@@ -3241,12 +3329,12 @@ def format_sniper_signal(result: dict) -> str:
     if result.get("entry_type") == "direct":
         entry_title = "⚡ دخول مباشر الآن"
         if result.get("fast_touch"):
-            entry_line = "⏱ الدخول: الآن لمدة دقيقة متحركة إذا السعر لا يزال قريبًا من منطقة الارتداد"
+            entry_line = "⏱ الدخول: الآن لمدة دقيقة متحركة فقط إذا أنت ضمن أول 30 ثانية من الشمعة والسعر ما زال قريبًا من منطقة الارتداد"
         else:
-            entry_line = "⏱ الدخول: الآن لمدة دقيقة متحركة"
+            entry_line = "⏱ الدخول: الآن لمدة دقيقة متحركة فقط ضمن أول 30 ثانية من الشمعة الحالية"
     else:
         entry_title = "🕯 دخول الشمعة القادمة"
-        entry_line = f"⏱ الدخول: مع بداية الشمعة القادمة {result.get('entry_time') or ''}".strip()
+        entry_line = f"⏱ الدخول: مع بداية الشمعة القادمة {result.get('entry_time') or ''} — جهّز الدخول عند افتتاح الشمعة".strip()
     reasons = "\n".join(f"✅ {r}" for r in result.get("reasons", [])[:5]) or "✅ توافق تحليلي قوي"
     blockers = ""
     if result.get("blockers"):
@@ -3277,6 +3365,17 @@ def format_sniper_watch(result: dict) -> str:
     elif levels.get("round_state") in {"touch", "near"}:
         zone = f"Round Number {sniper_price_fmt(levels.get('round'))}"
     likely = "🟢 CALL" if result.get("direction") == "CALL" else "🔴 PUT"
+    if result.get("entry_type") == "next":
+        return (
+            "🎯 OTC Sniper Pro\n\n"
+            "⚠️ جهّز الزوج للشمعة القادمة:\n"
+            f"💱 {result.get('pair')}\n\n"
+            f"الاتجاه المحتمل إذا ثبت التوافق: {likely}\n"
+            f"وقت الدخول المتوقع: {result.get('entry_time') or 'بداية الشمعة القادمة'}\n"
+            f"قوة المراقبة الحالية: {result.get('score')}%\n\n"
+            "⏳ انتظر تأكيد آخر ثواني من الشمعة الحالية...\n"
+            "إذا ثبتت الشروط قرب الإغلاق سأرسل دخول الشمعة القادمة."
+        )
     return (
         "🎯 OTC Sniper Pro\n\n"
         "⚠️ جهّز الزوج:\n"
@@ -3285,7 +3384,7 @@ def format_sniper_watch(result: dict) -> str:
         f"الاتجاه المحتمل إذا اكتمل التوافق: {likely}\n"
         f"قوة المراقبة الحالية: {result.get('score')}%\n\n"
         "⏳ انتظر التأكيد...\n"
-        "إذا اكتملت الشروط سأرسل الدخول مباشرة."
+        "إذا اكتملت شروط اللمسة ضمن توقيت المنصة سأرسل الدخول مباشرة."
     )
 
 
@@ -3296,7 +3395,8 @@ def build_sniper_intro_message() -> str:
         "• دعم ومقاومة و Round Numbers\n"
         "• شموع ورفض سعري\n"
         "• ضغط ticks حي من Quotex\n"
-        "• استمرار أو دخول مباشر عند الملامسة\n\n"
+        "• استمرار أو دخول مباشر عند الملامسة\n"
+        "• توقيت منصة Quotex: الدخول المتحرك فقط ضمن أول 30 ثانية، وبعدها يتحول للشمعة القادمة\n\n"
         "اختر طريقة البحث من الأزرار بالأسفل."
     )
 
@@ -3363,6 +3463,17 @@ async def sniper_search_worker(context: ContextTypes.DEFAULT_TYPE, user_id: int,
                             enough_time_for_touch = watch_age >= SNIPER_ZONE_FAST_MIN_SECONDS_AFTER_WATCH
                             still_fresh_touch = watch_age <= SNIPER_ZONE_FAST_MAX_SECONDS_AFTER_WATCH
                             if enough_time_for_touch and still_fresh_touch:
+                                await context.bot.send_message(
+                                    chat_id=user_id,
+                                    text=format_sniper_signal(result),
+                                    reply_markup=sniper_pro_keyboard,
+                                )
+                                return
+
+                        # صفقات الشمعة القادمة تحتاج تأكيدًا أقل ولكن فقط قرب نهاية الشمعة الحالية.
+                        if result.get("entry_type") == "next" and result.get("next_entry_window"):
+                            enough_next_confirmations = confirmation_count >= SNIPER_NEXT_CONFIRMATION_REQUIRED
+                            if enough_next_confirmations:
                                 await context.bot.send_message(
                                     chat_id=user_id,
                                     text=format_sniper_signal(result),
