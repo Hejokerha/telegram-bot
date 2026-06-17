@@ -442,7 +442,8 @@ admin_otc_list_ready_keyboard = ReplyKeyboardMarkup(
 trading_room_keyboard = ReplyKeyboardMarkup(
     [
         ["🚀 بدء جلسة تداول"],
-        ["📊 حالة الجلسة", "🛑 إيقاف الجلسة"],
+        ["📊 حالة الجلسة", "🩺 فحص بيانات OTC Live"],
+        ["🛑 إيقاف الجلسة"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -3020,6 +3021,8 @@ TRADING_ROOM_MAX_EXTRA_RECOVERY = int(os.getenv("TRADING_ROOM_MAX_EXTRA_RECOVERY
 TRADING_ROOM_MIN_TICKS = int(os.getenv("TRADING_ROOM_MIN_TICKS", "35"))
 TRADING_ROOM_MIN_CANDLES = int(os.getenv("TRADING_ROOM_MIN_CANDLES", "4"))
 TRADING_ROOM_DIRECT_ENTRY_MAX_SECOND = int(os.getenv("TRADING_ROOM_DIRECT_ENTRY_MAX_SECOND", "30"))
+TRADING_ROOM_DATA_RETRY_SECONDS = int(os.getenv("TRADING_ROOM_DATA_RETRY_SECONDS", "30"))
+TRADING_ROOM_DATA_MAX_RETRIES = int(os.getenv("TRADING_ROOM_DATA_MAX_RETRIES", "6"))
 
 
 def trading_room_key(admin_id: int) -> str:
@@ -3200,6 +3203,161 @@ def select_trading_room_pair() -> dict | None:
     return candidates[0]
 
 
+def get_trading_room_market_data_status() -> dict:
+    """يعطي حالة بيانات OTC Live التي تحتاجها غرفة الجلسة قبل اختيار زوج."""
+    try:
+        pair_map = get_otc_analysis_pair_map()
+        symbols = list(dict.fromkeys(pair_map.values()))
+        connected = bool(getattr(quotex_otc_feed, "connected", False)) if "quotex_otc_feed" in globals() else False
+        started = bool(getattr(quotex_otc_feed, "started", False)) if "quotex_otc_feed" in globals() else False
+
+        tick_ready = 0
+        candle_ready = 0
+        candidate_ready = 0
+        latest_age = None
+        latest_symbol = None
+        now_ts = time_module.time()
+
+        for pair, symbol in pair_map.items():
+            rows, last_tick, candles = _get_otc_rows_and_candles(symbol)
+            if len(rows) >= TRADING_ROOM_MIN_TICKS:
+                tick_ready += 1
+            if len(candles) >= TRADING_ROOM_MIN_CANDLES:
+                candle_ready += 1
+            if len(rows) >= TRADING_ROOM_MIN_TICKS and len(candles) >= TRADING_ROOM_MIN_CANDLES and last_tick:
+                candidate_ready += 1
+            try:
+                ts = float(last_tick.get("ts") or last_tick.get("timestamp") or 0)
+                if ts > 1e12:
+                    ts = ts / 1000.0
+                if ts > 0:
+                    age = max(0.0, now_ts - ts)
+                    if latest_age is None or age < latest_age:
+                        latest_age = age
+                        latest_symbol = symbol
+            except Exception:
+                pass
+
+        try:
+            best = select_trading_room_pair()
+        except Exception:
+            best = None
+
+        return {
+            "connected": connected,
+            "started": started,
+            "total_symbols": len(symbols),
+            "tick_ready": tick_ready,
+            "candle_ready": candle_ready,
+            "candidate_ready": candidate_ready,
+            "latest_age": latest_age,
+            "latest_symbol": latest_symbol,
+            "best": best,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def build_trading_room_market_data_status_message() -> str:
+    status = get_trading_room_market_data_status()
+    if status.get("error"):
+        return f"🩺 فحص بيانات OTC Live\n\nتعذر قراءة الحالة: {status.get('error')}"
+
+    latest_age = status.get("latest_age")
+    latest_text = "لا يوجد tick حديث" if latest_age is None else f"منذ {int(latest_age)} ثانية"
+    best = status.get("best")
+    best_text = f"{best.get('pair')} | قراءة {best.get('score')}%" if best else "لا يوجد زوج جاهز حاليًا"
+
+    return (
+        "🩺 فحص بيانات OTC Live\n"
+        "━━━━━━━━━━━━━━\n"
+        f"WebSocket: {'متصل ✅' if status.get('connected') else 'غير متصل ❌'}\n"
+        f"Live Feed Started: {'نعم ✅' if status.get('started') else 'لا ❌'}\n"
+        f"آخر tick: {latest_text}\n"
+        f"آخر رمز نشط: {status.get('latest_symbol') or 'غير متوفر'}\n"
+        f"الأزواج المتابعة: {status.get('total_symbols', 0)}\n"
+        f"أزواج عندها ticks كافية: {status.get('tick_ready', 0)}\n"
+        f"أزواج عندها شموع كافية: {status.get('candle_ready', 0)}\n"
+        f"أزواج جاهزة مبدئيًا للجلسة: {status.get('candidate_ready', 0)}\n"
+        f"أفضل زوج الآن: {best_text}\n\n"
+        "إذا الأرقام قليلة بعد Restart، انتظر دقيقة أو دقيقتين ثم أعد بدء الجلسة."
+    )
+
+
+async def trading_room_pair_select_retry_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data or {}
+    admin_id = int(data.get("admin_id") or 0)
+    state = get_trading_room_state(context, admin_id)
+    if not state or not state.get("active") or not state.get("waiting_pair_selection"):
+        return
+
+    retries = int(state.get("pair_select_retries", 0) or 0) + 1
+    state["pair_select_retries"] = retries
+    selected = select_trading_room_pair()
+
+    if selected:
+        state.update(selected)
+        state["waiting_pair_selection"] = False
+        state["last_reason"] = "تم اختيار زوج الجلسة بعد تجهيز البيانات"
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=(
+                "✅ أصبحت بيانات السوق جاهزة\n\n"
+                "🎯 تم اختيار زوج الجلسة\n\n"
+                f"💱 الزوج: {selected['pair']}\n"
+                f"📊 قوة قراءة الزوج: {selected['score']}%\n"
+                f"🧠 نمط الجلسة: {selected['strategy']}\n"
+                f"💵 السعر الحالي: {_safe_price_text(selected['pair'], selected['price'])}\n\n"
+                "افتح هذا الزوج وجهّزه. سأراقبه وأرسل لك الدخول عند ظهور نمط مناسب."
+            ),
+            reply_markup=trading_room_keyboard
+        )
+        try:
+            context.job_queue.run_repeating(
+                trading_room_scan_job,
+                interval=TRADING_ROOM_SCAN_INTERVAL_SECONDS,
+                first=2,
+                data={"admin_id": admin_id},
+                name=f"trading_room_scan_{admin_id}_{int(time_module.time())}",
+            )
+        except Exception as e:
+            logger.exception("Could not start trading room scan job after retry: %s", e)
+        return
+
+    if retries >= TRADING_ROOM_DATA_MAX_RETRIES:
+        state["active"] = False
+        state["waiting_pair_selection"] = False
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text=(
+                "❌ لم أجد زوجًا مناسبًا للجلسة بعد إعادة الفحص.\n\n"
+                "البيانات الحية غير كافية أو السوق غير واضح حاليًا. جرّب بعد قليل.\n\n"
+                + build_trading_room_market_data_status_message()
+            )[:3900],
+            reply_markup=trading_room_keyboard
+        )
+        return
+
+    await context.bot.send_message(
+        chat_id=admin_id,
+        text=(
+            "⏳ ما زلت أجهّز بيانات السوق...\n\n"
+            f"محاولة إعادة الفحص: {retries}/{TRADING_ROOM_DATA_MAX_RETRIES}\n"
+            "سأعيد الفحص تلقائيًا بعد قليل بدل إلغاء الجلسة مباشرة."
+        ),
+        reply_markup=trading_room_keyboard
+    )
+    try:
+        context.job_queue.run_once(
+            trading_room_pair_select_retry_job,
+            when=TRADING_ROOM_DATA_RETRY_SECONDS,
+            data={"admin_id": admin_id},
+            name=f"trading_room_pair_retry_{admin_id}_{int(time_module.time())}",
+        )
+    except Exception as e:
+        logger.exception("Could not schedule trading room pair retry job: %s", e)
+
+
 def analyze_trading_room_entry(state: dict) -> dict:
     pair = state.get("pair")
     symbol = state.get("symbol")
@@ -3337,11 +3495,27 @@ async def start_trading_room_session(update: Update, context: ContextTypes.DEFAU
 
     selected = select_trading_room_pair()
     if not selected:
-        state["active"] = False
+        state["waiting_pair_selection"] = True
+        state["pair_select_retries"] = 0
+        state["last_reason"] = "بانتظار تجهيز بيانات OTC Live"
         await update.message.reply_text(
-            "❌ لم أجد زوجًا مناسبًا للجلسة الآن.\n\nالبيانات الحية غير كافية أو السوق غير واضح. جرّب بعد قليل.",
+            (
+                "⏳ جاري تجهيز بيانات السوق...\n\n"
+                "لم أجد زوجًا مناسبًا فورًا لأن بيانات OTC Live قد تكون لسه عم تتجمع بعد Restart أو السوق غير واضح.\n"
+                f"سأعيد الفحص تلقائيًا كل {TRADING_ROOM_DATA_RETRY_SECONDS} ثانية بدل إلغاء الجلسة مباشرة.\n\n"
+                + build_trading_room_market_data_status_message()
+            )[:3900],
             reply_markup=trading_room_keyboard
         )
+        try:
+            context.job_queue.run_once(
+                trading_room_pair_select_retry_job,
+                when=TRADING_ROOM_DATA_RETRY_SECONDS,
+                data={"admin_id": admin_id},
+                name=f"trading_room_pair_retry_{admin_id}_{int(time_module.time())}",
+            )
+        except Exception as e:
+            logger.exception("Could not schedule trading room pair retry job: %s", e)
         return
 
     state.update(selected)
@@ -10024,6 +10198,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(user.id) and text == "📊 حالة الجلسة":
         await update.message.reply_text(
             build_trading_room_state_message(get_trading_room_state(context, user.id)),
+            reply_markup=trading_room_keyboard
+        )
+        return
+
+    if is_admin(user.id) and text == "🩺 فحص بيانات OTC Live":
+        await update.message.reply_text(
+            build_trading_room_market_data_status_message(),
             reply_markup=trading_room_keyboard
         )
         return
