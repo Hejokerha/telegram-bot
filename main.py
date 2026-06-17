@@ -2815,12 +2815,13 @@ def get_stable_direction(pair_or_candles=None, dt=None, lookback: int = 5, min_m
 # ===== OTC Sniper Pro (Admin-only experimental scanner) =====
 SNIPER_SEARCH_DURATION_SECONDS = int(os.getenv("SNIPER_SEARCH_DURATION_SECONDS", "300"))
 SNIPER_SCAN_INTERVAL_SECONDS = int(os.getenv("SNIPER_SCAN_INTERVAL_SECONDS", "5"))
-SNIPER_MIN_SIGNAL_SCORE = int(os.getenv("SNIPER_MIN_SIGNAL_SCORE", "90"))
-SNIPER_MIN_WATCH_SCORE = int(os.getenv("SNIPER_MIN_WATCH_SCORE", "76"))
+SNIPER_MIN_SIGNAL_SCORE = int(os.getenv("SNIPER_MIN_SIGNAL_SCORE", "92"))
+SNIPER_MIN_WATCH_SCORE = int(os.getenv("SNIPER_MIN_WATCH_SCORE", "88"))
 SNIPER_MIN_TICKS = int(os.getenv("SNIPER_MIN_TICKS", "45"))
 SNIPER_MIN_CANDLES = int(os.getenv("SNIPER_MIN_CANDLES", "8"))
-SNIPER_CONFIRMATION_REQUIRED = int(os.getenv("SNIPER_CONFIRMATION_REQUIRED", "2"))
-SNIPER_MIN_SECONDS_BEFORE_SIGNAL = int(os.getenv("SNIPER_MIN_SECONDS_BEFORE_SIGNAL", "10"))
+SNIPER_CONFIRMATION_REQUIRED = int(os.getenv("SNIPER_CONFIRMATION_REQUIRED", "3"))
+SNIPER_MIN_SECONDS_BEFORE_SIGNAL = int(os.getenv("SNIPER_MIN_SECONDS_BEFORE_SIGNAL", "20"))
+SNIPER_MAX_PREPARE_ALERTS = int(os.getenv("SNIPER_MAX_PREPARE_ALERTS", "1"))
 SNIPER_SEARCH_TASKS: dict[int, dict] = {}
 
 
@@ -3263,43 +3264,78 @@ def sniper_mode_label(mode: str) -> str:
 async def sniper_search_worker(context: ContextTypes.DEFAULT_TYPE, user_id: int, mode: str = "smart"):
     started_at = time_module.time()
     expires_at = started_at + SNIPER_SEARCH_DURATION_SECONDS
-    sent_watch_symbols = set()
-    confirmation_state = {}
+    active_key = None
+    active_result = None
+    prepare_alerts_sent = 0
+    confirmation_count = 0
     try:
         while time_module.time() < expires_at:
             result = sniper_scan_market(mode=mode)
-            if result.get("status") == "signal":
+            status = result.get("status")
+
+            # IMPORTANT:
+            # Sniper Pro must not spam many "prepare pair" messages.
+            # It locks on ONE candidate per search. If that candidate fails to confirm,
+            # the search ends with "no strong opportunity" instead of switching between pairs.
+            if status in {"signal", "watch"}:
                 key = (result.get("symbol"), result.get("direction"), result.get("entry_type"))
-                item = confirmation_state.setdefault(key, {"count": 0, "first_seen": time_module.time()})
-                item["count"] += 1
 
-                # First valid signal becomes a prepare alert only. The real entry is sent only
-                # if the same pair/direction remains valid for the required confirmations.
-                if key[0] not in sent_watch_symbols:
-                    sent_watch_symbols.add(key[0])
-                    await context.bot.send_message(chat_id=user_id, text=format_sniper_watch(result), reply_markup=sniper_pro_keyboard)
+                if active_key is None:
+                    active_key = key
+                    active_result = result
+                    prepare_alerts_sent += 1
+                    confirmation_count = 1 if status == "signal" else 0
+                    await context.bot.send_message(
+                        chat_id=user_id,
+                        text=format_sniper_watch(result),
+                        reply_markup=sniper_pro_keyboard,
+                    )
 
-                enough_confirmations = item["count"] >= SNIPER_CONFIRMATION_REQUIRED
-                enough_time = (time_module.time() - started_at) >= SNIPER_MIN_SECONDS_BEFORE_SIGNAL
-                if enough_confirmations and enough_time:
-                    await context.bot.send_message(chat_id=user_id, text=format_sniper_signal(result), reply_markup=sniper_pro_keyboard)
-                    return
-            elif result.get("status") == "watch":
-                symbol = result.get("symbol")
-                if symbol not in sent_watch_symbols:
-                    sent_watch_symbols.add(symbol)
-                    await context.bot.send_message(chat_id=user_id, text=format_sniper_watch(result), reply_markup=sniper_pro_keyboard)
+                elif key == active_key:
+                    active_result = result
+                    if status == "signal":
+                        confirmation_count += 1
+                        enough_confirmations = confirmation_count >= SNIPER_CONFIRMATION_REQUIRED
+                        enough_time = (time_module.time() - started_at) >= SNIPER_MIN_SECONDS_BEFORE_SIGNAL
+                        if enough_confirmations and enough_time:
+                            await context.bot.send_message(
+                                chat_id=user_id,
+                                text=format_sniper_signal(result),
+                                reply_markup=sniper_pro_keyboard,
+                            )
+                            return
+
+                else:
+                    # A different pair may look interesting, but we don't alert it in the same run.
+                    # This keeps the admin experience clean: one candidate, then confirm or fail.
+                    pass
+
             await asyncio.sleep(SNIPER_SCAN_INTERVAL_SECONDS)
-        await context.bot.send_message(
-            chat_id=user_id,
-            text=(
-                "🎯 OTC Sniper Pro\n\n"
-                "❌ لم تظهر فرصة قوية خلال مدة البحث.\n\n"
-                "السوق الحالي غير واضح أو الشروط لم تكتمل.\n"
-                "الأفضل الانتظار بدل الدخول العشوائي."
-            ),
-            reply_markup=sniper_pro_keyboard,
-        )
+
+        if active_result:
+            pair = active_result.get("pair") or "غير معروف"
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "🎯 OTC Sniper Pro\n\n"
+                    "❌ لم تكتمل فرصة الدخول.\n\n"
+                    f"تمت مراقبة الزوج: {pair}\n"
+                    "لكن الشروط لم تثبت بشكل كافٍ، لذلك لم يتم إرسال صفقة.\n"
+                    "الأفضل الانتظار بدل الدخول العشوائي."
+                ),
+                reply_markup=sniper_pro_keyboard,
+            )
+        else:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=(
+                    "🎯 OTC Sniper Pro\n\n"
+                    "❌ لم تظهر فرصة قوية خلال مدة البحث.\n\n"
+                    "السوق الحالي غير واضح أو الشروط لم تكتمل.\n"
+                    "الأفضل الانتظار بدل الدخول العشوائي."
+                ),
+                reply_markup=sniper_pro_keyboard,
+            )
     except asyncio.CancelledError:
         try:
             await context.bot.send_message(chat_id=user_id, text="🛑 تم إيقاف بحث OTC Sniper Pro.", reply_markup=sniper_pro_keyboard)
@@ -3320,7 +3356,6 @@ async def sniper_search_worker(context: ContextTypes.DEFAULT_TYPE, user_id: int,
                 SNIPER_SEARCH_TASKS.pop(int(user_id), None)
         except Exception:
             pass
-
 
 async def start_sniper_search(update: Update, context: ContextTypes.DEFAULT_TYPE, mode: str | None = None):
     user_id = int(update.effective_user.id)
