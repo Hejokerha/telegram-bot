@@ -385,7 +385,7 @@ main_keyboard = ReplyKeyboardMarkup(
     [
         ["📊 توليد إشارات", "👤 حالة حسابي"],
         ["🎥 مشاهدة فيديو شرح البوت"],
-        ["📞 تواصل مع المسؤول"],
+        ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
     ],
     resize_keyboard=True
 )
@@ -425,7 +425,7 @@ otc_list_manager_keyboard = ReplyKeyboardMarkup(
         ["📊 توليد إشارات", "👤 حالة حسابي"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🎥 مشاهدة فيديو شرح البوت"],
-        ["📞 تواصل مع المسؤول"],
+        ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
     ],
     resize_keyboard=True
 )
@@ -443,7 +443,7 @@ welcome_keyboard = ReplyKeyboardMarkup(
         ["🎁 الحصول على تجربة مجانية"],
         ["✅ نعم، أنا منضم", "❌ لا، لست مشتركًا"],
         ["🎥 مشاهدة فيديو شرح البوت"],
-        ["📞 تواصل مع المسؤول"],
+        ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
     ],
     resize_keyboard=True
 )
@@ -470,7 +470,7 @@ main_keyboard_en = ReplyKeyboardMarkup(
     [
         ["📊 Generate Signals", "👤 My Account"],
         ["🎥 Watch Bot Tutorial"],
-        ["📞 Contact Support"],
+        ["📞 Contact Support", "🌐 Change Language"],
     ],
     resize_keyboard=True
 )
@@ -480,7 +480,7 @@ welcome_keyboard_en = ReplyKeyboardMarkup(
         ["🎁 Get Free Trial"],
         ["✅ Yes, I Joined", "❌ No, I Haven't Joined"],
         ["🎥 Watch Bot Tutorial"],
-        ["📞 Contact Support"],
+        ["📞 Contact Support", "🌐 Change Language"],
     ],
     resize_keyboard=True
 )
@@ -7334,7 +7334,8 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
         return ReplyKeyboardMarkup(
             [
                 ["📊 توليد إشارات", "👤 حالة حسابي"],
-                ["📞 تواصل مع المسؤول", "🛠 لوحة الأدمن"],
+                ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
+                ["🛠 لوحة الأدمن"],
             ],
             resize_keyboard=True
         )
@@ -7417,8 +7418,10 @@ def get_signal_usage_summary(user_id: int) -> dict:
 
 
 def check_signal_usage_allowed(user_id: int, amount: int = 1) -> tuple[bool, str]:
+    # Usage limits disabled by request: all approved users can generate signals without limits.
     uid = int(user_id)
     amount = max(1, int(amount or 1))
+    return True, ""
 
     if is_admin(uid):
         return True, ""
@@ -7464,8 +7467,10 @@ def check_signal_usage_allowed(user_id: int, amount: int = 1) -> tuple[bool, str
 
 
 def record_signal_usage(user_id: int, amount: int = 1, source: str = "manual_signal"):
+    # Usage counting disabled by request. Keep the function as no-op for compatibility.
     uid = int(user_id)
     amount = max(1, int(amount or 1))
+    return
 
     if is_admin(uid):
         return
@@ -7529,18 +7534,7 @@ def build_account_status_message(user, lang: str = "ar") -> str:
         trial_used = "Yes" if has_used_video_trial(uid) else "No"
         plan_label = plan_labels.get(str(plan.get("key") or ""), "Not active" if not is_approved(uid) else str(plan.get("label", "Not specified")))
 
-        if plan.get("limit_type") == "unlimited":
-            usage_line = "Usage: Unlimited ♾"
-        elif plan.get("limit_type") == "total":
-            limit = int(plan.get("limit") or 0)
-            used = safe_int(usage.get("total"), 0)
-            usage_line = f"Usage: {used}/{limit} total | Remaining: {max(0, limit - used)}"
-        elif plan.get("limit_type") == "daily":
-            limit = int(plan.get("limit") or 0)
-            used = safe_int(usage.get("today"), 0)
-            usage_line = f"Today usage: {used}/{limit} | Remaining today: {max(0, limit - used)}"
-        else:
-            usage_line = "Usage: Not available before activation"
+        usage_line = "Usage: Unlimited ♾"
 
         return (
             "👤 My Account\n\n"
@@ -7560,18 +7554,7 @@ def build_account_status_message(user, lang: str = "ar") -> str:
     expires_at = approved_data.get("expires_at") or data.get("expires_at")
     trial_used = "نعم" if has_used_video_trial(uid) else "لا"
 
-    if plan.get("limit_type") == "unlimited":
-        usage_line = "الاستخدام: غير محدود ♾"
-    elif plan.get("limit_type") == "total":
-        limit = int(plan.get("limit") or 0)
-        used = safe_int(usage.get("total"), 0)
-        usage_line = f"الاستخدام: {used}/{limit} إجماليًا | المتبقي: {max(0, limit - used)}"
-    elif plan.get("limit_type") == "daily":
-        limit = int(plan.get("limit") or 0)
-        used = safe_int(usage.get("today"), 0)
-        usage_line = f"الاستخدام اليوم: {used}/{limit} | المتبقي اليوم: {max(0, limit - used)}"
-    else:
-        usage_line = "الاستخدام: غير متاح قبل التفعيل"
+    usage_line = "الاستخدام: غير محدود ♾"
 
     return (
         "👤 حالة حسابي\n\n"
@@ -8122,6 +8105,8 @@ def activate_video_trial_for_user(user_id: int):
 
 
 def check_signal_usage_allowed_lang(user_id: int, amount: int = 1, lang: str = "ar") -> tuple[bool, str]:
+    # Usage limits disabled by request.
+    return True, ""
     allowed, msg = check_signal_usage_allowed(user_id, amount)
     if allowed or lang != "en":
         return allowed, msg
@@ -8258,6 +8243,11 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text.strip()
     step = context.user_data.get("step")
+
+    if text in {"🌐 Change Language", "Change Language", "🌐 تغيير اللغة", "تغيير اللغة", "Language"}:
+        reset_signal_state(context)
+        await ask_language(update)
+        return
 
     # Contact / tutorial / free trial public actions
     if text in {"📞 Contact Support", "Contact Support"}:
@@ -8759,6 +8749,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     step = context.user_data.get("step")
 
     # ===== Language selection gate =====
+    if text in {"🌐 تغيير اللغة", "🌐 Change Language", "Change Language", "تغيير اللغة", "Language"}:
+        reset_signal_state(context)
+        await ask_language(update)
+        return
+
     if text in {"🇸🇦 العربية", "العربية", "Arabic"}:
         set_user_language(user.id, "ar", context)
         reset_signal_state(context)
@@ -9976,6 +9971,14 @@ def should_send_admin_error_alert() -> bool:
 
 
 async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    # Ignore harmless Telegram edit errors caused by pressing the same button/menu again.
+    try:
+        if context.error and "Message is not modified" in str(context.error):
+            logger.info("Ignored harmless Telegram error: %s", context.error)
+            return
+    except Exception:
+        pass
+
     error_text = "".join(traceback.format_exception(None, context.error, context.error.__traceback__)) if context.error else ""
     logger.error(
         "Telegram handler error | update=%s | error=%s\n%s",
