@@ -2815,10 +2815,12 @@ def get_stable_direction(pair_or_candles=None, dt=None, lookback: int = 5, min_m
 # ===== OTC Sniper Pro (Admin-only experimental scanner) =====
 SNIPER_SEARCH_DURATION_SECONDS = int(os.getenv("SNIPER_SEARCH_DURATION_SECONDS", "300"))
 SNIPER_SCAN_INTERVAL_SECONDS = int(os.getenv("SNIPER_SCAN_INTERVAL_SECONDS", "5"))
-SNIPER_MIN_SIGNAL_SCORE = int(os.getenv("SNIPER_MIN_SIGNAL_SCORE", "88"))
-SNIPER_MIN_WATCH_SCORE = int(os.getenv("SNIPER_MIN_WATCH_SCORE", "72"))
-SNIPER_MIN_TICKS = int(os.getenv("SNIPER_MIN_TICKS", "30"))
-SNIPER_MIN_CANDLES = int(os.getenv("SNIPER_MIN_CANDLES", "7"))
+SNIPER_MIN_SIGNAL_SCORE = int(os.getenv("SNIPER_MIN_SIGNAL_SCORE", "90"))
+SNIPER_MIN_WATCH_SCORE = int(os.getenv("SNIPER_MIN_WATCH_SCORE", "76"))
+SNIPER_MIN_TICKS = int(os.getenv("SNIPER_MIN_TICKS", "45"))
+SNIPER_MIN_CANDLES = int(os.getenv("SNIPER_MIN_CANDLES", "8"))
+SNIPER_CONFIRMATION_REQUIRED = int(os.getenv("SNIPER_CONFIRMATION_REQUIRED", "2"))
+SNIPER_MIN_SECONDS_BEFORE_SIGNAL = int(os.getenv("SNIPER_MIN_SECONDS_BEFORE_SIGNAL", "10"))
 SNIPER_SEARCH_TASKS: dict[int, dict] = {}
 
 
@@ -3084,32 +3086,54 @@ def sniper_analyze_pair(pair: str, symbol: str, mode: str = "smart") -> dict | N
                 put_score += 3
 
         # Noise and volatility checks
-        if tickp["consistency"] < 0.50 or tickp["momentum"] < 0.18:
+        severe_blockers = []
+        if tickp["consistency"] < 0.56 or tickp["momentum"] < 0.22:
             blockers.append("الحركة الحية ضعيفة أو متقطعة")
+            severe_blockers.append("ضعف الحركة الحية")
+        if cur_m["body_ratio"] < 0.12 and max(cur_m["upper_ratio"], cur_m["lower_ratio"]) < 0.55:
+            severe_blockers.append("شمعة تردد")
         if levels["avg_range"] <= 0:
             blockers.append("التذبذب غير صالح")
+            severe_blockers.append("تذبذب غير صالح")
 
         direction = "CALL" if call_score > put_score else "PUT"
         raw_score = max(call_score, put_score)
         opposite = min(call_score, put_score)
         gap = raw_score - opposite
         reasons = call_reasons if direction == "CALL" else put_reasons
-        confluence = max(0, min(99, 45 + raw_score + min(12, gap)))
+
+        # Score is intentionally strict: 99% should be rare and never appear with negative notes.
+        confluence = 55 + int(raw_score * 0.35) + int(min(35, gap) * 0.25)
 
         # Mode restrictions
         if mode == "direct" and entry_type != "direct":
-            confluence -= 10
+            confluence -= 12
         if mode == "next" and entry_type == "direct":
-            confluence -= 8
+            confluence -= 10
             entry_type = "next"
 
-        if gap < 14:
+        if gap < 18:
             blockers.append("تعارض بين CALL و PUT")
-            confluence -= 12
+            severe_blockers.append("تعارض الاتجاهات")
+            confluence -= 14
+        if len(reasons) < 3:
+            blockers.append("التوافق التحليلي غير كافٍ")
+            confluence -= 10
         if not reasons:
             return None
 
-        status = "signal" if confluence >= SNIPER_MIN_SIGNAL_SCORE and len(blockers) <= 1 else "watch" if (watch_hint and confluence >= SNIPER_MIN_WATCH_SCORE) else "none"
+        confluence = int(max(0, min(97, confluence)))
+
+        # A real signal must be clean. Negative notes become rejection/watch, not a 99% trade.
+        clean_signal = (
+            confluence >= SNIPER_MIN_SIGNAL_SCORE
+            and not severe_blockers
+            and len(blockers) == 0
+            and gap >= 20
+            and len(reasons) >= 3
+        )
+        watch_ok = bool(watch_hint and confluence >= SNIPER_MIN_WATCH_SCORE)
+        status = "signal" if clean_signal else "watch" if watch_ok else "none"
         if status == "none":
             return None
 
@@ -3240,13 +3264,27 @@ async def sniper_search_worker(context: ContextTypes.DEFAULT_TYPE, user_id: int,
     started_at = time_module.time()
     expires_at = started_at + SNIPER_SEARCH_DURATION_SECONDS
     sent_watch_symbols = set()
+    confirmation_state = {}
     try:
         while time_module.time() < expires_at:
             result = sniper_scan_market(mode=mode)
             if result.get("status") == "signal":
-                await context.bot.send_message(chat_id=user_id, text=format_sniper_signal(result), reply_markup=sniper_pro_keyboard)
-                return
-            if result.get("status") == "watch":
+                key = (result.get("symbol"), result.get("direction"), result.get("entry_type"))
+                item = confirmation_state.setdefault(key, {"count": 0, "first_seen": time_module.time()})
+                item["count"] += 1
+
+                # First valid signal becomes a prepare alert only. The real entry is sent only
+                # if the same pair/direction remains valid for the required confirmations.
+                if key[0] not in sent_watch_symbols:
+                    sent_watch_symbols.add(key[0])
+                    await context.bot.send_message(chat_id=user_id, text=format_sniper_watch(result), reply_markup=sniper_pro_keyboard)
+
+                enough_confirmations = item["count"] >= SNIPER_CONFIRMATION_REQUIRED
+                enough_time = (time_module.time() - started_at) >= SNIPER_MIN_SECONDS_BEFORE_SIGNAL
+                if enough_confirmations and enough_time:
+                    await context.bot.send_message(chat_id=user_id, text=format_sniper_signal(result), reply_markup=sniper_pro_keyboard)
+                    return
+            elif result.get("status") == "watch":
                 symbol = result.get("symbol")
                 if symbol not in sent_watch_symbols:
                     sent_watch_symbols.add(symbol)
@@ -3299,7 +3337,7 @@ async def start_sniper_search(update: Update, context: ContextTypes.DEFAULT_TYPE
         f"جاري فحص سوق OTC...\n"
         f"وضع البحث: {sniper_mode_label(mode)}\n\n"
         "يتم الآن مراقبة الأزواج الحية والبحث عن فرصة قوية.\n"
-        "إذا ظهرت فرصة مناسبة سأرسلها لك مباشرة.",
+        "إذا ظهرت فرصة مناسبة سأرسل لك تنبيه تجهيز أولًا، ثم صفقة الدخول بعد التأكيد.",
         reply_markup=sniper_pro_keyboard,
     )
 
