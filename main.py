@@ -3015,6 +3015,7 @@ TRADING_ROOM_ADMIN_ONLY = True
 TRADING_ROOM_SCAN_SECONDS = int(os.getenv("TRADING_ROOM_SCAN_SECONDS", "300"))
 TRADING_ROOM_SCAN_INTERVAL_SECONDS = int(os.getenv("TRADING_ROOM_SCAN_INTERVAL_SECONDS", "5"))
 TRADING_ROOM_RESULT_DELAY_SECONDS = int(os.getenv("TRADING_ROOM_RESULT_DELAY_SECONDS", "70"))
+TRADING_ROOM_RESULT_EXTRA_DELAY_SECONDS = int(os.getenv("TRADING_ROOM_RESULT_EXTRA_DELAY_SECONDS", "4"))
 TRADING_ROOM_MIN_PAIR_SCORE = int(os.getenv("TRADING_ROOM_MIN_PAIR_SCORE", "62"))
 TRADING_ROOM_MIN_ENTRY_SCORE = int(os.getenv("TRADING_ROOM_MIN_ENTRY_SCORE", "68"))
 TRADING_ROOM_MAX_EXTRA_RECOVERY = int(os.getenv("TRADING_ROOM_MAX_EXTRA_RECOVERY", "1"))
@@ -3430,7 +3431,17 @@ def analyze_trading_room_entry(state: dict) -> dict:
     if score < TRADING_ROOM_MIN_ENTRY_SCORE:
         return {"ok": False, "reason": f"قوة النمط غير كافية الآن ({score}%)"}
 
-    entry_dt = now_utc() if entry_mode == "direct" else next_full_minute(now_utc())
+    now_dt = now_utc()
+    if entry_mode == "direct":
+        # دخول مباشر داخل أول 30 ثانية: انتهاء الصفقة مع نهاية الشمعة الحالية.
+        entry_dt = now_dt
+        bucket_start = int(entry_dt.timestamp() // 60) * 60
+        expiry_ts = bucket_start + 60
+    else:
+        # دخول الشمعة القادمة: نحسب النتيجة بعد إغلاق شمعة الدخول نفسها، وليس بعد رسالة التنبيه.
+        entry_dt = next_full_minute(now_dt)
+        expiry_ts = entry_dt.timestamp() + 60
+
     return {
         "ok": True,
         "pair": pair,
@@ -3441,6 +3452,7 @@ def analyze_trading_room_entry(state: dict) -> dict:
         "score": min(score, 94),
         "price": price,
         "entry_ts": entry_dt.timestamp(),
+        "expiry_ts": float(expiry_ts),
         "entry_time_text": format_utc_plus_3(entry_dt),
     }
 
@@ -3618,9 +3630,15 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
     )
 
     try:
+        result_when = max(
+            5,
+            float(analysis.get("expiry_ts", time_module.time() + TRADING_ROOM_RESULT_DELAY_SECONDS))
+            + TRADING_ROOM_RESULT_EXTRA_DELAY_SECONDS
+            - time_module.time()
+        )
         context.job_queue.run_once(
             trading_room_result_job,
-            when=TRADING_ROOM_RESULT_DELAY_SECONDS,
+            when=result_when,
             data={"admin_id": admin_id, "trade": analysis},
             name=f"trading_room_result_{admin_id}_{int(time_module.time())}",
         )
@@ -3639,29 +3657,58 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
     symbol = trade.get("symbol")
     pair = trade.get("pair")
     direction = trade.get("direction")
-    try:
-        entry_price = float(trade.get("price"))
-    except Exception:
-        entry_price = None
+    # لا نحسب النتيجة قبل وقت انتهاء الصفقة الفعلي.
+    expiry_ts = float(trade.get("expiry_ts") or (time_module.time() + TRADING_ROOM_RESULT_DELAY_SECONDS))
+    due_ts = expiry_ts + TRADING_ROOM_RESULT_EXTRA_DELAY_SECONDS
+    if time_module.time() < due_ts:
+        try:
+            context.job_queue.run_once(
+                trading_room_result_job,
+                when=max(3, due_ts - time_module.time()),
+                data={"admin_id": admin_id, "trade": trade},
+                name=f"trading_room_result_wait_{admin_id}_{int(time_module.time())}",
+            )
+        except Exception as e:
+            logger.exception("Could not reschedule early trading room result job: %s", e)
+        return
 
-    last_price = None
-    try:
-        tick = quotex_otc_feed.snapshot(symbol)
-        last_price = float(tick.get("price"))
-    except Exception:
-        pass
+    entry_ts = float(trade.get("entry_ts") or 0)
+    entry_bucket_ts = int(entry_ts // 60) * 60 if entry_ts else 0
 
-    if entry_price is None or last_price is None:
+    # النتيجة هنا تُحسب حصراً من شكل شمعة الصفقة المغلقة.
+    # لا نستخدم السعر اللحظي snapshot إطلاقاً حتى لا تظهر نتيجة قبل إغلاق الشمعة أو من tick متأخر/مبكر.
+    try:
+        candle = quotex_otc_feed.candle(symbol, entry_ts)
+    except Exception:
+        candle = {}
+
+    candle_open = None
+    candle_close = None
+    try:
+        candle_bucket = int(float(candle.get("bucket_ts", 0) or 0)) if candle else 0
+        if not candle or candle_bucket != entry_bucket_ts:
+            raise ValueError("closed trade candle not available yet")
+        candle_open = float(candle.get("open"))
+        candle_close = float(candle.get("close"))
+    except Exception:
         state["waiting_result"] = False
         await context.bot.send_message(
             chat_id=admin_id,
-            text="⚠️ تعذر حساب نتيجة الصفقة بسبب نقص بيانات السعر. سنكمل مراقبة الجلسة.",
+            text=(
+                "⚠️ تعذر حساب نتيجة الصفقة لأن شمعة الصفقة المغلقة غير متوفرة بعد.\n"
+                "لن أعتمد على السعر اللحظي. سنكمل مراقبة الجلسة."
+            ),
             reply_markup=trading_room_keyboard
         )
         return
 
     eps = OTC_LIVE_TIE_EPSILON
-    win = (last_price > entry_price + eps) if direction == "CALL" else (last_price < entry_price - eps)
+    candle_is_green = candle_close > candle_open + eps
+    candle_is_red = candle_close < candle_open - eps
+    if direction == "CALL":
+        win = candle_is_green
+    else:
+        win = candle_is_red
     state["waiting_result"] = False
 
     if win:
@@ -3691,8 +3738,8 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
             f"{result_line}\n\n"
             f"💱 الزوج: {pair}\n"
             f"📌 الاتجاه: {'🟢 CALL' if direction == 'CALL' else '🔴 PUT'}\n"
-            f"سعر الدخول: {_safe_price_text(str(pair), entry_price)}\n"
-            f"سعر الإغلاق التقريبي: {_safe_price_text(str(pair), last_price)}\n\n"
+            f"افتتاح شمعة الصفقة: {_safe_price_text(str(pair), candle_open)}\n"
+            f"إغلاق شمعة الصفقة: {_safe_price_text(str(pair), candle_close)}\n\n"
             f"📊 نتيجة الجلسة الآن: {state.get('wins', 0)} ربح / {state.get('losses', 0)} خسارة"
         ),
         reply_markup=trading_room_keyboard
