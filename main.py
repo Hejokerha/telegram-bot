@@ -3027,6 +3027,11 @@ TRADING_ROOM_DATA_MAX_RETRIES = int(os.getenv("TRADING_ROOM_DATA_MAX_RETRIES", "
 # بعد أي خسارة لا ننهي الجلسة بسرعة؛ نمدد المراقبة بحثًا عن فرصة تعويض آمنة.
 TRADING_ROOM_RECOVERY_SEARCH_SECONDS = int(os.getenv("TRADING_ROOM_RECOVERY_SEARCH_SECONDS", "900"))
 TRADING_ROOM_RECOVERY_MESSAGE_COOLDOWN_SECONDS = int(os.getenv("TRADING_ROOM_RECOVERY_MESSAGE_COOLDOWN_SECONDS", "180"))
+# شروط إنهاء غرفة جلسة التداول: لا تنتهي الجلسة إلا عند أحد هذه الأهداف.
+TRADING_ROOM_TARGET_WINS = int(os.getenv("TRADING_ROOM_TARGET_WINS", "3"))
+TRADING_ROOM_MAX_LOSSES = int(os.getenv("TRADING_ROOM_MAX_LOSSES", "3"))
+TRADING_ROOM_MAX_RECOVERY_LOSSES = int(os.getenv("TRADING_ROOM_MAX_RECOVERY_LOSSES", "2"))
+TRADING_ROOM_RECOVERY_MULTIPLIER = float(os.getenv("TRADING_ROOM_RECOVERY_MULTIPLIER", "2.0"))
 
 
 def trading_room_key(admin_id: int) -> str:
@@ -3063,18 +3068,14 @@ def build_session_money_plan(balance: float) -> dict:
     # إدارة مالية بسيطة وآمنة للجلسة التجريبية: 2% من الرصيد، مع حد أدنى عملي.
     risk_percent = 0.02
     trade_amount = max(1.0, round(balance * risk_percent, 2))
-    if balance < 50:
-        max_trades = 3
-    elif balance < 200:
-        max_trades = 4
-    else:
-        max_trades = 5
+    # لم تعد الجلسة تنتهي بعدد صفقات ثابت؛ تنتهي حسب شروط الربح/الخسارة المحددة.
+    max_trades = 0
     return {
         "balance": balance,
         "risk_percent": risk_percent,
         "trade_amount": trade_amount,
         "max_trades": max_trades,
-        "max_planned_risk": round(trade_amount * max_trades, 2),
+        "max_planned_risk": round(trade_amount * TRADING_ROOM_MAX_LOSSES, 2),
     }
 
 
@@ -3462,8 +3463,9 @@ def build_trading_room_intro(plan: dict) -> str:
         "🧠 غرفة جلسة تداول\n\n"
         f"💰 الرصيد المسجل: {plan['balance']:.2f}$\n"
         f"📌 دخول الصفقة المقترح: {plan['trade_amount']:.2f}$\n"
-        f"📊 عدد صفقات الجلسة: {plan['max_trades']} صفقات\n"
-        f"🛡 الخطر المخطط للجلسة: {plan['max_planned_risk']:.2f}$ تقريبًا\n\n"
+        f"🛡 الخطر المخطط التقريبي: {plan['max_planned_risk']:.2f}$\n"
+        f"🎯 هدف الجلسة: {TRADING_ROOM_TARGET_WINS} ربح\n"
+        f"⛔ حد الإيقاف: {TRADING_ROOM_MAX_LOSSES} خسارة أو {TRADING_ROOM_MAX_RECOVERY_LOSSES} خسارة تعويضية\n\n"
         "سأفحص أزواج OTC الحية، أختار زوجًا مناسبًا للجلسة، ثم أراقبه فقط خلال الجلسة.\n"
         "هذه الميزة تجريبية للأدمن فقط الآن."
     )
@@ -3479,9 +3481,11 @@ def build_trading_room_state_message(state: dict) -> str:
         f"الزوج: {state.get('pair') or 'لم يحدد بعد'}",
         f"الاستراتيجية الحالية: {state.get('strategy') or 'قيد القراءة'}",
         f"الرصيد: {float(state.get('balance', 0) or 0):.2f}$",
-        f"دخول الصفقة: {float(state.get('trade_amount', 0) or 0):.2f}$",
-        f"الصفقات المنفذة: {int(state.get('trades_done', 0) or 0)} / {int(state.get('max_trades', 0) or 0)}",
+        f"دخول الصفقة الأساسي: {float(state.get('trade_amount', 0) or 0):.2f}$",
+        f"دخول التعويض: {float(state.get('trade_amount', 0) or 0) * TRADING_ROOM_RECOVERY_MULTIPLIER:.2f}$",
+        f"الصفقات المنفذة: {int(state.get('trades_done', 0) or 0)}",
         f"النتائج: {int(state.get('wins', 0) or 0)} ربح / {int(state.get('losses', 0) or 0)} خسارة",
+        f"خسائر التعويض: {int(state.get('recovery_losses', 0) or 0)} / {TRADING_ROOM_MAX_RECOVERY_LOSSES}",
     ]
     if state.get("last_reason"):
         lines.append(f"آخر قراءة: {state.get('last_reason')}")
@@ -3500,6 +3504,7 @@ async def start_trading_room_session(update: Update, context: ContextTypes.DEFAU
         "wins": 0,
         "losses": 0,
         "trades_done": 0,
+        "recovery_losses": 0,
         "extra_recovery_used": 0,
         "recovery_mode": False,
         "recovery_notified_at": 0.0,
@@ -3573,29 +3578,19 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     if time_module.time() > float(state.get("expires_at", 0) or 0):
-        net_now = int(state.get("wins", 0) or 0) - int(state.get("losses", 0) or 0)
-        if net_now < 0 or state.get("recovery_mode"):
+        # لا ننهي غرفة الجلسة بسبب انتهاء وقت المراقبة فقط.
+        # الجلسة تنتهي فقط عند 3 ربح أو 3 خسارة أو خسارتين تعويضيات.
+        state["expires_at"] = time_module.time() + (
+            TRADING_ROOM_RECOVERY_SEARCH_SECONDS if state.get("recovery_mode") else TRADING_ROOM_SCAN_SECONDS
+        )
+        last_notice = float(state.get("monitor_extend_notified_at", 0) or 0)
+        if time_module.time() - last_notice >= TRADING_ROOM_RECOVERY_MESSAGE_COOLDOWN_SECONDS:
+            state["monitor_extend_notified_at"] = time_module.time()
             await context.bot.send_message(
                 chat_id=admin_id,
-                text=(
-                    "⌛ انتهى وقت البحث عن فرصة تعويض آمنة.\n\n"
-                    "ما ظهر دخول مناسب بدون تهور، لذلك الأفضل نوقف هنا بدل الدخول العشوائي.\n"
-                    f"نتيجة الجلسة الحالية: {state.get('wins', 0)} ربح / {state.get('losses', 0)} خسارة"
-                ),
+                text="⏳ لا يوجد دخول مناسب الآن. سأستمر بالمراقبة بدون دخول عشوائي.",
                 reply_markup=trading_room_keyboard
             )
-        else:
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text="⌛ انتهى وقت مراقبة الجلسة بدون ظهور دخول مناسب.\n\nالأفضل نوقف هنا بدل الدخول العشوائي.",
-                reply_markup=trading_room_keyboard
-            )
-        state["active"] = False
-        try:
-            context.job.schedule_removal()
-        except Exception:
-            pass
-        return
 
     analysis = analyze_trading_room_entry(state)
     if not analysis.get("ok"):
@@ -3606,25 +3601,30 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
     entry_mode = analysis["entry_mode"]
     entry_text = "⚡ دخول مباشر الآن لمدة دقيقة متحركة" if entry_mode == "direct" else f"🕯 دخول الشمعة القادمة عند {analysis['entry_time_text']}"
     dir_line = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
+
+    base_amount = float(state.get('trade_amount', 0) or 0)
+    is_recovery_trade = bool(state.get("recovery_mode") or int(state.get("wins", 0) or 0) < int(state.get("losses", 0) or 0))
+    trade_amount = round(base_amount * (TRADING_ROOM_RECOVERY_MULTIPLIER if is_recovery_trade else 1.0), 2)
+    analysis["trade_amount"] = trade_amount
+    analysis["recovery_trade"] = is_recovery_trade
+
     state.update({
         "waiting_result": True,
         "current_trade": analysis,
         "trades_done": int(state.get("trades_done", 0) or 0) + 1,
     })
 
+    amount_line = f"💰 دخول الصفقة المقترح: {trade_amount:.2f}$"
+    if is_recovery_trade:
+        amount_line += "  🔁 تعويض"
+
     await context.bot.send_message(
         chat_id=admin_id,
         text=(
-            "🧠 غرفة جلسة تداول\n\n"
             f"{entry_text}\n\n"
-            f"💱 الزوج: {analysis['pair']}\n"
             "🧭 المدة: M1\n"
-            f"📌 الاتجاه: {dir_line}\n"
-            f"💵 السعر الحالي: {_safe_price_text(analysis['pair'], analysis['price'])}\n"
-            f"📊 قوة النمط: {analysis['score']}%\n"
-            f"📌 نمط الدخول: {analysis['setup']}\n\n"
-            f"💰 دخول الصفقة المقترح: {float(state.get('trade_amount', 0) or 0):.2f}$\n"
-            "⚠️ تجريبي للأدمن فقط. التزم بإدارة رأس المال."
+            f"📌 الاتجاه: {dir_line}\n\n\n"
+            f"{amount_line}"
         ),
         reply_markup=trading_room_keyboard
     )
@@ -3711,64 +3711,50 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
         win = candle_is_red
     state["waiting_result"] = False
 
+    was_recovery_trade = bool(trade.get("recovery_trade"))
     if win:
         state["wins"] = int(state.get("wins", 0) or 0) + 1
         result_line = "✅ مبروك، الصفقة ربحت"
     else:
         state["losses"] = int(state.get("losses", 0) or 0) + 1
+        if was_recovery_trade:
+            state["recovery_losses"] = int(state.get("recovery_losses", 0) or 0) + 1
         result_line = "❌ معوضة، الصفقة خسرت"
 
-    net = int(state.get("wins", 0) or 0) - int(state.get("losses", 0) or 0)
+    wins = int(state.get("wins", 0) or 0)
+    losses = int(state.get("losses", 0) or 0)
+    recovery_losses = int(state.get("recovery_losses", 0) or 0)
 
-    # إذا صار في خسارة غير معوضة، لا ننهي الجلسة بسرعة.
-    # نمدد وقت المراقبة ونحوّل الجلسة لوضع تعويض، لكن بدون إعطاء صفقات عشوائية.
-    if net < 0:
+    if not win:
         state["recovery_mode"] = True
         state["expires_at"] = time_module.time() + TRADING_ROOM_RECOVERY_SEARCH_SECONDS
-        state["last_reason"] = "وضع تعويض: نبحث عن فرصة آمنة فقط"
-    elif net >= 0 and state.get("recovery_mode"):
+        state["last_reason"] = "جاري البحث عن صفقة تعويضية آمنة"
+    elif was_recovery_trade:
         state["recovery_mode"] = False
-        state["last_reason"] = "تمت معادلة الجلسة أو تحسينها"
-    trades_done = int(state.get("trades_done", 0) or 0)
-    max_trades = int(state.get("max_trades", 0) or 0)
+        state["last_reason"] = "تم تعويض الخسارة"
+    elif losses > wins:
+        state["recovery_mode"] = True
 
     await context.bot.send_message(
         chat_id=admin_id,
         text=(
             f"{result_line}\n\n"
-            f"💱 الزوج: {pair}\n"
-            f"📌 الاتجاه: {'🟢 CALL' if direction == 'CALL' else '🔴 PUT'}\n"
-            f"افتتاح شمعة الصفقة: {_safe_price_text(str(pair), candle_open)}\n"
-            f"إغلاق شمعة الصفقة: {_safe_price_text(str(pair), candle_close)}\n\n"
-            f"📊 نتيجة الجلسة الآن: {state.get('wins', 0)} ربح / {state.get('losses', 0)} خسارة"
+            f"📊 نتيجة الجلسة الآن: {wins} ربح / {losses} خسارة"
         ),
         reply_markup=trading_room_keyboard
     )
 
-    if net < 0:
-        last_recovery_notice = float(state.get("recovery_notified_at", 0) or 0)
-        if time_module.time() - last_recovery_notice >= TRADING_ROOM_RECOVERY_MESSAGE_COOLDOWN_SECONDS:
-            state["recovery_notified_at"] = time_module.time()
-            await context.bot.send_message(
-                chat_id=admin_id,
-                text=(
-                    "🔁 الجلسة فيها خسارة غير معوضة.\n\n"
-                    f"سأستمر بالبحث عن فرصة تعويض آمنة لمدة تصل إلى {int(TRADING_ROOM_RECOVERY_SEARCH_SECONDS / 60)} دقيقة.\n"
-                    "إذا لم تظهر فرصة مناسبة، لن ندخل عشوائيًا."
-                ),
-                reply_markup=trading_room_keyboard
-            )
-
     should_finish = False
     finish_reason = ""
-    if trades_done >= max_trades:
-        if net < 0:
-            # لا نغلق الجلسة وهي خاسرة فقط لأن عدد الصفقات المبدئي انتهى.
-            # نتركها في وضع التعويض حتى تنتهي مهلة البحث الآمن أو تظهر فرصة تعويض.
-            state["max_trades"] = max(trades_done + 1, max_trades + 1)
-        else:
-            should_finish = True
-            finish_reason = "وصلنا لعدد صفقات الجلسة المحدد."
+    if wins >= TRADING_ROOM_TARGET_WINS:
+        should_finish = True
+        finish_reason = f"تحقق هدف الجلسة: {TRADING_ROOM_TARGET_WINS} ربح."
+    elif losses >= TRADING_ROOM_MAX_LOSSES:
+        should_finish = True
+        finish_reason = f"وصلنا لحد الإيقاف: {TRADING_ROOM_MAX_LOSSES} خسارة."
+    elif recovery_losses >= TRADING_ROOM_MAX_RECOVERY_LOSSES:
+        should_finish = True
+        finish_reason = f"وصلنا لحد التعويض: {TRADING_ROOM_MAX_RECOVERY_LOSSES} خسارة تعويضية."
 
     if should_finish:
         state["active"] = False
@@ -3777,9 +3763,17 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
             text=(
                 "🏁 انتهت جلسة التداول\n\n"
                 f"السبب: {finish_reason}\n"
-                f"النتيجة النهائية: {state.get('wins', 0)} ربح / {state.get('losses', 0)} خسارة\n\n"
+                f"النتيجة النهائية: {wins} ربح / {losses} خسارة\n\n"
                 "الأفضل نرتاح الآن. إذا بدك جلسة جديدة، خليها بعد 3 ساعات على الأقل."
             ),
+            reply_markup=trading_room_keyboard
+        )
+        return
+
+    if losses > wins or state.get("recovery_mode"):
+        await context.bot.send_message(
+            chat_id=admin_id,
+            text="🔁 جاري البحث عن صفقة تعويضية آمنة...",
             reply_markup=trading_room_keyboard
         )
 
