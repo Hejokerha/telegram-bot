@@ -1711,6 +1711,95 @@ def set_bot_enabled(value: bool):
     _cache_set("system:bot_enabled", bool(value))
 
 
+# ===== Maintenance waiters =====
+def maintenance_waiters_ref():
+    return system_ref().child("maintenance_waiters")
+
+
+def remember_maintenance_waiter(user_id: int, lang: str = "ar", name: str = "", username: str = ""):
+    """يحفظ فقط المستخدمين الذين حاولوا استخدام البوت أثناء الصيانة حتى نبلغهم عند عودة التشغيل."""
+    try:
+        uid = int(user_id)
+        lang = "en" if str(lang).lower() == "en" else "ar"
+        ref = maintenance_waiters_ref().child(str(uid))
+        old_data = ref.get() or {}
+        data = {
+            "telegram_id": uid,
+            "language": lang,
+            "name": name or old_data.get("name", ""),
+            "username": username or old_data.get("username", ""),
+            "first_seen": old_data.get("first_seen") or now_iso(),
+            "last_seen": now_iso(),
+        }
+        ref.set(data)
+        return True
+    except Exception as e:
+        logger.warning("Could not remember maintenance waiter | user=%s | error=%s", user_id, e)
+        return False
+
+
+def get_maintenance_waiters() -> dict:
+    try:
+        data = maintenance_waiters_ref().get() or {}
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.warning("Could not read maintenance waiters: %s", e)
+        return {}
+
+
+def clear_maintenance_waiters():
+    try:
+        maintenance_waiters_ref().delete()
+    except Exception as e:
+        logger.warning("Could not clear maintenance waiters: %s", e)
+
+
+def build_maintenance_finished_text(lang: str = "ar") -> str:
+    if str(lang).lower() == "en":
+        return (
+            "✅ Maintenance is complete.\n\n"
+            "TRADING TIME Bot is back online now.\n"
+            "You can use the bot again."
+        )
+    return (
+        "✅ انتهت التحديثات.\n\n"
+        "بوت TRADING TIME عاد للعمل الآن.\n"
+        "يمكنك استخدام البوت من جديد."
+    )
+
+
+async def notify_maintenance_waiters(context: ContextTypes.DEFAULT_TYPE) -> tuple[int, int]:
+    """يرسل رسالة العودة فقط لمن حاول استخدام البوت أثناء الصيانة ثم يمسح القائمة."""
+    waiters = get_maintenance_waiters()
+    if not waiters:
+        return 0, 0
+
+    sent = 0
+    failed = 0
+
+    for uid_str, info in list(waiters.items()):
+        try:
+            uid = int(uid_str)
+            lang = "en" if isinstance(info, dict) and str(info.get("language") or "").lower() == "en" else "ar"
+            if is_approved(uid) or is_otc_list_manager(uid):
+                markup = build_main_menu_for_user(uid, lang)
+            else:
+                markup = welcome_keyboard_en if lang == "en" else welcome_keyboard
+
+            await context.bot.send_message(
+                chat_id=uid,
+                text=build_maintenance_finished_text(lang),
+                reply_markup=markup,
+            )
+            sent += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            failed += 1
+            logger.warning("Could not notify maintenance waiter %s: %s", uid_str, e)
+
+    clear_maintenance_waiters()
+    return sent, failed
+
 
 def force_reject_pending_user(user_id: int):
     """رفض الطلب وتنظيف pending/cache فورًا حتى لا يبقى المستخدم عالقًا."""
@@ -7331,6 +7420,15 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
     if is_otc_list_manager(user_id) and not is_admin(user_id):
         return otc_list_manager_keyboard if lang != "en" else main_keyboard_en
     if is_admin(user_id):
+        if lang == "en":
+            return ReplyKeyboardMarkup(
+                [
+                    ["📊 Generate Signals", "👤 My Account"],
+                    ["📞 Contact Support", "🌐 Change Language"],
+                    ["🛠 Admin Panel"],
+                ],
+                resize_keyboard=True
+            )
         return ReplyKeyboardMarkup(
             [
                 ["📊 توليد إشارات", "👤 حالة حسابي"],
@@ -7731,7 +7829,29 @@ async def send_user_details(update: Update, target_id: int, show_admin_actions: 
         await update.message.reply_text(msg, parse_mode="HTML")
 
 
-async def send_maintenance_message(update: Update):
+async def send_maintenance_message(update: Update, context: ContextTypes.DEFAULT_TYPE | None = None, lang: str | None = None):
+    user = update.effective_user
+    if lang is None and user is not None:
+        lang = get_user_language(user.id, context)
+    lang = "en" if str(lang).lower() == "en" else "ar"
+
+    if user is not None and not is_admin(user.id):
+        remember_maintenance_waiter(
+            user.id,
+            lang=lang,
+            name=user.full_name or "",
+            username=user.username or "",
+        )
+
+    if lang == "en":
+        await update.message.reply_text(
+            "🛠 The bot is currently under maintenance.\n\n"
+            "We are making some updates and improvements.\n"
+            "Please try again later.\n\n"
+            "Thank you for understanding 🤍"
+        )
+        return
+
     await update.message.reply_text(
         "🛠 البوت تحت الصيانة حاليًا\n\n"
         "نقوم حاليًا ببعض التحديثات والتحسينات.\n"
@@ -7886,15 +8006,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     lang = get_user_language(user.id, context)
 
     if not get_bot_enabled():
-        if lang == "en":
-            await update.message.reply_text(
-                "🛠 The bot is currently under maintenance.\n\n"
-                "We are making some updates and improvements.\n"
-                "Please try again later.\n\n"
-                "Thank you for understanding 🤍"
-            )
-        else:
-            await send_maintenance_message(update)
+        await send_maintenance_message(update, context, lang)
         return
 
     # مشرف الليستات: إذا كان مفعّلًا يظهر له كيبورد الليستات+الإشارات، وإذا غير مفعّل يرجع لمسار البداية.
@@ -8249,15 +8361,24 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_language(update)
         return
 
+    # Admin owner can still open the admin panel while testing English mode.
+    if is_admin(user.id) and text in {"🛠 Admin Panel", "Admin Panel", "🛠 لوحة الأدمن"}:
+        reset_signal_state(context)
+        await update.message.reply_text(
+            "🛠 Admin panel opened.",
+            reply_markup=admin_main_keyboard
+        )
+        return
+
     # Contact / tutorial / free trial public actions
-    if text in {"📞 Contact Support", "Contact Support"}:
+    if text in {"📞 Contact Support", "Contact Support", "📞 تواصل مع المسؤول", "تواصل مع المسؤول"}:
         await update.message.reply_text(
             f"📞 Contact support here:\n{ADMIN_USERNAME}",
             reply_markup=welcome_keyboard_en if not is_approved(user.id) else build_main_menu_for_user(user.id, "en")
         )
         return
 
-    if text in {"🔙 Back", "⬅️ Back", "Back"}:
+    if text in {"🔙 Back", "⬅️ Back", "Back", "🔙 رجوع", "⬅️ رجوع"}:
         reset_signal_state(context)
         await update.message.reply_text(
             "Back to menu.",
@@ -8433,7 +8554,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Approved English user flow
-    if text in {"📊 Generate Signals", "Generate Signals"}:
+    if text in {"📊 Generate Signals", "Generate Signals", "📊 توليد إشارات", "توليد إشارات"}:
         allowed, limit_msg = check_signal_usage_allowed_lang(user.id, 1, "en")
         if not allowed:
             reset_signal_state(context)
@@ -8444,7 +8565,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("📊 Choose market type 👇", reply_markup=market_mode_keyboard_en)
         return
 
-    if text in {"👤 My Account", "My Account"}:
+    if text in {"👤 My Account", "My Account", "👤 حسابي", "👤 حالة حسابي"}:
         await update.message.reply_text(
             build_account_status_message(user, lang="en"),
             parse_mode="HTML",
@@ -8782,7 +8903,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await ask_language(update)
         return
 
-    if (not is_admin(user.id)) and get_user_language(user.id, context) == "en":
+    lang = get_user_language(user.id, context)
+
+    # ===== Maintenance mode =====
+    # يسمح بتغيير اللغة فقط، لكن أي استخدام آخر أثناء الإيقاف يُسجل ليتم إعلامه عند عودة البوت.
+    if not is_admin(user.id) and not get_bot_enabled():
+        await send_maintenance_message(update, context, lang)
+        return
+
+    if lang == "en":
         await handle_message_en(update, context)
         return
 
@@ -8983,7 +9112,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== Maintenance mode =====
     if not is_admin(user.id) and not get_bot_enabled():
-        await send_maintenance_message(update)
+        await send_maintenance_message(update, context, get_user_language(user.id, context))
         return
 
     if "فيديو شرح" in text:
@@ -9431,7 +9560,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == "🟢 تشغيل البوت":
             set_bot_enabled(True)
-            await update.message.reply_text("✅ تم تشغيل البوت للعامة", reply_markup=admin_main_keyboard)
+            sent, failed = await notify_maintenance_waiters(context)
+            msg = "✅ تم تشغيل البوت للعامة"
+            if sent or failed:
+                msg += f"\n\n📣 تم إعلام {sent} مستخدم حاولوا استخدام البوت أثناء الصيانة."
+                if failed:
+                    msg += f"\n⚠️ تعذر إرسال الإشعار إلى {failed} مستخدم."
+            await update.message.reply_text(msg, reply_markup=admin_main_keyboard)
             return
 
         if text == "🔴 إيقاف البوت":
