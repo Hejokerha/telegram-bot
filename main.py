@@ -2836,9 +2836,11 @@ SNIPER_ZONE_FAST_MAX_SECONDS_AFTER_WATCH = float(os.getenv("SNIPER_ZONE_FAST_MAX
 SNIPER_DIRECT_CURRENT_CANDLE_MAX_ELAPSED_SECONDS = float(os.getenv("SNIPER_DIRECT_CURRENT_CANDLE_MAX_ELAPSED_SECONDS", "30"))
 # صفقات الشمعة القادمة: نرسل التأكيد قرب نهاية الشمعة الحالية فقط حتى تكون جاهز للدخول مع بداية الجديدة.
 SNIPER_NEXT_ENTRY_LEAD_SECONDS = float(os.getenv("SNIPER_NEXT_ENTRY_LEAD_SECONDS", "18"))
-SNIPER_NEXT_CONFIRMATION_REQUIRED = int(os.getenv("SNIPER_NEXT_CONFIRMATION_REQUIRED", "2"))
+SNIPER_NEXT_CONFIRMATION_REQUIRED = int(os.getenv("SNIPER_NEXT_CONFIRMATION_REQUIRED", "1"))
 SNIPER_NEXT_WATCH_MIN_SCORE = int(os.getenv("SNIPER_NEXT_WATCH_MIN_SCORE", "84"))
 SNIPER_NEXT_SIGNAL_MIN_SCORE = int(os.getenv("SNIPER_NEXT_SIGNAL_MIN_SCORE", "88"))
+# إذا أرسلنا تنبيه تجهيز للشمعة القادمة ثم تغيّر وقت الدخول المتوقع، نلغي الفرصة بدل أن يبقى البحث صافن لعدة شموع.
+SNIPER_NEXT_ENTRY_MAX_WATCH_SECONDS = float(os.getenv("SNIPER_NEXT_ENTRY_MAX_WATCH_SECONDS", "70"))
 SNIPER_SEARCH_TASKS: dict[int, dict] = {}
 
 
@@ -3373,8 +3375,8 @@ def format_sniper_watch(result: dict) -> str:
             f"الاتجاه المحتمل إذا ثبت التوافق: {likely}\n"
             f"وقت الدخول المتوقع: {result.get('entry_time') or 'بداية الشمعة القادمة'}\n"
             f"قوة المراقبة الحالية: {result.get('score')}%\n\n"
-            "⏳ انتظر تأكيد آخر ثواني من الشمعة الحالية...\n"
-            "إذا ثبتت الشروط قرب الإغلاق سأرسل دخول الشمعة القادمة."
+            "⏳ انتظر التأكيد في آخر ثواني قبل وقت الدخول...\n"
+            "إذا لم تكتمل الشروط قبل هذا الوقت سألغي الفرصة ولن أرسل دخولًا متأخرًا."
         )
     return (
         "🎯 OTC Sniper Pro\n\n"
@@ -3422,6 +3424,29 @@ async def sniper_search_worker(context: ContextTypes.DEFAULT_TYPE, user_id: int,
     confirmation_count = 0
     try:
         while time_module.time() < expires_at:
+            # إذا كنا نراقب فرصة "الشمعة القادمة" وانتهى وقتها أو تغيّر وقت الدخول المتوقع، لا ننتظر شمعتين وثلاث.
+            # نلغيها مباشرة حتى يكون سلوك Sniper Pro واضح وسريع.
+            if active_result and active_result.get("entry_type") == "next":
+                try:
+                    watch_age = time_module.time() - float(active_watch_started_at or started_at)
+                    current_next_time = sniper_current_m1_timing().get("next_entry_time")
+                    expected_time = active_result.get("entry_time")
+                    if (expected_time and current_next_time and current_next_time != expected_time) or watch_age > SNIPER_NEXT_ENTRY_MAX_WATCH_SECONDS:
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text=(
+                                "🎯 OTC Sniper Pro\n\n"
+                                "❌ انتهت فرصة الشمعة القادمة ولم تكتمل الشروط.\n\n"
+                                f"الزوج الذي تمت مراقبته: {active_result.get('pair') or 'غير معروف'}\n"
+                                f"وقت الدخول المتوقع كان: {expected_time or 'غير محدد'}\n\n"
+                                "لن أرسل دخولًا متأخرًا بعد مرور وقت الصفقة."
+                            ),
+                            reply_markup=sniper_pro_keyboard,
+                        )
+                        return
+                except Exception:
+                    pass
+
             if active_key and active_pair and active_symbol:
                 # بعد تنبيه "جهّز الزوج" نراقب نفس الزوج فقط.
                 # هذا يمنع التشتت، والأهم يسمح بدخول الملامسة السريع قبل أن تهرب الحركة.
@@ -3439,6 +3464,16 @@ async def sniper_search_worker(context: ContextTypes.DEFAULT_TYPE, user_id: int,
                 key = (result.get("symbol"), result.get("direction"), result.get("entry_type"))
 
                 if active_key is None:
+                    # إذا ظهرت فرصة الشمعة القادمة مكتملة فعلًا ونحن داخل نافذة آخر الثواني،
+                    # لا نرسل "جهّز" ثم نضيّع وقت الدخول؛ نرسل الصفقة مباشرة.
+                    if status == "signal" and result.get("entry_type") == "next" and result.get("next_entry_window"):
+                        await context.bot.send_message(
+                            chat_id=user_id,
+                            text=format_sniper_signal(result),
+                            reply_markup=sniper_pro_keyboard,
+                        )
+                        return
+
                     active_key = key
                     active_pair = result.get("pair")
                     active_symbol = result.get("symbol")
@@ -3470,16 +3505,14 @@ async def sniper_search_worker(context: ContextTypes.DEFAULT_TYPE, user_id: int,
                                 )
                                 return
 
-                        # صفقات الشمعة القادمة تحتاج تأكيدًا أقل ولكن فقط قرب نهاية الشمعة الحالية.
+                        # صفقات الشمعة القادمة لا يجوز أن تتأخر: إذا اكتملت داخل نافذة آخر الثواني نرسلها فورًا.
                         if result.get("entry_type") == "next" and result.get("next_entry_window"):
-                            enough_next_confirmations = confirmation_count >= SNIPER_NEXT_CONFIRMATION_REQUIRED
-                            if enough_next_confirmations:
-                                await context.bot.send_message(
-                                    chat_id=user_id,
-                                    text=format_sniper_signal(result),
-                                    reply_markup=sniper_pro_keyboard,
-                                )
-                                return
+                            await context.bot.send_message(
+                                chat_id=user_id,
+                                text=format_sniper_signal(result),
+                                reply_markup=sniper_pro_keyboard,
+                            )
+                            return
 
                         # الفرص العادية تبقى تحتاج تأكيدات أكثر.
                         enough_confirmations = confirmation_count >= SNIPER_CONFIRMATION_REQUIRED
