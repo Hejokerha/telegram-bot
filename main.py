@@ -2822,6 +2822,13 @@ SNIPER_MIN_CANDLES = int(os.getenv("SNIPER_MIN_CANDLES", "8"))
 SNIPER_CONFIRMATION_REQUIRED = int(os.getenv("SNIPER_CONFIRMATION_REQUIRED", "3"))
 SNIPER_MIN_SECONDS_BEFORE_SIGNAL = int(os.getenv("SNIPER_MIN_SECONDS_BEFORE_SIGNAL", "20"))
 SNIPER_MAX_PREPARE_ALERTS = int(os.getenv("SNIPER_MAX_PREPARE_ALERTS", "1"))
+# دخول الملامسة السريع: خاص بفرص الدعم/المقاومة/Round Number.
+# الفكرة: بعد رسالة "جهّز الزوج" لا ننتظر تأكيدات ثقيلة إذا كانت الفرصة عبارة عن لمس منطقة وارتداد سريع.
+SNIPER_ZONE_FAST_ENTRY_ENABLED = os.getenv("SNIPER_ZONE_FAST_ENTRY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+SNIPER_ZONE_FAST_MIN_SCORE = int(os.getenv("SNIPER_ZONE_FAST_MIN_SCORE", "86"))
+SNIPER_ZONE_FAST_MIN_GAP = int(os.getenv("SNIPER_ZONE_FAST_MIN_GAP", "12"))
+SNIPER_ZONE_FAST_MIN_SECONDS_AFTER_WATCH = float(os.getenv("SNIPER_ZONE_FAST_MIN_SECONDS_AFTER_WATCH", "3"))
+SNIPER_ZONE_FAST_MAX_SECONDS_AFTER_WATCH = float(os.getenv("SNIPER_ZONE_FAST_MAX_SECONDS_AFTER_WATCH", "45"))
 SNIPER_SEARCH_TASKS: dict[int, dict] = {}
 
 
@@ -3056,32 +3063,51 @@ def sniper_analyze_pair(pair: str, symbol: str, mode: str = "smart") -> dict | N
         support_touch = levels["support_state"] in {"touch", "near"}
         resistance_touch = levels["resistance_state"] in {"touch", "near"}
         round_touch = levels["round_state"] in {"touch", "near"}
+        zone_type = None
+        zone_side = None
+        zone_reversal_confirmed = False
         if support_touch:
             watch_hint = True
+            zone_type = zone_type or "support"
+            zone_side = zone_side or "CALL"
             if cur_m["lower_ratio"] >= 0.35 or tickp["bias"] == "CALL":
                 call_score += 22
                 call_reasons.append("ارتداد/ملامسة دعم قريب")
                 entry_type = "direct"
+                # لمس دعم + أول ارتداد أو ضغط شرائي = فرصة ملامسة سريعة.
+                zone_reversal_confirmed = bool(tickp["bias"] == "CALL" or (cur_m["lower_ratio"] >= 0.30 and price >= float(current["open"])))
             else:
                 put_score -= 12
                 blockers.append("PUT قريب من دعم حساس")
         if resistance_touch:
             watch_hint = True
+            zone_type = zone_type or "resistance"
+            zone_side = zone_side or "PUT"
             if cur_m["upper_ratio"] >= 0.35 or tickp["bias"] == "PUT":
                 put_score += 22
                 put_reasons.append("رفض/ملامسة مقاومة قريبة")
                 entry_type = "direct"
+                # لمس مقاومة + أول رفض أو ضغط بيعي = فرصة ملامسة سريعة.
+                zone_reversal_confirmed = bool(tickp["bias"] == "PUT" or (cur_m["upper_ratio"] >= 0.30 and price <= float(current["open"])))
             else:
                 call_score -= 12
                 blockers.append("CALL قريب من مقاومة حساسة")
         if round_touch:
             watch_hint = True
+            if zone_type is None:
+                zone_type = "round"
             if cur_m["lower_ratio"] > cur_m["upper_ratio"] and tickp["bias"] == "CALL":
                 call_score += 10
                 call_reasons.append("تفاعل إيجابي قرب Round Number")
+                zone_side = zone_side or "CALL"
+                entry_type = "direct"
+                zone_reversal_confirmed = True
             elif cur_m["upper_ratio"] > cur_m["lower_ratio"] and tickp["bias"] == "PUT":
                 put_score += 10
                 put_reasons.append("تفاعل سلبي قرب Round Number")
+                zone_side = zone_side or "PUT"
+                entry_type = "direct"
+                zone_reversal_confirmed = True
             else:
                 call_score += 3
                 put_score += 3
@@ -3125,7 +3151,7 @@ def sniper_analyze_pair(pair: str, symbol: str, mode: str = "smart") -> dict | N
 
         confluence = int(max(0, min(97, confluence)))
 
-        # A real signal must be clean. Negative notes become rejection/watch, not a 99% trade.
+        # A normal signal must be clean. Negative notes become rejection/watch, not a high-confidence trade.
         clean_signal = (
             confluence >= SNIPER_MIN_SIGNAL_SCORE
             and not severe_blockers
@@ -3133,8 +3159,25 @@ def sniper_analyze_pair(pair: str, symbol: str, mode: str = "smart") -> dict | N
             and gap >= 20
             and len(reasons) >= 3
         )
+
+        # Fast zone-touch signal: for دعم/مقاومة/Round Number touches.
+        # This is intentionally faster than normal confirmation because the entry may disappear within seconds.
+        # It still requires the direction to match the zone logic and enough analytical agreement.
+        fatal_blockers = {"شمعة تردد", "تذبذب غير صالح", "تعارض الاتجاهات"}
+        fast_touch_signal = (
+            SNIPER_ZONE_FAST_ENTRY_ENABLED
+            and entry_type == "direct"
+            and bool(watch_hint)
+            and bool(zone_reversal_confirmed)
+            and (zone_side in {None, direction})
+            and confluence >= SNIPER_ZONE_FAST_MIN_SCORE
+            and gap >= SNIPER_ZONE_FAST_MIN_GAP
+            and len(reasons) >= 2
+            and not any(b in fatal_blockers for b in severe_blockers)
+        )
+
         watch_ok = bool(watch_hint and confluence >= SNIPER_MIN_WATCH_SCORE)
-        status = "signal" if clean_signal else "watch" if watch_ok else "none"
+        status = "signal" if (clean_signal or fast_touch_signal) else "watch" if watch_ok else "none"
         if status == "none":
             return None
 
@@ -3154,6 +3197,9 @@ def sniper_analyze_pair(pair: str, symbol: str, mode: str = "smart") -> dict | N
             "reasons": reasons[:5],
             "blockers": blockers[:3],
             "levels": levels,
+            "setup_type": "zone_touch" if bool(watch_hint) and entry_type == "direct" else "normal",
+            "zone_type": zone_type,
+            "fast_touch": bool(fast_touch_signal),
             "payout": int((quotex_otc_feed.instrument(symbol) or {}).get("payout", 0) or 0),
         }
     except Exception as e:
@@ -3194,7 +3240,10 @@ def format_sniper_signal(result: dict) -> str:
     direction_icon = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
     if result.get("entry_type") == "direct":
         entry_title = "⚡ دخول مباشر الآن"
-        entry_line = "⏱ الدخول: الآن لمدة دقيقة متحركة"
+        if result.get("fast_touch"):
+            entry_line = "⏱ الدخول: الآن لمدة دقيقة متحركة إذا السعر لا يزال قريبًا من منطقة الارتداد"
+        else:
+            entry_line = "⏱ الدخول: الآن لمدة دقيقة متحركة"
     else:
         entry_title = "🕯 دخول الشمعة القادمة"
         entry_line = f"⏱ الدخول: مع بداية الشمعة القادمة {result.get('entry_time') or ''}".strip()
@@ -3265,12 +3314,21 @@ async def sniper_search_worker(context: ContextTypes.DEFAULT_TYPE, user_id: int,
     started_at = time_module.time()
     expires_at = started_at + SNIPER_SEARCH_DURATION_SECONDS
     active_key = None
+    active_pair = None
+    active_symbol = None
     active_result = None
+    active_watch_started_at = None
     prepare_alerts_sent = 0
     confirmation_count = 0
     try:
         while time_module.time() < expires_at:
-            result = sniper_scan_market(mode=mode)
+            if active_key and active_pair and active_symbol:
+                # بعد تنبيه "جهّز الزوج" نراقب نفس الزوج فقط.
+                # هذا يمنع التشتت، والأهم يسمح بدخول الملامسة السريع قبل أن تهرب الحركة.
+                result = sniper_analyze_pair(active_pair, active_symbol, mode=mode) or {"status": "none"}
+            else:
+                result = sniper_scan_market(mode=mode)
+
             status = result.get("status")
 
             # IMPORTANT:
@@ -3282,7 +3340,10 @@ async def sniper_search_worker(context: ContextTypes.DEFAULT_TYPE, user_id: int,
 
                 if active_key is None:
                     active_key = key
+                    active_pair = result.get("pair")
+                    active_symbol = result.get("symbol")
                     active_result = result
+                    active_watch_started_at = time_module.time()
                     prepare_alerts_sent += 1
                     confirmation_count = 1 if status == "signal" else 0
                     await context.bot.send_message(
@@ -3295,6 +3356,21 @@ async def sniper_search_worker(context: ContextTypes.DEFAULT_TYPE, user_id: int,
                     active_result = result
                     if status == "signal":
                         confirmation_count += 1
+                        watch_age = time_module.time() - float(active_watch_started_at or started_at)
+
+                        # فرص ملامسة الدعم/المقاومة لازم تدخل بسرعة، لأن التأكيد الطويل يضيع الارتداد.
+                        if result.get("fast_touch"):
+                            enough_time_for_touch = watch_age >= SNIPER_ZONE_FAST_MIN_SECONDS_AFTER_WATCH
+                            still_fresh_touch = watch_age <= SNIPER_ZONE_FAST_MAX_SECONDS_AFTER_WATCH
+                            if enough_time_for_touch and still_fresh_touch:
+                                await context.bot.send_message(
+                                    chat_id=user_id,
+                                    text=format_sniper_signal(result),
+                                    reply_markup=sniper_pro_keyboard,
+                                )
+                                return
+
+                        # الفرص العادية تبقى تحتاج تأكيدات أكثر.
                         enough_confirmations = confirmation_count >= SNIPER_CONFIRMATION_REQUIRED
                         enough_time = (time_module.time() - started_at) >= SNIPER_MIN_SECONDS_BEFORE_SIGNAL
                         if enough_confirmations and enough_time:
