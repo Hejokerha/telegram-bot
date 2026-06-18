@@ -3042,6 +3042,11 @@ TRADING_ROOM_PAIR_WEAK_HEALTH = int(os.getenv("TRADING_ROOM_PAIR_WEAK_HEALTH", "
 TRADING_ROOM_PAIR_STALE_SECONDS = int(os.getenv("TRADING_ROOM_PAIR_STALE_SECONDS", "12"))
 TRADING_ROOM_PAIR_NO_ENTRY_SWITCH_SCANS = int(os.getenv("TRADING_ROOM_PAIR_NO_ENTRY_SWITCH_SCANS", "24"))
 TRADING_ROOM_BRAIN_NOTICE_COOLDOWN_SECONDS = int(os.getenv("TRADING_ROOM_BRAIN_NOTICE_COOLDOWN_SECONDS", "90"))
+# تهدئة وعي الجلسة: لا نغيّر الزوج فورًا بعد اختياره، ولا بسبب قراءة واحدة ضعيفة.
+TRADING_ROOM_PAIR_MIN_OBSERVE_SECONDS = int(os.getenv("TRADING_ROOM_PAIR_MIN_OBSERVE_SECONDS", "120"))
+TRADING_ROOM_PAIR_SWITCH_COOLDOWN_SECONDS = int(os.getenv("TRADING_ROOM_PAIR_SWITCH_COOLDOWN_SECONDS", "180"))
+TRADING_ROOM_PAIR_BAD_CONFIRM_SCANS = int(os.getenv("TRADING_ROOM_PAIR_BAD_CONFIRM_SCANS", "3"))
+TRADING_ROOM_PAIR_TICK_MAX_AGE_SECONDS = int(os.getenv("TRADING_ROOM_PAIR_TICK_MAX_AGE_SECONDS", "20"))
 
 
 
@@ -3135,6 +3140,17 @@ def analyze_pair_for_trading_room(pair: str, symbol: str) -> dict | None:
 
     try:
         current_price = float(last_tick.get("price"))
+    except Exception:
+        return None
+
+    # لا نختار زوج للجلسة إذا آخر tick قديم.
+    # هذا كان سبب التخبيص: يختار زوجًا ثم يغيّره فورًا لأن البيانات قديمة.
+    try:
+        tick_ts = float(last_tick.get("ts") or last_tick.get("timestamp") or 0)
+        if tick_ts > 1e12:
+            tick_ts = tick_ts / 1000.0
+        if not tick_ts or time_module.time() - tick_ts > TRADING_ROOM_PAIR_TICK_MAX_AGE_SECONDS:
+            return None
     except Exception:
         return None
 
@@ -3379,18 +3395,44 @@ def select_trading_room_pair_for_brain(state: dict) -> dict | None:
 
 
 def trading_room_should_switch_pair(state: dict, health_info: dict) -> tuple[bool, str]:
+    """قرار تغيير الزوج يجب أن يكون هادئًا وليس عصبيًا.
+    لا نغيّر الزوج بسبب قراءة واحدة، ولا فورًا بعد اختيار الزوج، ولا كل عدة ثواني.
+    """
     if state.get("waiting_pair_selection") or state.get("waiting_result"):
         return False, ""
+
+    now_ts = time_module.time()
+    selected_at = float(state.get("pair_selected_at", 0) or 0)
+    if selected_at and now_ts - selected_at < TRADING_ROOM_PAIR_MIN_OBSERVE_SECONDS:
+        return False, ""
+
+    last_switch_at = float(state.get("last_pair_switch_at", 0) or 0)
+    if last_switch_at and now_ts - last_switch_at < TRADING_ROOM_PAIR_SWITCH_COOLDOWN_SECONDS:
+        return False, ""
+
     if int(state.get("pair_switches", 0) or 0) >= TRADING_ROOM_PAIR_MAX_SWITCHES:
         return False, "تم الوصول لحد تغيير الأزواج داخل الجلسة"
+
     label = health_info.get("label")
     reason = str(health_info.get("reason") or "")
+
+    bad_condition = False
     if label == "bad":
-        return True, reason or "سلوك الزوج أصبح سيئًا"
-    # في وضع التعويض نكون أكثر صرامة: الزوج الضعيف لا يصلح لتعويض آمن.
-    if state.get("recovery_mode") and label == "weak":
-        return True, reason or "الزوج ضعيف ولا يصلح للتعويض"
-    return False, ""
+        bad_condition = True
+    elif state.get("recovery_mode") and label == "weak":
+        # في التعويض نكون أصرم، لكن أيضًا نطلب تكرار الضعف أكثر من مرة.
+        bad_condition = True
+
+    if not bad_condition:
+        state["pair_bad_scans"] = 0
+        return False, ""
+
+    bad_scans = int(state.get("pair_bad_scans", 0) or 0) + 1
+    state["pair_bad_scans"] = bad_scans
+    if bad_scans < TRADING_ROOM_PAIR_BAD_CONFIRM_SCANS:
+        return False, ""
+
+    return True, reason or "سلوك الزوج أصبح ضعيفًا أكثر من مرة"
 
 
 async def trading_room_switch_pair_if_needed(context: ContextTypes.DEFAULT_TYPE, admin_id: int, state: dict) -> bool:
@@ -3431,6 +3473,9 @@ async def trading_room_switch_pair_if_needed(context: ContextTypes.DEFAULT_TYPE,
 
     state.update(new_pair)
     state["pair_switches"] = int(state.get("pair_switches", 0) or 0) + 1
+    state["last_pair_switch_at"] = time_module.time()
+    state["pair_selected_at"] = time_module.time()
+    state["pair_bad_scans"] = 0
     state["no_entry_scans"] = 0
     state["last_reason"] = f"تم تغيير الزوج بقرار غرفة التداول: {reason}"
     state["pair_health"] = None
@@ -3547,6 +3592,8 @@ async def trading_room_pair_select_retry_job(context: ContextTypes.DEFAULT_TYPE)
     if selected:
         state.update(selected)
         state["waiting_pair_selection"] = False
+        state["pair_selected_at"] = time_module.time()
+        state["pair_bad_scans"] = 0
         state["last_reason"] = "تم اختيار زوج الجلسة بعد تجهيز البيانات"
         await context.bot.send_message(
             chat_id=admin_id,
@@ -3796,6 +3843,9 @@ async def start_trading_room_session(update: Update, context: ContextTypes.DEFAU
         "last_trade_direction": None,
         "no_entry_scans": 0,
         "last_brain_notice_at": 0.0,
+        "pair_selected_at": 0.0,
+        "last_pair_switch_at": 0.0,
+        "pair_bad_scans": 0,
     }
     context.bot_data[trading_room_key(admin_id)] = state
     await update.message.reply_text(build_trading_room_intro(plan), reply_markup=trading_room_keyboard)
@@ -3826,6 +3876,8 @@ async def start_trading_room_session(update: Update, context: ContextTypes.DEFAU
         return
 
     state.update(selected)
+    state["pair_selected_at"] = time_module.time()
+    state["pair_bad_scans"] = 0
     state["last_reason"] = "تم اختيار زوج الجلسة"
     await update.message.reply_text(
         "🎯 تم اختيار زوج الجلسة\n\n"
