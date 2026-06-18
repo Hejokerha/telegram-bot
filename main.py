@@ -3033,6 +3033,17 @@ TRADING_ROOM_MAX_LOSSES = int(os.getenv("TRADING_ROOM_MAX_LOSSES", "3"))
 TRADING_ROOM_MAX_RECOVERY_LOSSES = int(os.getenv("TRADING_ROOM_MAX_RECOVERY_LOSSES", "2"))
 TRADING_ROOM_RECOVERY_MULTIPLIER = float(os.getenv("TRADING_ROOM_RECOVERY_MULTIPLIER", "2.0"))
 
+# ===== Trading Room Session Brain =====
+# طبقة وعي الجلسة: تراقب سلوك الزوج، تمنع تكرار نفس النمط الخاسر،
+# وتغيّر الزوج تلقائيًا إذا صار ضعيفًا أو متذبذبًا.
+TRADING_ROOM_PAIR_MAX_SWITCHES = int(os.getenv("TRADING_ROOM_PAIR_MAX_SWITCHES", "2"))
+TRADING_ROOM_PAIR_BAD_HEALTH = int(os.getenv("TRADING_ROOM_PAIR_BAD_HEALTH", "42"))
+TRADING_ROOM_PAIR_WEAK_HEALTH = int(os.getenv("TRADING_ROOM_PAIR_WEAK_HEALTH", "55"))
+TRADING_ROOM_PAIR_STALE_SECONDS = int(os.getenv("TRADING_ROOM_PAIR_STALE_SECONDS", "12"))
+TRADING_ROOM_PAIR_NO_ENTRY_SWITCH_SCANS = int(os.getenv("TRADING_ROOM_PAIR_NO_ENTRY_SWITCH_SCANS", "24"))
+TRADING_ROOM_BRAIN_NOTICE_COOLDOWN_SECONDS = int(os.getenv("TRADING_ROOM_BRAIN_NOTICE_COOLDOWN_SECONDS", "90"))
+
+
 
 def trading_room_key(admin_id: int) -> str:
     return f"trading_room:{int(admin_id)}"
@@ -3084,6 +3095,24 @@ def _safe_price_text(pair: str, price: float) -> str:
         return f"{float(price):.5f}" if "JPY" not in str(pair) else f"{float(price):.3f}"
     except Exception:
         return str(price)
+
+
+def _money_signed(value) -> str:
+    try:
+        v = float(value or 0)
+        sign = "+" if v > 0 else ""
+        return f"{sign}{v:.2f}$"
+    except Exception:
+        return "0.00$"
+
+
+def _trading_room_loss_units_for_trade(trade: dict) -> int:
+    try:
+        if bool((trade or {}).get("recovery_trade")):
+            return max(1, int(round(float(TRADING_ROOM_RECOVERY_MULTIPLIER))))
+    except Exception:
+        pass
+    return 1
 
 
 def _get_otc_rows_and_candles(symbol: str):
@@ -3207,6 +3236,221 @@ def select_trading_room_pair() -> dict | None:
     candidates.sort(key=lambda x: (x.get("score", 0), int(x.get("payout", 0) or 0)), reverse=True)
     return candidates[0]
 
+
+
+
+def _trading_room_market_mood_from_metrics(momentum: float, pressure: float, rhythm: float, avg_body: float, noise: float) -> str:
+    try:
+        if noise >= 0.82 or abs(pressure) < 0.08:
+            return "متذبذب"
+        if rhythm >= 0.62 and avg_body >= 0.34 and momentum >= 0.42:
+            return "ترندي"
+        if rhythm < 0.48 and avg_body >= 0.24 and momentum >= 0.30:
+            return "ارتدادي"
+        if momentum < 0.20 or avg_body < 0.18:
+            return "ميت"
+        return "متوسط"
+    except Exception:
+        return "غير واضح"
+
+
+def assess_trading_room_pair_health(state: dict) -> dict:
+    """يقيّم هل الزوج الحالي ما زال مناسبًا للجلسة.
+    هذه الدالة لا تعطي صفقات، فقط تعطي قرار وعي للجلسة.
+    """
+    pair = state.get("pair")
+    symbol = state.get("symbol")
+    if not pair or not symbol:
+        return {"health": 0, "label": "bad", "mood": "غير محدد", "reason": "لا يوجد زوج محدد"}
+
+    rows, last_tick, candles = _get_otc_rows_and_candles(symbol)
+    now_ts = time_module.time()
+    if len(rows) < 20 or not last_tick or len(candles) < 3:
+        return {"health": 20, "label": "bad", "mood": "بيانات ضعيفة", "reason": "بيانات الزوج غير كافية"}
+
+    try:
+        tick_ts = float(last_tick.get("ts") or last_tick.get("timestamp") or 0)
+        if tick_ts > 1e12:
+            tick_ts = tick_ts / 1000.0
+        age = now_ts - tick_ts if tick_ts else 999
+    except Exception:
+        age = 999
+    if age > TRADING_ROOM_PAIR_STALE_SECONDS:
+        return {"health": 25, "label": "bad", "mood": "متوقف", "reason": f"آخر tick قديم منذ {int(age)} ثانية"}
+
+    try:
+        sample = rows[-35:]
+        prices = [float(r[1]) for r in sample]
+        rng = max(prices) - min(prices)
+        if rng <= 0:
+            return {"health": 25, "label": "bad", "mood": "ميت", "reason": "الحركة شبه ثابتة"}
+        change = prices[-1] - prices[0]
+        up = sum(1 for a, b in zip(prices, prices[1:]) if b > a)
+        down = sum(1 for a, b in zip(prices, prices[1:]) if b < a)
+        total = max(1, up + down)
+        pressure = (up - down) / total
+        momentum = min(abs(change) / rng, 1.0)
+
+        recent_closed = candles[-7:-1] if len(candles) >= 7 else candles[:-1]
+        bodies = []
+        dirs = []
+        wick_noise = 0
+        for c in recent_closed[-6:]:
+            o = float(c.get("open")); h = float(c.get("high")); l = float(c.get("low")); cl = float(c.get("close"))
+            cr = max(h - l, 0.0)
+            if cr <= 0:
+                continue
+            body = abs(cl - o) / cr
+            upper = (h - max(o, cl)) / cr
+            lower = (min(o, cl) - l) / cr
+            bodies.append(body)
+            dirs.append(1 if cl > o else -1 if cl < o else 0)
+            if upper > 0.45 or lower > 0.45 or body < 0.16:
+                wick_noise += 1
+        avg_body = sum(bodies) / max(1, len(bodies))
+        rhythm = abs(sum(dirs[-4:])) / max(1, len(dirs[-4:])) if dirs else 0
+        noise = 1.0 - min(abs(pressure), 1.0)
+        mood = _trading_room_market_mood_from_metrics(momentum, pressure, rhythm, avg_body, noise)
+
+        health = int(round(
+            momentum * 28 + abs(pressure) * 26 + avg_body * 20 + rhythm * 16 + max(0, 10 - wick_noise * 2)
+        ))
+
+        reason_parts = []
+        if wick_noise >= 4:
+            health -= 14
+            reason_parts.append("ذيول/دوجي كثيرة")
+        if noise >= 0.86:
+            health -= 12
+            reason_parts.append("ضغط الحركة غير واضح")
+        if momentum < 0.18:
+            health -= 10
+            reason_parts.append("حركة ضعيفة")
+
+        # لا نكرر نفس النمط الخاسر فورًا إذا السوق لم يتغير.
+        last_loss_setup = state.get("last_loss_setup")
+        current_strategy = state.get("strategy_type")
+        if last_loss_setup and current_strategy and str(last_loss_setup) == str(current_strategy):
+            health -= 10
+            reason_parts.append("نفس النمط السابق الخاسر")
+
+        # طول الانتظار بدون دخول يقلل صحة الزوج.
+        no_entry_scans = int(state.get("no_entry_scans", 0) or 0)
+        if no_entry_scans >= TRADING_ROOM_PAIR_NO_ENTRY_SWITCH_SCANS:
+            health -= 18
+            reason_parts.append("انتظار طويل بدون فرصة")
+
+        health = max(0, min(100, health))
+        label = "good" if health >= TRADING_ROOM_PAIR_WEAK_HEALTH else "weak" if health >= TRADING_ROOM_PAIR_BAD_HEALTH else "bad"
+        reason = "، ".join(reason_parts) if reason_parts else f"سلوك الزوج {mood} وصالح للمراقبة"
+        return {
+            "health": health,
+            "label": label,
+            "mood": mood,
+            "reason": reason,
+            "momentum": round(momentum, 2),
+            "pressure": round(pressure, 2),
+            "avg_body": round(avg_body, 2),
+            "rhythm": round(rhythm, 2),
+        }
+    except Exception as e:
+        return {"health": 20, "label": "bad", "mood": "خطأ", "reason": f"تعذر تقييم الزوج: {e}"}
+
+
+def select_trading_room_pair_for_brain(state: dict) -> dict | None:
+    """اختيار زوج جديد مع استبعاد الزوج الحالي والأزواج التي فشلت داخل نفس الجلسة."""
+    pair_map = get_otc_analysis_pair_map()
+    current_symbol = state.get("symbol")
+    bad_symbols = set(state.get("bad_symbols") or [])
+    candidates = []
+    for pair, symbol in pair_map.items():
+        if symbol == current_symbol or symbol in bad_symbols:
+            continue
+        normalized = normalize_otc_currency_pair_name(pair, symbol)
+        if not normalized or not is_valid_otc_currency_pair_name(normalized):
+            continue
+        result = analyze_pair_for_trading_room(normalized, symbol)
+        if result:
+            candidates.append(result)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda x: (x.get("score", 0), int(x.get("payout", 0) or 0)), reverse=True)
+    return candidates[0]
+
+
+def trading_room_should_switch_pair(state: dict, health_info: dict) -> tuple[bool, str]:
+    if state.get("waiting_pair_selection") or state.get("waiting_result"):
+        return False, ""
+    if int(state.get("pair_switches", 0) or 0) >= TRADING_ROOM_PAIR_MAX_SWITCHES:
+        return False, "تم الوصول لحد تغيير الأزواج داخل الجلسة"
+    label = health_info.get("label")
+    reason = str(health_info.get("reason") or "")
+    if label == "bad":
+        return True, reason or "سلوك الزوج أصبح سيئًا"
+    # في وضع التعويض نكون أكثر صرامة: الزوج الضعيف لا يصلح لتعويض آمن.
+    if state.get("recovery_mode") and label == "weak":
+        return True, reason or "الزوج ضعيف ولا يصلح للتعويض"
+    return False, ""
+
+
+async def trading_room_switch_pair_if_needed(context: ContextTypes.DEFAULT_TYPE, admin_id: int, state: dict) -> bool:
+    health = assess_trading_room_pair_health(state)
+    state["pair_health"] = int(health.get("health", 0) or 0)
+    state["pair_health_label"] = health.get("label")
+    state["market_mood"] = health.get("mood")
+    state["pair_health_reason"] = health.get("reason")
+
+    should_switch, reason = trading_room_should_switch_pair(state, health)
+    if not should_switch:
+        return False
+
+    old_pair = state.get("pair")
+    old_symbol = state.get("symbol")
+    if old_symbol:
+        bad_symbols = set(state.get("bad_symbols") or [])
+        bad_symbols.add(old_symbol)
+        state["bad_symbols"] = list(bad_symbols)
+
+    new_pair = select_trading_room_pair_for_brain(state)
+    if not new_pair:
+        state["last_reason"] = f"الزوج الحالي ضعيف: {reason}. لم أجد بديلًا أنظف الآن."
+        last_notice = float(state.get("last_brain_notice_at", 0) or 0)
+        if time_module.time() - last_notice >= TRADING_ROOM_BRAIN_NOTICE_COOLDOWN_SECONDS:
+            state["last_brain_notice_at"] = time_module.time()
+            await context.bot.send_message(
+                chat_id=admin_id,
+                text=(
+                    "🧠 قرار غرفة التداول\n\n"
+                    f"الزوج الحالي أصبح ضعيفًا: {old_pair}\n"
+                    f"السبب: {reason}\n\n"
+                    "لم أجد زوجًا بديلًا أنظف الآن، سأستمر بالمراقبة بدون دخول عشوائي."
+                ),
+                reply_markup=trading_room_keyboard
+            )
+        return False
+
+    state.update(new_pair)
+    state["pair_switches"] = int(state.get("pair_switches", 0) or 0) + 1
+    state["no_entry_scans"] = 0
+    state["last_reason"] = f"تم تغيير الزوج بقرار غرفة التداول: {reason}"
+    state["pair_health"] = None
+    state["pair_health_label"] = None
+    state["market_mood"] = None
+    await context.bot.send_message(
+        chat_id=admin_id,
+        text=(
+            "🧠 قرار غرفة التداول\n\n"
+            f"الزوج السابق لم يعد مناسبًا: {old_pair}\n"
+            f"السبب: {reason}\n\n"
+            "🔄 سأغيّر الزوج للجلسة.\n\n"
+            f"💱 الزوج الجديد: {new_pair['pair']}\n"
+            f"📊 قراءة الزوج: {new_pair['score']}%\n"
+            f"🧠 نمط الجلسة: {new_pair['strategy']}\n\n"
+            "افتح الزوج الجديد وجهّزه. سأراقبه قبل إعطاء أي دخول."
+        ),
+        reply_markup=trading_room_keyboard
+    )
+    return True
 
 def get_trading_room_market_data_status() -> dict:
     """يعطي حالة بيانات OTC Live التي تحتاجها غرفة الجلسة قبل اختيار زوج."""
@@ -3426,11 +3670,31 @@ def analyze_trading_room_entry(state: dict) -> dict:
     if direction is None:
         return {"ok": False, "reason": "لا يوجد نمط دخول واضح الآن"}
 
-    score = int(round(momentum * 35 + abs(pressure) * 35 + body_ratio * 20 + 10))
+    # وعي الجلسة: لا نكرر نفس اتجاه/نمط آخر خسارة فورًا إلا إذا القوة أعلى بوضوح.
+    last_loss_setup = state.get("last_loss_setup")
+    last_loss_direction = state.get("last_loss_direction")
+    current_setup_key = setup or strategy_type
+    preliminary_score = int(round(momentum * 35 + abs(pressure) * 35 + body_ratio * 20 + 10))
+    if last_loss_setup and last_loss_direction:
+        same_setup = str(last_loss_setup) == str(current_setup_key) or str(last_loss_setup) == str(strategy_type)
+        same_direction = str(last_loss_direction) == str(direction)
+        if same_setup and same_direction and preliminary_score < (TRADING_ROOM_MIN_ENTRY_SCORE + 12):
+            return {"ok": False, "reason": "رفضت تكرار نفس النمط الخاسر قبل ظهور قوة أوضح"}
+
+    score = preliminary_score
     if entry_mode == "wait":
         return {"ok": False, "watch": True, "reason": "النمط موجود لكن ننتظر توقيت الدخول المناسب", "score": score, "direction": direction}
-    if score < TRADING_ROOM_MIN_ENTRY_SCORE:
-        return {"ok": False, "reason": f"قوة النمط غير كافية الآن ({score}%)"}
+
+    required_score = TRADING_ROOM_MIN_ENTRY_SCORE
+    if state.get("recovery_mode"):
+        required_score += 6
+    if state.get("brain_mode") == "protect_profit":
+        required_score += 5
+    if state.get("brain_mode") == "danger":
+        required_score += 8
+
+    if score < required_score:
+        return {"ok": False, "reason": f"قوة النمط غير كافية حسب وضع الجلسة ({score}% / المطلوب {required_score}%)"}
 
     now_dt = now_utc()
     if entry_mode == "direct":
@@ -3485,7 +3749,12 @@ def build_trading_room_state_message(state: dict) -> str:
         f"دخول التعويض: {float(state.get('trade_amount', 0) or 0) * TRADING_ROOM_RECOVERY_MULTIPLIER:.2f}$",
         f"الصفقات المنفذة: {int(state.get('trades_done', 0) or 0)}",
         f"النتائج: {int(state.get('wins', 0) or 0)} ربح / {int(state.get('losses', 0) or 0)} خسارة",
+        f"صافي الجلسة: {_money_signed(state.get('net_profit', 0.0))}",
         f"خسائر التعويض: {int(state.get('recovery_losses', 0) or 0)} / {TRADING_ROOM_MAX_RECOVERY_LOSSES}",
+        f"وضع الجلسة: {state.get('brain_mode') or state.get('session_mode') or 'normal'}",
+        f"مزاج السوق: {state.get('market_mood') or 'قيد القراءة'}",
+        f"صحة الزوج: {state.get('pair_health') if state.get('pair_health') is not None else 'قيد القراءة'}",
+        f"تغييرات الزوج: {int(state.get('pair_switches', 0) or 0)} / {TRADING_ROOM_PAIR_MAX_SWITCHES}",
     ]
     if state.get("last_reason"):
         lines.append(f"آخر قراءة: {state.get('last_reason')}")
@@ -3503,6 +3772,9 @@ async def start_trading_room_session(update: Update, context: ContextTypes.DEFAU
         "max_trades": plan["max_trades"],
         "wins": 0,
         "losses": 0,
+        "net_profit": 0.0,
+        "unrecovered_loss": False,
+        "session_mode": "normal",
         "trades_done": 0,
         "recovery_losses": 0,
         "extra_recovery_used": 0,
@@ -3511,6 +3783,19 @@ async def start_trading_room_session(update: Update, context: ContextTypes.DEFAU
         "waiting_result": False,
         "started_at": time_module.time(),
         "expires_at": time_module.time() + TRADING_ROOM_SCAN_SECONDS,
+        # Session Brain
+        "brain_mode": "normal",
+        "market_mood": None,
+        "pair_health": None,
+        "pair_health_label": None,
+        "pair_switches": 0,
+        "bad_symbols": [],
+        "last_loss_setup": None,
+        "last_loss_direction": None,
+        "last_trade_setup": None,
+        "last_trade_direction": None,
+        "no_entry_scans": 0,
+        "last_brain_notice_at": 0.0,
     }
     context.bot_data[trading_room_key(admin_id)] = state
     await update.message.reply_text(build_trading_room_intro(plan), reply_markup=trading_room_keyboard)
@@ -3592,10 +3877,17 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=trading_room_keyboard
             )
 
+    switched = await trading_room_switch_pair_if_needed(context, admin_id, state)
+    if switched:
+        return
+
     analysis = analyze_trading_room_entry(state)
     if not analysis.get("ok"):
         state["last_reason"] = analysis.get("reason", "لا يوجد دخول الآن")
+        state["no_entry_scans"] = int(state.get("no_entry_scans", 0) or 0) + 1
         return
+
+    state["no_entry_scans"] = 0
 
     direction = analysis["direction"]
     entry_mode = analysis["entry_mode"]
@@ -3603,7 +3895,9 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
     dir_line = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
 
     base_amount = float(state.get('trade_amount', 0) or 0)
-    is_recovery_trade = bool(state.get("recovery_mode") or int(state.get("wins", 0) or 0) < int(state.get("losses", 0) or 0))
+    # الصفقة التعويضية تكون فقط عند وجود خسارة غير معوضة.
+    # لا نكرر تعويض وراء تعويض؛ بعد تعويض خاسر ترجع الصفقة التالية عادية إذا لم تنتهِ الجلسة.
+    is_recovery_trade = bool(state.get("recovery_mode") and state.get("unrecovered_loss"))
     trade_amount = round(base_amount * (TRADING_ROOM_RECOVERY_MULTIPLIER if is_recovery_trade else 1.0), 2)
     analysis["trade_amount"] = trade_amount
     analysis["recovery_trade"] = is_recovery_trade
@@ -3612,6 +3906,8 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
         "waiting_result": True,
         "current_trade": analysis,
         "trades_done": int(state.get("trades_done", 0) or 0) + 1,
+        "last_trade_setup": analysis.get("setup") or state.get("strategy_type"),
+        "last_trade_direction": analysis.get("direction"),
     })
 
     amount_line = f"💰 دخول الصفقة المقترح: {trade_amount:.2f}$"
@@ -3712,28 +4008,68 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
     state["waiting_result"] = False
 
     was_recovery_trade = bool(trade.get("recovery_trade"))
+    trade_amount = float(trade.get("trade_amount") or state.get("trade_amount", 0) or 0)
+
     if win:
-        state["wins"] = int(state.get("wins", 0) or 0) + 1
-        result_line = "✅ مبروك، الصفقة ربحت"
-    else:
-        state["losses"] = int(state.get("losses", 0) or 0) + 1
+        state["net_profit"] = round(float(state.get("net_profit", 0.0) or 0.0) + trade_amount, 2)
         if was_recovery_trade:
+            # إذا ربحت صفقة التعويض، نعتبر الخسارة السابقة تعوضت وتحولت لصالح الجلسة.
+            state["losses"] = max(0, int(state.get("losses", 0) or 0) - 1)
+            state["wins"] = int(state.get("wins", 0) or 0) + 1
+            state["unrecovered_loss"] = False
+            state["recovery_mode"] = False
+            state["session_mode"] = "normal"
+            state["last_reason"] = "تم تعويض الخسارة"
+            state["brain_mode"] = "normal"
+            state["last_loss_setup"] = None
+            state["last_loss_direction"] = None
+            result_line = "✅ مبروك، صفقة التعويض ربحت"
+        else:
+            state["wins"] = int(state.get("wins", 0) or 0) + 1
+            state["unrecovered_loss"] = False
+            state["recovery_mode"] = False
+            state["session_mode"] = "normal"
+            state["brain_mode"] = "protect_profit" if int(state.get("wins", 0) or 0) >= 2 else "normal"
+            state["last_loss_setup"] = None
+            state["last_loss_direction"] = None
+            result_line = "✅ مبروك، الصفقة ربحت"
+    else:
+        state["net_profit"] = round(float(state.get("net_profit", 0.0) or 0.0) - trade_amount, 2)
+        if was_recovery_trade:
+            # تعويض خاسر = خسارتين بوحدة الصفقة الأساسية، ولا ندخل تعويض وراء تعويض.
+            state["losses"] = int(state.get("losses", 0) or 0) + _trading_room_loss_units_for_trade(trade)
             state["recovery_losses"] = int(state.get("recovery_losses", 0) or 0) + 1
-        result_line = "❌ معوضة، الصفقة خسرت"
+            state["unrecovered_loss"] = False
+            state["recovery_mode"] = False
+            state["session_mode"] = "normal"
+            state["last_reason"] = "صفقة التعويض خسرت؛ الصفقة التالية عادية إذا لم تنتهِ الجلسة"
+            state["brain_mode"] = "danger"
+            state["last_loss_setup"] = trade.get("setup") or state.get("strategy_type")
+            state["last_loss_direction"] = trade.get("direction")
+            try:
+                bs = set(state.get("bad_symbols") or [])
+                if trade.get("symbol"):
+                    bs.add(trade.get("symbol"))
+                state["bad_symbols"] = list(bs)
+            except Exception:
+                pass
+            result_line = "❌ معوضة، صفقة التعويض خسرت"
+        else:
+            state["losses"] = int(state.get("losses", 0) or 0) + 1
+            state["unrecovered_loss"] = True
+            state["recovery_mode"] = True
+            state["session_mode"] = "recovery"
+            state["expires_at"] = time_module.time() + TRADING_ROOM_RECOVERY_SEARCH_SECONDS
+            state["last_reason"] = "جاري البحث عن صفقة تعويضية آمنة"
+            state["brain_mode"] = "recovery"
+            state["last_loss_setup"] = trade.get("setup") or state.get("strategy_type")
+            state["last_loss_direction"] = trade.get("direction")
+            result_line = "❌ معوضة، الصفقة خسرت"
 
     wins = int(state.get("wins", 0) or 0)
     losses = int(state.get("losses", 0) or 0)
     recovery_losses = int(state.get("recovery_losses", 0) or 0)
-
-    if not win:
-        state["recovery_mode"] = True
-        state["expires_at"] = time_module.time() + TRADING_ROOM_RECOVERY_SEARCH_SECONDS
-        state["last_reason"] = "جاري البحث عن صفقة تعويضية آمنة"
-    elif was_recovery_trade:
-        state["recovery_mode"] = False
-        state["last_reason"] = "تم تعويض الخسارة"
-    elif losses > wins:
-        state["recovery_mode"] = True
+    net_profit = float(state.get("net_profit", 0.0) or 0.0)
 
     await context.bot.send_message(
         chat_id=admin_id,
@@ -3763,17 +4099,22 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
             text=(
                 "🏁 انتهت جلسة التداول\n\n"
                 f"السبب: {finish_reason}\n"
-                f"النتيجة النهائية: {wins} ربح / {losses} خسارة\n\n"
+                f"النتيجة النهائية: {wins} ربح / {losses} خسارة\n"
+                f"صافي الجلسة: {_money_signed(net_profit)}\n\n"
                 "الأفضل نرتاح الآن. إذا بدك جلسة جديدة، خليها بعد 3 ساعات على الأقل."
             ),
             reply_markup=trading_room_keyboard
         )
         return
 
-    if losses > wins or state.get("recovery_mode"):
+    if state.get("recovery_mode") and state.get("unrecovered_loss"):
         await context.bot.send_message(
             chat_id=admin_id,
-            text="🔁 جاري البحث عن صفقة تعويضية آمنة...",
+            text=(
+                "🔁 جاري البحث عن صفقة تعويضية آمنة...\n\n"
+                "🧠 قراءة الجلسة: لن أكرر نفس النمط الخاسر مباشرة، "
+                "وإذا صار الزوج ضعيفًا سأغيّره بقرار من غرفة التداول."
+            ),
             reply_markup=trading_room_keyboard
         )
 
