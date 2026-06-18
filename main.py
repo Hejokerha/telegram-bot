@@ -1385,14 +1385,14 @@ async def send_firebase_24h_report_job(context: ContextTypes.DEFAULT_TYPE):
         report = build_firebase_24h_report_text()
 
         # إرسال التقرير للأدمن على الخاص
-        await context.bot.send_message(
+        await safe_send_message(context.bot,
             chat_id=ADMIN_TELEGRAM_ID,
             text=report[:3900]
         )
 
         # إذا التقرير طويل، أرسل الباقي برسالة ثانية
         if len(report) > 3900:
-            await context.bot.send_message(
+            await safe_send_message(context.bot,
                 chat_id=ADMIN_TELEGRAM_ID,
                 text=report[3900:7800]
             )
@@ -1527,16 +1527,43 @@ def request_json_with_retries(url: str, *, params=None, headers=None, timeout: i
 
 
 async def safe_send_message(bot, *, chat_id, text: str, parse_mode: str | None = None, reply_markup=None):
-    try:
-        return await bot.send_message(
-            chat_id=chat_id,
-            text=text,
-            parse_mode=parse_mode,
-            reply_markup=reply_markup,
-        )
-    except Exception as e:
-        logger.exception("Telegram send_message failed | chat_id=%s | error=%s", chat_id, e)
-        return None
+    """Send Telegram message safely.
+    Telegram can occasionally timeout without the bot being broken.
+    We retry once, then log a warning without crashing job callbacks.
+    """
+    last_error = None
+    for attempt in range(2):
+        try:
+            return await bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+                reply_markup=reply_markup,
+            )
+        except Exception as e:
+            last_error = e
+            err_name = e.__class__.__name__
+            err_text = str(e)
+            if err_name == "TimedOut" or "Timed out" in err_text:
+                logger.warning(
+                    "Telegram send_message timeout | chat_id=%s | attempt=%s/2",
+                    chat_id,
+                    attempt + 1,
+                )
+                if attempt == 0:
+                    try:
+                        await asyncio.sleep(1.5)
+                    except Exception:
+                        pass
+                    continue
+                return None
+
+            logger.exception("Telegram send_message failed | chat_id=%s | error=%s", chat_id, e)
+            return None
+
+    if last_error:
+        logger.warning("Telegram send_message skipped after retries | chat_id=%s | error=%s", chat_id, last_error)
+    return None
 
 def format_dt_ar(iso_value: str):
     dt = parse_iso(iso_value)
@@ -1797,7 +1824,7 @@ async def notify_maintenance_waiters(context: ContextTypes.DEFAULT_TYPE) -> tupl
             else:
                 markup = welcome_keyboard_en if lang == "en" else welcome_keyboard
 
-            await context.bot.send_message(
+            await safe_send_message(context.bot,
                 chat_id=uid,
                 text=build_maintenance_finished_text(lang),
                 reply_markup=markup,
@@ -1888,7 +1915,7 @@ def force_revoke_user_access(user_id: int, status: str = "new"):
 
 async def send_revoked_welcome_keyboard(context: ContextTypes.DEFAULT_TYPE, user_id: int):
     try:
-        await context.bot.send_message(
+        await safe_send_message(context.bot,
             chat_id=int(user_id),
             text=(
                 "⛔ تم إلغاء تفعيل حسابك.\n\n"
@@ -3459,7 +3486,7 @@ async def trading_room_switch_pair_if_needed(context: ContextTypes.DEFAULT_TYPE,
         last_notice = float(state.get("last_brain_notice_at", 0) or 0)
         if time_module.time() - last_notice >= TRADING_ROOM_BRAIN_NOTICE_COOLDOWN_SECONDS:
             state["last_brain_notice_at"] = time_module.time()
-            await context.bot.send_message(
+            await safe_send_message(context.bot,
                 chat_id=admin_id,
                 text=(
                     "🧠 قرار غرفة التداول\n\n"
@@ -3481,7 +3508,7 @@ async def trading_room_switch_pair_if_needed(context: ContextTypes.DEFAULT_TYPE,
     state["pair_health"] = None
     state["pair_health_label"] = None
     state["market_mood"] = None
-    await context.bot.send_message(
+    await safe_send_message(context.bot,
         chat_id=admin_id,
         text=(
             "🧠 قرار غرفة التداول\n\n"
@@ -3595,7 +3622,7 @@ async def trading_room_pair_select_retry_job(context: ContextTypes.DEFAULT_TYPE)
         state["pair_selected_at"] = time_module.time()
         state["pair_bad_scans"] = 0
         state["last_reason"] = "تم اختيار زوج الجلسة بعد تجهيز البيانات"
-        await context.bot.send_message(
+        await safe_send_message(context.bot,
             chat_id=admin_id,
             text=(
                 "✅ أصبحت بيانات السوق جاهزة\n\n"
@@ -3623,7 +3650,7 @@ async def trading_room_pair_select_retry_job(context: ContextTypes.DEFAULT_TYPE)
     if retries >= TRADING_ROOM_DATA_MAX_RETRIES:
         state["active"] = False
         state["waiting_pair_selection"] = False
-        await context.bot.send_message(
+        await safe_send_message(context.bot,
             chat_id=admin_id,
             text=(
                 "❌ لم أجد زوجًا مناسبًا للجلسة بعد إعادة الفحص.\n\n"
@@ -3634,7 +3661,7 @@ async def trading_room_pair_select_retry_job(context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    await context.bot.send_message(
+    await safe_send_message(context.bot,
         chat_id=admin_id,
         text=(
             "⏳ ما زلت أجهّز بيانات السوق...\n\n"
@@ -3923,7 +3950,7 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
         last_notice = float(state.get("monitor_extend_notified_at", 0) or 0)
         if time_module.time() - last_notice >= TRADING_ROOM_RECOVERY_MESSAGE_COOLDOWN_SECONDS:
             state["monitor_extend_notified_at"] = time_module.time()
-            await context.bot.send_message(
+            await safe_send_message(context.bot,
                 chat_id=admin_id,
                 text="⏳ لا يوجد دخول مناسب الآن. سأستمر بالمراقبة بدون دخول عشوائي.",
                 reply_markup=trading_room_keyboard
@@ -3966,7 +3993,7 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
     if is_recovery_trade:
         amount_line += "  🔁 تعويض"
 
-    await context.bot.send_message(
+    await safe_send_message(context.bot,
         chat_id=admin_id,
         text=(
             f"{entry_text}\n\n"
@@ -4040,7 +4067,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
         candle_close = float(candle.get("close"))
     except Exception:
         state["waiting_result"] = False
-        await context.bot.send_message(
+        await safe_send_message(context.bot,
             chat_id=admin_id,
             text=(
                 "⚠️ تعذر حساب نتيجة الصفقة لأن شمعة الصفقة المغلقة غير متوفرة بعد.\n"
@@ -4123,7 +4150,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
     recovery_losses = int(state.get("recovery_losses", 0) or 0)
     net_profit = float(state.get("net_profit", 0.0) or 0.0)
 
-    await context.bot.send_message(
+    await safe_send_message(context.bot,
         chat_id=admin_id,
         text=(
             f"{result_line}\n\n"
@@ -4146,7 +4173,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
 
     if should_finish:
         state["active"] = False
-        await context.bot.send_message(
+        await safe_send_message(context.bot,
             chat_id=admin_id,
             text=(
                 "🏁 انتهت جلسة التداول\n\n"
@@ -4160,7 +4187,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     if state.get("recovery_mode") and state.get("unrecovered_loss"):
-        await context.bot.send_message(
+        await safe_send_message(context.bot,
             chat_id=admin_id,
             text=(
                 "🔁 جاري البحث عن صفقة تعويضية آمنة...\n\n"
@@ -4329,7 +4356,7 @@ async def otc_live_feed_health_check_job(context: ContextTypes.DEFAULT_TYPE):
             last_alert_at = float(otc_live_health_state.get("last_alert_at") or 0)
             if now_ts - last_alert_at >= OTC_LIVE_HEALTH_ALERT_COOLDOWN_SECONDS:
                 otc_live_health_state["last_alert_at"] = now_ts
-                await context.bot.send_message(
+                await safe_send_message(context.bot,
                     chat_id=ADMIN_TELEGRAM_ID,
                     text="⚠️ تنبيه OTC Live\n\n" + build_otc_live_health_message(),
                 )
@@ -4337,7 +4364,7 @@ async def otc_live_feed_health_check_job(context: ContextTypes.DEFAULT_TYPE):
 
         # عند رجوع البث بعد مشكلة، نرسل رسالة رجوع مرة واحدة.
         if previous_ok is False and health.get("ok"):
-            await context.bot.send_message(
+            await safe_send_message(context.bot,
                 chat_id=ADMIN_TELEGRAM_ID,
                 text="✅ عاد بث OTC Live للعمل\n\n" + build_otc_live_health_message(),
             )
@@ -4676,7 +4703,7 @@ async def resolve_otc_live_channel_trade(context: ContextTypes.DEFAULT_TYPE):
         if not is_otc_live_publish_allowed_now():
             logger.info("OTC LIVE absolute guard blocked send_message")
             return
-        await context.bot.send_message(
+        await safe_send_message(context.bot,
             chat_id=OTC_LIVE_CHANNEL_ID,
             text=text
         )
@@ -4899,7 +4926,7 @@ async def auto_publish_otc_live_channel(context: ContextTypes.DEFAULT_TYPE):
         if not is_otc_live_publish_allowed_now():
             logger.info("OTC LIVE absolute guard blocked send_message")
             return
-        sent = await context.bot.send_message(
+        sent = await safe_send_message(context.bot,
             chat_id=OTC_LIVE_CHANNEL_ID,
             text=text,
         )
@@ -6016,7 +6043,7 @@ async def finalize_otc_list_results_job(context: ContextTypes.DEFAULT_TYPE):
             "meta": meta,
         })
 
-        await context.bot.send_message(
+        await safe_send_message(context.bot,
             chat_id=admin_id,
             text=(
                 "✅ نتائج ليستة OTC جاهزة ومحفوظة.\n\n"
@@ -6731,7 +6758,7 @@ async def publish_daily_otc_live_stats(context: ContextTypes.DEFAULT_TYPE):
             logger.info("Daily OTC Live stats skipped: no trades for today")
             return
 
-        await context.bot.send_message(
+        await safe_send_message(context.bot,
             chat_id=OTC_LIVE_CHANNEL_ID,
             text=message
         )
@@ -6763,7 +6790,7 @@ async def publish_otc_list(context: ContextTypes.DEFAULT_TYPE):
         )
         message_text = build_channel_otc_signals_message("MIXED OTC", count, interval_minutes, signals)
 
-        await context.bot.send_message(
+        await safe_send_message(context.bot,
             chat_id=CHANNEL_ID,
             text=message_text,
             parse_mode="Markdown"
@@ -7075,7 +7102,7 @@ async def notify_global_market_closed_once(context: ContextTypes.DEFAULT_TYPE):
         return
 
     try:
-        await context.bot.send_message(
+        await safe_send_message(context.bot,
             chat_id=GLOBAL_CHANNEL_ID,
             text=GLOBAL_MARKET_CLOSED_MESSAGE,
             parse_mode="Markdown"
@@ -9073,7 +9100,7 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="HTML"
         )
         try:
-            await context.bot.send_message(
+            await safe_send_message(context.bot,
                 chat_id=target_id,
                 text="✅ تم تفعيل حسابك بنجاح لمدة أسبوع\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
             )
@@ -9089,7 +9116,7 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="HTML"
         )
         try:
-            await context.bot.send_message(
+            await safe_send_message(context.bot,
                 chat_id=target_id,
                 text="✅ تم تفعيل حسابك بنجاح لمدة شهر\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
             )
@@ -9105,7 +9132,7 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="HTML"
         )
         try:
-            await context.bot.send_message(
+            await safe_send_message(context.bot,
                 chat_id=target_id,
                 text="✅ تم تفعيل حسابك بنجاح بشكل دائم\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
             )
@@ -9122,7 +9149,7 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             parse_mode="HTML"
         )
         try:
-            await context.bot.send_message(
+            await safe_send_message(context.bot,
                 chat_id=target_id,
                 text="❌ تم رفض طلبك أو إيقافه\n\nإذا كنت ترى أن هذا بالخطأ، تواصل مع الأدمن.",
                 reply_markup=welcome_keyboard
@@ -9712,7 +9739,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "──────────────"
             )
             try:
-                await context.bot.send_message(
+                await safe_send_message(context.bot,
                     chat_id=ADMIN_TELEGRAM_ID,
                     text=admin_message,
                     parse_mode="HTML",
@@ -9883,7 +9910,7 @@ async def send_video_watched_button_job(context: ContextTypes.DEFAULT_TYPE):
             return
 
         if get_user_language(user_id) == "en":
-            await context.bot.send_message(
+            await safe_send_message(context.bot,
                 chat_id=user_id,
                 text=(
                     "✅ Did you watch the full bot tutorial video?\n\n"
@@ -9892,7 +9919,7 @@ async def send_video_watched_button_job(context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=video_watched_keyboard_en
             )
         else:
-            await context.bot.send_message(
+            await safe_send_message(context.bot,
                 chat_id=user_id,
                 text=(
                     "✅ هل شاهدت فيديو شرح البوت كاملًا؟\n\n"
@@ -10384,7 +10411,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "──────────────"
             )
             try:
-                await context.bot.send_message(
+                await safe_send_message(context.bot,
                     chat_id=ADMIN_TELEGRAM_ID,
                     text=admin_message,
                     parse_mode="HTML",
@@ -10417,7 +10444,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         try:
-            await context.bot.send_message(
+            await safe_send_message(context.bot,
                 chat_id=int(target_id),
                 text="💬 رسالة من الأدمن\n\n" + message
             )
@@ -10480,7 +10507,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     skipped_count += 1
                     continue
 
-                await context.bot.send_message(chat_id=user_id_int, text=broadcast_text)
+                await safe_send_message(context.bot,chat_id=user_id_int, text=broadcast_text)
                 sent_count += 1
             except Exception:
                 failed_count += 1
@@ -10621,7 +10648,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     skipped_count += 1
                     continue
 
-                await context.bot.send_message(chat_id=user_id_int, text=broadcast_text)
+                await safe_send_message(context.bot,chat_id=user_id_int, text=broadcast_text)
                 sent_count += 1
             except Exception:
                 failed_count += 1
@@ -11100,7 +11127,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 set_user_expiry(target_id, "week")
                 await update.message.reply_text("✅ تم تفعيل المستخدم لمدة أسبوع", reply_markup=admin_main_keyboard)
                 try:
-                    await context.bot.send_message(
+                    await safe_send_message(context.bot,
                         chat_id=target_id,
                         text="✅ تم تفعيل حسابك بنجاح لمدة أسبوع\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
                     )
@@ -11113,7 +11140,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 set_user_expiry(target_id, "month")
                 await update.message.reply_text("✅ تم تفعيل المستخدم لمدة شهر", reply_markup=admin_main_keyboard)
                 try:
-                    await context.bot.send_message(
+                    await safe_send_message(context.bot,
                         chat_id=target_id,
                         text="✅ تم تفعيل حسابك بنجاح لمدة شهر\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
                     )
@@ -11126,7 +11153,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 set_user_expiry(target_id, "forever")
                 await update.message.reply_text("✅ تم تفعيل المستخدم بشكل دائم", reply_markup=admin_main_keyboard)
                 try:
-                    await context.bot.send_message(
+                    await safe_send_message(context.bot,
                         chat_id=target_id,
                         text="✅ تم تفعيل حسابك بنجاح بشكل دائم\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
                     )
@@ -11338,6 +11365,9 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
         if context.error and "Message is not modified" in str(context.error):
             logger.info("Ignored harmless Telegram error: %s", context.error)
             return
+        if context.error and (context.error.__class__.__name__ == "TimedOut" or "Timed out" in str(context.error)):
+            logger.warning("Ignored Telegram timeout error: %s", context.error)
+            return
     except Exception:
         pass
 
@@ -11356,7 +11386,7 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
                 f"الخطأ: {html.escape(str(context.error))}\n\n"
                 f"تفاصيل مختصرة:\n<code>{html.escape(error_text[-2500:] if error_text else 'no traceback')}</code>"
             )
-            await context.bot.send_message(
+            await safe_send_message(context.bot,
                 chat_id=ADMIN_TELEGRAM_ID,
                 text=msg[:3900],
                 parse_mode="HTML"
