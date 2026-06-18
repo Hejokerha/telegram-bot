@@ -3173,7 +3173,7 @@ def analyze_pair_for_trading_room(pair: str, symbol: str) -> dict | None:
     # لا نختار زوج للجلسة إذا آخر tick قديم.
     # هذا كان سبب التخبيص: يختار زوجًا ثم يغيّره فورًا لأن البيانات قديمة.
     try:
-        tick_ts = float(last_tick.get("ts") or last_tick.get("timestamp") or 0)
+        tick_ts = float(last_tick.get("time") or last_tick.get("ts") or last_tick.get("timestamp") or 0)
         if tick_ts > 1e12:
             tick_ts = tick_ts / 1000.0
         if not tick_ts or time_module.time() - tick_ts > TRADING_ROOM_PAIR_TICK_MAX_AGE_SECONDS:
@@ -3312,7 +3312,7 @@ def assess_trading_room_pair_health(state: dict) -> dict:
         return {"health": 20, "label": "bad", "mood": "بيانات ضعيفة", "reason": "بيانات الزوج غير كافية"}
 
     try:
-        tick_ts = float(last_tick.get("ts") or last_tick.get("timestamp") or 0)
+        tick_ts = float(last_tick.get("time") or last_tick.get("ts") or last_tick.get("timestamp") or 0)
         if tick_ts > 1e12:
             tick_ts = tick_ts / 1000.0
         age = now_ts - tick_ts if tick_ts else 999
@@ -3548,7 +3548,7 @@ def get_trading_room_market_data_status() -> dict:
             if len(rows) >= TRADING_ROOM_MIN_TICKS and len(candles) >= TRADING_ROOM_MIN_CANDLES and last_tick:
                 candidate_ready += 1
             try:
-                ts = float(last_tick.get("ts") or last_tick.get("timestamp") or 0)
+                ts = float(last_tick.get("time") or last_tick.get("ts") or last_tick.get("timestamp") or 0)
                 if ts > 1e12:
                     ts = ts / 1000.0
                 if ts > 0:
