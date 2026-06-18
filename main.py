@@ -3152,6 +3152,28 @@ def _money_signed(value) -> str:
         return "0.00$"
 
 
+def _normalize_payout_percent(value, default: float = 80.0) -> float:
+    """يرجع نسبة payout كما كانت عند لحظة دخول الصفقة.
+    مثال: 83 يعني الربح الصافي = مبلغ الدخول * 0.83.
+    """
+    try:
+        payout = float(value or default)
+        if payout <= 0:
+            payout = default
+        if payout > 100:
+            payout = 100.0
+        return round(payout, 2)
+    except Exception:
+        return float(default)
+
+
+def _trading_room_win_profit(trade_amount: float, payout_percent: float | int | None) -> float:
+    try:
+        return round(float(trade_amount or 0) * (_normalize_payout_percent(payout_percent) / 100.0), 2)
+    except Exception:
+        return 0.0
+
+
 def _percent_text(value) -> str:
     try:
         v = float(value)
@@ -3711,6 +3733,14 @@ def analyze_trading_room_entry(state: dict) -> dict:
     except Exception:
         return {"ok": False, "reason": "تعذر قراءة السعر الحالي"}
 
+    # نثبت نسبة الزوج عند لحظة توليد الصفقة لأن Quotex قد تغيّر payout بعد الدخول،
+    # أما ربح الصفقة في المنصة يُحسب على نسبة الدخول نفسها.
+    try:
+        instrument = quotex_otc_feed.instrument(symbol) or {}
+        payout_at_entry = _normalize_payout_percent(instrument.get("payout", 80), 80.0)
+    except Exception:
+        payout_at_entry = 80.0
+
     sample = rows[-20:]
     prices = [float(r[1]) for r in sample]
     rng = max(prices) - min(prices)
@@ -3804,6 +3834,7 @@ def analyze_trading_room_entry(state: dict) -> dict:
         "setup": setup,
         "score": min(score, 94),
         "price": price,
+        "payout": payout_at_entry,
         "entry_ts": entry_dt.timestamp(),
         "expiry_ts": float(expiry_ts),
         "entry_time_text": format_utc_plus_3(entry_dt),
@@ -4097,9 +4128,12 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
 
     was_recovery_trade = bool(trade.get("recovery_trade"))
     trade_amount = float(trade.get("trade_amount") or state.get("trade_amount", 0) or 0)
+    payout_at_entry = _normalize_payout_percent(trade.get("payout", 80), 80.0)
+    win_profit = _trading_room_win_profit(trade_amount, payout_at_entry)
 
     if win:
-        state["net_profit"] = round(float(state.get("net_profit", 0.0) or 0.0) + trade_amount, 2)
+        # الربح الصافي في Quotex ليس كامل مبلغ الدخول؛ بل مبلغ الدخول × payout لحظة الدخول.
+        state["net_profit"] = round(float(state.get("net_profit", 0.0) or 0.0) + win_profit, 2)
         if was_recovery_trade:
             # إذا ربحت صفقة التعويض، نعتبر الخسارة السابقة تعوضت وتحولت لصالح الجلسة.
             state["losses"] = max(0, int(state.get("losses", 0) or 0) - 1)
