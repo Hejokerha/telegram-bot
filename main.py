@@ -4338,16 +4338,84 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
     eps = OTC_LIVE_TIE_EPSILON
     candle_is_green = candle_close > candle_open + eps
     candle_is_red = candle_close < candle_open - eps
-    if direction == "CALL":
-        win = candle_is_green
-    else:
-        win = candle_is_red
     state["waiting_result"] = False
 
     was_recovery_trade = bool(trade.get("recovery_trade"))
     trade_amount = float(trade.get("trade_amount") or state.get("trade_amount", 0) or 0)
     payout_at_entry = _normalize_payout_percent(trade.get("payout", 80), 80.0)
     win_profit = _trading_room_win_profit(trade_amount, payout_at_entry)
+
+    # إذا أغلقت الشمعة دوجي / تعادل (الفتح والإغلاق نفس السعر تقريبًا)
+    # لا تُحسب الصفقة ربح ولا خسارة، وفي Quotex عادةً يرجع مبلغ الدخول بدون ربح.
+    # مهم جدًا خصوصًا بصفقة التعويض: لا نعتبرها خسارة تعويضية ولا نلغي الخسارة السابقة.
+    if not candle_is_green and not candle_is_red:
+        net_profit = float(state.get("net_profit", 0.0) or 0.0)
+        wins = int(state.get("wins", 0) or 0)
+        losses = int(state.get("losses", 0) or 0)
+        if was_recovery_trade and bool(state.get("unrecovered_loss")):
+            state["recovery_mode"] = True
+            state["session_mode"] = "recovery"
+            state["brain_mode"] = "recovery"
+            state["expires_at"] = time_module.time() + TRADING_ROOM_RECOVERY_SEARCH_SECONDS
+            state["last_reason"] = "صفقة التعويض انتهت تعادل؛ سأبحث عن تعويض آمن من جديد"
+            result_line = "⚖️ صفقة التعويض انتهت تعادل"
+            follow_line = "الخسارة السابقة لم تُحسب كتعويض، وسأبحث عن فرصة تعويضية آمنة بدون اعتبارها خسارة."
+        else:
+            state["recovery_mode"] = False
+            state["session_mode"] = "normal"
+            state["brain_mode"] = "normal"
+            state["last_reason"] = "الصفقة انتهت تعادل ولم تُحسب ربح أو خسارة"
+            result_line = "⚖️ الصفقة انتهت تعادل"
+            follow_line = "لن تُحسب ربح ولا خسارة، وسأكمل مراقبة الجلسة بشكل طبيعي."
+        try:
+            history = list(state.get("trade_ledger") or [])
+            history.append({
+                "time": time_module.time(),
+                "pair": trade.get("pair"),
+                "symbol": trade.get("symbol"),
+                "direction": trade.get("direction"),
+                "recovery_trade": was_recovery_trade,
+                "amount": float(trade_amount or 0),
+                "payout": payout_at_entry,
+                "result": "draw",
+                "pnl": 0.0,
+                "effective_win_units": 0,
+                "effective_loss_units": 0,
+                "net_after": round(net_profit, 2),
+            })
+            state["trade_ledger"] = history[-100:]
+        except Exception:
+            pass
+        await safe_send_message(context.bot,
+            chat_id=admin_id,
+            text=(
+                f"{result_line}\n\n"
+                f"{follow_line}\n\n"
+                f"📊 نتيجة الجلسة الآن: {wins} ربح / {losses} خسارة\n"
+                f"💰 صافي الجلسة الآن: {_money_signed(net_profit)}"
+            ),
+            reply_markup=get_trading_room_active_keyboard(admin_id)
+        )
+        try:
+            save_trading_room_state(context, admin_id, state)
+        except Exception:
+            pass
+        if state.get("active") and not state.get("waiting_result"):
+            try:
+                context.job_queue.run_once(
+                    trading_room_scan_job,
+                    when=8,
+                    data={"admin_id": admin_id},
+                    name=f"trading_room_scan_after_draw_{admin_id}_{int(time_module.time())}",
+                )
+            except Exception as e:
+                logger.exception("Could not schedule scan after draw: %s", e)
+        return
+
+    if direction == "CALL":
+        win = candle_is_green
+    else:
+        win = candle_is_red
 
     if win:
         # الربح الصافي في Quotex ليس كامل مبلغ الدخول؛ بل مبلغ الدخول × payout لحظة الدخول.
