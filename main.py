@@ -456,6 +456,47 @@ trading_room_active_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+trading_room_ready_keyboard = ReplyKeyboardMarkup(
+    [
+        ["✅ نعم، أنا مستعد"],
+        ["❌ إلغاء الجلسة"],
+    ],
+    resize_keyboard=True
+)
+
+trading_room_after_win_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🚀 جلسة جديدة"],
+        ["🛑 إنهاء اليوم"],
+    ],
+    resize_keyboard=True
+)
+
+trading_room_after_loss_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🚀 بدء جلسة جديدة"],
+        ["⏰ ذكرني بعد نصف ساعة"],
+        ["🧊 تعطيل غرفة التداول نصف ساعة"],
+    ],
+    resize_keyboard=True
+)
+
+trading_room_retreat_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🧊 تعطيل غرفة التداول نصف ساعة"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+trading_room_loss_confirm_keyboards = {
+    1: ReplyKeyboardMarkup([["نعم متأكد"], ["لا، خليني أتراجع"]], resize_keyboard=True),
+    2: ReplyKeyboardMarkup([["لا يهمني دعنا نكمل"], ["حسنا شكرا لتذكيري"]], resize_keyboard=True),
+    3: ReplyKeyboardMarkup([["عندي خطة واضحة"], ["غالبًا غضب، أوقفني"]], resize_keyboard=True),
+    4: ReplyKeyboardMarkup([["أتحمل القرار"], ["أوقفني نصف ساعة"]], resize_keyboard=True),
+    5: ReplyKeyboardMarkup([["أوافق، ابدأ جلسة جديدة"], ["تراجع وتعطيل نصف ساعة"]], resize_keyboard=True),
+}
+
 welcome_keyboard = ReplyKeyboardMarkup(
     [
         ["🎁 الحصول على تجربة مجانية"],
@@ -3117,24 +3158,78 @@ def parse_balance_amount(text: str) -> float | None:
         return None
 
 
+def _round_platform_amount(value) -> int:
+    """Quotex amount fields do not support decimals: 6.50+ -> 7, below 6.50 -> 6."""
+    try:
+        v = float(value or 0)
+        if v <= 0:
+            return 1
+        return max(1, int(v + 0.5))
+    except Exception:
+        return 1
+
+
+def _money_whole(value) -> str:
+    try:
+        return f"{_round_platform_amount(value)}$"
+    except Exception:
+        return "1$"
+
+
+def trading_room_user_cooldown_key(user_id: int) -> str:
+    return f"trading_room_cooldown_until:{int(user_id)}"
+
+
+def get_trading_room_cooldown_remaining(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
+    try:
+        until_ts = float(context.bot_data.get(trading_room_user_cooldown_key(user_id), 0) or 0)
+        return max(0, int(until_ts - time_module.time()))
+    except Exception:
+        return 0
+
+
+def set_trading_room_cooldown(context: ContextTypes.DEFAULT_TYPE, user_id: int, seconds: int = 1800):
+    try:
+        context.bot_data[trading_room_user_cooldown_key(user_id)] = time_module.time() + int(seconds)
+    except Exception:
+        pass
+
+
+def clear_trading_room_cooldown(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    try:
+        context.bot_data.pop(trading_room_user_cooldown_key(user_id), None)
+    except Exception:
+        pass
+
+
+def _cooldown_text(seconds: int) -> str:
+    try:
+        minutes = max(1, int((int(seconds) + 59) // 60))
+        return f"{minutes} دقيقة"
+    except Exception:
+        return "نصف ساعة"
+
+
 def build_session_money_plan(balance: float) -> dict:
     balance = float(balance)
-    # مبلغ دخول الصفقة محسوب كنسبة من رأس المال.
+    # المنصة لا تقبل فواصل في مبلغ الدخول؛ لذلك نقرّب المبلغ لرقم صحيح.
     risk_percent = float(TRADING_ROOM_TRADE_AMOUNT_PERCENT) / 100.0
-    trade_amount = max(1.0, round(balance * risk_percent, 2))
-    # الجلسة لا تنتهي بعدد صفقات؛ تنتهي عند وصول صافي الجلسة إلى هدف الربح أو حد الخسارة.
-    target_profit_amount = round(balance * (TRADING_ROOM_TARGET_PROFIT_PERCENT / 100.0), 2)
-    max_loss_amount = round(balance * (TRADING_ROOM_MAX_LOSS_PERCENT / 100.0), 2)
+    trade_amount_raw = balance * risk_percent
+    trade_amount = float(_round_platform_amount(trade_amount_raw))
+    recovery_amount = float(_round_platform_amount(trade_amount * TRADING_ROOM_RECOVERY_MULTIPLIER))
+    # أهداف الجلسة كنسبة من رأس المال، وتُعرض كأرقام صحيحة حتى تكون واضحة للمستخدم.
+    target_profit_amount = float(_round_platform_amount(balance * (TRADING_ROOM_TARGET_PROFIT_PERCENT / 100.0)))
+    max_loss_amount = float(_round_platform_amount(balance * (TRADING_ROOM_MAX_LOSS_PERCENT / 100.0)))
     return {
         "balance": balance,
         "risk_percent": risk_percent,
         "trade_amount": trade_amount,
+        "recovery_amount": recovery_amount,
         "max_trades": 0,
         "target_profit_amount": target_profit_amount,
         "max_loss_amount": max_loss_amount,
         "max_planned_risk": max_loss_amount,
     }
-
 
 def _safe_price_text(pair: str, price: float) -> str:
     try:
@@ -3717,6 +3812,74 @@ async def trading_room_pair_select_retry_job(context: ContextTypes.DEFAULT_TYPE)
         logger.exception("Could not schedule trading room pair retry job: %s", e)
 
 
+async def trading_room_start_market_flow(context: ContextTypes.DEFAULT_TYPE, admin_id: int):
+    state = get_trading_room_state(context, admin_id)
+    if not state or not state.get("active") or not state.get("ready_confirmed"):
+        return
+
+    selected = select_trading_room_pair()
+    if not selected:
+        state["waiting_pair_selection"] = True
+        state["pair_select_retries"] = 0
+        state["last_reason"] = "بانتظار تجهيز بيانات OTC Live"
+        await safe_send_message(
+            context.bot,
+            chat_id=admin_id,
+            text="⏳ جاري تجهيز بيانات السوق...",
+            reply_markup=trading_room_active_keyboard,
+        )
+        try:
+            context.job_queue.run_once(
+                trading_room_pair_select_retry_job,
+                when=TRADING_ROOM_DATA_RETRY_SECONDS,
+                data={"admin_id": admin_id},
+                name=f"trading_room_pair_retry_{admin_id}_{int(time_module.time())}",
+            )
+        except Exception as e:
+            logger.exception("Could not schedule trading room pair retry job: %s", e)
+        return
+
+    state.update(selected)
+    state["pair_selected_at"] = time_module.time()
+    state["pair_bad_scans"] = 0
+    state["last_reason"] = "تم اختيار زوج الجلسة"
+    await safe_send_message(
+        context.bot,
+        chat_id=admin_id,
+        text="✅ أصبحت بيانات السوق جاهزة\n\n" + build_trading_room_selected_pair_message(selected["pair"]),
+        reply_markup=trading_room_active_keyboard,
+    )
+    try:
+        context.job_queue.run_repeating(
+            trading_room_scan_job,
+            interval=TRADING_ROOM_SCAN_INTERVAL_SECONDS,
+            first=2,
+            data={"admin_id": admin_id},
+            name=f"trading_room_scan_{admin_id}_{int(time_module.time())}",
+        )
+    except Exception as e:
+        logger.exception("Could not start trading room scan job: %s", e)
+
+
+async def trading_room_begin_market_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data or {}
+    admin_id = int(data.get("admin_id") or 0)
+    await trading_room_start_market_flow(context, admin_id)
+
+
+async def trading_room_half_hour_reminder_job(context: ContextTypes.DEFAULT_TYPE):
+    data = context.job.data or {}
+    admin_id = int(data.get("admin_id") or 0)
+    if not admin_id:
+        return
+    await safe_send_message(
+        context.bot,
+        chat_id=admin_id,
+        text="⏰ مرّت نصف ساعة. إذا كنت هادئًا ومستعدًا تقدر تبدأ جلسة جديدة، والأفضل تلتزم بالخطة بدون استعجال.",
+        reply_markup=trading_room_keyboard,
+    )
+
+
 def analyze_trading_room_entry(state: dict) -> dict:
     pair = state.get("pair")
     symbol = state.get("symbol")
@@ -3845,13 +4008,13 @@ def build_trading_room_intro(plan: dict) -> str:
     return (
         "🧠 غرفة جلسة تداول\n\n"
         f"💰 الرصيد المسجل: {plan['balance']:.2f}$\n"
-        f"📌 دخول الصفقة المقترح: {plan['trade_amount']:.2f}$ ({_percent_text(TRADING_ROOM_TRADE_AMOUNT_PERCENT)})\n"
-        f"🔁 دخول التعويض: {plan['trade_amount'] * TRADING_ROOM_RECOVERY_MULTIPLIER:.2f}$\n"
-        f"🎯 تارجت الربح: {_percent_text(TRADING_ROOM_TARGET_PROFIT_PERCENT)} ({plan['target_profit_amount']:.2f}$)\n"
-        f"⛔ حد الخسارة: {_percent_text(TRADING_ROOM_MAX_LOSS_PERCENT)} ({plan['max_loss_amount']:.2f}$)\n\n"
+        f"📌 دخول الصفقة المقترح: {int(plan['trade_amount'])}$ ({_percent_text(TRADING_ROOM_TRADE_AMOUNT_PERCENT)})\n"
+        f"🔁 دخول التعويض: {int(plan['recovery_amount'])}$\n"
+        f"🎯 تارجت الربح: {_percent_text(TRADING_ROOM_TARGET_PROFIT_PERCENT)} ({int(plan['target_profit_amount'])}$)\n"
+        f"⛔ حد الخسارة: {_percent_text(TRADING_ROOM_MAX_LOSS_PERCENT)} ({int(plan['max_loss_amount'])}$)\n\n"
         "سأفحص أزواج OTC الحية، أختار زوجًا مناسبًا للجلسة، ثم أراقبه فقط خلال الجلسة.\n"
-        "الجلسة تتوقف حسب صافي الربح أو الخسارة، وليس حسب عدد الصفقات.\n"
-        "هذه الميزة تجريبية للأدمن فقط الآن."
+        "الجلسة تتوقف حسب صافي الربح أو الخسارة، وليس حسب عدد الصفقات.\n\n"
+        "اقرأ الخطة بهدوء، وبعدها أكد إذا كنت مستعدًا."
     )
 
 
@@ -3865,13 +4028,13 @@ def build_trading_room_state_message(state: dict) -> str:
         f"الزوج: {state.get('pair') or 'لم يحدد بعد'}",
         f"الاستراتيجية الحالية: {state.get('strategy') or 'قيد القراءة'}",
         f"الرصيد: {float(state.get('balance', 0) or 0):.2f}$",
-        f"دخول الصفقة الأساسي: {float(state.get('trade_amount', 0) or 0):.2f}$",
-        f"دخول التعويض: {float(state.get('trade_amount', 0) or 0) * TRADING_ROOM_RECOVERY_MULTIPLIER:.2f}$",
+        f"دخول الصفقة الأساسي: {int(_round_platform_amount(state.get('trade_amount', 0)))}$",
+        f"دخول التعويض: {int(_round_platform_amount(state.get('recovery_amount', state.get('trade_amount', 0))))}$",
         f"الصفقات المنفذة: {int(state.get('trades_done', 0) or 0)}",
         f"النتائج: {int(state.get('wins', 0) or 0)} ربح / {int(state.get('losses', 0) or 0)} خسارة",
         f"صافي الجلسة: {_money_signed(state.get('net_profit', 0.0))}",
-        f"تارجت الربح: {_money_signed(state.get('target_profit_amount', 0.0))}",
-        f"حد الخسارة: -{float(state.get('max_loss_amount', 0.0) or 0.0):.2f}$",
+        f"تارجت الربح: {int(_round_platform_amount(state.get('target_profit_amount', 0.0)))}$",
+        f"حد الخسارة: -{int(_round_platform_amount(state.get('max_loss_amount', 0.0)))}$",
         f"خسائر التعويض: {int(state.get('recovery_losses', 0) or 0)}",
         f"وضع الجلسة: {state.get('brain_mode') or state.get('session_mode') or 'normal'}",
         f"مزاج السوق: {state.get('market_mood') or 'قيد القراءة'}",
@@ -3888,9 +4051,12 @@ async def start_trading_room_session(update: Update, context: ContextTypes.DEFAU
     plan = build_session_money_plan(balance)
     state = {
         "active": True,
+        "pending_ready": True,
+        "ready_confirmed": False,
         "admin_id": admin_id,
         "balance": plan["balance"],
         "trade_amount": plan["trade_amount"],
+        "recovery_amount": plan["recovery_amount"],
         "target_profit_amount": plan["target_profit_amount"],
         "max_loss_amount": plan["max_loss_amount"],
         "max_trades": plan["max_trades"],
@@ -3925,46 +4091,12 @@ async def start_trading_room_session(update: Update, context: ContextTypes.DEFAU
         "pair_bad_scans": 0,
     }
     context.bot_data[trading_room_key(admin_id)] = state
-    await update.message.reply_text(build_trading_room_intro(plan), reply_markup=trading_room_active_keyboard)
-
-    selected = select_trading_room_pair()
-    if not selected:
-        state["waiting_pair_selection"] = True
-        state["pair_select_retries"] = 0
-        state["last_reason"] = "بانتظار تجهيز بيانات OTC Live"
-        await update.message.reply_text(
-            "⏳ جاري تجهيز بيانات السوق...",
-            reply_markup=trading_room_active_keyboard
-        )
-        try:
-            context.job_queue.run_once(
-                trading_room_pair_select_retry_job,
-                when=TRADING_ROOM_DATA_RETRY_SECONDS,
-                data={"admin_id": admin_id},
-                name=f"trading_room_pair_retry_{admin_id}_{int(time_module.time())}",
-            )
-        except Exception as e:
-            logger.exception("Could not schedule trading room pair retry job: %s", e)
-        return
-
-    state.update(selected)
-    state["pair_selected_at"] = time_module.time()
-    state["pair_bad_scans"] = 0
-    state["last_reason"] = "تم اختيار زوج الجلسة"
+    await update.message.reply_text(build_trading_room_intro(plan), reply_markup=trading_room_ready_keyboard)
     await update.message.reply_text(
-        build_trading_room_selected_pair_message(selected['pair']),
-        reply_markup=trading_room_active_keyboard
+        "هل أنت مستعد نبدأ الجلسة؟",
+        reply_markup=trading_room_ready_keyboard,
     )
-    try:
-        context.job_queue.run_repeating(
-            trading_room_scan_job,
-            interval=TRADING_ROOM_SCAN_INTERVAL_SECONDS,
-            first=2,
-            data={"admin_id": admin_id},
-            name=f"trading_room_scan_{admin_id}_{int(time_module.time())}",
-        )
-    except Exception as e:
-        logger.exception("Could not start trading room scan job: %s", e)
+
 
 
 async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
@@ -4017,7 +4149,7 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
     # الصفقة التعويضية تكون فقط عند وجود خسارة غير معوضة.
     # لا نكرر تعويض وراء تعويض؛ بعد تعويض خاسر ترجع الصفقة التالية عادية إذا لم تنتهِ الجلسة.
     is_recovery_trade = bool(state.get("recovery_mode") and state.get("unrecovered_loss"))
-    trade_amount = round(base_amount * (TRADING_ROOM_RECOVERY_MULTIPLIER if is_recovery_trade else 1.0), 2)
+    trade_amount = float(_round_platform_amount(state.get('recovery_amount') if is_recovery_trade else base_amount))
     analysis["trade_amount"] = trade_amount
     analysis["recovery_trade"] = is_recovery_trade
 
@@ -4029,7 +4161,7 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
         "last_trade_direction": analysis.get("direction"),
     })
 
-    amount_line = f"💰 دخول الصفقة المقترح: {trade_amount:.2f}$"
+    amount_line = f"💰 دخول الصفقة المقترح: {int(trade_amount)}$"
     if is_recovery_trade:
         amount_line += "  🔁 تعويض"
 
@@ -4215,17 +4347,26 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
 
     if should_finish:
         state["active"] = False
-        await safe_send_message(context.bot,
-            chat_id=admin_id,
-            text=(
+        if net_profit >= 0:
+            end_text = (
+                "🏁 انتهت جلسة التداول على ربح ✅\n\n"
+                f"السبب: {finish_reason}\n"
+                f"النتيجة النهائية: {wins} ربح / {losses} خسارة\n"
+                f"صافي الجلسة: {_money_signed(net_profit)}\n\n"
+                "🔥 ممتاز، هيك الشغل الصح: هدف واضح، التزام بالخطة، وخروج وأنت رابح.\n"
+                "أجمل ربح هو الربح اللي بتعرف توقف عنده."
+            )
+            keyboard = trading_room_after_win_keyboard
+        else:
+            end_text = (
                 "🏁 انتهت جلسة التداول\n\n"
                 f"السبب: {finish_reason}\n"
                 f"النتيجة النهائية: {wins} ربح / {losses} خسارة\n"
                 f"صافي الجلسة: {_money_signed(net_profit)}\n\n"
-                "الأفضل نرتاح الآن. إذا بدك جلسة جديدة، خليها بعد 3 ساعات على الأقل."
-            ),
-            reply_markup=trading_room_keyboard
-        )
+                "الأفضل الالتزام بالخطة وإدارة رأس المال. دعنا نحاول مجددًا بعد نصف ساعة لو أحببت."
+            )
+            keyboard = trading_room_after_loss_keyboard
+        await safe_send_message(context.bot, chat_id=admin_id, text=end_text, reply_markup=keyboard)
         return
 
     if state.get("recovery_mode") and state.get("unrecovered_loss"):
@@ -10721,7 +10862,142 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    if is_admin(user.id) and text == "✅ نعم، أنا مستعد":
+        state = get_trading_room_state(context, user.id)
+        if not state or not state.get("active") or not state.get("pending_ready"):
+            await update.message.reply_text("لا توجد جلسة بانتظار التأكيد الآن.", reply_markup=trading_room_keyboard)
+            return
+        state["pending_ready"] = False
+        state["ready_confirmed"] = True
+        await update.message.reply_text(
+            "بسم الله، جاري البحث عن زوج مناسب...",
+            reply_markup=trading_room_active_keyboard,
+        )
+        try:
+            context.job_queue.run_once(
+                trading_room_begin_market_job,
+                when=10,
+                data={"admin_id": int(user.id)},
+                name=f"trading_room_begin_{int(user.id)}_{int(time_module.time())}",
+            )
+        except Exception as e:
+            logger.exception("Could not schedule trading room begin job: %s", e)
+            await trading_room_start_market_flow(context, int(user.id))
+        return
+
+    if is_admin(user.id) and text == "❌ إلغاء الجلسة":
+        clear_trading_room_state(context, user.id)
+        context.user_data["trading_room_loss_confirm_stage"] = None
+        await update.message.reply_text("تم إلغاء الجلسة.", reply_markup=trading_room_keyboard)
+        return
+
+    if is_admin(user.id) and text == "🛑 إنهاء اليوم":
+        context.user_data["trading_room_loss_confirm_stage"] = None
+        await update.message.reply_text(
+            "قرار ممتاز. الحفاظ على الربح والهدوء أهم من كثرة الصفقات.",
+            reply_markup=trading_room_keyboard,
+        )
+        return
+
+    if is_admin(user.id) and text in {"حسنا شكرا لتذكيري", "لا، خليني أتراجع"}:
+        context.user_data["trading_room_loss_confirm_stage"] = None
+        await update.message.reply_text(
+            "قرار ممتاز. إذا بتحب، فيك توقف غرفة التداول عندك نصف ساعة احتياطيًا حتى ما ترجع بتهور.",
+            reply_markup=trading_room_retreat_keyboard,
+        )
+        return
+
+    if is_admin(user.id) and text in {"🧊 تعطيل غرفة التداول نصف ساعة", "أوقفني نصف ساعة", "تراجع وتعطيل نصف ساعة", "غالبًا غضب، أوقفني"}:
+        clear_trading_room_state(context, user.id)
+        set_trading_room_cooldown(context, user.id, 1800)
+        context.user_data["trading_room_loss_confirm_stage"] = None
+        await update.message.reply_text(
+            "🧊 تم تعطيل غرفة التداول عندك لمدة نصف ساعة.\n\nهذا القرار لحماية رأس المال ومنع التهور بعد الخسارة.",
+            reply_markup=trading_room_keyboard,
+        )
+        return
+
+    if is_admin(user.id) and text == "⏰ ذكرني بعد نصف ساعة":
+        try:
+            context.job_queue.run_once(
+                trading_room_half_hour_reminder_job,
+                when=1800,
+                data={"admin_id": int(user.id)},
+                name=f"trading_room_reminder_{int(user.id)}_{int(time_module.time())}",
+            )
+        except Exception as e:
+            logger.exception("Could not schedule trading room reminder: %s", e)
+        await update.message.reply_text(
+            "تمام، سأذكّرك بعد نصف ساعة. الأفضل الآن تبعد شوي عن الشاشة.",
+            reply_markup=trading_room_keyboard,
+        )
+        return
+
+    if is_admin(user.id) and text in {"🚀 جلسة جديدة", "🚀 بدء جلسة جديدة"}:
+        # بعد جلسة خاسرة نمرر المستخدم على مراحل تهدئة قبل السماح بجلسة جديدة.
+        if text == "🚀 بدء جلسة جديدة":
+            context.user_data["trading_room_loss_confirm_stage"] = 1
+            await update.message.reply_text(
+                "لا يبدو هذا خيارًا صائبًا الآن. هل أنت متأكد أنك تريد جلسة جديدة مباشرة بعد الخسارة؟",
+                reply_markup=trading_room_loss_confirm_keyboards[1],
+            )
+            return
+        context.user_data["step"] = "trading_room_waiting_balance"
+        await update.message.reply_text(
+            "💰 اكتب رصيد الحساب الحالي بالدولار.\n\nمثال: 50 أو 120.5",
+            reply_markup=trading_room_keyboard,
+        )
+        return
+
+    if is_admin(user.id) and text in {"نعم متأكد", "لا يهمني دعنا نكمل", "عندي خطة واضحة", "أتحمل القرار", "أوافق، ابدأ جلسة جديدة"}:
+        stage = int(context.user_data.get("trading_room_loss_confirm_stage") or 0)
+        if stage <= 0:
+            await update.message.reply_text("لا يوجد تأكيد خسارة نشط الآن.", reply_markup=trading_room_keyboard)
+            return
+        if stage == 1:
+            context.user_data["trading_room_loss_confirm_stage"] = 2
+            await update.message.reply_text(
+                "تذكر أن السوق لا يرحم. لا تنجر نحو الغضب أو محاولة الانتقام من السوق.",
+                reply_markup=trading_room_loss_confirm_keyboards[2],
+            )
+            return
+        if stage == 2:
+            context.user_data["trading_room_loss_confirm_stage"] = 3
+            await update.message.reply_text(
+                "قبل ما نكمل: هل قرارك مبني على خطة واضحة أم مجرد غضب من الخسارة؟",
+                reply_markup=trading_room_loss_confirm_keyboards[3],
+            )
+            return
+        if stage == 3:
+            context.user_data["trading_room_loss_confirm_stage"] = 4
+            await update.message.reply_text(
+                "آخر تنبيه جدي: جلسة ثانية بعد الخسارة تزيد خطر التهور. هل تتحمل القرار؟",
+                reply_markup=trading_room_loss_confirm_keyboards[4],
+            )
+            return
+        if stage == 4:
+            context.user_data["trading_room_loss_confirm_stage"] = 5
+            await update.message.reply_text(
+                "المرحلة الأخيرة. لو بدأت الآن، التزم بالمبلغ والحدود ولا تكسر الخطة. اختر بوعي.",
+                reply_markup=trading_room_loss_confirm_keyboards[5],
+            )
+            return
+        context.user_data["trading_room_loss_confirm_stage"] = None
+        context.user_data["step"] = "trading_room_waiting_balance"
+        await update.message.reply_text(
+            "تمام، القرار قرارك. اكتب رصيد الحساب الحالي بالدولار لنبدأ جلسة جديدة.",
+            reply_markup=trading_room_keyboard,
+        )
+        return
+
     if is_admin(user.id) and text == "🚀 بدء جلسة تداول":
+        remaining = get_trading_room_cooldown_remaining(context, user.id)
+        if remaining > 0:
+            await update.message.reply_text(
+                f"🧊 غرفة التداول متوقفة احتياطيًا عندك لمدة {_cooldown_text(remaining)} تقريبًا.\n\nهذا لحماية رأس المال ومنع الدخول تحت تأثير الانفعال.",
+                reply_markup=trading_room_keyboard,
+            )
+            return
         context.user_data["step"] = "trading_room_waiting_balance"
         await update.message.reply_text(
             "💰 اكتب رصيد الحساب الحالي بالدولار.\n\nمثال: 50 أو 120.5",
@@ -10744,6 +11020,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if is_admin(user.id) and text == "🛑 إيقاف الجلسة":
+        context.user_data["trading_room_loss_confirm_stage"] = None
         clear_trading_room_state(context, user.id)
         await update.message.reply_text(
             "🛑 تم إيقاف جلسة التداول التجريبية.",
@@ -10752,6 +11029,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if is_admin(user.id) and step == "trading_room_waiting_balance":
+        remaining = get_trading_room_cooldown_remaining(context, user.id)
+        if remaining > 0:
+            context.user_data["step"] = None
+            await update.message.reply_text(
+                f"🧊 غرفة التداول متوقفة احتياطيًا عندك لمدة {_cooldown_text(remaining)} تقريبًا.",
+                reply_markup=trading_room_keyboard,
+            )
+            return
         balance = parse_balance_amount(text)
         if balance is None:
             await update.message.reply_text(
