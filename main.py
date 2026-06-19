@@ -3107,7 +3107,7 @@ TRADING_ROOM_TARGET_WINS = int(os.getenv("TRADING_ROOM_TARGET_WINS", "3"))
 TRADING_ROOM_MAX_LOSSES = int(os.getenv("TRADING_ROOM_MAX_LOSSES", "3"))
 TRADING_ROOM_MAX_RECOVERY_LOSSES = int(os.getenv("TRADING_ROOM_MAX_RECOVERY_LOSSES", "2"))
 TRADING_ROOM_RECOVERY_MULTIPLIER = float(os.getenv("TRADING_ROOM_RECOVERY_MULTIPLIER", "2.0"))
-TRADING_ROOM_TRADE_AMOUNT_PERCENT = float(os.getenv("TRADING_ROOM_TRADE_AMOUNT_PERCENT", "2"))
+TRADING_ROOM_TRADE_AMOUNT_PERCENT = float(os.getenv("TRADING_ROOM_TRADE_AMOUNT_PERCENT", "1"))
 # أهداف غرفة جلسة التداول أصبحت مبنية على نسبة من رأس المال، لا على عدد صفقات.
 TRADING_ROOM_TARGET_PROFIT_PERCENT = float(os.getenv("TRADING_ROOM_TARGET_PROFIT_PERCENT", "6"))
 TRADING_ROOM_MAX_LOSS_PERCENT = float(os.getenv("TRADING_ROOM_MAX_LOSS_PERCENT", "6"))
@@ -3267,6 +3267,35 @@ def _trading_room_win_profit(trade_amount: float, payout_percent: float | int | 
         return round(float(trade_amount or 0) * (_normalize_payout_percent(payout_percent) / 100.0), 2)
     except Exception:
         return 0.0
+
+
+def _append_trading_room_ledger(state: dict, trade: dict, win: bool, pnl: float, effective_win_units: int = 0, effective_loss_units: int = 0):
+    """يسجل نتيجة الصفقة كدفتر حسابات فعلي للجلسة.
+
+    الربح في Quotex = مبلغ الدخول × payout المثبت عند لحظة الدخول.
+    الخسارة = مبلغ الدخول كامل.
+    صفقة التعويض الرابحة تُسجل كوحدتي ربح منطقيًا: تعويض الصفقة السابقة + ربح الصفقة الحالية،
+    لكن صافي المال يبقى محسوبًا فعليًا حسب مبلغ الدخول والـ payout.
+    """
+    try:
+        history = list(state.get("trade_ledger") or [])
+        history.append({
+            "time": time_module.time(),
+            "pair": trade.get("pair"),
+            "symbol": trade.get("symbol"),
+            "direction": trade.get("direction"),
+            "recovery_trade": bool(trade.get("recovery_trade")),
+            "amount": float(trade.get("trade_amount") or 0),
+            "payout": _normalize_payout_percent(trade.get("payout", 80), 80.0),
+            "result": "win" if win else "loss",
+            "pnl": round(float(pnl or 0), 2),
+            "effective_win_units": int(effective_win_units or 0),
+            "effective_loss_units": int(effective_loss_units or 0),
+            "net_after": round(float(state.get("net_profit", 0.0) or 0.0), 2),
+        })
+        state["trade_ledger"] = history[-100:]
+    except Exception:
+        pass
 
 
 def _percent_text(value) -> str:
@@ -4063,6 +4092,10 @@ async def start_trading_room_session(update: Update, context: ContextTypes.DEFAU
         "wins": 0,
         "losses": 0,
         "net_profit": 0.0,
+        "trade_ledger": [],
+        "pending_loss_units": 0,
+        "pending_loss_amount": 0.0,
+        "pending_loss_payout": 0.0,
         "unrecovered_loss": False,
         "session_mode": "normal",
         "trades_done": 0,
@@ -4267,32 +4300,50 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
         # الربح الصافي في Quotex ليس كامل مبلغ الدخول؛ بل مبلغ الدخول × payout لحظة الدخول.
         state["net_profit"] = round(float(state.get("net_profit", 0.0) or 0.0) + win_profit, 2)
         if was_recovery_trade:
-            # إذا ربحت صفقة التعويض، نعتبر الخسارة السابقة تعوضت وتحولت لصالح الجلسة.
-            state["losses"] = max(0, int(state.get("losses", 0) or 0) - 1)
-            state["wins"] = int(state.get("wins", 0) or 0) + 1
+            # صفقة التعويض الرابحة تغطي الصفقة السابقة + تعتبر الصفقة الحالية رابحة.
+            # مثال: خسارة 7$ ثم تعويض 14$ رابح على payout 83% => الصافي = -7 + 11.62 = +4.62$
+            # لكن عدّاد النتيجة يتحول إلى ربحين منطقيًا: الصفقة القديمة تعوضت + الصفقة الجديدة ربحت.
+            recovered_units = max(1, int(state.get("pending_loss_units", 0) or 1))
+            effective_win_units = recovered_units + 1
+            state["losses"] = max(0, int(state.get("losses", 0) or 0) - recovered_units)
+            state["wins"] = int(state.get("wins", 0) or 0) + effective_win_units
+            state["pending_loss_units"] = 0
+            state["pending_loss_amount"] = 0.0
+            state["pending_loss_payout"] = 0.0
             state["unrecovered_loss"] = False
             state["recovery_mode"] = False
             state["session_mode"] = "normal"
-            state["last_reason"] = "تم تعويض الخسارة"
+            state["last_reason"] = "تم تعويض الخسارة السابقة وربحت صفقة التعويض"
             state["brain_mode"] = "normal"
             state["last_loss_setup"] = None
             state["last_loss_direction"] = None
-            result_line = "✅ مبروك، صفقة التعويض ربحت"
+            _append_trading_room_ledger(state, trade, True, win_profit, effective_win_units=effective_win_units, effective_loss_units=0)
+            result_line = "✅ مبروك، صفقة التعويض ربحت وغطّت الخسارة السابقة"
         else:
             state["wins"] = int(state.get("wins", 0) or 0) + 1
+            state["pending_loss_units"] = 0
+            state["pending_loss_amount"] = 0.0
+            state["pending_loss_payout"] = 0.0
             state["unrecovered_loss"] = False
             state["recovery_mode"] = False
             state["session_mode"] = "normal"
             state["brain_mode"] = "protect_profit" if int(state.get("wins", 0) or 0) >= 2 else "normal"
             state["last_loss_setup"] = None
             state["last_loss_direction"] = None
+            _append_trading_room_ledger(state, trade, True, win_profit, effective_win_units=1, effective_loss_units=0)
             result_line = "✅ مبروك، الصفقة ربحت"
     else:
-        state["net_profit"] = round(float(state.get("net_profit", 0.0) or 0.0) - trade_amount, 2)
+        loss_amount = round(float(trade_amount or 0), 2)
+        state["net_profit"] = round(float(state.get("net_profit", 0.0) or 0.0) - loss_amount, 2)
         if was_recovery_trade:
-            # تعويض خاسر = خسارتين بوحدة الصفقة الأساسية، ولا ندخل تعويض وراء تعويض.
-            state["losses"] = int(state.get("losses", 0) or 0) + _trading_room_loss_units_for_trade(trade)
+            # تعويض خاسر = خسارتين بوحدة الصفقة الأساسية، بالإضافة للخسارة الأصلية الموجودة أصلًا بالعدّاد.
+            # لذلك لو خسرنا 7$ ثم تعويض 14$ خسر، تصبح النتيجة 3 خسارات فعلية من ناحية رأس المال.
+            effective_loss_units = _trading_room_loss_units_for_trade(trade)
+            state["losses"] = int(state.get("losses", 0) or 0) + effective_loss_units
             state["recovery_losses"] = int(state.get("recovery_losses", 0) or 0) + 1
+            state["pending_loss_units"] = 0
+            state["pending_loss_amount"] = 0.0
+            state["pending_loss_payout"] = 0.0
             state["unrecovered_loss"] = False
             state["recovery_mode"] = False
             state["session_mode"] = "normal"
@@ -4307,9 +4358,13 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
                 state["bad_symbols"] = list(bs)
             except Exception:
                 pass
+            _append_trading_room_ledger(state, trade, False, -loss_amount, effective_win_units=0, effective_loss_units=effective_loss_units)
             result_line = "❌ معوضة، صفقة التعويض خسرت"
         else:
             state["losses"] = int(state.get("losses", 0) or 0) + 1
+            state["pending_loss_units"] = 1
+            state["pending_loss_amount"] = loss_amount
+            state["pending_loss_payout"] = payout_at_entry
             state["unrecovered_loss"] = True
             state["recovery_mode"] = True
             state["session_mode"] = "recovery"
@@ -4318,6 +4373,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
             state["brain_mode"] = "recovery"
             state["last_loss_setup"] = trade.get("setup") or state.get("strategy_type")
             state["last_loss_direction"] = trade.get("direction")
+            _append_trading_room_ledger(state, trade, False, -loss_amount, effective_win_units=0, effective_loss_units=1)
             result_line = "❌ معوضة، الصفقة خسرت"
 
     wins = int(state.get("wins", 0) or 0)
@@ -4329,7 +4385,8 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
         chat_id=admin_id,
         text=(
             f"{result_line}\n\n"
-            f"📊 نتيجة الجلسة الآن: {wins} ربح / {losses} خسارة"
+            f"📊 نتيجة الجلسة الآن: {wins} ربح / {losses} خسارة\n"
+            f"💰 صافي الجلسة الآن: {_money_signed(net_profit)}"
         ),
         reply_markup=trading_room_active_keyboard
     )
