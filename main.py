@@ -479,6 +479,12 @@ def get_trading_room_active_keyboard(user_id: int):
     return ReplyKeyboardMarkup([["🛑 إيقاف الجلسة"]], resize_keyboard=True)
 
 
+def get_trading_room_smart_exit_keyboard(user_id: int):
+    if _tr_lang(user_id) == "en":
+        return ReplyKeyboardMarkup([["🛑 Stop and secure result"], ["▶️ Continue session"]], resize_keyboard=True)
+    return ReplyKeyboardMarkup([["🛑 إيقاف وحفظ النتيجة"], ["▶️ متابعة الجلسة"]], resize_keyboard=True)
+
+
 def get_trading_room_ready_keyboard(user_id: int):
     if _tr_lang(user_id) == "en":
         return ReplyKeyboardMarkup([["✅ Yes, I am ready"], ["❌ Cancel Session"]], resize_keyboard=True)
@@ -3170,6 +3176,14 @@ TRADING_ROOM_TRADE_AMOUNT_PERCENT = float(os.getenv("TRADING_ROOM_TRADE_AMOUNT_P
 TRADING_ROOM_TARGET_PROFIT_PERCENT = float(os.getenv("TRADING_ROOM_TARGET_PROFIT_PERCENT", "3"))
 TRADING_ROOM_MAX_LOSS_PERCENT = float(os.getenv("TRADING_ROOM_MAX_LOSS_PERCENT", "4"))
 
+# Smart exit suggestion: if a session takes too long and reaches a decent partial profit
+# or a controlled partial loss, pause and ask the user whether to stop or continue.
+TRADING_ROOM_SMART_EXIT_MIN_SECONDS = int(os.getenv("TRADING_ROOM_SMART_EXIT_MIN_SECONDS", "1800"))
+TRADING_ROOM_SMART_EXIT_PROFIT_PART = float(os.getenv("TRADING_ROOM_SMART_EXIT_PROFIT_PART", "0.50"))
+TRADING_ROOM_SMART_EXIT_LOSS_PART = float(os.getenv("TRADING_ROOM_SMART_EXIT_LOSS_PART", "0.50"))
+TRADING_ROOM_SMART_EXIT_FLAT_SECONDS = int(os.getenv("TRADING_ROOM_SMART_EXIT_FLAT_SECONDS", "2700"))
+TRADING_ROOM_SMART_EXIT_COOLDOWN_SECONDS = int(os.getenv("TRADING_ROOM_SMART_EXIT_COOLDOWN_SECONDS", "900"))
+
 # ===== Trading Room Session Brain =====
 # طبقة وعي الجلسة: تراقب سلوك الزوج، تمنع تكرار نفس النمط الخاسر،
 # وتغيّر الزوج تلقائيًا إذا صار ضعيفًا أو متذبذبًا.
@@ -4251,6 +4265,9 @@ async def start_trading_room_session(update: Update, context: ContextTypes.DEFAU
         "pair_selected_at": 0.0,
         "last_pair_switch_at": 0.0,
         "pair_bad_scans": 0,
+        "smart_exit_waiting": False,
+        "smart_exit_reason": None,
+        "smart_exit_last_suggested_at": 0.0,
     }
     context.bot_data[trading_room_key(admin_id)] = state
     await safe_send_message(
@@ -4268,6 +4285,103 @@ async def start_trading_room_session(update: Update, context: ContextTypes.DEFAU
 
 
 
+def build_trading_room_smart_exit_message(state: dict, reason_type: str, lang: str = "ar") -> str:
+    net_profit = float(state.get("net_profit", 0.0) or 0.0)
+    elapsed_min = int(max(0, time_module.time() - float(state.get("started_at", time_module.time()) or time_module.time())) // 60)
+    trades_done = int(state.get("trades_done", 0) or 0)
+    pair_switches = int(state.get("pair_switches", 0) or 0)
+    if lang == "en":
+        if reason_type == "profit":
+            intro = "The session has been running for a while and you are currently in profit."
+            advice = "A smart exit now can be better than forcing the full target and giving the market a chance to take it back."
+        elif reason_type == "loss":
+            intro = "The session has been running for a while and the loss is still controlled."
+            advice = "Stopping here may protect the account from emotional continuation or revenge trading."
+        else:
+            intro = "The session has been running for a long time without clear progress."
+            advice = "It may be better to pause and try again when the market is cleaner."
+        return (
+            "🧠 Smart session suggestion\n\n"
+            f"{intro}\n\n"
+            f"⏱ Session time: {elapsed_min} minutes\n"
+            f"📊 Trades so far: {trades_done}\n"
+            f"🔄 Pair switches: {pair_switches}\n"
+            f"💰 Current net: {_money_signed(net_profit)}\n\n"
+            f"{advice}\n\n"
+            "Choose whether to stop and secure the current result, or continue the session."
+        )
+    if reason_type == "profit":
+        intro = "الجلسة طولت، وحاليًا نحن على ربح جيد."
+        advice = "أحيانًا الخروج الذكي بربح جزئي أفضل من الإصرار على التارجت الكامل وترك السوق يرجع يسحب الربح."
+    elif reason_type == "loss":
+        intro = "الجلسة طولت، والخسارة الحالية ما زالت تحت السيطرة."
+        advice = "الإيقاف هنا ممكن يحمي رأس المال من الاستمرار تحت ضغط نفسي أو محاولة تعويض عشوائية."
+    else:
+        intro = "الجلسة طولت بدون تقدم واضح."
+        advice = "ممكن الأفضل نرتاح ونرجع بوقت يكون السوق أنظف."
+    return (
+        "🧠 اقتراح ذكي للجلسة\n\n"
+        f"{intro}\n\n"
+        f"⏱ مدة الجلسة: {elapsed_min} دقيقة\n"
+        f"📊 عدد الصفقات: {trades_done}\n"
+        f"🔄 تغييرات الزوج: {pair_switches}\n"
+        f"💰 صافي الجلسة الحالي: {_money_signed(net_profit)}\n\n"
+        f"{advice}\n\n"
+        "اختر إذا بدك نوقف ونحفظ النتيجة الحالية، أو نكمل الجلسة."
+    )
+
+
+def trading_room_smart_exit_reason(state: dict) -> str | None:
+    try:
+        if not state or not state.get("active") or state.get("waiting_result") or state.get("pending_ready"):
+            return None
+        if state.get("smart_exit_waiting"):
+            return None
+        now = time_module.time()
+        last = float(state.get("smart_exit_last_suggested_at", 0) or 0)
+        if last and now - last < TRADING_ROOM_SMART_EXIT_COOLDOWN_SECONDS:
+            return None
+        elapsed = now - float(state.get("started_at", now) or now)
+        trades_done = int(state.get("trades_done", 0) or 0)
+        if elapsed < TRADING_ROOM_SMART_EXIT_MIN_SECONDS or trades_done < 2:
+            return None
+        net_profit = float(state.get("net_profit", 0.0) or 0.0)
+        target_profit = abs(float(state.get("target_profit_amount", 0.0) or 0.0))
+        max_loss = abs(float(state.get("max_loss_amount", 0.0) or 0.0))
+        trade_amount = abs(float(state.get("trade_amount", 1.0) or 1.0))
+        # Protect decent partial profit after a long, back-and-forth session.
+        profit_threshold = max(trade_amount, target_profit * TRADING_ROOM_SMART_EXIT_PROFIT_PART) if target_profit > 0 else trade_amount
+        if net_profit >= profit_threshold:
+            return "profit"
+        # Stop controlled loss before it becomes the full loss limit.
+        loss_threshold = max(trade_amount, max_loss * TRADING_ROOM_SMART_EXIT_LOSS_PART) if max_loss > 0 else trade_amount
+        if net_profit <= -loss_threshold:
+            return "loss"
+        # If the session is flat for too long with several trades/switches, suggest a pause.
+        if elapsed >= TRADING_ROOM_SMART_EXIT_FLAT_SECONDS and trades_done >= 4 and abs(net_profit) < max(trade_amount, 1.0):
+            return "flat"
+    except Exception:
+        logger.exception("trading_room_smart_exit_reason failed")
+    return None
+
+
+async def trading_room_maybe_suggest_smart_exit(context: ContextTypes.DEFAULT_TYPE, admin_id: int, state: dict) -> bool:
+    reason = trading_room_smart_exit_reason(state)
+    if not reason:
+        return False
+    lang = get_user_language(admin_id)
+    state["smart_exit_waiting"] = True
+    state["smart_exit_reason"] = reason
+    state["smart_exit_last_suggested_at"] = time_module.time()
+    await safe_send_message(
+        context.bot,
+        chat_id=admin_id,
+        text=build_trading_room_smart_exit_message(state, reason, lang),
+        reply_markup=get_trading_room_smart_exit_keyboard(admin_id),
+    )
+    return True
+
+
 async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
     data = context.job.data or {}
     admin_id = int(data.get("admin_id") or 0)
@@ -4282,6 +4396,9 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
         return
 
     if state.get("waiting_result"):
+        return
+
+    if state.get("smart_exit_waiting"):
         return
 
     if time_module.time() > float(state.get("expires_at", 0) or 0):
@@ -4654,6 +4771,9 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
                 )
             keyboard = get_trading_room_after_loss_keyboard(admin_id)
         await safe_send_message(context.bot, chat_id=admin_id, text=end_text, reply_markup=keyboard)
+        return
+
+    if await trading_room_maybe_suggest_smart_exit(context, admin_id, state):
         return
 
     if state.get("recovery_mode") and state.get("unrecovered_loss"):
@@ -10890,6 +11010,43 @@ async def handle_trading_room_message(update: Update, context: ContextTypes.DEFA
             build_trading_room_market_data_status_message(),
             reply_markup=get_trading_room_menu_keyboard(user.id)
         )
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"▶️ متابعة الجلسة", "▶️ Continue session", "متابعة الجلسة", "Continue session"}:
+        state = get_trading_room_state(context, user.id)
+        if state and state.get("active") and state.get("smart_exit_waiting"):
+            state["smart_exit_waiting"] = False
+            state["smart_exit_reason"] = None
+            state["smart_exit_last_suggested_at"] = time_module.time()
+            await safe_send_message(
+                context.bot,
+                chat_id=user.id,
+                text=_tr_room_text(user.id, "تمام، سنكمل الجلسة بحذر وبدون دخول عشوائي.", "Okay, I will continue the session carefully without random entries."),
+                reply_markup=get_trading_room_active_keyboard(user.id),
+            )
+            return True
+        await safe_send_message(context.bot, chat_id=user.id, text=_tr_room_text(user.id, "لا يوجد اقتراح إيقاف نشط الآن.", "There is no active stop suggestion right now."), reply_markup=get_trading_room_menu_keyboard(user.id))
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"🛑 إيقاف وحفظ النتيجة", "🛑 Stop and secure result", "إيقاف وحفظ النتيجة", "Stop and secure result"}:
+        state = get_trading_room_state(context, user.id)
+        if state and state.get("active"):
+            net_profit = float(state.get("net_profit", 0.0) or 0.0)
+            wins = int(state.get("wins", 0) or 0)
+            losses = int(state.get("losses", 0) or 0)
+            state["active"] = False
+            state["smart_exit_waiting"] = False
+            reason = _tr_room_text(user.id, "إيقاف ذكي لحفظ نتيجة الجلسة الحالية.", "Smart stop to secure the current session result.")
+            end_text = (
+                (_tr_room_text(user.id, "🏁 تم إيقاف جلسة التداول", "🏁 Trading session stopped") + "\n\n")
+                + (_tr_room_text(user.id, "السبب: ", "Reason: ") + reason + "\n")
+                + (_tr_room_text(user.id, f"النتيجة الحالية: {wins} ربح / {losses} خسارة\n", f"Current result: {wins} win / {losses} loss\n"))
+                + (_tr_room_text(user.id, f"صافي الجلسة: {_money_signed(net_profit)}\n\n", f"Session net: {_money_signed(net_profit)}\n\n"))
+                + (_tr_room_text(user.id, "قرار ممتاز. أحيانًا حماية النتيجة أهم من مطاردة التارجت الكامل.", "Excellent decision. Sometimes protecting the current result matters more than chasing the full target."))
+            )
+            await safe_send_message(context.bot, chat_id=user.id, text=end_text, reply_markup=get_trading_room_menu_keyboard(user.id))
+            return True
+        await safe_send_message(context.bot, chat_id=user.id, text=_tr_room_text(user.id, "لا توجد جلسة نشطة الآن.", "There is no active session right now."), reply_markup=get_trading_room_menu_keyboard(user.id))
         return True
 
     if (is_admin(user.id) or is_approved(user.id)) and text in {"🛑 إيقاف الجلسة", "إيقاف الجلسة", "ايقاف الجلسة", "وقف الجلسة", "إيقاف", "ايقاف", "🛑 Stop Session"}:
