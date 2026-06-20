@@ -3199,11 +3199,23 @@ def clear_trading_room_state(context: ContextTypes.DEFAULT_TYPE, admin_id: int):
 
 def parse_balance_amount(text: str) -> float | None:
     try:
-        cleaned = str(text or "").strip().replace("$", "").replace(",", ".")
-        cleaned = re.sub(r"[^0-9\.]", "", cleaned)
-        if not cleaned:
+        raw = str(text or "").strip()
+        if not raw:
             return None
-        value = float(cleaned)
+        # دعم الأرقام العربية والفاصلة العربية/العشرية، واستخراج آخر رقم من الرسالة
+        # حتى لو كان المستخدم يرد على رسالة بوت وفي النص اقتباس أو كلمات إضافية.
+        trans = str.maketrans({
+            "٠": "0", "١": "1", "٢": "2", "٣": "3", "٤": "4",
+            "٥": "5", "٦": "6", "٧": "7", "٨": "8", "٩": "9",
+            "۰": "0", "۱": "1", "۲": "2", "۳": "3", "۴": "4",
+            "۵": "5", "۶": "6", "۷": "7", "۸": "8", "۹": "9",
+            "٫": ".", "،": ".", ",": ".", "$": " ",
+        })
+        cleaned = raw.translate(trans)
+        matches = re.findall(r"\d+(?:\.\d+)?", cleaned)
+        if not matches:
+            return None
+        value = float(matches[-1])
         if value <= 0:
             return None
         return value
@@ -4177,9 +4189,16 @@ async def start_trading_room_session(update: Update, context: ContextTypes.DEFAU
         "pair_bad_scans": 0,
     }
     context.bot_data[trading_room_key(admin_id)] = state
-    await update.message.reply_text(build_trading_room_intro(plan), reply_markup=trading_room_ready_keyboard)
-    await update.message.reply_text(
-        "هل أنت مستعد نبدأ الجلسة؟",
+    await safe_send_message(
+        context.bot,
+        chat_id=admin_id,
+        text=build_trading_room_intro(plan),
+        reply_markup=trading_room_ready_keyboard,
+    )
+    await safe_send_message(
+        context.bot,
+        chat_id=admin_id,
+        text="هل أنت مستعد نبدأ الجلسة؟",
         reply_markup=trading_room_ready_keyboard,
     )
 
@@ -11034,21 +11053,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ===== Trading session room =====
     if (is_admin(user.id) or is_approved(user.id)) and text in {"🧠 غرفة جلسة تداول", "🧠 Trading Session Room"}:
         reset_signal_state(context)
-        await update.message.reply_text(
-            build_trading_room_warning_message(get_user_language(user.id)),
-            reply_markup=get_trading_room_menu_keyboard(user.id)
+        await safe_send_message(
+            context.bot,
+            chat_id=user.id,
+            text=build_trading_room_warning_message(get_user_language(user.id)),
+            reply_markup=get_trading_room_menu_keyboard(user.id),
         )
         return
 
-    if (is_admin(user.id) or is_approved(user.id)) and text in {"✅ نعم، أنا مستعد", "✅ Yes, I am ready"}:
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"✅ نعم، أنا مستعد", "نعم", "انا مستعد", "أنا مستعد", "جاهز", "✅ Yes, I am ready"}:
         state = get_trading_room_state(context, user.id)
         if not state or not state.get("active") or not state.get("pending_ready"):
             await update.message.reply_text("لا توجد جلسة بانتظار التأكيد الآن.", reply_markup=get_trading_room_menu_keyboard(user.id))
             return
         state["pending_ready"] = False
         state["ready_confirmed"] = True
-        await update.message.reply_text(
-            "بسم الله، جاري البحث عن زوج مناسب...",
+        await safe_send_message(
+            context.bot,
+            chat_id=user.id,
+            text="بسم الله، جاري البحث عن زوج مناسب...",
             reply_markup=get_trading_room_active_keyboard(user.id),
         )
         try:
@@ -11063,10 +11086,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await trading_room_start_market_flow(context, int(user.id))
         return
 
-    if (is_admin(user.id) or is_approved(user.id)) and text in {"❌ إلغاء الجلسة", "❌ Cancel Session"}:
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"❌ إلغاء الجلسة", "إلغاء الجلسة", "الغاء الجلسة", "الغاء", "إلغاء", "❌ Cancel Session"}:
         clear_trading_room_state(context, user.id)
         context.user_data["trading_room_loss_confirm_stage"] = None
-        await update.message.reply_text("تم إلغاء الجلسة.", reply_markup=get_trading_room_menu_keyboard(user.id))
+        await safe_send_message(context.bot, chat_id=user.id, text="تم إلغاء الجلسة.", reply_markup=get_trading_room_menu_keyboard(user.id))
         return
 
     if (is_admin(user.id) or is_approved(user.id)) and text in {"🛑 إنهاء اليوم", "🛑 End Today"}:
@@ -11121,8 +11144,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         context.user_data["step"] = "trading_room_waiting_balance"
-        await update.message.reply_text(
-            "💰 اكتب رصيد الحساب الحالي بالدولار.\n\nمثال: 50 أو 120.5",
+        await safe_send_message(
+            context.bot,
+            chat_id=user.id,
+            text="💰 اكتب رصيد الحساب الحالي بالدولار.\n\nمثال: 50 أو 120.5",
             reply_markup=get_trading_room_menu_keyboard(user.id),
         )
         return
@@ -11168,7 +11193,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if (is_admin(user.id) or is_approved(user.id)) and text in {"🚀 بدء جلسة تداول", "🚀 Start Trading Session"}:
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"🚀 بدء جلسة تداول", "بدء جلسة تداول", "بدء الجلسة", "🚀 Start Trading Session"}:
         remaining = get_trading_room_cooldown_remaining(context, user.id)
         if remaining > 0:
             await update.message.reply_text(
@@ -11177,9 +11202,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
         context.user_data["step"] = "trading_room_waiting_balance"
-        await update.message.reply_text(
-            "💰 اكتب رصيد الحساب الحالي بالدولار.\n\nمثال: 50 أو 120.5",
-            reply_markup=get_trading_room_menu_keyboard(user.id)
+        await safe_send_message(
+            context.bot,
+            chat_id=user.id,
+            text="💰 اكتب رصيد الحساب الحالي بالدولار.\n\nمثال: 50 أو 120.5",
+            reply_markup=get_trading_room_menu_keyboard(user.id),
         )
         return
 
@@ -11197,16 +11224,29 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if (is_admin(user.id) or is_approved(user.id)) and text in {"🛑 إيقاف الجلسة", "🛑 Stop Session"}:
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"🛑 إيقاف الجلسة", "إيقاف الجلسة", "ايقاف الجلسة", "وقف الجلسة", "إيقاف", "ايقاف", "🛑 Stop Session"}:
         context.user_data["trading_room_loss_confirm_stage"] = None
         clear_trading_room_state(context, user.id)
-        await update.message.reply_text(
-            "🛑 تم إيقاف جلسة التداول التجريبية.",
-            reply_markup=get_trading_room_menu_keyboard(user.id)
+        await safe_send_message(
+            context.bot,
+            chat_id=user.id,
+            text="🛑 تم إيقاف جلسة التداول التجريبية.",
+            reply_markup=get_trading_room_menu_keyboard(user.id),
         )
         return
 
     if (is_admin(user.id) or is_approved(user.id)) and step == "trading_room_waiting_balance":
+        if text in {"🛑 إيقاف الجلسة", "إيقاف الجلسة", "ايقاف الجلسة", "وقف الجلسة", "إيقاف", "ايقاف", "❌ إلغاء الجلسة", "إلغاء الجلسة", "الغاء الجلسة", "الغاء", "إلغاء", "⬅️ رجوع", "🔙 رجوع", "رجوع"}:
+            context.user_data["step"] = None
+            context.user_data["trading_room_loss_confirm_stage"] = None
+            clear_trading_room_state(context, user.id)
+            await safe_send_message(
+                context.bot,
+                chat_id=user.id,
+                text="🛑 تم إيقاف جلسة التداول التجريبية.",
+                reply_markup=get_trading_room_menu_keyboard(user.id),
+            )
+            return
         remaining = get_trading_room_cooldown_remaining(context, user.id)
         if remaining > 0:
             context.user_data["step"] = None
@@ -11217,9 +11257,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         balance = parse_balance_amount(text)
         if balance is None:
-            await update.message.reply_text(
-                "❌ لم أفهم الرصيد. اكتب رقم فقط، مثال: 50 أو 120.5",
-                reply_markup=get_trading_room_menu_keyboard(user.id)
+            await safe_send_message(
+                context.bot,
+                chat_id=user.id,
+                text="❌ لم أفهم الرصيد. اكتب رقم فقط، مثال: 50 أو 120.5",
+                reply_markup=get_trading_room_menu_keyboard(user.id),
             )
             return
         context.user_data["step"] = None
