@@ -10439,12 +10439,240 @@ async def block_signal_for_unapproved_user(update: Update, context: ContextTypes
 
 
 
+
+async def handle_trading_room_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Handle Trading Session Room messages for both Arabic and English users before language-specific fallbacks."""
+    if not update.message or not update.message.text:
+        return False
+    user = update.effective_user
+    text = (update.message.text or "").strip()
+    step = context.user_data.get("step")
+    # ===== Trading session room =====
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"🧠 غرفة جلسة تداول", "🧠 Trading Session Room"}:
+        reset_signal_state(context)
+        await safe_send_message(
+            context.bot,
+            chat_id=user.id,
+            text=build_trading_room_warning_message(get_user_language(user.id)),
+            reply_markup=get_trading_room_menu_keyboard(user.id),
+        )
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"✅ نعم، أنا مستعد", "نعم", "انا مستعد", "أنا مستعد", "جاهز", "✅ Yes, I am ready"}:
+        state = get_trading_room_state(context, user.id)
+        if not state or not state.get("active") or not state.get("pending_ready"):
+            await update.message.reply_text("لا توجد جلسة بانتظار التأكيد الآن.", reply_markup=get_trading_room_menu_keyboard(user.id))
+            return True
+        state["pending_ready"] = False
+        state["ready_confirmed"] = True
+        await safe_send_message(
+            context.bot,
+            chat_id=user.id,
+            text="بسم الله، جاري البحث عن زوج مناسب...",
+            reply_markup=get_trading_room_active_keyboard(user.id),
+        )
+        try:
+            context.job_queue.run_once(
+                trading_room_begin_market_job,
+                when=10,
+                data={"admin_id": int(user.id)},
+                name=f"trading_room_begin_{int(user.id)}_{int(time_module.time())}",
+            )
+        except Exception as e:
+            logger.exception("Could not schedule trading room begin job: %s", e)
+            await trading_room_start_market_flow(context, int(user.id))
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"❌ إلغاء الجلسة", "إلغاء الجلسة", "الغاء الجلسة", "الغاء", "إلغاء", "❌ Cancel Session"}:
+        clear_trading_room_state(context, user.id)
+        context.user_data["trading_room_loss_confirm_stage"] = None
+        await safe_send_message(context.bot, chat_id=user.id, text="تم إلغاء الجلسة.", reply_markup=get_trading_room_menu_keyboard(user.id))
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"🛑 إنهاء اليوم", "🛑 End Today"}:
+        context.user_data["trading_room_loss_confirm_stage"] = None
+        await update.message.reply_text(
+            "قرار ممتاز. الحفاظ على الربح والهدوء أهم من كثرة الصفقات.",
+            reply_markup=get_trading_room_menu_keyboard(user.id),
+        )
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"حسنا شكرا لتذكيري", "لا، خليني أتراجع"}:
+        context.user_data["trading_room_loss_confirm_stage"] = None
+        await update.message.reply_text(
+            "قرار ممتاز. إذا بتحب، فيك توقف غرفة التداول عندك نصف ساعة احتياطيًا حتى ما ترجع بتهور.",
+            reply_markup=trading_room_retreat_keyboard,
+        )
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"🧊 تعطيل غرفة التداول نصف ساعة", "أوقفني نصف ساعة", "تراجع وتعطيل نصف ساعة", "غالبًا غضب، أوقفني"}:
+        clear_trading_room_state(context, user.id)
+        set_trading_room_cooldown(context, user.id, 1800)
+        context.user_data["trading_room_loss_confirm_stage"] = None
+        await update.message.reply_text(
+            "🧊 تم تعطيل غرفة التداول عندك لمدة نصف ساعة.\n\nهذا القرار لحماية رأس المال ومنع التهور بعد الخسارة.",
+            reply_markup=get_trading_room_menu_keyboard(user.id),
+        )
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and text == "⏰ ذكرني بعد نصف ساعة":
+        try:
+            context.job_queue.run_once(
+                trading_room_half_hour_reminder_job,
+                when=1800,
+                data={"admin_id": int(user.id)},
+                name=f"trading_room_reminder_{int(user.id)}_{int(time_module.time())}",
+            )
+        except Exception as e:
+            logger.exception("Could not schedule trading room reminder: %s", e)
+        await update.message.reply_text(
+            "تمام، سأذكّرك بعد نصف ساعة. الأفضل الآن تبعد شوي عن الشاشة.",
+            reply_markup=get_trading_room_menu_keyboard(user.id),
+        )
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"🚀 جلسة جديدة", "🚀 بدء جلسة جديدة", "🚀 Start New Session"}:
+        # بعد جلسة خاسرة نمرر المستخدم على مراحل تهدئة قبل السماح بجلسة جديدة.
+        if text == "🚀 بدء جلسة جديدة":
+            context.user_data["trading_room_loss_confirm_stage"] = 1
+            await update.message.reply_text(
+                "لا يبدو هذا خيارًا صائبًا الآن. هل أنت متأكد أنك تريد جلسة جديدة مباشرة بعد الخسارة؟",
+                reply_markup=trading_room_loss_confirm_keyboards[1],
+            )
+            return True
+        context.user_data["step"] = "trading_room_waiting_balance"
+        await safe_send_message(
+            context.bot,
+            chat_id=user.id,
+            text="💰 اكتب رصيد الحساب الحالي بالدولار.\n\nمثال: 50 أو 120.5",
+            reply_markup=get_trading_room_menu_keyboard(user.id),
+        )
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"نعم متأكد", "لا يهمني دعنا نكمل", "عندي خطة واضحة", "أتحمل القرار", "أوافق، ابدأ جلسة جديدة"}:
+        stage = int(context.user_data.get("trading_room_loss_confirm_stage") or 0)
+        if stage <= 0:
+            await update.message.reply_text("لا يوجد تأكيد خسارة نشط الآن.", reply_markup=get_trading_room_menu_keyboard(user.id))
+            return True
+        if stage == 1:
+            context.user_data["trading_room_loss_confirm_stage"] = 2
+            await update.message.reply_text(
+                "تذكر أن السوق لا يرحم. لا تنجر نحو الغضب أو محاولة الانتقام من السوق.",
+                reply_markup=trading_room_loss_confirm_keyboards[2],
+            )
+            return True
+        if stage == 2:
+            context.user_data["trading_room_loss_confirm_stage"] = 3
+            await update.message.reply_text(
+                "قبل ما نكمل: هل قرارك مبني على خطة واضحة أم مجرد غضب من الخسارة؟",
+                reply_markup=trading_room_loss_confirm_keyboards[3],
+            )
+            return True
+        if stage == 3:
+            context.user_data["trading_room_loss_confirm_stage"] = 4
+            await update.message.reply_text(
+                "آخر تنبيه جدي: جلسة ثانية بعد الخسارة تزيد خطر التهور. هل تتحمل القرار؟",
+                reply_markup=trading_room_loss_confirm_keyboards[4],
+            )
+            return True
+        if stage == 4:
+            context.user_data["trading_room_loss_confirm_stage"] = 5
+            await update.message.reply_text(
+                "المرحلة الأخيرة. لو بدأت الآن، التزم بالمبلغ والحدود ولا تكسر الخطة. اختر بوعي.",
+                reply_markup=trading_room_loss_confirm_keyboards[5],
+            )
+            return True
+        context.user_data["trading_room_loss_confirm_stage"] = None
+        context.user_data["step"] = "trading_room_waiting_balance"
+        await update.message.reply_text(
+            "تمام، القرار قرارك. اكتب رصيد الحساب الحالي بالدولار لنبدأ جلسة جديدة.",
+            reply_markup=get_trading_room_menu_keyboard(user.id),
+        )
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"🚀 بدء جلسة تداول", "بدء جلسة تداول", "بدء الجلسة", "🚀 Start Trading Session"}:
+        remaining = get_trading_room_cooldown_remaining(context, user.id)
+        if remaining > 0:
+            await update.message.reply_text(
+                f"🧊 غرفة التداول متوقفة احتياطيًا عندك لمدة {_cooldown_text(remaining)} تقريبًا.\n\nهذا لحماية رأس المال ومنع الدخول تحت تأثير الانفعال.",
+                reply_markup=get_trading_room_menu_keyboard(user.id),
+            )
+            return True
+        context.user_data["step"] = "trading_room_waiting_balance"
+        await safe_send_message(
+            context.bot,
+            chat_id=user.id,
+            text="💰 اكتب رصيد الحساب الحالي بالدولار.\n\nمثال: 50 أو 120.5",
+            reply_markup=get_trading_room_menu_keyboard(user.id),
+        )
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and text == "📊 حالة الجلسة":
+        await update.message.reply_text(
+            build_trading_room_state_message(get_trading_room_state(context, user.id)),
+            reply_markup=get_trading_room_menu_keyboard(user.id)
+        )
+        return True
+
+    if is_admin(user.id) and text == "🩺 فحص بيانات OTC Live":
+        await update.message.reply_text(
+            build_trading_room_market_data_status_message(),
+            reply_markup=get_trading_room_menu_keyboard(user.id)
+        )
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"🛑 إيقاف الجلسة", "إيقاف الجلسة", "ايقاف الجلسة", "وقف الجلسة", "إيقاف", "ايقاف", "🛑 Stop Session"}:
+        context.user_data["trading_room_loss_confirm_stage"] = None
+        clear_trading_room_state(context, user.id)
+        await safe_send_message(
+            context.bot,
+            chat_id=user.id,
+            text="🛑 تم إيقاف جلسة التداول التجريبية.",
+            reply_markup=get_trading_room_menu_keyboard(user.id),
+        )
+        return True
+
+    if (is_admin(user.id) or is_approved(user.id)) and step == "trading_room_waiting_balance":
+        if text in {"🛑 إيقاف الجلسة", "إيقاف الجلسة", "ايقاف الجلسة", "وقف الجلسة", "إيقاف", "ايقاف", "❌ إلغاء الجلسة", "إلغاء الجلسة", "الغاء الجلسة", "الغاء", "إلغاء", "⬅️ رجوع", "🔙 رجوع", "رجوع"}:
+            context.user_data["step"] = None
+            context.user_data["trading_room_loss_confirm_stage"] = None
+            clear_trading_room_state(context, user.id)
+            await safe_send_message(
+                context.bot,
+                chat_id=user.id,
+                text="🛑 تم إيقاف جلسة التداول التجريبية.",
+                reply_markup=get_trading_room_menu_keyboard(user.id),
+            )
+            return True
+        remaining = get_trading_room_cooldown_remaining(context, user.id)
+        if remaining > 0:
+            context.user_data["step"] = None
+            await update.message.reply_text(
+                f"🧊 غرفة التداول متوقفة احتياطيًا عندك لمدة {_cooldown_text(remaining)} تقريبًا.",
+                reply_markup=get_trading_room_menu_keyboard(user.id),
+            )
+            return True
+        balance = parse_balance_amount(text)
+        if balance is None:
+            await safe_send_message(
+                context.bot,
+                chat_id=user.id,
+                text="❌ لم أفهم الرصيد. اكتب رقم فقط، مثال: 50 أو 120.5",
+                reply_markup=get_trading_room_menu_keyboard(user.id),
+            )
+            return True
+        context.user_data["step"] = None
+        await start_trading_room_session(update, context, balance)
+        return True
+
+    return False
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not update.message or not update.message.text:
         return
 
     user = update.effective_user
-    text = update.message.text
+    text = (update.message.text or "").strip()
     step = context.user_data.get("step")
 
     # ===== Language selection gate =====
@@ -10487,6 +10715,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # يسمح بتغيير اللغة فقط، لكن أي استخدام آخر أثناء الإيقاف يُسجل ليتم إعلامه عند عودة البوت.
     if not is_admin(user.id) and not get_bot_enabled():
         await send_maintenance_message(update, context, lang)
+        return
+
+    # Trading Session Room is shared between Arabic and English users; handle it before English fallback.
+    if await handle_trading_room_message(update, context):
         return
 
     if lang == "en":
