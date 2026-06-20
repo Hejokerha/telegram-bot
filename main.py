@@ -442,7 +442,8 @@ admin_otc_list_ready_keyboard = ReplyKeyboardMarkup(
 
 
 # ===== Trading Room Keyboards =====
-# داخل غرفة الجلسة نستخدم InlineKeyboard بدل ReplyKeyboard حتى لا يرسل المستخدم رسالة مقتبسة عند الضغط على زر.
+# رجعنا أزرار غرفة الجلسة إلى ReplyKeyboard مثل قبل حتى لا تظهر كأزرار تحت كل رسالة.
+# مع دعم كامل للغة الإنجليزية داخل الغرفة.
 
 def _tr_lang(user_id: int) -> str:
     try:
@@ -454,104 +455,71 @@ def _tr_lang(user_id: int) -> str:
 def get_trading_room_menu_keyboard(user_id: int):
     lang = _tr_lang(user_id)
     if lang == "en":
-        rows = [[InlineKeyboardButton("🚀 Start Trading Session", callback_data="tr_start")]]
+        rows = [["🚀 Start Trading Session"]]
         if is_admin(user_id):
-            rows.append([
-                InlineKeyboardButton("📊 Session Status", callback_data="tr_status"),
-                InlineKeyboardButton("🩺 OTC Live Check", callback_data="tr_diag"),
-            ])
-        rows.append([InlineKeyboardButton("🛑 Stop Session", callback_data="tr_stop")])
-        rows.append([InlineKeyboardButton("🔙 Back", callback_data="tr_back")])
-        return InlineKeyboardMarkup(rows)
-    rows = [[InlineKeyboardButton("🚀 بدء جلسة تداول", callback_data="tr_start")]]
+            rows.append(["📊 Session Status", "🩺 OTC Live Check"])
+        rows.append(["🛑 Stop Session"])
+        rows.append(["🔙 Back"])
+        return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+    rows = [["🚀 بدء جلسة تداول"]]
     if is_admin(user_id):
-        rows.append([
-            InlineKeyboardButton("📊 حالة الجلسة", callback_data="tr_status"),
-            InlineKeyboardButton("🩺 فحص بيانات OTC Live", callback_data="tr_diag"),
-        ])
-    rows.append([InlineKeyboardButton("🛑 إيقاف الجلسة", callback_data="tr_stop")])
-    rows.append([InlineKeyboardButton("⬅️ رجوع", callback_data="tr_back")])
-    return InlineKeyboardMarkup(rows)
+        rows.append(["📊 حالة الجلسة", "🩺 فحص بيانات OTC Live"])
+    rows.append(["🛑 إيقاف الجلسة"])
+    rows.append(["⬅️ رجوع"])
+    return ReplyKeyboardMarkup(rows, resize_keyboard=True)
 
 
 def get_trading_room_active_keyboard(user_id: int):
     if _tr_lang(user_id) == "en":
-        return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 Stop Session", callback_data="tr_stop")]])
-    return InlineKeyboardMarkup([[InlineKeyboardButton("🛑 إيقاف الجلسة", callback_data="tr_stop")]])
+        return ReplyKeyboardMarkup([["🛑 Stop Session"]], resize_keyboard=True)
+    return ReplyKeyboardMarkup([["🛑 إيقاف الجلسة"]], resize_keyboard=True)
 
 
 def get_trading_room_ready_keyboard(user_id: int):
     if _tr_lang(user_id) == "en":
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("✅ Yes, I am ready", callback_data="tr_ready_yes")],
-            [InlineKeyboardButton("❌ Cancel Session", callback_data="tr_ready_cancel")],
-        ])
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ نعم، أنا مستعد", callback_data="tr_ready_yes")],
-        [InlineKeyboardButton("❌ إلغاء الجلسة", callback_data="tr_ready_cancel")],
-    ])
+        return ReplyKeyboardMarkup([["✅ Yes, I am ready"], ["❌ Cancel Session"]], resize_keyboard=True)
+    return ReplyKeyboardMarkup([["✅ نعم، أنا مستعد"], ["❌ إلغاء الجلسة"]], resize_keyboard=True)
 
 
 def get_trading_room_after_win_keyboard(user_id: int):
     if _tr_lang(user_id) == "en":
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🚀 New Session", callback_data="tr_new_win")],
-            [InlineKeyboardButton("🛑 End Today", callback_data="tr_end_day")],
-        ])
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 جلسة جديدة", callback_data="tr_new_win")],
-        [InlineKeyboardButton("🛑 إنهاء اليوم", callback_data="tr_end_day")],
-    ])
+        return ReplyKeyboardMarkup([["🚀 New Session"], ["🛑 End Today"], ["🔙 Back"]], resize_keyboard=True)
+    return ReplyKeyboardMarkup([["🚀 جلسة جديدة"], ["🛑 إنهاء اليوم"], ["⬅️ رجوع"]], resize_keyboard=True)
 
 
 def get_trading_room_after_loss_keyboard(user_id: int):
     if _tr_lang(user_id) == "en":
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🚀 Start New Session", callback_data="tr_new_loss")],
-            [InlineKeyboardButton("⏰ Remind me in 30 minutes", callback_data="tr_remind_30")],
-            [InlineKeyboardButton("🧊 Lock room for 30 minutes", callback_data="tr_cooldown_30")],
-        ])
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🚀 بدء جلسة جديدة", callback_data="tr_new_loss")],
-        [InlineKeyboardButton("⏰ ذكرني بعد نصف ساعة", callback_data="tr_remind_30")],
-        [InlineKeyboardButton("🧊 تعطيل غرفة التداول نصف ساعة", callback_data="tr_cooldown_30")],
-    ])
+        return ReplyKeyboardMarkup([["🚀 Start New Session"], ["⏰ Remind me in 30 minutes"], ["🧊 Lock room for 30 minutes"], ["🔙 Back"]], resize_keyboard=True)
+    return ReplyKeyboardMarkup([["🚀 بدء جلسة جديدة"], ["⏰ ذكرني بعد نصف ساعة"], ["🧊 تعطيل غرفة التداول نصف ساعة"], ["⬅️ رجوع"]], resize_keyboard=True)
 
 
 def get_trading_room_retreat_keyboard(user_id: int):
     if _tr_lang(user_id) == "en":
-        return InlineKeyboardMarkup([
-            [InlineKeyboardButton("🧊 Lock room for 30 minutes", callback_data="tr_cooldown_30")],
-            [InlineKeyboardButton("🔙 Back", callback_data="tr_back")],
-        ])
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🧊 تعطيل غرفة التداول نصف ساعة", callback_data="tr_cooldown_30")],
-        [InlineKeyboardButton("⬅️ رجوع", callback_data="tr_back")],
-    ])
+        return ReplyKeyboardMarkup([["🧊 Lock room for 30 minutes"], ["🔙 Back"]], resize_keyboard=True)
+    return ReplyKeyboardMarkup([["🧊 تعطيل غرفة التداول نصف ساعة"], ["⬅️ رجوع"]], resize_keyboard=True)
 
 
 def get_trading_room_loss_confirm_keyboard(user_id: int, stage: int):
     lang = _tr_lang(user_id)
     if lang == "en":
         labels = {
-            1: [("Yes, I am sure", "tr_loss_yes"), ("No, let me step back", "tr_loss_retreat")],
-            2: [("I do not care, continue", "tr_loss_yes"), ("Thanks for reminding me", "tr_loss_retreat")],
-            3: [("I have a clear plan", "tr_loss_yes"), ("Probably anger, stop me", "tr_loss_cooldown")],
-            4: [("I accept responsibility", "tr_loss_yes"), ("Stop me for 30 minutes", "tr_loss_cooldown")],
-            5: [("I agree, start a new session", "tr_loss_yes"), ("Step back and lock 30 minutes", "tr_loss_cooldown")],
+            1: [["Yes, I am sure"], ["No, let me step back"]],
+            2: [["I do not care, continue"], ["Thanks for reminding me"]],
+            3: [["I have a clear plan"], ["Probably anger, stop me"]],
+            4: [["I accept responsibility"], ["Stop me for 30 minutes"]],
+            5: [["I agree, start a new session"], ["Step back and lock 30 minutes"]],
         }
     else:
         labels = {
-            1: [("نعم متأكد", "tr_loss_yes"), ("لا، خليني أتراجع", "tr_loss_retreat")],
-            2: [("لا يهمني دعنا نكمل", "tr_loss_yes"), ("حسنا شكرا لتذكيري", "tr_loss_retreat")],
-            3: [("عندي خطة واضحة", "tr_loss_yes"), ("غالبًا غضب، أوقفني", "tr_loss_cooldown")],
-            4: [("أتحمل القرار", "tr_loss_yes"), ("أوقفني نصف ساعة", "tr_loss_cooldown")],
-            5: [("أوافق، ابدأ جلسة جديدة", "tr_loss_yes"), ("تراجع وتعطيل نصف ساعة", "tr_loss_cooldown")],
+            1: [["نعم متأكد"], ["لا، خليني أتراجع"]],
+            2: [["لا يهمني دعنا نكمل"], ["حسنا شكرا لتذكيري"]],
+            3: [["عندي خطة واضحة"], ["غالبًا غضب، أوقفني"]],
+            4: [["أتحمل القرار"], ["أوقفني نصف ساعة"]],
+            5: [["أوافق، ابدأ جلسة جديدة"], ["تراجع وتعطيل نصف ساعة"]],
         }
-    rows = [[InlineKeyboardButton(txt, callback_data=cb)] for txt, cb in labels.get(int(stage), labels[1])]
-    return InlineKeyboardMarkup(rows)
+    return ReplyKeyboardMarkup(labels.get(int(stage), labels[1]), resize_keyboard=True)
 
-# ReplyKeyboard fallbacks القديمة تبقى فقط لو أرسل المستخدم نص يدويًا.
+# متغيرات قديمة للتوافق مع أي موضع يستخدمها مباشرة.
 trading_room_public_keyboard = ReplyKeyboardMarkup([["🚀 بدء جلسة تداول"], ["🛑 إيقاف الجلسة"], ["⬅️ رجوع"]], resize_keyboard=True)
 trading_room_public_keyboard_en = ReplyKeyboardMarkup([["🚀 Start Trading Session"], ["🛑 Stop Session"], ["🔙 Back"]], resize_keyboard=True)
 trading_room_ready_keyboard = ReplyKeyboardMarkup([["✅ نعم، أنا مستعد"], ["❌ إلغاء الجلسة"]], resize_keyboard=True)
@@ -10729,7 +10697,7 @@ async def handle_trading_room_message(update: Update, context: ContextTypes.DEFA
         )
         return True
 
-    if (is_admin(user.id) or is_approved(user.id)) and text in {"حسنا شكرا لتذكيري", "لا، خليني أتراجع"}:
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"حسنا شكرا لتذكيري", "لا، خليني أتراجع", "Thanks for reminding me", "No, let me step back"}:
         context.user_data["trading_room_loss_confirm_stage"] = None
         await update.message.reply_text(
             "قرار ممتاز. إذا بتحب، فيك توقف غرفة التداول عندك نصف ساعة احتياطيًا حتى ما ترجع بتهور.",
@@ -10737,7 +10705,7 @@ async def handle_trading_room_message(update: Update, context: ContextTypes.DEFA
         )
         return True
 
-    if (is_admin(user.id) or is_approved(user.id)) and text in {"🧊 تعطيل غرفة التداول نصف ساعة", "أوقفني نصف ساعة", "تراجع وتعطيل نصف ساعة", "غالبًا غضب، أوقفني"}:
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"🧊 تعطيل غرفة التداول نصف ساعة", "أوقفني نصف ساعة", "تراجع وتعطيل نصف ساعة", "غالبًا غضب، أوقفني", "🧊 Lock room for 30 minutes", "Stop me for 30 minutes", "Step back and lock 30 minutes", "Probably anger, stop me"}:
         clear_trading_room_state(context, user.id)
         set_trading_room_cooldown(context, user.id, 1800)
         context.user_data["trading_room_loss_confirm_stage"] = None
@@ -10747,7 +10715,7 @@ async def handle_trading_room_message(update: Update, context: ContextTypes.DEFA
         )
         return True
 
-    if (is_admin(user.id) or is_approved(user.id)) and text == "⏰ ذكرني بعد نصف ساعة":
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"⏰ ذكرني بعد نصف ساعة", "⏰ Remind me in 30 minutes"}:
         try:
             context.job_queue.run_once(
                 trading_room_half_hour_reminder_job,
@@ -10763,9 +10731,9 @@ async def handle_trading_room_message(update: Update, context: ContextTypes.DEFA
         )
         return True
 
-    if (is_admin(user.id) or is_approved(user.id)) and text in {"🚀 جلسة جديدة", "🚀 بدء جلسة جديدة", "🚀 Start New Session"}:
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"🚀 جلسة جديدة", "🚀 New Session", "🚀 بدء جلسة جديدة", "🚀 Start New Session"}:
         # بعد جلسة خاسرة نمرر المستخدم على مراحل تهدئة قبل السماح بجلسة جديدة.
-        if text == "🚀 بدء جلسة جديدة":
+        if text in {"🚀 بدء جلسة جديدة", "🚀 Start New Session"}:
             context.user_data["trading_room_loss_confirm_stage"] = 1
             await update.message.reply_text(
                 "لا يبدو هذا خيارًا صائبًا الآن. هل أنت متأكد أنك تريد جلسة جديدة مباشرة بعد الخسارة؟",
@@ -10781,7 +10749,7 @@ async def handle_trading_room_message(update: Update, context: ContextTypes.DEFA
         )
         return True
 
-    if (is_admin(user.id) or is_approved(user.id)) and text in {"نعم متأكد", "لا يهمني دعنا نكمل", "عندي خطة واضحة", "أتحمل القرار", "أوافق، ابدأ جلسة جديدة"}:
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"نعم متأكد", "لا يهمني دعنا نكمل", "عندي خطة واضحة", "أتحمل القرار", "أوافق، ابدأ جلسة جديدة", "Yes, I am sure", "I do not care, continue", "I have a clear plan", "I accept responsibility", "I agree, start a new session"}:
         stage = int(context.user_data.get("trading_room_loss_confirm_stage") or 0)
         if stage <= 0:
             await update.message.reply_text("لا يوجد تأكيد خسارة نشط الآن.", reply_markup=get_trading_room_menu_keyboard(user.id))
@@ -10839,14 +10807,14 @@ async def handle_trading_room_message(update: Update, context: ContextTypes.DEFA
         )
         return True
 
-    if (is_admin(user.id) or is_approved(user.id)) and text == "📊 حالة الجلسة":
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"📊 حالة الجلسة", "📊 Session Status"}:
         await update.message.reply_text(
             build_trading_room_state_message(get_trading_room_state(context, user.id)),
             reply_markup=get_trading_room_menu_keyboard(user.id)
         )
         return True
 
-    if is_admin(user.id) and text == "🩺 فحص بيانات OTC Live":
+    if is_admin(user.id) and text in {"🩺 فحص بيانات OTC Live", "🩺 OTC Live Check"}:
         await update.message.reply_text(
             build_trading_room_market_data_status_message(),
             reply_markup=get_trading_room_menu_keyboard(user.id)
@@ -10865,7 +10833,7 @@ async def handle_trading_room_message(update: Update, context: ContextTypes.DEFA
         return True
 
     if (is_admin(user.id) or is_approved(user.id)) and step == "trading_room_waiting_balance":
-        if text in {"🛑 إيقاف الجلسة", "إيقاف الجلسة", "ايقاف الجلسة", "وقف الجلسة", "إيقاف", "ايقاف", "❌ إلغاء الجلسة", "إلغاء الجلسة", "الغاء الجلسة", "الغاء", "إلغاء", "⬅️ رجوع", "🔙 رجوع", "رجوع"}:
+        if text in {"🛑 إيقاف الجلسة", "إيقاف الجلسة", "ايقاف الجلسة", "وقف الجلسة", "إيقاف", "ايقاف", "🛑 Stop Session", "❌ إلغاء الجلسة", "إلغاء الجلسة", "الغاء الجلسة", "الغاء", "إلغاء", "❌ Cancel Session", "⬅️ رجوع", "🔙 رجوع", "رجوع", "🔙 Back", "Back"}:
             context.user_data["step"] = None
             context.user_data["trading_room_loss_confirm_stage"] = None
             clear_trading_room_state(context, user.id)
@@ -11564,7 +11532,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if (is_admin(user.id) or is_approved(user.id)) and text in {"حسنا شكرا لتذكيري", "لا، خليني أتراجع"}:
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"حسنا شكرا لتذكيري", "لا، خليني أتراجع", "Thanks for reminding me", "No, let me step back"}:
         context.user_data["trading_room_loss_confirm_stage"] = None
         await update.message.reply_text(
             "قرار ممتاز. إذا بتحب، فيك توقف غرفة التداول عندك نصف ساعة احتياطيًا حتى ما ترجع بتهور.",
@@ -11572,7 +11540,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if (is_admin(user.id) or is_approved(user.id)) and text in {"🧊 تعطيل غرفة التداول نصف ساعة", "أوقفني نصف ساعة", "تراجع وتعطيل نصف ساعة", "غالبًا غضب، أوقفني"}:
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"🧊 تعطيل غرفة التداول نصف ساعة", "أوقفني نصف ساعة", "تراجع وتعطيل نصف ساعة", "غالبًا غضب، أوقفني", "🧊 Lock room for 30 minutes", "Stop me for 30 minutes", "Step back and lock 30 minutes", "Probably anger, stop me"}:
         clear_trading_room_state(context, user.id)
         set_trading_room_cooldown(context, user.id, 1800)
         context.user_data["trading_room_loss_confirm_stage"] = None
@@ -11582,7 +11550,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if (is_admin(user.id) or is_approved(user.id)) and text == "⏰ ذكرني بعد نصف ساعة":
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"⏰ ذكرني بعد نصف ساعة", "⏰ Remind me in 30 minutes"}:
         try:
             context.job_queue.run_once(
                 trading_room_half_hour_reminder_job,
@@ -11598,9 +11566,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if (is_admin(user.id) or is_approved(user.id)) and text in {"🚀 جلسة جديدة", "🚀 بدء جلسة جديدة", "🚀 Start New Session"}:
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"🚀 جلسة جديدة", "🚀 New Session", "🚀 بدء جلسة جديدة", "🚀 Start New Session"}:
         # بعد جلسة خاسرة نمرر المستخدم على مراحل تهدئة قبل السماح بجلسة جديدة.
-        if text == "🚀 بدء جلسة جديدة":
+        if text in {"🚀 بدء جلسة جديدة", "🚀 Start New Session"}:
             context.user_data["trading_room_loss_confirm_stage"] = 1
             await update.message.reply_text(
                 "لا يبدو هذا خيارًا صائبًا الآن. هل أنت متأكد أنك تريد جلسة جديدة مباشرة بعد الخسارة؟",
@@ -11616,7 +11584,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if (is_admin(user.id) or is_approved(user.id)) and text in {"نعم متأكد", "لا يهمني دعنا نكمل", "عندي خطة واضحة", "أتحمل القرار", "أوافق، ابدأ جلسة جديدة"}:
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"نعم متأكد", "لا يهمني دعنا نكمل", "عندي خطة واضحة", "أتحمل القرار", "أوافق، ابدأ جلسة جديدة", "Yes, I am sure", "I do not care, continue", "I have a clear plan", "I accept responsibility", "I agree, start a new session"}:
         stage = int(context.user_data.get("trading_room_loss_confirm_stage") or 0)
         if stage <= 0:
             await update.message.reply_text("لا يوجد تأكيد خسارة نشط الآن.", reply_markup=get_trading_room_menu_keyboard(user.id))
@@ -11674,14 +11642,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    if (is_admin(user.id) or is_approved(user.id)) and text == "📊 حالة الجلسة":
+    if (is_admin(user.id) or is_approved(user.id)) and text in {"📊 حالة الجلسة", "📊 Session Status"}:
         await update.message.reply_text(
             build_trading_room_state_message(get_trading_room_state(context, user.id)),
             reply_markup=get_trading_room_menu_keyboard(user.id)
         )
         return
 
-    if is_admin(user.id) and text == "🩺 فحص بيانات OTC Live":
+    if is_admin(user.id) and text in {"🩺 فحص بيانات OTC Live", "🩺 OTC Live Check"}:
         await update.message.reply_text(
             build_trading_room_market_data_status_message(),
             reply_markup=get_trading_room_menu_keyboard(user.id)
@@ -11700,7 +11668,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if (is_admin(user.id) or is_approved(user.id)) and step == "trading_room_waiting_balance":
-        if text in {"🛑 إيقاف الجلسة", "إيقاف الجلسة", "ايقاف الجلسة", "وقف الجلسة", "إيقاف", "ايقاف", "❌ إلغاء الجلسة", "إلغاء الجلسة", "الغاء الجلسة", "الغاء", "إلغاء", "⬅️ رجوع", "🔙 رجوع", "رجوع"}:
+        if text in {"🛑 إيقاف الجلسة", "إيقاف الجلسة", "ايقاف الجلسة", "وقف الجلسة", "إيقاف", "ايقاف", "🛑 Stop Session", "❌ إلغاء الجلسة", "إلغاء الجلسة", "الغاء الجلسة", "الغاء", "إلغاء", "❌ Cancel Session", "⬅️ رجوع", "🔙 رجوع", "رجوع", "🔙 Back", "Back"}:
             context.user_data["step"] = None
             context.user_data["trading_room_loss_confirm_stage"] = None
             clear_trading_room_state(context, user.id)
