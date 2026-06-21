@@ -4126,7 +4126,7 @@ def analyze_trading_room_entry(state: dict) -> dict:
     market_trend_bias = "CALL" if strong_trend_up else "PUT" if strong_trend_down else None
 
     seconds = now_utc().astimezone(UTC_PLUS_3).second
-    direct_allowed = seconds <= TRADING_ROOM_DIRECT_ENTRY_MAX_SECOND
+    direct_allowed = False  # direct moving-minute entries disabled by request
     # دخول الشمعة القادمة لا يرسل مبكرًا. ننتظر آخر ثواني ونفحص مرة ثانية عمليًا لأن الجوب يكرر كل عدة ثوان.
     next_candle_allowed = seconds >= int(os.getenv("TRADING_ROOM_NEXT_CONFIRM_MIN_SECOND", "54"))
 
@@ -4176,12 +4176,12 @@ def analyze_trading_room_entry(state: dict) -> dict:
         score = 45 + m35["momentum"] * 18 + max(0, -m10["pressure"]) * 18 + cp["upper_wick"] * 18 + min(0.20, avg_body) * 20
         if strong_trend_up:
             score -= 18
-        add_candidate("OVEREXTENSION_REVERSAL", "PUT", score, "direct" if direct_allowed else "next_candle", "انعكاس بعد اندفاع صاعد زائد", "Reversal after overextended bullish push")
+        add_candidate("OVEREXTENSION_REVERSAL", "PUT", score, "next_candle", "انعكاس بعد اندفاع صاعد زائد", "Reversal after overextended bullish push")
     if allow_reversal_against_downtrend and m35["change"] < 0 and m35["momentum"] >= 0.70 and (m10["pressure"] >= 0.08 or cp["lower_wick"] >= 0.34):
         score = 45 + m35["momentum"] * 18 + max(0, m10["pressure"]) * 18 + cp["lower_wick"] * 18 + min(0.20, avg_body) * 20
         if strong_trend_down:
             score -= 18
-        add_candidate("OVEREXTENSION_REVERSAL", "CALL", score, "direct" if direct_allowed else "next_candle", "انعكاس بعد اندفاع هابط زائد", "Reversal after overextended bearish push")
+        add_candidate("OVEREXTENSION_REVERSAL", "CALL", score, "next_candle", "انعكاس بعد اندفاع هابط زائد", "Reversal after overextended bearish push")
 
     # 3) فشل اختراق صغير: السعر يكسر قمة/قاع مصغر ثم يرجع بسرعة.
     if len(prices_60) >= 30:
@@ -4192,10 +4192,10 @@ def analyze_trading_room_entry(state: dict) -> dict:
         broke_down_then_failed = min(last_five) < prev_low and prices_60[-1] > prev_low and m10["pressure"] > 0.02
         if broke_up_then_failed:
             score = 60 + min(20, abs(prices_60[-1] - prev_high) / max(m60["range"], 1e-12) * 80) + max(0, -m10["pressure"]) * 15
-            add_candidate("FAILED_BREAKOUT", "PUT", score, "direct" if direct_allowed else "next_candle", "فشل اختراق علوي صغير", "Failed small upside breakout")
+            add_candidate("FAILED_BREAKOUT", "PUT", score, "next_candle", "فشل اختراق علوي صغير", "Failed small upside breakout")
         if broke_down_then_failed:
             score = 60 + min(20, abs(prices_60[-1] - prev_low) / max(m60["range"], 1e-12) * 80) + max(0, m10["pressure"]) * 15
-            add_candidate("FAILED_BREAKOUT", "CALL", score, "direct" if direct_allowed else "next_candle", "فشل كسر سفلي صغير", "Failed small downside breakout")
+            add_candidate("FAILED_BREAKOUT", "CALL", score, "next_candle", "فشل كسر سفلي صغير", "Failed small downside breakout")
 
     # 4) الهدوء ثم الانفجار: ضغط جديد بعد ضغط سابق ضيق.
     if len(prices_60) >= 50 and avg_range > 0:
@@ -4214,10 +4214,10 @@ def analyze_trading_room_entry(state: dict) -> dict:
     # 5) رفض الذيل: السعر حاول جهة وفشل، مع ضغط ticks مؤكد.
     if cp["lower_wick"] >= 0.38 and m10["pressure"] > 0.10 and cp["body_ratio"] >= 0.12:
         score = 50 + cp["lower_wick"] * 26 + max(0, m10["pressure"]) * 18 + min(10, m10["momentum"] * 10)
-        add_candidate("WICK_REJECTION", "CALL", score, "direct" if direct_allowed else "next_candle", "رفض ذيل سفلي", "Lower wick rejection")
+        add_candidate("WICK_REJECTION", "CALL", score, "next_candle", "رفض ذيل سفلي", "Lower wick rejection")
     if cp["upper_wick"] >= 0.38 and m10["pressure"] < -0.10 and cp["body_ratio"] >= 0.12:
         score = 50 + cp["upper_wick"] * 26 + max(0, -m10["pressure"]) * 18 + min(10, m10["momentum"] * 10)
-        add_candidate("WICK_REJECTION", "PUT", score, "direct" if direct_allowed else "next_candle", "رفض ذيل علوي", "Upper wick rejection")
+        add_candidate("WICK_REJECTION", "PUT", score, "next_candle", "رفض ذيل علوي", "Upper wick rejection")
 
     # 6) تبدل المزاج: اتجاه كان واضحًا ثم بدأ ينعكس تدريجيًا، وليس عشوائيًا.
     if len(closed_parts) >= 4 and not noisy_market:
@@ -4300,9 +4300,7 @@ def analyze_trading_room_entry(state: dict) -> dict:
     if best["score"] < required_score:
         return {"ok": False, "reason": f"قوة النمط غير كافية حسب وضع الجلسة ({best['score']}% / المطلوب {required_score}%)"}
 
-    entry_mode = best["preferred_mode"]
-    if entry_mode == "direct" and not direct_allowed:
-        entry_mode = "next_candle"
+    entry_mode = "next_candle"  # direct moving-minute entries are disabled
     if entry_mode == "next_candle" and not next_candle_allowed:
         # هذه هي إعادة التأكيد: لا نرسل الآن. سنعيد الفحص تلقائيًا عند قرب بداية الشمعة.
         return {
