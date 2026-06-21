@@ -3458,9 +3458,14 @@ def _trading_room_admin_setup_deep_text(setup_kind: str, direction: str, setup: 
                 "The setup fails if the trendline/channel stops being respected."
             ),
             "WICK_REJECTION": (
-                "The entry was based on a rejection wick showing that price attempted one side and failed.",
-                "The expected behavior was follow-through away from the wick.",
-                "The setup fails if the wick was only noise and the next candle accepts against it."
+                "A wick by itself is not enough for a trade. This old label should only appear as support, not as a standalone setup.",
+                "The expected behavior needs confirmation from zone, liquidity, structure, or round-number context.",
+                "The setup fails if the wick was only noise and price accepts against it."
+            ),
+            "WICK_REJECTION_CONFLUENCE": (
+                "Price rejected with a wick at a meaningful context area, not randomly in the middle of movement. The wick was supported by zone/liquidity/structure confirmation.",
+                "The expected behavior was that the wick represents real rejection, so the next candle should move away from that area in the trade direction.",
+                "The setup fails if the level gets absorbed, the liquidity sweep turns into a real breakout, or price accepts back through the rejected area."
             ),
             "MOMENTUM_CONTINUATION": (
                 "The last ticks and recent candles showed clean pressure in one direction.",
@@ -3541,9 +3546,14 @@ def _trading_room_admin_setup_deep_text(setup_kind: str, direction: str, setup: 
             "يفشل السيناريو إذا الترند المصغر ما عاد محترم وانكسر."
         ),
         "WICK_REJECTION": (
-            "الدخول كان مبني على ذيل رفض؛ السعر حاول جهة وفشل يرجع منها.",
-            "المفروض الشمعة التالية تكمل بعيدًا عن الذيل لا ترجع تبتلعه.",
+            "الذيل وحده لا يكفي للدخول. هذا التصنيف القديم يجب أن يكون داعمًا فقط وليس سببًا مستقلًا للصفقة.",
+            "المفروض وجود تأكيد من منطقة أو سيولة أو بنية أو رقم دائري قبل الاعتماد عليه.",
             "يفشل السيناريو إذا الذيل كان مجرد ضوضاء والسعر قبل الاتجاه المعاكس."
+        ),
+        "WICK_REJECTION_CONFLUENCE": (
+            "الدخول لم يكن بسبب ذيل فقط؛ الذيل ظهر عند سياق مهم مثل منطقة/سيولة/بنية/رقم دائري، لذلك اعتبره البوت رفضًا سعريًا له معنى.",
+            "المفروض أن الذيل يمثل رفضًا حقيقيًا، فتتحرك شمعة الدخول بعيدًا عن المنطقة باتجاه الصفقة.",
+            "يفشل السيناريو إذا تم امتصاص المنطقة، أو تحول سحب السيولة إلى اختراق حقيقي، أو قبل السعر الرجوع داخل المنطقة المرفوضة."
         ),
         "MOMENTUM_CONTINUATION": (
             "آخر الحركة والشموع كانت تعطي ضغط نظيف باتجاه واحد.",
@@ -3655,6 +3665,7 @@ def _trading_room_admin_result_deep_text(trade: dict, win: bool | None, candle_o
                 "EQUAL_LIQUIDITY_SWEEP": "Equal high/low liquidity was collected and price rejected after the sweep.",
                 "TRENDLINE_PULLBACK": "The micro trendline/channel pullback held and continuation followed.",
                 "WICK_REJECTION": "The rejection wick got follow-through; price moved away from the rejected side.",
+                "WICK_REJECTION_CONFLUENCE": "The wick rejection got confirmation: price moved away from the confluence area instead of accepting through it.",
                 "MOMENTUM_CONTINUATION": "Momentum continued long enough and did not flip during the entry candle.",
                 "STRONG_TREND_CONTINUATION": "The strong trend kept control during the trade candle.",
                 "OVEREXTENSION_REVERSAL": "The stretched move cooled down and gave the expected pullback/reversal.",
@@ -3674,6 +3685,7 @@ def _trading_room_admin_result_deep_text(trade: dict, win: bool | None, candle_o
             "EQUAL_LIQUIDITY_SWEEP": "Liquidity collection did not create reversal. Price kept moving after taking the equal highs/lows.",
             "TRENDLINE_PULLBACK": "The trendline/channel pullback failed; price stopped respecting the micro trend structure.",
             "WICK_REJECTION": "The wick rejection did not get follow-through. The next candle absorbed the rejection and accepted against it.",
+            "WICK_REJECTION_CONFLUENCE": "The confluence failed: the zone/liquidity rejection was absorbed and price accepted back through the area, so the wick was not real rejection.",
             "MOMENTUM_CONTINUATION": "The momentum was already weakening or exhausted. The entry followed pressure that did not continue into the trade candle.",
             "STRONG_TREND_CONTINUATION": "The strong trend paused or pulled back during the exact entry candle, so continuation did not materialize.",
             "OVEREXTENSION_REVERSAL": "The move was not exhaustion; it was still active acceleration, so the counter move was too early.",
@@ -3701,6 +3713,7 @@ def _trading_room_admin_result_deep_text(trade: dict, win: bool | None, candle_o
             "EQUAL_LIQUIDITY_SWEEP": "تم أخذ سيولة القمم/القيعان المتساوية ثم ظهر رفض بعدها.",
             "TRENDLINE_PULLBACK": "الترند/القناة المصغرة صمدت، وبعد الرجوع كمل السعر بالاتجاه.",
             "WICK_REJECTION": "ذيل الرفض حصل على متابعة، والسعر ابتعد عن جهة الرفض.",
+            "WICK_REJECTION_CONFLUENCE": "رفض الذيل حصل على تأكيد؛ السعر ابتعد عن منطقة الالتقاء بدل ما يقبل التداول داخلها.",
             "MOMENTUM_CONTINUATION": "الزخم كمل كفاية ولم ينقلب خلال شمعة الصفقة.",
             "STRONG_TREND_CONTINUATION": "الترند القوي بقي مسيطرًا خلال شمعة الدخول.",
             "OVEREXTENSION_REVERSAL": "الحركة المتمددة هدأت وأعطت التصحيح/الانعكاس المتوقع.",
@@ -3719,6 +3732,7 @@ def _trading_room_admin_result_deep_text(trade: dict, win: bool | None, candle_o
         "EQUAL_LIQUIDITY_SWEEP": "جمع السيولة من القمم/القيعان المتساوية لم يعطِ انعكاس؛ السعر كمل بعد أخذ السيولة.",
         "TRENDLINE_PULLBACK": "رجوع الترند/القناة فشل؛ السعر لم يعد يحترم البنية المصغرة.",
         "WICK_REJECTION": "ذيل الرفض لم يحصل على متابعة. الشمعة التالية ابتلعت الرفض وقبلت بعكسه.",
+        "WICK_REJECTION_CONFLUENCE": "فشل الالتقاء: المنطقة/السيولة التي ظهر عندها الذيل تم امتصاصها، والسعر قبل الرجوع داخلها، لذلك لم يكن الذيل رفضًا حقيقيًا.",
         "MOMENTUM_CONTINUATION": "الزخم كان يضعف أو مستهلكًا. الدخول تبع ضغط لم يستمر داخل شمعة الصفقة.",
         "STRONG_TREND_CONTINUATION": "الترند القوي توقف أو دخل بتصحيح أثناء شمعة الدخول، لذلك لم تظهر المتابعة المتوقعة.",
         "OVEREXTENSION_REVERSAL": "الحركة لم تكن استهلاكًا؛ كانت تسارعًا حقيقيًا، لذلك الدخول العكسي كان مبكرًا.",
@@ -4893,13 +4907,38 @@ def analyze_trading_room_entry(state: dict) -> dict:
                 score = 55 + abs(m20["pressure"]) * 18 + min(20, (new_range / max(old_range, 1e-12)))
                 add_candidate("COMPRESSION_BREAKOUT", "PUT", score, "next_candle", "خروج هابط بعد هدوء", "Bearish breakout after compression")
 
-    # 5) رفض الذيل: السعر حاول جهة وفشل، مع ضغط ticks مؤكد.
-    if cp["lower_wick"] >= 0.38 and m10["pressure"] > 0.10 and cp["body_ratio"] >= 0.12:
-        score = 50 + cp["lower_wick"] * 26 + max(0, m10["pressure"]) * 18 + min(10, m10["momentum"] * 10)
-        add_candidate("WICK_REJECTION", "CALL", score, "next_candle", "رفض ذيل سفلي", "Lower wick rejection")
-    if cp["upper_wick"] >= 0.38 and m10["pressure"] < -0.10 and cp["body_ratio"] >= 0.12:
-        score = 50 + cp["upper_wick"] * 26 + max(0, -m10["pressure"]) * 18 + min(10, m10["momentum"] * 10)
-        add_candidate("WICK_REJECTION", "PUT", score, "next_candle", "رفض ذيل علوي", "Upper wick rejection")
+    # 5) رفض الذيل: ممنوع يدخل على ذيل فقط.
+    # الذيل لا يصبح فرصة إلا إذا كان داخل قصة سوق واضحة: منطقة/سيولة/راوند نمبر/بنية/أوردر بلوك/ترند لاين.
+    bullish_wick_confluence_keys = (
+        "support_rejection", "retest_bullish", "fvg_bullish_retest", "fake_breakout_down",
+        "round_bullish_rejection", "bos_bullish_retest", "choch_bullish",
+        "order_block_bullish_retest", "equal_low_sweep", "trendline_pullback_bullish",
+        "micro_double_bottom", "liquidity_sweep_low",
+    )
+    bearish_wick_confluence_keys = (
+        "resistance_rejection", "retest_bearish", "fvg_bearish_retest", "fake_breakout_up",
+        "round_bearish_rejection", "bos_bearish_retest", "choch_bearish",
+        "order_block_bearish_retest", "equal_high_sweep", "trendline_pullback_bearish",
+        "micro_double_top", "liquidity_sweep_high",
+    )
+    bullish_wick_confluence = [k for k in bullish_wick_confluence_keys if structure_ctx.get(k)]
+    bearish_wick_confluence = [k for k in bearish_wick_confluence_keys if structure_ctx.get(k)]
+    if cp["lower_wick"] >= 0.38 and m10["pressure"] > 0.10 and cp["body_ratio"] >= 0.12 and bullish_wick_confluence:
+        confluence_bonus = min(18, len(bullish_wick_confluence) * 5)
+        score = 54 + cp["lower_wick"] * 20 + max(0, m10["pressure"]) * 14 + min(8, m10["momentum"] * 8) + confluence_bonus
+        add_candidate(
+            "WICK_REJECTION_CONFLUENCE", "CALL", score, "next_candle",
+            "رفض ذيل سفلي مع تأكيد منطقة/سيولة", "Lower wick rejection with zone/liquidity confluence",
+            {"confluence": bullish_wick_confluence},
+        )
+    if cp["upper_wick"] >= 0.38 and m10["pressure"] < -0.10 and cp["body_ratio"] >= 0.12 and bearish_wick_confluence:
+        confluence_bonus = min(18, len(bearish_wick_confluence) * 5)
+        score = 54 + cp["upper_wick"] * 20 + max(0, -m10["pressure"]) * 14 + min(8, m10["momentum"] * 8) + confluence_bonus
+        add_candidate(
+            "WICK_REJECTION_CONFLUENCE", "PUT", score, "next_candle",
+            "رفض ذيل علوي مع تأكيد منطقة/سيولة", "Upper wick rejection with zone/liquidity confluence",
+            {"confluence": bearish_wick_confluence},
+        )
 
     # 6) تبدل المزاج: اتجاه كان واضحًا ثم بدأ ينعكس تدريجيًا، وليس عشوائيًا.
     if len(closed_parts) >= 4 and not noisy_market:
@@ -4937,7 +4976,7 @@ def analyze_trading_room_entry(state: dict) -> dict:
             if direction == "PUT" and overextended_down and kind != "STRONG_TREND_CONTINUATION":
                 continue
         # إذا آخر 10 ticks عكس اتجاه المرشح بقوة، نرفضه إلا لو هو انعكاس مؤكد.
-        if kind not in ("OVEREXTENSION_REVERSAL", "FAILED_BREAKOUT", "WICK_REJECTION", "STRUCTURE_RETEST", "LIQUIDITY_SWEEP", "ROUND_NUMBER_REJECTION", "BOS_CHOCH_RETEST", "ORDER_BLOCK_RETEST", "EQUAL_LIQUIDITY_SWEEP", "TRENDLINE_PULLBACK"):
+        if kind not in ("OVEREXTENSION_REVERSAL", "FAILED_BREAKOUT", "WICK_REJECTION_CONFLUENCE", "WICK_REJECTION", "STRUCTURE_RETEST", "LIQUIDITY_SWEEP", "ROUND_NUMBER_REJECTION", "BOS_CHOCH_RETEST", "ORDER_BLOCK_RETEST", "EQUAL_LIQUIDITY_SWEEP", "TRENDLINE_PULLBACK"):
             if direction == "CALL" and m10["pressure"] < -0.22:
                 continue
             if direction == "PUT" and m10["pressure"] > 0.22:
@@ -4975,7 +5014,7 @@ def analyze_trading_room_entry(state: dict) -> dict:
         if market_trend_bias and direction == market_trend_bias:
             trend_bonus = 20 if kind == "STRONG_TREND_CONTINUATION" else 12
         structure_bonus = 12 if kind in ("TREND_RETEST_CONTINUATION", "STRUCTURE_RETEST", "LIQUIDITY_SWEEP", "ROUND_NUMBER_REJECTION", "BOS_CHOCH_RETEST", "ORDER_BLOCK_RETEST", "EQUAL_LIQUIDITY_SWEEP", "TRENDLINE_PULLBACK") else 0
-        reversal_bonus = 0 if market_trend_bias else (1 if kind in ("FAILED_BREAKOUT", "OVEREXTENSION_REVERSAL", "WICK_REJECTION", "STRUCTURE_RETEST", "LIQUIDITY_SWEEP", "ROUND_NUMBER_REJECTION", "BOS_CHOCH_RETEST", "ORDER_BLOCK_RETEST", "EQUAL_LIQUIDITY_SWEEP", "TRENDLINE_PULLBACK") else 0)
+        reversal_bonus = 0 if market_trend_bias else (1 if kind in ("FAILED_BREAKOUT", "OVEREXTENSION_REVERSAL", "WICK_REJECTION_CONFLUENCE", "WICK_REJECTION", "STRUCTURE_RETEST", "LIQUIDITY_SWEEP", "ROUND_NUMBER_REJECTION", "BOS_CHOCH_RETEST", "ORDER_BLOCK_RETEST", "EQUAL_LIQUIDITY_SWEEP", "TRENDLINE_PULLBACK") else 0)
         return (int(x.get("score", 0)) + trend_bonus + structure_bonus, trend_bonus, structure_bonus, reversal_bonus)
 
     safe_candidates.sort(key=_candidate_priority, reverse=True)
