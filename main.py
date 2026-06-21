@@ -4014,6 +4014,258 @@ async def trading_room_half_hour_reminder_job(context: ContextTypes.DEFAULT_TYPE
     )
 
 
+def _trading_room_market_structure_context(closed_parts: list[dict], current_parts: dict, price: float, m10: dict, m20: dict, m35: dict) -> dict:
+    """Smart-structure context for Trading Room entries.
+
+    This is intentionally lightweight and works only from cached OTC ticks/candles:
+    support/resistance zones, round numbers, retest, fake breakout, wick rejection, trend bias, BOS/CHOCH,
+    simple order-block/FVG approximations, equal-high/low liquidity, and pullback continuation.
+    """
+    ctx = {
+        "support": None,
+        "resistance": None,
+        "atr": 0.0,
+        "trend_bias": None,
+        "near_support": False,
+        "near_resistance": False,
+        "support_rejection": False,
+        "resistance_rejection": False,
+        "fake_breakout_up": False,
+        "fake_breakout_down": False,
+        "retest_bullish": False,
+        "retest_bearish": False,
+        "fvg_bullish_retest": False,
+        "fvg_bearish_retest": False,
+        "round_near": False,
+        "round_level": None,
+        "round_bullish_rejection": False,
+        "round_bearish_rejection": False,
+        "bos_bullish_retest": False,
+        "bos_bearish_retest": False,
+        "choch_bullish": False,
+        "choch_bearish": False,
+        "order_block_bullish_retest": False,
+        "order_block_bearish_retest": False,
+        "equal_low_sweep": False,
+        "equal_high_sweep": False,
+        "trendline_pullback_bullish": False,
+        "trendline_pullback_bearish": False,
+        "micro_double_bottom": False,
+        "micro_double_top": False,
+        "liquidity_sweep_low": False,
+        "liquidity_sweep_high": False,
+        "quality": 0,
+    }
+    try:
+        parts = [c for c in (closed_parts or []) if c and c.get("range", 0) > 0]
+        if len(parts) < 5:
+            return ctx
+
+        recent = parts[-12:]
+        ranges = [float(c.get("range", 0) or 0) for c in recent if float(c.get("range", 0) or 0) > 0]
+        atr = sum(ranges) / max(1, len(ranges))
+        ctx["atr"] = atr
+        if atr <= 0:
+            return ctx
+
+        highs = [float(c["high"]) for c in recent]
+        lows = [float(c["low"]) for c in recent]
+        closes = [float(c["close"]) for c in recent]
+        opens = [float(c["open"]) for c in recent]
+        cp = current_parts or {}
+        cur_high = float(cp.get("high", price) or price)
+        cur_low = float(cp.get("low", price) or price)
+        cur_close = float(cp.get("close", price) or price)
+
+        # nearest active levels from recent candle structure, excluding the current forming candle
+        below_levels = [x for x in lows[-10:] + closes[-10:] if x <= price]
+        above_levels = [x for x in highs[-10:] + closes[-10:] if x >= price]
+        support = max(below_levels) if below_levels else min(lows)
+        resistance = min(above_levels) if above_levels else max(highs)
+        ctx["support"] = support
+        ctx["resistance"] = resistance
+
+        zone = max(atr * 0.38, abs(price) * 0.000015)
+        ctx["near_support"] = abs(price - support) <= zone or (cur_low <= support + zone and cur_close >= support - zone)
+        ctx["near_resistance"] = abs(price - resistance) <= zone or (cur_high >= resistance - zone and cur_close <= resistance + zone)
+
+        # Trend structure from highs/lows and closes, not only ticks.
+        old_mid = (sum(closes[-10:-5]) / max(1, len(closes[-10:-5]))) if len(closes) >= 10 else closes[0]
+        new_mid = sum(closes[-5:]) / max(1, len(closes[-5:]))
+        higher_lows = lows[-1] > min(lows[-5:-1]) if len(lows) >= 5 else False
+        lower_highs = highs[-1] < max(highs[-5:-1]) if len(highs) >= 5 else False
+        if new_mid > old_mid and m20.get("pressure", 0) > -0.08 and (m35.get("change", 0) > 0 or higher_lows):
+            ctx["trend_bias"] = "CALL"
+        elif new_mid < old_mid and m20.get("pressure", 0) < 0.08 and (m35.get("change", 0) < 0 or lower_highs):
+            ctx["trend_bias"] = "PUT"
+
+        # Rejection/sweep at support/resistance from current candle + last closed candle.
+        last = parts[-1]
+        lower_reject = (cp.get("lower_wick", 0) >= 0.34 or last.get("lower_wick", 0) >= 0.40) and cur_close >= support
+        upper_reject = (cp.get("upper_wick", 0) >= 0.34 or last.get("upper_wick", 0) >= 0.40) and cur_close <= resistance
+        ctx["support_rejection"] = bool(ctx["near_support"] and lower_reject and m10.get("pressure", 0) > -0.16)
+        ctx["resistance_rejection"] = bool(ctx["near_resistance"] and upper_reject and m10.get("pressure", 0) < 0.16)
+
+        prev_low = min(lows[-8:-1]) if len(lows) >= 8 else min(lows[:-1])
+        prev_high = max(highs[-8:-1]) if len(highs) >= 8 else max(highs[:-1])
+        ctx["liquidity_sweep_low"] = bool(cur_low < prev_low and cur_close > prev_low and m10.get("pressure", 0) > -0.05)
+        ctx["liquidity_sweep_high"] = bool(cur_high > prev_high and cur_close < prev_high and m10.get("pressure", 0) < 0.05)
+        ctx["fake_breakout_down"] = bool(ctx["liquidity_sweep_low"] and cp.get("lower_wick", 0) >= 0.28)
+        ctx["fake_breakout_up"] = bool(ctx["liquidity_sweep_high"] and cp.get("upper_wick", 0) >= 0.28)
+
+        # Retest of broken level: price returns to old resistance/support and rejects.
+        broken_resistance = None
+        broken_support = None
+        if len(parts) >= 7:
+            old_high = max(float(c["high"]) for c in parts[-7:-2])
+            old_low = min(float(c["low"]) for c in parts[-7:-2])
+            last_close = float(parts[-1]["close"])
+            prev_close = float(parts[-2]["close"])
+            if prev_close > old_high - zone and last_close >= old_high - zone:
+                broken_resistance = old_high
+            if prev_close < old_low + zone and last_close <= old_low + zone:
+                broken_support = old_low
+        if broken_resistance is not None:
+            ctx["retest_bullish"] = bool(abs(price - broken_resistance) <= zone * 1.25 and (ctx["support_rejection"] or m10.get("pressure", 0) >= 0.08))
+        if broken_support is not None:
+            ctx["retest_bearish"] = bool(abs(price - broken_support) <= zone * 1.25 and (ctx["resistance_rejection"] or m10.get("pressure", 0) <= -0.08))
+
+        # Simple FVG/imbalance approximation: 3-candle impulse leaves a zone; later price retests it.
+        # We do not draw it, only use it as an extra confirmation.
+        for i in range(max(2, len(parts) - 8), len(parts)):
+            if i < 2:
+                continue
+            a, b, c = parts[i-2], parts[i-1], parts[i]
+            bullish_impulse = a["high"] < c["low"] and b.get("body_ratio", 0) >= 0.45 and c["dir"] >= 0
+            bearish_impulse = a["low"] > c["high"] and b.get("body_ratio", 0) >= 0.45 and c["dir"] <= 0
+            if bullish_impulse:
+                lo, hi = float(a["high"]), float(c["low"])
+                if lo <= price <= hi + zone and m10.get("pressure", 0) > -0.10:
+                    ctx["fvg_bullish_retest"] = True
+            if bearish_impulse:
+                lo, hi = float(c["high"]), float(a["low"])
+                if lo - zone <= price <= hi and m10.get("pressure", 0) < 0.10:
+                    ctx["fvg_bearish_retest"] = True
+
+        # Round-number reaction (psychological levels). Works generically for OTC prices too.
+        try:
+            abs_price = abs(float(price))
+            if abs_price >= 1000:
+                round_step = 10.0
+            elif abs_price >= 100:
+                round_step = 1.0
+            elif abs_price >= 10:
+                round_step = 0.10
+            elif abs_price >= 1:
+                round_step = 0.01
+            elif abs_price >= 0.10:
+                round_step = 0.001
+            elif abs_price >= 0.01:
+                round_step = 0.0001
+            else:
+                round_step = max(abs_price * 0.001, 0.00001)
+            nearest_round = round(price / round_step) * round_step if round_step > 0 else price
+            round_zone = max(atr * 0.30, round_step * 0.08)
+            ctx["round_level"] = nearest_round
+            ctx["round_near"] = bool(abs(price - nearest_round) <= round_zone or cur_low <= nearest_round <= cur_high)
+            ctx["round_bullish_rejection"] = bool(ctx["round_near"] and cur_low <= nearest_round + round_zone and cur_close > nearest_round and (cp.get("lower_wick", 0) >= 0.26 or m10.get("pressure", 0) > 0.08))
+            ctx["round_bearish_rejection"] = bool(ctx["round_near"] and cur_high >= nearest_round - round_zone and cur_close < nearest_round and (cp.get("upper_wick", 0) >= 0.26 or m10.get("pressure", 0) < -0.08))
+        except Exception:
+            pass
+
+        # BOS/CHOCH approximation from recent swing highs/lows.
+        try:
+            if len(parts) >= 10:
+                swing_high = max(float(c["high"]) for c in parts[-10:-3])
+                swing_low = min(float(c["low"]) for c in parts[-10:-3])
+                prev_swing_high = max(float(c["high"]) for c in parts[-14:-7]) if len(parts) >= 14 else swing_high
+                prev_swing_low = min(float(c["low"]) for c in parts[-14:-7]) if len(parts) >= 14 else swing_low
+                last_close = float(parts[-1]["close"])
+                prior_close = float(parts[-2]["close"])
+                broke_high = last_close > swing_high - zone and prior_close <= swing_high + zone
+                broke_low = last_close < swing_low + zone and prior_close >= swing_low - zone
+                ctx["bos_bullish_retest"] = bool(broke_high and abs(price - swing_high) <= zone * 1.45 and m10.get("pressure", 0) > -0.12)
+                ctx["bos_bearish_retest"] = bool(broke_low and abs(price - swing_low) <= zone * 1.45 and m10.get("pressure", 0) < 0.12)
+                ctx["choch_bullish"] = bool(last_close > prev_swing_high and m20.get("change", 0) > 0 and m10.get("pressure", 0) > 0.05)
+                ctx["choch_bearish"] = bool(last_close < prev_swing_low and m20.get("change", 0) < 0 and m10.get("pressure", 0) < -0.05)
+        except Exception:
+            pass
+
+        # Order-block approximation: last opposite candle before impulse, then retest of its body.
+        try:
+            impulse = [c for c in parts[-8:] if c.get("body_ratio", 0) >= 0.48]
+            if impulse and avg_range > 0:
+                for j in range(len(parts)-2, max(1, len(parts)-10), -1):
+                    c = parts[j]
+                    prev = parts[j-1]
+                    # bullish OB: last red candle before strong bullish displacement
+                    if c.get("dir") > 0 and c.get("body_ratio", 0) >= 0.45 and prev.get("dir") < 0:
+                        ob_low = min(float(prev["open"]), float(prev["close"]))
+                        ob_high = max(float(prev["open"]), float(prev["close"]))
+                        if ob_low - zone <= price <= ob_high + zone and (ctx.get("support_rejection") or cp.get("lower_wick", 0) >= 0.24 or m10.get("pressure", 0) > 0.08):
+                            ctx["order_block_bullish_retest"] = True
+                            break
+                    # bearish OB: last green candle before strong bearish displacement
+                    if c.get("dir") < 0 and c.get("body_ratio", 0) >= 0.45 and prev.get("dir") > 0:
+                        ob_low = min(float(prev["open"]), float(prev["close"]))
+                        ob_high = max(float(prev["open"]), float(prev["close"]))
+                        if ob_low - zone <= price <= ob_high + zone and (ctx.get("resistance_rejection") or cp.get("upper_wick", 0) >= 0.24 or m10.get("pressure", 0) < -0.08):
+                            ctx["order_block_bearish_retest"] = True
+                            break
+        except Exception:
+            pass
+
+        # Equal highs/lows liquidity sweep + micro double top/bottom.
+        try:
+            if len(parts) >= 8:
+                lows7 = [float(c["low"]) for c in parts[-8:-1]]
+                highs7 = [float(c["high"]) for c in parts[-8:-1]]
+                low_cluster = min(lows7)
+                high_cluster = max(highs7)
+                equal_lows = sum(1 for x in lows7 if abs(x - low_cluster) <= zone * 0.85) >= 2
+                equal_highs = sum(1 for x in highs7 if abs(x - high_cluster) <= zone * 0.85) >= 2
+                ctx["equal_low_sweep"] = bool(equal_lows and cur_low < low_cluster - zone * 0.15 and cur_close > low_cluster and m10.get("pressure", 0) > -0.05)
+                ctx["equal_high_sweep"] = bool(equal_highs and cur_high > high_cluster + zone * 0.15 and cur_close < high_cluster and m10.get("pressure", 0) < 0.05)
+                ctx["micro_double_bottom"] = bool(equal_lows and ctx.get("near_support") and cur_close > low_cluster and m10.get("pressure", 0) > 0.08)
+                ctx["micro_double_top"] = bool(equal_highs and ctx.get("near_resistance") and cur_close < high_cluster and m10.get("pressure", 0) < -0.08)
+        except Exception:
+            pass
+
+        # Trendline / channel pullback approximation using recent closes.
+        try:
+            if len(closes) >= 8:
+                first_half = sum(closes[-8:-4]) / 4
+                second_half = sum(closes[-4:]) / 4
+                slope = second_half - first_half
+                pullback_zone = max(atr * 0.55, abs(price) * 0.00002)
+                rising_structure = slope > 0 and lows[-1] >= min(lows[-5:]) and m20.get("pressure", 0) > -0.10
+                falling_structure = slope < 0 and highs[-1] <= max(highs[-5:]) and m20.get("pressure", 0) < 0.10
+                ctx["trendline_pullback_bullish"] = bool(rising_structure and (ctx.get("near_support") or ctx.get("round_bullish_rejection") or abs(price - new_mid) <= pullback_zone) and m10.get("pressure", 0) > -0.05)
+                ctx["trendline_pullback_bearish"] = bool(falling_structure and (ctx.get("near_resistance") or ctx.get("round_bearish_rejection") or abs(price - new_mid) <= pullback_zone) and m10.get("pressure", 0) < 0.05)
+        except Exception:
+            pass
+
+        q = 0
+        for key in (
+            "support_rejection", "resistance_rejection", "fake_breakout_down", "fake_breakout_up",
+            "retest_bullish", "retest_bearish", "fvg_bullish_retest", "fvg_bearish_retest",
+            "round_bullish_rejection", "round_bearish_rejection", "bos_bullish_retest", "bos_bearish_retest",
+            "choch_bullish", "choch_bearish", "order_block_bullish_retest", "order_block_bearish_retest",
+            "equal_low_sweep", "equal_high_sweep", "trendline_pullback_bullish", "trendline_pullback_bearish",
+            "micro_double_bottom", "micro_double_top"
+        ):
+            if ctx.get(key):
+                q += 10
+        if ctx.get("trend_bias"):
+            q += 8
+        if ctx.get("round_near"):
+            q += 4
+        ctx["quality"] = min(100, q)
+        return ctx
+    except Exception:
+        return ctx
+
+
 def analyze_trading_room_entry(state: dict) -> dict:
     """Entry Confirmation Engine لغرفة جلسة التداول فقط.
 
@@ -4145,6 +4397,72 @@ def analyze_trading_room_entry(state: dict) -> dict:
             "extra": extra or {},
         })
 
+    structure_ctx = _trading_room_market_structure_context(closed_parts, cp, price, m10, m20, m35)
+    structure_bias = structure_ctx.get("trend_bias")
+
+    # Smart Money / Market Structure layer:
+    # support-resistance retest, liquidity sweep, fake breakout, FVG-like retest.
+    # These are not shown to the user; they only improve the internal entry decision.
+    if not noisy_market:
+        if structure_ctx.get("retest_bullish") or structure_ctx.get("support_rejection") or structure_ctx.get("fvg_bullish_retest"):
+            if not strong_trend_down and m10["pressure"] > -0.14:
+                score = 66 + min(14, structure_ctx.get("quality", 0) * 0.22) + max(0, m10["pressure"]) * 14 + cp["lower_wick"] * 10
+                add_candidate("STRUCTURE_RETEST", "CALL", score, "next_candle", "إعادة اختبار منطقة ورفض سعري صاعد", "Bullish zone retest with price rejection")
+        if structure_ctx.get("retest_bearish") or structure_ctx.get("resistance_rejection") or structure_ctx.get("fvg_bearish_retest"):
+            if not strong_trend_up and m10["pressure"] < 0.14:
+                score = 66 + min(14, structure_ctx.get("quality", 0) * 0.22) + max(0, -m10["pressure"]) * 14 + cp["upper_wick"] * 10
+                add_candidate("STRUCTURE_RETEST", "PUT", score, "next_candle", "إعادة اختبار منطقة ورفض سعري هابط", "Bearish zone retest with price rejection")
+        if structure_ctx.get("fake_breakout_down") and not strong_trend_down:
+            score = 70 + min(12, structure_ctx.get("quality", 0) * 0.18) + max(0, m10["pressure"]) * 16 + cp["lower_wick"] * 10
+            add_candidate("LIQUIDITY_SWEEP", "CALL", score, "next_candle", "سحب سيولة أسفل المنطقة ثم رجوع", "Liquidity sweep below support then reclaim")
+        if structure_ctx.get("fake_breakout_up") and not strong_trend_up:
+            score = 70 + min(12, structure_ctx.get("quality", 0) * 0.18) + max(0, -m10["pressure"]) * 16 + cp["upper_wick"] * 10
+            add_candidate("LIQUIDITY_SWEEP", "PUT", score, "next_candle", "سحب سيولة أعلى المنطقة ثم رجوع", "Liquidity sweep above resistance then reject")
+
+    # Round-number rejection: psychological level + rejection/tick pressure.
+    if not noisy_market:
+        if structure_ctx.get("round_bullish_rejection") and not strong_trend_down:
+            score = 67 + min(14, structure_ctx.get("quality", 0) * 0.16) + cp["lower_wick"] * 12 + max(0, m10["pressure"]) * 14
+            add_candidate("ROUND_NUMBER_REJECTION", "CALL", score, "next_candle", "رفض سعري من رقم دائري", "Bullish rejection from a round number")
+        if structure_ctx.get("round_bearish_rejection") and not strong_trend_up:
+            score = 67 + min(14, structure_ctx.get("quality", 0) * 0.16) + cp["upper_wick"] * 12 + max(0, -m10["pressure"]) * 14
+            add_candidate("ROUND_NUMBER_REJECTION", "PUT", score, "next_candle", "رفض سعري من رقم دائري", "Bearish rejection from a round number")
+
+    # Broader technical-analysis layer: BOS/CHOCH, order block retest, equal liquidity, trendline pullback, double top/bottom.
+    if not noisy_market:
+        if (structure_ctx.get("bos_bullish_retest") or structure_ctx.get("choch_bullish")) and not strong_trend_down and m10["pressure"] > -0.12:
+            score = 69 + min(13, structure_ctx.get("quality", 0) * 0.15) + max(0, m20["pressure"]) * 12
+            add_candidate("BOS_CHOCH_RETEST", "CALL", score, "next_candle", "كسر بنية صاعد مع إعادة اختبار", "Bullish structure break / CHOCH retest")
+        if (structure_ctx.get("bos_bearish_retest") or structure_ctx.get("choch_bearish")) and not strong_trend_up and m10["pressure"] < 0.12:
+            score = 69 + min(13, structure_ctx.get("quality", 0) * 0.15) + max(0, -m20["pressure"]) * 12
+            add_candidate("BOS_CHOCH_RETEST", "PUT", score, "next_candle", "كسر بنية هابط مع إعادة اختبار", "Bearish structure break / CHOCH retest")
+        if structure_ctx.get("order_block_bullish_retest") and not strong_trend_down:
+            score = 70 + min(14, structure_ctx.get("quality", 0) * 0.17) + cp["lower_wick"] * 10 + max(0, m10["pressure"]) * 12
+            add_candidate("ORDER_BLOCK_RETEST", "CALL", score, "next_candle", "إعادة اختبار أوردر بلوك صاعد", "Bullish order-block retest")
+        if structure_ctx.get("order_block_bearish_retest") and not strong_trend_up:
+            score = 70 + min(14, structure_ctx.get("quality", 0) * 0.17) + cp["upper_wick"] * 10 + max(0, -m10["pressure"]) * 12
+            add_candidate("ORDER_BLOCK_RETEST", "PUT", score, "next_candle", "إعادة اختبار أوردر بلوك هابط", "Bearish order-block retest")
+        if (structure_ctx.get("equal_low_sweep") or structure_ctx.get("micro_double_bottom")) and not strong_trend_down:
+            score = 68 + min(12, structure_ctx.get("quality", 0) * 0.14) + cp["lower_wick"] * 14 + max(0, m10["pressure"]) * 14
+            add_candidate("EQUAL_LIQUIDITY_SWEEP", "CALL", score, "next_candle", "سحب سيولة من قيعان متساوية", "Equal lows liquidity sweep / double bottom")
+        if (structure_ctx.get("equal_high_sweep") or structure_ctx.get("micro_double_top")) and not strong_trend_up:
+            score = 68 + min(12, structure_ctx.get("quality", 0) * 0.14) + cp["upper_wick"] * 14 + max(0, -m10["pressure"]) * 14
+            add_candidate("EQUAL_LIQUIDITY_SWEEP", "PUT", score, "next_candle", "سحب سيولة من قمم متساوية", "Equal highs liquidity sweep / double top")
+        if structure_ctx.get("trendline_pullback_bullish") and not strong_trend_down:
+            score = 66 + min(12, structure_ctx.get("quality", 0) * 0.13) + max(0, m20["pressure"]) * 11 + rhythm * 8
+            add_candidate("TRENDLINE_PULLBACK", "CALL", score, "next_candle", "ارتداد مع ترند صاعد", "Bullish trendline/channel pullback")
+        if structure_ctx.get("trendline_pullback_bearish") and not strong_trend_up:
+            score = 66 + min(12, structure_ctx.get("quality", 0) * 0.13) + max(0, -m20["pressure"]) * 11 + rhythm * 8
+            add_candidate("TRENDLINE_PULLBACK", "PUT", score, "next_candle", "ارتداد مع ترند هابط", "Bearish trendline/channel pullback")
+
+    # إذا في ترند قوي ومعه إعادة اختبار، نعزز الدخول مع الاتجاه بدل البحث عن عكسه.
+    if not noisy_market and strong_trend_up and (structure_ctx.get("retest_bullish") or structure_ctx.get("support_rejection") or structure_bias == "CALL"):
+        score = 76 + min(10, structure_ctx.get("quality", 0) * 0.16) + max(0, m20["pressure"]) * 10
+        add_candidate("TREND_RETEST_CONTINUATION", "CALL", score, "next_candle", "ترند صاعد مع إعادة اختبار منطقة", "Bullish trend retest continuation")
+    if not noisy_market and strong_trend_down and (structure_ctx.get("retest_bearish") or structure_ctx.get("resistance_rejection") or structure_bias == "PUT"):
+        score = 76 + min(10, structure_ctx.get("quality", 0) * 0.16) + max(0, -m20["pressure"]) * 10
+        add_candidate("TREND_RETEST_CONTINUATION", "PUT", score, "next_candle", "ترند هابط مع إعادة اختبار منطقة", "Bearish trend retest continuation")
+
     # 1) استمرار زخم نظيف: مسموح فقط إذا الحركة ليست مستهلكة بشكل مبالغ.
     overextended_up = m35["change"] > 0 and m35["momentum"] >= 0.88 and m20["momentum"] >= 0.82 and cp["upper_wick"] < 0.18
     overextended_down = m35["change"] < 0 and m35["momentum"] >= 0.88 and m20["momentum"] >= 0.82 and cp["lower_wick"] < 0.18
@@ -4255,7 +4573,7 @@ def analyze_trading_room_entry(state: dict) -> dict:
             if direction == "PUT" and overextended_down and kind != "STRONG_TREND_CONTINUATION":
                 continue
         # إذا آخر 10 ticks عكس اتجاه المرشح بقوة، نرفضه إلا لو هو انعكاس مؤكد.
-        if kind not in ("OVEREXTENSION_REVERSAL", "FAILED_BREAKOUT", "WICK_REJECTION"):
+        if kind not in ("OVEREXTENSION_REVERSAL", "FAILED_BREAKOUT", "WICK_REJECTION", "STRUCTURE_RETEST", "LIQUIDITY_SWEEP", "ROUND_NUMBER_REJECTION", "BOS_CHOCH_RETEST", "ORDER_BLOCK_RETEST", "EQUAL_LIQUIDITY_SWEEP", "TRENDLINE_PULLBACK"):
             if direction == "CALL" and m10["pressure"] < -0.22:
                 continue
             if direction == "PUT" and m10["pressure"] > 0.22:
@@ -4292,8 +4610,9 @@ def analyze_trading_room_entry(state: dict) -> dict:
         trend_bonus = 0
         if market_trend_bias and direction == market_trend_bias:
             trend_bonus = 20 if kind == "STRONG_TREND_CONTINUATION" else 12
-        reversal_bonus = 0 if market_trend_bias else (1 if kind in ("FAILED_BREAKOUT", "OVEREXTENSION_REVERSAL", "WICK_REJECTION") else 0)
-        return (int(x.get("score", 0)) + trend_bonus, trend_bonus, reversal_bonus)
+        structure_bonus = 12 if kind in ("TREND_RETEST_CONTINUATION", "STRUCTURE_RETEST", "LIQUIDITY_SWEEP", "ROUND_NUMBER_REJECTION", "BOS_CHOCH_RETEST", "ORDER_BLOCK_RETEST", "EQUAL_LIQUIDITY_SWEEP", "TRENDLINE_PULLBACK") else 0
+        reversal_bonus = 0 if market_trend_bias else (1 if kind in ("FAILED_BREAKOUT", "OVEREXTENSION_REVERSAL", "WICK_REJECTION", "STRUCTURE_RETEST", "LIQUIDITY_SWEEP", "ROUND_NUMBER_REJECTION", "BOS_CHOCH_RETEST", "ORDER_BLOCK_RETEST", "EQUAL_LIQUIDITY_SWEEP", "TRENDLINE_PULLBACK") else 0)
+        return (int(x.get("score", 0)) + trend_bonus + structure_bonus, trend_bonus, structure_bonus, reversal_bonus)
 
     safe_candidates.sort(key=_candidate_priority, reverse=True)
     best = safe_candidates[0]
@@ -4314,9 +4633,9 @@ def analyze_trading_room_entry(state: dict) -> dict:
 
     # إعادة فحص أخيرة داخلية مباشرة قبل الإرسال: لو آخر ticks انقلبت فجأة نلغي.
     latest = _movement_metrics(_prices_from(8))
-    if best["direction"] == "CALL" and latest["pressure"] < -0.20 and best["kind"] not in ("FAILED_BREAKOUT", "WICK_REJECTION"):
+    if best["direction"] == "CALL" and latest["pressure"] < -0.20 and best["kind"] not in ("FAILED_BREAKOUT", "WICK_REJECTION", "STRUCTURE_RETEST", "LIQUIDITY_SWEEP", "ROUND_NUMBER_REJECTION", "BOS_CHOCH_RETEST", "ORDER_BLOCK_RETEST", "EQUAL_LIQUIDITY_SWEEP", "TRENDLINE_PULLBACK"):
         return {"ok": False, "reason": "تم إلغاء الدخول لأن آخر ثواني ضعفت قبل الإرسال"}
-    if best["direction"] == "PUT" and latest["pressure"] > 0.20 and best["kind"] not in ("FAILED_BREAKOUT", "WICK_REJECTION"):
+    if best["direction"] == "PUT" and latest["pressure"] > 0.20 and best["kind"] not in ("FAILED_BREAKOUT", "WICK_REJECTION", "STRUCTURE_RETEST", "LIQUIDITY_SWEEP", "ROUND_NUMBER_REJECTION", "BOS_CHOCH_RETEST", "ORDER_BLOCK_RETEST", "EQUAL_LIQUIDITY_SWEEP", "TRENDLINE_PULLBACK"):
         return {"ok": False, "reason": "تم إلغاء الدخول لأن آخر ثواني ضعفت قبل الإرسال"}
     if market_trend_bias and best["direction"] != market_trend_bias:
         return {"ok": False, "reason": "تم إلغاء الدخول لأن الاتجاه العام قوي عكس الصفقة"}
@@ -4339,6 +4658,7 @@ def analyze_trading_room_entry(state: dict) -> dict:
         "entry_mode": entry_mode,
         "setup": setup,
         "setup_kind": best["kind"],
+        "structure_bias": structure_bias,
         "score": min(int(best["score"]), 96),
         "price": price,
         "payout": payout_at_entry,
