@@ -4015,14 +4015,18 @@ async def trading_room_half_hour_reminder_job(context: ContextTypes.DEFAULT_TYPE
 
 
 def analyze_trading_room_entry(state: dict) -> dict:
+    """Entry Confirmation Engine لغرفة جلسة التداول فقط.
+
+    الفكرة: لا نقرر CALL/PUT من الزخم فقط. نبني عدة فرص مرشحة، نفلتر الخطير منها،
+    ثم نختار أنظف فرصة ونعيد تأكيد توقيت دخول الشمعة القادمة قرب بداية الشمعة فقط.
+    """
     pair = state.get("pair")
     symbol = state.get("symbol")
-    strategy_type = state.get("strategy_type") or "continuation"
     if not pair or not symbol:
         return {"ok": False, "reason": "لم يتم اختيار زوج للجلسة"}
 
     rows, last_tick, candles = _get_otc_rows_and_candles(symbol)
-    if len(rows) < 20 or not last_tick or len(candles) < 3:
+    if len(rows) < max(45, TRADING_ROOM_MIN_TICKS) or not last_tick or len(candles) < max(5, TRADING_ROOM_MIN_CANDLES):
         return {"ok": False, "reason": "بيانات الزوج غير كافية الآن"}
 
     try:
@@ -4030,113 +4034,265 @@ def analyze_trading_room_entry(state: dict) -> dict:
     except Exception:
         return {"ok": False, "reason": "تعذر قراءة السعر الحالي"}
 
-    # نثبت نسبة الزوج عند لحظة توليد الصفقة لأن Quotex قد تغيّر payout بعد الدخول،
-    # أما ربح الصفقة في المنصة يُحسب على نسبة الدخول نفسها.
+    try:
+        tick_ts = float(last_tick.get("time") or last_tick.get("ts") or last_tick.get("timestamp") or 0)
+        if tick_ts > 1e12:
+            tick_ts = tick_ts / 1000.0
+        if not tick_ts or time_module.time() - tick_ts > TRADING_ROOM_PAIR_TICK_MAX_AGE_SECONDS:
+            return {"ok": False, "reason": "آخر tick للزوج قديم"}
+    except Exception:
+        return {"ok": False, "reason": "تعذر قراءة وقت آخر tick"}
+
     try:
         instrument = quotex_otc_feed.instrument(symbol) or {}
         payout_at_entry = _normalize_payout_percent(instrument.get("payout", 80), 80.0)
     except Exception:
         payout_at_entry = 80.0
 
-    sample = rows[-20:]
-    prices = [float(r[1]) for r in sample]
-    rng = max(prices) - min(prices)
-    if rng <= 0:
+    def _prices_from(n: int):
+        sample = rows[-n:] if len(rows) >= n else rows
+        return [float(r[1]) for r in sample]
+
+    def _movement_metrics(prices: list[float]) -> dict:
+        if len(prices) < 3:
+            return {"range": 0.0, "change": 0.0, "pressure": 0.0, "momentum": 0.0, "up": 0, "down": 0, "density": 0.0}
+        rng = max(prices) - min(prices)
+        change = prices[-1] - prices[0]
+        up = sum(1 for a, b in zip(prices, prices[1:]) if b > a)
+        down = sum(1 for a, b in zip(prices, prices[1:]) if b < a)
+        total = max(1, up + down)
+        pressure = (up - down) / total
+        momentum = min(abs(change) / rng, 1.0) if rng > 0 else 0.0
+        density = (up + down) / max(1, len(prices) - 1)
+        return {"range": rng, "change": change, "pressure": pressure, "momentum": momentum, "up": up, "down": down, "density": density}
+
+    prices_60 = _prices_from(60)
+    prices_35 = _prices_from(35)
+    prices_20 = _prices_from(20)
+    prices_10 = _prices_from(10)
+    m60 = _movement_metrics(prices_60)
+    m35 = _movement_metrics(prices_35)
+    m20 = _movement_metrics(prices_20)
+    m10 = _movement_metrics(prices_10)
+    if m20["range"] <= 0 or m35["range"] <= 0:
         return {"ok": False, "reason": "الحركة ثابتة جدًا"}
-    change = prices[-1] - prices[0]
-    up = sum(1 for a, b in zip(prices, prices[1:]) if b > a)
-    down = sum(1 for a, b in zip(prices, prices[1:]) if b < a)
-    total = max(1, up + down)
-    pressure = (up - down) / total
-    momentum = min(abs(change) / rng, 1.0)
 
-    candle = candles[-1] if candles else {}
-    try:
-        o = float(candle.get("open")); h = float(candle.get("high")); l = float(candle.get("low")); cl = float(candle.get("close"))
-        crange = max(h - l, 0.0)
-        body_ratio = abs(cl - o) / crange if crange > 0 else 0.0
-        upper_wick = (h - max(o, cl)) / crange if crange > 0 else 0.0
-        lower_wick = (min(o, cl) - l) / crange if crange > 0 else 0.0
-    except Exception:
-        body_ratio = upper_wick = lower_wick = 0.0
+    # قراءة الشموع الأخيرة: دوجي/ذيول/اتجاه/استهلاك الحركة.
+    closed = candles[-8:-1] if len(candles) >= 8 else candles[:-1]
+    current_candle = candles[-1] if candles else {}
 
-    direction = None
-    setup = ""
-    entry_mode = "next_candle"
+    def _candle_parts(c: dict) -> dict:
+        try:
+            o = float(c.get("open")); h = float(c.get("high")); l = float(c.get("low")); cl = float(c.get("close"))
+            rng = max(h - l, 0.0)
+            body = abs(cl - o)
+            return {
+                "open": o, "high": h, "low": l, "close": cl, "range": rng, "body": body,
+                "body_ratio": (body / rng if rng > 0 else 0.0),
+                "upper_wick": ((h - max(o, cl)) / rng if rng > 0 else 0.0),
+                "lower_wick": ((min(o, cl) - l) / rng if rng > 0 else 0.0),
+                "dir": 1 if cl > o else -1 if cl < o else 0,
+            }
+        except Exception:
+            return {"open": 0.0, "high": 0.0, "low": 0.0, "close": 0.0, "range": 0.0, "body": 0.0, "body_ratio": 0.0, "upper_wick": 0.0, "lower_wick": 0.0, "dir": 0}
+
+    cp = _candle_parts(current_candle)
+    closed_parts = [_candle_parts(c) for c in closed if c]
+    if len(closed_parts) < 3:
+        return {"ok": False, "reason": "شموع الزوج غير كافية الآن"}
+
+    avg_body = sum(c["body_ratio"] for c in closed_parts[-6:]) / max(1, len(closed_parts[-6:]))
+    avg_range = sum(c["range"] for c in closed_parts[-6:]) / max(1, len(closed_parts[-6:]))
+    recent_dirs = [c["dir"] for c in closed_parts[-5:]]
+    rhythm = abs(sum(recent_dirs)) / max(1, len(recent_dirs))
+    doji_count = sum(1 for c in closed_parts[-5:] if c["body_ratio"] <= 0.16)
+    wick_heavy_count = sum(1 for c in closed_parts[-5:] if max(c["upper_wick"], c["lower_wick"]) >= 0.62)
+    noisy_market = (doji_count >= 3 and rhythm < 0.55) or (wick_heavy_count >= 4 and abs(m20["pressure"]) < 0.28)
+
     seconds = now_utc().astimezone(UTC_PLUS_3).second
-
-    # المنصة: الدخول المتحرك M1 صالح فقط في أول 30 ثانية من الشمعة.
     direct_allowed = seconds <= TRADING_ROOM_DIRECT_ENTRY_MAX_SECOND
+    # دخول الشمعة القادمة لا يرسل مبكرًا. ننتظر آخر ثواني ونفحص مرة ثانية عمليًا لأن الجوب يكرر كل عدة ثوان.
+    next_candle_allowed = seconds >= int(os.getenv("TRADING_ROOM_NEXT_CONFIRM_MIN_SECOND", "54"))
 
-    if strategy_type == "reaction" and direct_allowed:
-        # رد فعل سريع: ذيل أو ضغط عكسي داخل أول نصف الشمعة.
-        if lower_wick >= 0.34 and pressure > 0.10:
-            direction = "CALL"; setup = "ارتداد سريع داخل الشمعة"; entry_mode = "direct"
-        elif upper_wick >= 0.34 and pressure < -0.10:
-            direction = "PUT"; setup = "رفض سريع داخل الشمعة"; entry_mode = "direct"
-    
-    if direction is None:
-        # استمرار أو دخول الشمعة القادمة: نفضل قرب نهاية الشمعة.
-        if change > 0 and pressure > 0.16 and momentum >= 0.45 and upper_wick < 0.45:
-            direction = "CALL"; setup = "استمرار زخم صاعد"; entry_mode = "next_candle" if seconds >= 38 else "wait"
-        elif change < 0 and pressure < -0.16 and momentum >= 0.45 and lower_wick < 0.45:
-            direction = "PUT"; setup = "استمرار زخم هابط"; entry_mode = "next_candle" if seconds >= 38 else "wait"
+    candidates = []
 
-    if direction is None:
-        return {"ok": False, "reason": "لا يوجد نمط دخول واضح الآن"}
+    def add_candidate(kind: str, direction: str, score: float, preferred_mode: str, setup_ar: str, setup_en: str, extra: dict | None = None):
+        if not direction or score <= 0:
+            return
+        candidates.append({
+            "kind": kind,
+            "direction": direction,
+            "score": int(round(max(0, min(100, score)))),
+            "preferred_mode": preferred_mode,
+            "setup_ar": setup_ar,
+            "setup_en": setup_en,
+            "extra": extra or {},
+        })
 
-    # وعي الجلسة: لا نكرر نفس اتجاه/نمط آخر خسارة فورًا إلا إذا القوة أعلى بوضوح.
+    # 1) استمرار زخم نظيف: مسموح فقط إذا الحركة ليست مستهلكة بشكل مبالغ.
+    overextended_up = m35["change"] > 0 and m35["momentum"] >= 0.88 and m20["momentum"] >= 0.82 and cp["upper_wick"] < 0.18
+    overextended_down = m35["change"] < 0 and m35["momentum"] >= 0.88 and m20["momentum"] >= 0.82 and cp["lower_wick"] < 0.18
+    if not noisy_market:
+        if m35["change"] > 0 and m20["pressure"] >= 0.24 and m20["momentum"] >= 0.42 and rhythm >= 0.44 and not overextended_up and cp["upper_wick"] < 0.48:
+            score = 42 + abs(m20["pressure"]) * 22 + m20["momentum"] * 20 + avg_body * 10 + rhythm * 8
+            add_candidate("MOMENTUM_CONTINUATION", "CALL", score, "next_candle", "استمرار زخم صاعد نظيف", "Clean bullish momentum continuation")
+        if m35["change"] < 0 and m20["pressure"] <= -0.24 and m20["momentum"] >= 0.42 and rhythm >= 0.44 and not overextended_down and cp["lower_wick"] < 0.48:
+            score = 42 + abs(m20["pressure"]) * 22 + m20["momentum"] * 20 + avg_body * 10 + rhythm * 8
+            add_candidate("MOMENTUM_CONTINUATION", "PUT", score, "next_candle", "استمرار زخم هابط نظيف", "Clean bearish momentum continuation")
+
+    # 2) انعكاس بعد اندفاع زائد: لا نلحق السعر عندما يتعب، بل نبحث عن ضعف آخر ticks/ذيل.
+    if m35["change"] > 0 and m35["momentum"] >= 0.70 and (m10["pressure"] <= -0.08 or cp["upper_wick"] >= 0.34):
+        score = 45 + m35["momentum"] * 18 + max(0, -m10["pressure"]) * 18 + cp["upper_wick"] * 18 + min(0.20, avg_body) * 20
+        add_candidate("OVEREXTENSION_REVERSAL", "PUT", score, "direct" if direct_allowed else "next_candle", "انعكاس بعد اندفاع صاعد زائد", "Reversal after overextended bullish push")
+    if m35["change"] < 0 and m35["momentum"] >= 0.70 and (m10["pressure"] >= 0.08 or cp["lower_wick"] >= 0.34):
+        score = 45 + m35["momentum"] * 18 + max(0, m10["pressure"]) * 18 + cp["lower_wick"] * 18 + min(0.20, avg_body) * 20
+        add_candidate("OVEREXTENSION_REVERSAL", "CALL", score, "direct" if direct_allowed else "next_candle", "انعكاس بعد اندفاع هابط زائد", "Reversal after overextended bearish push")
+
+    # 3) فشل اختراق صغير: السعر يكسر قمة/قاع مصغر ثم يرجع بسرعة.
+    if len(prices_60) >= 30:
+        prev_high = max(prices_60[-30:-5])
+        prev_low = min(prices_60[-30:-5])
+        last_five = prices_60[-5:]
+        broke_up_then_failed = max(last_five) > prev_high and prices_60[-1] < prev_high and m10["pressure"] < -0.02
+        broke_down_then_failed = min(last_five) < prev_low and prices_60[-1] > prev_low and m10["pressure"] > 0.02
+        if broke_up_then_failed:
+            score = 60 + min(20, abs(prices_60[-1] - prev_high) / max(m60["range"], 1e-12) * 80) + max(0, -m10["pressure"]) * 15
+            add_candidate("FAILED_BREAKOUT", "PUT", score, "direct" if direct_allowed else "next_candle", "فشل اختراق علوي صغير", "Failed small upside breakout")
+        if broke_down_then_failed:
+            score = 60 + min(20, abs(prices_60[-1] - prev_low) / max(m60["range"], 1e-12) * 80) + max(0, m10["pressure"]) * 15
+            add_candidate("FAILED_BREAKOUT", "CALL", score, "direct" if direct_allowed else "next_candle", "فشل كسر سفلي صغير", "Failed small downside breakout")
+
+    # 4) الهدوء ثم الانفجار: ضغط جديد بعد ضغط سابق ضيق.
+    if len(prices_60) >= 50 and avg_range > 0:
+        old_range = max(prices_60[-50:-18]) - min(prices_60[-50:-18])
+        new_range = max(prices_60[-18:]) - min(prices_60[-18:])
+        compression = old_range < (avg_range * 0.75) if avg_range > 0 else False
+        breakout_clean = new_range > old_range * 1.35 if old_range > 0 else False
+        if compression and breakout_clean and not noisy_market:
+            if m20["change"] > 0 and m20["pressure"] > 0.22 and not overextended_up:
+                score = 55 + abs(m20["pressure"]) * 18 + min(20, (new_range / max(old_range, 1e-12)))
+                add_candidate("COMPRESSION_BREAKOUT", "CALL", score, "next_candle", "خروج صاعد بعد هدوء", "Bullish breakout after compression")
+            elif m20["change"] < 0 and m20["pressure"] < -0.22 and not overextended_down:
+                score = 55 + abs(m20["pressure"]) * 18 + min(20, (new_range / max(old_range, 1e-12)))
+                add_candidate("COMPRESSION_BREAKOUT", "PUT", score, "next_candle", "خروج هابط بعد هدوء", "Bearish breakout after compression")
+
+    # 5) رفض الذيل: السعر حاول جهة وفشل، مع ضغط ticks مؤكد.
+    if cp["lower_wick"] >= 0.38 and m10["pressure"] > 0.10 and cp["body_ratio"] >= 0.12:
+        score = 50 + cp["lower_wick"] * 26 + max(0, m10["pressure"]) * 18 + min(10, m10["momentum"] * 10)
+        add_candidate("WICK_REJECTION", "CALL", score, "direct" if direct_allowed else "next_candle", "رفض ذيل سفلي", "Lower wick rejection")
+    if cp["upper_wick"] >= 0.38 and m10["pressure"] < -0.10 and cp["body_ratio"] >= 0.12:
+        score = 50 + cp["upper_wick"] * 26 + max(0, -m10["pressure"]) * 18 + min(10, m10["momentum"] * 10)
+        add_candidate("WICK_REJECTION", "PUT", score, "direct" if direct_allowed else "next_candle", "رفض ذيل علوي", "Upper wick rejection")
+
+    # 6) تبدل المزاج: اتجاه كان واضحًا ثم بدأ ينعكس تدريجيًا، وليس عشوائيًا.
+    if len(closed_parts) >= 4 and not noisy_market:
+        old_bias = sum(c["dir"] for c in closed_parts[-5:-2])
+        last_bias = sum(c["dir"] for c in closed_parts[-2:])
+        if old_bias <= -2 and last_bias >= 1 and m20["pressure"] > 0.18 and m20["change"] > 0:
+            score = 54 + max(0, m20["pressure"]) * 20 + m20["momentum"] * 14 + cp["lower_wick"] * 10
+            add_candidate("MOOD_SHIFT", "CALL", score, "next_candle", "تبدل مزاج لصعود", "Market mood shift to bullish")
+        elif old_bias >= 2 and last_bias <= -1 and m20["pressure"] < -0.18 and m20["change"] < 0:
+            score = 54 + max(0, -m20["pressure"]) * 20 + m20["momentum"] * 14 + cp["upper_wick"] * 10
+            add_candidate("MOOD_SHIFT", "PUT", score, "next_candle", "تبدل مزاج لهبوط", "Market mood shift to bearish")
+
+    if not candidates:
+        if noisy_market:
+            return {"ok": False, "reason": "السوق متذبذب وكثرة ذيول/دوجي تمنع الدخول الآن"}
+        return {"ok": False, "reason": "لا يوجد نمط دخول منطقي الآن"}
+
+    # فلتر الخطر العام: لا نسمح باستمرار زخم بعد استهلاك قوي، لكن نسمح للانعكاس/فشل الاختراق.
+    filtered = []
+    for c in candidates:
+        kind = c["kind"]
+        direction = c["direction"]
+        if kind in ("MOMENTUM_CONTINUATION", "COMPRESSION_BREAKOUT", "MOOD_SHIFT"):
+            if direction == "CALL" and overextended_up:
+                continue
+            if direction == "PUT" and overextended_down:
+                continue
+        # إذا آخر 10 ticks عكس اتجاه المرشح بقوة، نرفضه إلا لو هو انعكاس مؤكد.
+        if kind not in ("OVEREXTENSION_REVERSAL", "FAILED_BREAKOUT", "WICK_REJECTION"):
+            if direction == "CALL" and m10["pressure"] < -0.22:
+                continue
+            if direction == "PUT" and m10["pressure"] > 0.22:
+                continue
+        filtered.append(c)
+
+    if not filtered:
+        return {"ok": False, "reason": "النمط ظهر لكن فلتر الخطر رفضه قبل الدخول"}
+
+    # لا نكرر نفس النمط الخاسر مباشرة إلا إذا النتيجة عالية جدًا أو نوع فرصة مختلف.
     last_loss_setup = state.get("last_loss_setup")
     last_loss_direction = state.get("last_loss_direction")
-    current_setup_key = setup or strategy_type
-    preliminary_score = int(round(momentum * 35 + abs(pressure) * 35 + body_ratio * 20 + 10))
-    if last_loss_setup and last_loss_direction:
-        same_setup = str(last_loss_setup) == str(current_setup_key) or str(last_loss_setup) == str(strategy_type)
-        same_direction = str(last_loss_direction) == str(direction)
-        if same_setup and same_direction and preliminary_score < (TRADING_ROOM_MIN_ENTRY_SCORE + 12):
-            return {"ok": False, "reason": "رفضت تكرار نفس النمط الخاسر قبل ظهور قوة أوضح"}
-
-    score = preliminary_score
-    if entry_mode == "wait":
-        return {"ok": False, "watch": True, "reason": "النمط موجود لكن ننتظر توقيت الدخول المناسب", "score": score, "direction": direction}
+    safe_candidates = []
+    for c in filtered:
+        same_setup = last_loss_setup and str(last_loss_setup) == str(c["kind"])
+        same_direction = last_loss_direction and str(last_loss_direction) == str(c["direction"])
+        if same_setup and same_direction and c["score"] < (TRADING_ROOM_MIN_ENTRY_SCORE + 14):
+            continue
+        safe_candidates.append(c)
+    if not safe_candidates:
+        return {"ok": False, "reason": "رفضت تكرار نفس النمط الخاسر قبل ظهور تأكيد أقوى"}
 
     required_score = TRADING_ROOM_MIN_ENTRY_SCORE
     if state.get("recovery_mode"):
-        required_score += 6
+        required_score += 7
     if state.get("brain_mode") == "protect_profit":
         required_score += 5
     if state.get("brain_mode") == "danger":
-        required_score += 8
+        required_score += 9
 
-    if score < required_score:
-        return {"ok": False, "reason": f"قوة النمط غير كافية حسب وضع الجلسة ({score}% / المطلوب {required_score}%)"}
+    safe_candidates.sort(key=lambda x: (x["score"], 1 if x["kind"] in ("FAILED_BREAKOUT", "OVEREXTENSION_REVERSAL", "WICK_REJECTION") else 0), reverse=True)
+    best = safe_candidates[0]
+    if best["score"] < required_score:
+        return {"ok": False, "reason": f"قوة النمط غير كافية حسب وضع الجلسة ({best['score']}% / المطلوب {required_score}%)"}
+
+    entry_mode = best["preferred_mode"]
+    if entry_mode == "direct" and not direct_allowed:
+        entry_mode = "next_candle"
+    if entry_mode == "next_candle" and not next_candle_allowed:
+        # هذه هي إعادة التأكيد: لا نرسل الآن. سنعيد الفحص تلقائيًا عند قرب بداية الشمعة.
+        return {
+            "ok": False,
+            "watch": True,
+            "reason": "يوجد مرشح دخول، لكن سأعيد تأكيده قبل وقت الدخول بثوانٍ",
+            "score": best["score"],
+            "direction": best["direction"],
+            "candidate_kind": best["kind"],
+        }
+
+    # إعادة فحص أخيرة داخلية مباشرة قبل الإرسال: لو آخر ticks انقلبت فجأة نلغي.
+    latest = _movement_metrics(_prices_from(8))
+    if best["direction"] == "CALL" and latest["pressure"] < -0.20 and best["kind"] not in ("FAILED_BREAKOUT", "WICK_REJECTION"):
+        return {"ok": False, "reason": "تم إلغاء الدخول لأن آخر ثواني ضعفت قبل الإرسال"}
+    if best["direction"] == "PUT" and latest["pressure"] > 0.20 and best["kind"] not in ("FAILED_BREAKOUT", "WICK_REJECTION"):
+        return {"ok": False, "reason": "تم إلغاء الدخول لأن آخر ثواني ضعفت قبل الإرسال"}
 
     now_dt = now_utc()
     if entry_mode == "direct":
-        # دخول مباشر داخل أول 30 ثانية: انتهاء الصفقة مع نهاية الشمعة الحالية.
         entry_dt = now_dt
         bucket_start = int(entry_dt.timestamp() // 60) * 60
         expiry_ts = bucket_start + 60
     else:
-        # دخول الشمعة القادمة: نحسب النتيجة بعد إغلاق شمعة الدخول نفسها، وليس بعد رسالة التنبيه.
         entry_dt = next_full_minute(now_dt)
         expiry_ts = entry_dt.timestamp() + 60
 
+    setup = best["setup_en"] if get_user_language(int(state.get("admin_id") or 0)) == "en" else best["setup_ar"]
     return {
         "ok": True,
         "pair": pair,
         "symbol": symbol,
-        "direction": direction,
+        "direction": best["direction"],
         "entry_mode": entry_mode,
         "setup": setup,
-        "score": min(score, 94),
+        "setup_kind": best["kind"],
+        "score": min(int(best["score"]), 96),
         "price": price,
         "payout": payout_at_entry,
         "entry_ts": entry_dt.timestamp(),
         "expiry_ts": float(expiry_ts),
         "entry_time_text": format_utc_plus_3(entry_dt),
     }
-
 
 def build_trading_room_intro(plan: dict, lang: str = "ar") -> str:
     if lang == "en":
@@ -4445,7 +4601,7 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
         "waiting_result": True,
         "current_trade": analysis,
         "trades_done": int(state.get("trades_done", 0) or 0) + 1,
-        "last_trade_setup": analysis.get("setup") or state.get("strategy_type"),
+        "last_trade_setup": analysis.get("setup_kind") or analysis.get("setup") or state.get("strategy_type"),
         "last_trade_direction": analysis.get("direction"),
     })
 
@@ -4677,7 +4833,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
             state["session_mode"] = "normal"
             state["last_reason"] = "Recovery trade lost; next trade is normal if the session continues" if en else "صفقة التعويض خسرت؛ الصفقة التالية عادية إذا لم تنتهِ الجلسة"
             state["brain_mode"] = "danger"
-            state["last_loss_setup"] = trade.get("setup") or state.get("strategy_type")
+            state["last_loss_setup"] = trade.get("setup_kind") or trade.get("setup") or state.get("strategy_type")
             state["last_loss_direction"] = trade.get("direction")
             try:
                 bs = set(state.get("bad_symbols") or [])
@@ -4699,7 +4855,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
             state["expires_at"] = time_module.time() + TRADING_ROOM_RECOVERY_SEARCH_SECONDS
             state["last_reason"] = "Searching for a safe recovery trade" if en else "جاري البحث عن صفقة تعويضية آمنة"
             state["brain_mode"] = "recovery"
-            state["last_loss_setup"] = trade.get("setup") or state.get("strategy_type")
+            state["last_loss_setup"] = trade.get("setup_kind") or trade.get("setup") or state.get("strategy_type")
             state["last_loss_direction"] = trade.get("direction")
             _append_trading_room_ledger(state, trade, False, -loss_amount, effective_win_units=0, effective_loss_units=1)
             result_line = ("❌ The trade lost" if en else "❌ معوضة، الصفقة خسرت")
