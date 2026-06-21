@@ -3404,80 +3404,369 @@ def build_trading_room_selected_pair_message(pair: str, lang: str = "ar") -> str
     )
 
 
+
+def _trading_room_admin_setup_deep_text(setup_kind: str, direction: str, setup: str, lang: str = "ar") -> tuple[str, str, str]:
+    """تحليل نصي أعمق للأدمن: لماذا دخلنا؟ وما الذي كان يفترض أن يحدث؟ ومتى يفشل السيناريو؟"""
+    kind = str(setup_kind or "UNKNOWN").upper()
+    direction = str(direction or "").upper()
+    up = direction == "CALL"
+    if lang == "en":
+        data = {
+            "STRUCTURE_RETEST": (
+                "The engine saw a price area that had been respected before, then price returned to it and showed rejection.",
+                "The expected behavior was that the retest holds and the next candle continues away from the area in the trade direction.",
+                "The setup fails if price accepts back inside/through the zone instead of respecting the retest."
+            ),
+            "TREND_RETEST_CONTINUATION": (
+                "The market had an active trend/momentum leg and price pulled back into a retest area instead of breaking structure.",
+                "The expected behavior was continuation with the trend after the pullback finishes.",
+                "The setup fails if the pullback turns into structure break or momentum flips before the entry candle closes."
+            ),
+            "LIQUIDITY_SWEEP": (
+                "Price swept a nearby high/low liquidity point and returned back from it.",
+                "The expected behavior was a reversal after the stop-hunt/liquidity grab.",
+                "The setup fails if the sweep becomes a real breakout and price keeps accepting beyond that level."
+            ),
+            "FAILED_BREAKOUT": (
+                "Price tried to break a nearby micro high/low but failed to hold the break.",
+                "The expected behavior was a move back in the opposite direction after the failed break.",
+                "The setup fails if the breakout attempt becomes valid and the market continues beyond the broken level."
+            ),
+            "ROUND_NUMBER_REJECTION": (
+                "Price reacted near a psychological/round number where many traders usually place orders.",
+                "The expected behavior was rejection from that number, not acceptance beyond it.",
+                "The setup fails if price starts accepting above/below the round number with no rejection."
+            ),
+            "ORDER_BLOCK_RETEST": (
+                "Price returned to the last opposite candle before an impulse move, which can act as an order block.",
+                "The expected behavior was a reaction from that block and continuation in the chosen direction.",
+                "The setup fails if the block is absorbed and price closes through it."
+            ),
+            "BOS_CHOCH_RETEST": (
+                "The engine detected a small structure shift/break, then a retest of the broken area.",
+                "The expected behavior was that the retest confirms the new structure direction.",
+                "The setup fails if the supposed structure shift is invalidated quickly."
+            ),
+            "EQUAL_LIQUIDITY_SWEEP": (
+                "Price attacked equal highs/lows and then showed a rejection attempt.",
+                "The expected behavior was reversal after liquidity collection.",
+                "The setup fails if liquidity collection turns into continuation instead of rejection."
+            ),
+            "TRENDLINE_PULLBACK": (
+                "Price pulled back toward a micro trendline/channel area and showed reaction.",
+                "The expected behavior was continuation from that pullback area.",
+                "The setup fails if the trendline/channel stops being respected."
+            ),
+            "WICK_REJECTION": (
+                "The entry was based on a rejection wick showing that price attempted one side and failed.",
+                "The expected behavior was follow-through away from the wick.",
+                "The setup fails if the wick was only noise and the next candle accepts against it."
+            ),
+            "MOMENTUM_CONTINUATION": (
+                "The last ticks and recent candles showed clean pressure in one direction.",
+                "The expected behavior was short continuation before momentum exhausts.",
+                "The setup fails if the move was already exhausted or the last seconds flip against it."
+            ),
+            "STRONG_TREND_CONTINUATION": (
+                "The engine detected a strong directional trend/momentum and avoided counter-trend logic.",
+                "The expected behavior was continuation with the strong direction.",
+                "The setup fails if momentum suddenly stalls and forms a pullback/reversal candle."
+            ),
+            "OVEREXTENSION_REVERSAL": (
+                "The move looked stretched and the engine expected a short pullback/reversal.",
+                "The expected behavior was that the exhausted move slows down and reverses.",
+                "The setup fails if the move was not exhaustion but real trend acceleration."
+            ),
+            "COMPRESSION_BREAKOUT": (
+                "The market compressed in a narrow range, then started to break out.",
+                "The expected behavior was clean continuation after the compression release.",
+                "The setup fails if the breakout becomes a fake breakout and returns inside the range."
+            ),
+            "MOOD_SHIFT": (
+                "Recent behavior changed from one-sided pressure to the opposite side.",
+                "The expected behavior was that the new pressure continues for the entry candle.",
+                "The setup fails if the change was only a temporary correction."
+            ),
+        }
+        fallback = (
+            f"The engine selected this trade because the internal pattern was {setup or kind}.",
+            "The expected behavior was that the next closed candle confirms the selected direction.",
+            "The setup fails if price behavior changes before or during the entry candle."
+        )
+        return data.get(kind, fallback)
+    data = {
+        "STRUCTURE_RETEST": (
+            "البوت رأى منطقة سعرية تم احترامها سابقًا، ثم عاد السعر لاختبارها وظهر رفض سعري منها.",
+            "المفروض أن المنطقة تمسك السعر وتدفع الشمعة التالية بعيدًا عنها باتجاه الصفقة.",
+            "يفشل السيناريو إذا السعر قبل الدخول داخل المنطقة أو اخترقها بدل ما يحترم إعادة الاختبار."
+        ),
+        "TREND_RETEST_CONTINUATION": (
+            "كان في اتجاه/زخم فعّال، والسعر رجع لاختبار منطقة داخل الاتجاه بدل ما يكسر البنية.",
+            "المفروض أن الرجوع يكون مجرد تصحيح، وبعده تكمل الشمعة مع الاتجاه.",
+            "يفشل السيناريو إذا التصحيح تحول لكسر بنية أو انعكس الزخم قبل إغلاق شمعة الصفقة."
+        ),
+        "LIQUIDITY_SWEEP": (
+            "السعر سحب سيولة من قمة/قاع قريب ثم رجع منها، وهذا غالبًا يعطي ارتداد قصير.",
+            "المفروض بعد سحب السيولة يصير رفض ويرجع السعر بعكس جهة السحب.",
+            "يفشل السيناريو إذا السحب تحول لاختراق حقيقي والسعر قبل البقاء بعد المستوى."
+        ),
+        "FAILED_BREAKOUT": (
+            "السعر حاول يكسر قمة/قاع صغير لكنه فشل يثبت بعد الكسر.",
+            "المفروض بعد فشل الاختراق يرجع السعر للجهة المعاكسة.",
+            "يفشل السيناريو إذا محاولة الاختراق صارت اختراق حقيقي واستمر السعر بعدها."
+        ),
+        "ROUND_NUMBER_REJECTION": (
+            "السعر اقترب من رقم دائري/نفسي، وهي مناطق كثير أوامر تتجمع حولها.",
+            "المفروض يظهر رفض من الرقم الدائري بدل قبول السعر فوقه أو تحته.",
+            "يفشل السيناريو إذا السعر قبل التداول بعد الرقم بدون رفض واضح."
+        ),
+        "ORDER_BLOCK_RETEST": (
+            "السعر رجع لآخر شمعة عكسية قبل اندفاع، وهي ممكن تتصرف كمنطقة أوامر.",
+            "المفروض تظهر ردة فعل من هذه المنطقة ويكمل السعر باتجاه الصفقة.",
+            "يفشل السيناريو إذا منطقة الأوامر انامتصت وأغلقت الشمعة داخلها أو بعدها."
+        ),
+        "BOS_CHOCH_RETEST": (
+            "البوت قرأ تبدل/كسر بنية صغير ثم إعادة اختبار لمنطقة الكسر.",
+            "المفروض إعادة الاختبار تؤكد اتجاه البنية الجديدة.",
+            "يفشل السيناريو إذا تبدل البنية طلع وهمي وانلغى بسرعة."
+        ),
+        "EQUAL_LIQUIDITY_SWEEP": (
+            "السعر هاجم قمم/قيعان متساوية ثم ظهر رفض بعد أخذ السيولة.",
+            "المفروض بعد جمع السيولة يرجع السعر بعكس جهة السحب.",
+            "يفشل السيناريو إذا جمع السيولة تحول لاستمرار وليس انعكاس."
+        ),
+        "TRENDLINE_PULLBACK": (
+            "السعر رجع على ترند/قناة مصغّرة وظهر تفاعل من نفس الاتجاه.",
+            "المفروض أن الارتداد من خط الحركة يعطي استمرار للاتجاه.",
+            "يفشل السيناريو إذا الترند المصغر ما عاد محترم وانكسر."
+        ),
+        "WICK_REJECTION": (
+            "الدخول كان مبني على ذيل رفض؛ السعر حاول جهة وفشل يرجع منها.",
+            "المفروض الشمعة التالية تكمل بعيدًا عن الذيل لا ترجع تبتلعه.",
+            "يفشل السيناريو إذا الذيل كان مجرد ضوضاء والسعر قبل الاتجاه المعاكس."
+        ),
+        "MOMENTUM_CONTINUATION": (
+            "آخر الحركة والشموع كانت تعطي ضغط نظيف باتجاه واحد.",
+            "المفروض يكون في استمرار قصير قبل ما يستهلك الزخم.",
+            "يفشل السيناريو إذا الحركة كانت مستهلكة أو آخر الثواني قلبت ضد الصفقة."
+        ),
+        "STRONG_TREND_CONTINUATION": (
+            "البوت قرأ ترند/مومنتم قوي وفضّل الدخول مع الاتجاه بدل عكسه.",
+            "المفروض يستمر الدفع مع الاتجاه خلال شمعة الصفقة.",
+            "يفشل السيناريو إذا الزخم وقف فجأة وتحوّل لتصحيح أو انعكاس."
+        ),
+        "OVEREXTENSION_REVERSAL": (
+            "الحركة ظهرت متمددة زيادة، والبوت توقع تصحيح/ارتداد قصير.",
+            "المفروض الحركة المستهلكة تهدأ ثم تعكس مؤقتًا.",
+            "يفشل السيناريو إذا الحركة لم تكن استهلاكًا بل تسارع ترند حقيقي."
+        ),
+        "COMPRESSION_BREAKOUT": (
+            "السوق كان مضغوطًا داخل نطاق ضيق ثم بدأ خروج واضح.",
+            "المفروض خروج الضغط يعطي استمرار قصير باتجاه الكسر.",
+            "يفشل السيناريو إذا الكسر كان وهمي ورجع السعر داخل النطاق."
+        ),
+        "MOOD_SHIFT": (
+            "سلوك السعر تبدل من ضغط باتجاه إلى بداية ضغط بالاتجاه الآخر.",
+            "المفروض المزاج الجديد يستمر خلال شمعة الدخول.",
+            "يفشل السيناريو إذا التبدل كان مجرد تصحيح مؤقت."
+        ),
+    }
+    fallback = (
+        f"البوت اختار الدخول لأن القراءة الداخلية كانت {setup or kind}.",
+        "المفروض أن شمعة الدخول تؤكد الاتجاه المختار.",
+        "يفشل السيناريو إذا تغير سلوك السعر قبل أو أثناء شمعة الصفقة."
+    )
+    return data.get(kind, fallback)
+
+
 def build_trading_room_admin_entry_reason(trade: dict, lang: str = "ar") -> str:
-    """سبب دخول الصفقة يظهر لحساب الأدمن فقط داخل غرفة جلسة التداول."""
+    """سبب دخول الصفقة يظهر لحساب الأدمن فقط داخل غرفة جلسة التداول، بصياغة تحليلية مفيدة."""
     try:
         setup = str(trade.get("setup") or trade.get("setup_kind") or "غير محدد")
         setup_kind = str(trade.get("setup_kind") or "UNKNOWN")
         score = trade.get("score")
         direction = str(trade.get("direction") or "")
         payout = _normalize_payout_percent(trade.get("payout", 80), 80.0)
-        score_line = f"{int(score)}%" if score is not None else "غير متوفر"
+        price = trade.get("price")
+        score_line = f"{int(score)}%" if score is not None else ("غير متوفر" if lang != "en" else "not available")
+        premise, expectation, risk = _trading_room_admin_setup_deep_text(setup_kind, direction, setup, lang)
+        price_line = ""
+        try:
+            price_line = f"\nEntry price snapshot: {float(price):.5f}" if lang == "en" else f"\nلقطة السعر وقت القرار: {float(price):.5f}"
+        except Exception:
+            pass
         if lang == "en":
             return (
-                "🧠 Admin entry reason\n"
-                f"Pattern: {setup}\n"
-                f"Direction chosen: {direction}\n"
-                f"Internal type: {setup_kind}\n"
-                f"Entry score: {score_line}\n"
+                "🧠 Admin entry analysis\n"
+                f"Setup: {setup_kind}\n"
+                f"Direction: {direction}\n"
+                f"Why entry: {premise}\n"
+                f"Expected reaction: {expectation}\n"
+                f"Failure condition: {risk}\n"
+                f"Entry strength: {score_line}\n"
                 f"Payout fixed at entry: {payout:g}%"
+                f"{price_line}"
             )
         return (
-            "🧠 سبب دخول الصفقة للأدمن\n"
-            f"النمط: {setup}\n"
+            "🧠 تحليل سبب الدخول للأدمن\n"
+            f"نوع القراءة: {setup_kind}\n"
             f"الاتجاه المختار: {direction}\n"
-            f"نوع القراءة الداخلي: {setup_kind}\n"
+            f"لماذا دخلنا؟ {premise}\n"
+            f"ماذا كان المتوقع؟ {expectation}\n"
+            f"متى يفشل السيناريو؟ {risk}\n"
             f"قوة الدخول: {score_line}\n"
             f"نسبة الزوج المثبتة وقت الدخول: {payout:g}%"
+            f"{price_line}"
         )
     except Exception:
         return "🧠 سبب الدخول غير متوفر حاليًا." if lang != "en" else "🧠 Entry reason is not available right now."
 
 
-def build_trading_room_admin_result_reason(trade: dict, win: bool | None, candle_open: float, candle_close: float, lang: str = "ar") -> str:
-    """سبب الربح/الخسارة يظهر للأدمن فقط اعتمادًا على شمعة الإغلاق الحقيقية."""
+def _trading_room_admin_result_deep_text(trade: dict, win: bool | None, candle_open: float, candle_close: float, candle_high=None, candle_low=None, lang: str = "ar") -> str:
+    kind = str(trade.get("setup_kind") or "UNKNOWN").upper()
+    direction = str(trade.get("direction") or "").upper()
+    setup = str(trade.get("setup") or kind)
+    try:
+        o = float(candle_open); c = float(candle_close)
+        h = float(candle_high) if candle_high is not None else max(o, c)
+        l = float(candle_low) if candle_low is not None else min(o, c)
+        rng = max(h-l, 1e-12)
+        body_ratio = abs(c-o)/rng
+        upper_wick = (h-max(o,c))/rng
+        lower_wick = (min(o,c)-l)/rng
+    except Exception:
+        body_ratio = upper_wick = lower_wick = 0.0
+    expected_side = "bullish" if direction == "CALL" else "bearish"
+    if lang == "en":
+        if win is None:
+            return (
+                "The entry candle finished almost neutral. This means the setup did not get real follow-through, "
+                "but it was not invalidated strongly enough to count as a loss. The correct lesson is to treat this as no confirmation, not as a valid win."
+            )
+        if win:
+            base = {
+                "STRUCTURE_RETEST": "The retest zone held. Price did not accept through the zone and the candle closed in the expected direction.",
+                "TREND_RETEST_CONTINUATION": "The pullback stayed corrective and the trend/momentum continued during the entry candle.",
+                "LIQUIDITY_SWEEP": "The liquidity sweep was followed by rejection, so the stop-hunt behaved as a reversal trigger.",
+                "FAILED_BREAKOUT": "The breakout attempt failed and price returned away from the broken micro level.",
+                "ROUND_NUMBER_REJECTION": "The psychological number held as a reaction area and price rejected it.",
+                "ORDER_BLOCK_RETEST": "The order block reacted correctly; price respected the block instead of absorbing it.",
+                "BOS_CHOCH_RETEST": "The structure shift remained valid and the retest confirmed the new direction.",
+                "EQUAL_LIQUIDITY_SWEEP": "Equal high/low liquidity was collected and price rejected after the sweep.",
+                "TRENDLINE_PULLBACK": "The micro trendline/channel pullback held and continuation followed.",
+                "WICK_REJECTION": "The rejection wick got follow-through; price moved away from the rejected side.",
+                "MOMENTUM_CONTINUATION": "Momentum continued long enough and did not flip during the entry candle.",
+                "STRONG_TREND_CONTINUATION": "The strong trend kept control during the trade candle.",
+                "OVEREXTENSION_REVERSAL": "The stretched move cooled down and gave the expected pullback/reversal.",
+                "COMPRESSION_BREAKOUT": "The compression breakout produced follow-through instead of returning inside the range.",
+                "MOOD_SHIFT": "The new mood/pressure continued during the entry candle."
+            }.get(kind, "The market confirmed the original entry idea during the trade candle.")
+            return base
+        # loss
+        base = {
+            "STRUCTURE_RETEST": "The retest idea failed: the area did not hold after entry. What looked like rejection was likely only a temporary bounce/absorption, then price accepted back through the zone.",
+            "TREND_RETEST_CONTINUATION": "The trend pullback turned into a deeper counter-move. Momentum was not strong enough to continue from the retest.",
+            "LIQUIDITY_SWEEP": "The supposed liquidity sweep did not reverse. It behaved more like a real breakout/continuation after liquidity was taken.",
+            "FAILED_BREAKOUT": "The breakout was not truly failed. Price continued validating the break instead of rejecting it.",
+            "ROUND_NUMBER_REJECTION": "The round number did not reject price strongly enough. The market accepted around/beyond the number, so the psychological level was weak.",
+            "ORDER_BLOCK_RETEST": "The order block was absorbed. Instead of reacting from the block, price traded through it and invalidated the area.",
+            "BOS_CHOCH_RETEST": "The structure shift was not confirmed. The retest failed and the market invalidated the assumed new structure.",
+            "EQUAL_LIQUIDITY_SWEEP": "Liquidity collection did not create reversal. Price kept moving after taking the equal highs/lows.",
+            "TRENDLINE_PULLBACK": "The trendline/channel pullback failed; price stopped respecting the micro trend structure.",
+            "WICK_REJECTION": "The wick rejection did not get follow-through. The next candle absorbed the rejection and accepted against it.",
+            "MOMENTUM_CONTINUATION": "The momentum was already weakening or exhausted. The entry followed pressure that did not continue into the trade candle.",
+            "STRONG_TREND_CONTINUATION": "The strong trend paused or pulled back during the exact entry candle, so continuation did not materialize.",
+            "OVEREXTENSION_REVERSAL": "The move was not exhaustion; it was still active acceleration, so the counter move was too early.",
+            "COMPRESSION_BREAKOUT": "The breakout after compression was fake. Price returned against the breakout instead of continuing.",
+            "MOOD_SHIFT": "The mood shift was not stable; it was only a temporary correction and the previous pressure came back."
+        }.get(kind, "The market invalidated the original entry idea during the trade candle.")
+        if body_ratio < 0.22 and max(upper_wick, lower_wick) > 0.45:
+            base += " The candle also had a weak body/large wick, which suggests indecision and absorption rather than clean confirmation."
+        return base
+    # Arabic
+    if win is None:
+        return (
+            "شمعة الدخول انتهت شبه محايدة. هذا يعني أن الفكرة لم تحصل على متابعة حقيقية، "
+            "لكنها أيضًا لم تُكسر بقوة كافية لنحسبها خسارة. الدرس هنا: هذا كان غياب تأكيد، وليس صفقة ناجحة."
+        )
+    if win:
+        base = {
+            "STRUCTURE_RETEST": "منطقة إعادة الاختبار صمدت؛ السعر لم يقبل الكسر داخلها/بعدها وأغلقت الشمعة مع الاتجاه المتوقع.",
+            "TREND_RETEST_CONTINUATION": "التصحيح بقي صحيًا، والترند/المومنتم كمل خلال شمعة الدخول.",
+            "LIQUIDITY_SWEEP": "سحب السيولة تبعه رفض فعلي، لذلك تصرف كفخ ثم ارتداد.",
+            "FAILED_BREAKOUT": "محاولة الاختراق فشلت فعلًا والسعر رجع بعيدًا عن مستوى الكسر الصغير.",
+            "ROUND_NUMBER_REJECTION": "الرقم الدائري صمد كمنطقة تفاعل وظهر منه رفض سعري.",
+            "ORDER_BLOCK_RETEST": "منطقة الأوردر بلوك أعطت ردة فعل صحيحة ولم يتم امتصاصها.",
+            "BOS_CHOCH_RETEST": "تبدل/كسر البنية بقي صالحًا وإعادة الاختبار أكدت الاتجاه الجديد.",
+            "EQUAL_LIQUIDITY_SWEEP": "تم أخذ سيولة القمم/القيعان المتساوية ثم ظهر رفض بعدها.",
+            "TRENDLINE_PULLBACK": "الترند/القناة المصغرة صمدت، وبعد الرجوع كمل السعر بالاتجاه.",
+            "WICK_REJECTION": "ذيل الرفض حصل على متابعة، والسعر ابتعد عن جهة الرفض.",
+            "MOMENTUM_CONTINUATION": "الزخم كمل كفاية ولم ينقلب خلال شمعة الصفقة.",
+            "STRONG_TREND_CONTINUATION": "الترند القوي بقي مسيطرًا خلال شمعة الدخول.",
+            "OVEREXTENSION_REVERSAL": "الحركة المتمددة هدأت وأعطت التصحيح/الانعكاس المتوقع.",
+            "COMPRESSION_BREAKOUT": "الخروج من الضغط أعطى متابعة ولم يرجع داخل النطاق.",
+            "MOOD_SHIFT": "المزاج الجديد للسوق استمر خلال شمعة الدخول."
+        }.get(kind, "السوق أكد فكرة الدخول الأصلية خلال شمعة الصفقة.")
+        return base
+    base = {
+        "STRUCTURE_RETEST": "فكرة إعادة الاختبار فشلت: المنطقة لم تصمد بعد الدخول. الرفض اللي ظهر قبل الصفقة كان غالبًا ارتداد مؤقت أو امتصاص، وبعدها السعر قبل الرجوع داخل/عكس المنطقة.",
+        "TREND_RETEST_CONTINUATION": "رجوع السعر لم يعد تصحيحًا صحيًا؛ تحول لحركة أعمق عكس الاتجاه، والزخم لم يكن كافيًا ليكمل من إعادة الاختبار.",
+        "LIQUIDITY_SWEEP": "سحب السيولة لم ينتج عنه انعكاس. الحركة تصرفت كاختراق/استمرار حقيقي بعد أخذ السيولة.",
+        "FAILED_BREAKOUT": "الاختراق لم يكن فاشلًا فعليًا؛ السعر أكّد الكسر بدل ما يرفضه.",
+        "ROUND_NUMBER_REJECTION": "الرقم الدائري لم يرفض السعر بقوة. السوق قبل التداول حول/بعد الرقم، لذلك المستوى النفسي كان ضعيفًا.",
+        "ORDER_BLOCK_RETEST": "منطقة الأوردر بلوك تم امتصاصها. بدل ما تعطي ردة فعل، السعر تداول خلالها وأبطلها.",
+        "BOS_CHOCH_RETEST": "تبدل البنية لم يتأكد. إعادة الاختبار فشلت والسوق ألغى البنية المفترضة.",
+        "EQUAL_LIQUIDITY_SWEEP": "جمع السيولة من القمم/القيعان المتساوية لم يعطِ انعكاس؛ السعر كمل بعد أخذ السيولة.",
+        "TRENDLINE_PULLBACK": "رجوع الترند/القناة فشل؛ السعر لم يعد يحترم البنية المصغرة.",
+        "WICK_REJECTION": "ذيل الرفض لم يحصل على متابعة. الشمعة التالية ابتلعت الرفض وقبلت بعكسه.",
+        "MOMENTUM_CONTINUATION": "الزخم كان يضعف أو مستهلكًا. الدخول تبع ضغط لم يستمر داخل شمعة الصفقة.",
+        "STRONG_TREND_CONTINUATION": "الترند القوي توقف أو دخل بتصحيح أثناء شمعة الدخول، لذلك لم تظهر المتابعة المتوقعة.",
+        "OVEREXTENSION_REVERSAL": "الحركة لم تكن استهلاكًا؛ كانت تسارعًا حقيقيًا، لذلك الدخول العكسي كان مبكرًا.",
+        "COMPRESSION_BREAKOUT": "الخروج بعد الهدوء كان كسرًا وهميًا، والسعر رجع عكس الاختراق بدل المتابعة.",
+        "MOOD_SHIFT": "تبدل المزاج لم يكن ثابتًا؛ كان تصحيحًا مؤقتًا ثم عاد الضغط السابق."
+    }.get(kind, "السوق أبطل فكرة الدخول الأصلية خلال شمعة الصفقة.")
+    if body_ratio < 0.22 and max(upper_wick, lower_wick) > 0.45:
+        base += " كذلك جسم الشمعة كان ضعيفًا مع ذيل واضح، وهذا يدل على تردد/امتصاص وليس تأكيد نظيف."
+    return base
+
+
+def build_trading_room_admin_result_reason(trade: dict, win: bool | None, candle_open: float, candle_close: float, lang: str = "ar", candle_high=None, candle_low=None) -> str:
+    """سبب الربح/الخسارة يظهر للأدمن فقط بصياغة تحليلية مفيدة وليس فقط لون الشمعة."""
     try:
         direction = str(trade.get("direction") or "")
         setup = str(trade.get("setup") or trade.get("setup_kind") or "غير محدد")
         setup_kind = str(trade.get("setup_kind") or "UNKNOWN")
         o = float(candle_open)
         c = float(candle_close)
+        try:
+            h = float(candle_high) if candle_high is not None else max(o, c)
+            l = float(candle_low) if candle_low is not None else min(o, c)
+        except Exception:
+            h, l = max(o, c), min(o, c)
         candle_dir_ar = "خضراء صاعدة" if c > o else "حمراء هابطة" if c < o else "دوجي / تعادل"
         candle_dir_en = "green bullish" if c > o else "red bearish" if c < o else "doji / draw"
-        if win is None:
-            if lang == "en":
-                return (
-                    "🧠 Admin result reason\n"
-                    f"The trade candle closed as {candle_dir_en}. Open: {o:.5f} | Close: {c:.5f}.\n"
-                    "The candle did not close clearly in either direction, so the trade was treated as a draw.\n"
-                    f"Original setup: {setup} ({setup_kind})"
-                )
-            return (
-                "🧠 سبب النتيجة للأدمن\n"
-                f"شمعة الصفقة أغلقت {candle_dir_ar}. الافتتاح: {o:.5f} | الإغلاق: {c:.5f}.\n"
-                "ما كان في إغلاق واضح باتجاه معيّن، لذلك انحسبت تعادل.\n"
-                f"النمط الأصلي: {setup} ({setup_kind})"
-            )
-        matched_ar = "نفس اتجاه الصفقة" if win else "عكس اتجاه الصفقة"
-        matched_en = "in the trade direction" if win else "against the trade direction"
+        deep = _trading_room_admin_result_deep_text(trade, win, o, c, h, l, lang)
         if lang == "en":
-            verdict = "won" if win else "lost"
+            status = "draw" if win is None else "won" if win else "lost"
             return (
-                "🧠 Admin result reason\n"
-                f"The trade {verdict} because the closed candle was {candle_dir_en}, closing {matched_en}.\n"
-                f"Open: {o:.5f} | Close: {c:.5f}.\n"
-                f"Original entry logic: {setup} ({setup_kind})."
+                "🧠 Admin result analysis\n"
+                f"Result: {status}\n"
+                f"Original setup: {setup} ({setup_kind})\n"
+                f"Market explanation: {deep}\n"
+                f"Trade candle: {candle_dir_en}\n"
+                f"O/H/L/C: {o:.5f} / {h:.5f} / {l:.5f} / {c:.5f}"
             )
-        verdict = "ربحت" if win else "خسرت"
+        status = "تعادل" if win is None else "ربحت" if win else "خسرت"
         return (
-            "🧠 سبب النتيجة للأدمن\n"
-            f"الصفقة {verdict} لأن شمعة الصفقة المغلقة كانت {candle_dir_ar} وأغلقت {matched_ar}.\n"
-            f"الافتتاح: {o:.5f} | الإغلاق: {c:.5f}.\n"
-            f"منطق الدخول الأصلي: {setup} ({setup_kind})."
+            "🧠 تحليل سبب النتيجة للأدمن\n"
+            f"النتيجة: {status}\n"
+            f"منطق الدخول الأصلي: {setup} ({setup_kind})\n"
+            f"التفسير السوقي: {deep}\n"
+            f"شمعة الصفقة: {candle_dir_ar}\n"
+            f"O/H/L/C: {o:.5f} / {h:.5f} / {l:.5f} / {c:.5f}"
         )
     except Exception:
         return "🧠 سبب النتيجة غير متوفر حاليًا." if lang != "en" else "🧠 Result reason is not available right now."
-
 
 def _trading_room_loss_units_for_trade(trade: dict) -> int:
     try:
@@ -5129,12 +5418,16 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
 
     candle_open = None
     candle_close = None
+    candle_high = None
+    candle_low = None
     try:
         candle_bucket = int(float(candle.get("bucket_ts", 0) or 0)) if candle else 0
         if not candle or candle_bucket != entry_bucket_ts:
             raise ValueError("closed trade candle not available yet")
         candle_open = float(candle.get("open"))
         candle_close = float(candle.get("close"))
+        candle_high = float(candle.get("high", max(candle_open, candle_close)))
+        candle_low = float(candle.get("low", min(candle_open, candle_close)))
     except Exception:
         state["waiting_result"] = False
         await safe_send_message(context.bot,
@@ -5206,7 +5499,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
             f"{follow_line}\n\n"
         )
         if is_admin(admin_id):
-            result_message += build_trading_room_admin_result_reason(trade, None, candle_open, candle_close, lang) + "\n\n"
+            result_message += build_trading_room_admin_result_reason(trade, None, candle_open, candle_close, lang, candle_high, candle_low) + "\n\n"
         result_message += (f"📊 Session result now: {wins} win / {losses} loss\n" if en else f"📊 نتيجة الجلسة الآن: {wins} ربح / {losses} خسارة\n")
         result_message += (f"💰 Session net now: {_money_signed(net_profit)}" if en else f"💰 صافي الجلسة الآن: {_money_signed(net_profit)}")
         await safe_send_message(context.bot,
@@ -5322,7 +5615,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
 
     result_message = f"{result_line}\n\n"
     if is_admin(admin_id):
-        result_message += build_trading_room_admin_result_reason(trade, win, candle_open, candle_close, lang) + "\n\n"
+        result_message += build_trading_room_admin_result_reason(trade, win, candle_open, candle_close, lang, candle_high, candle_low) + "\n\n"
     result_message += (f"📊 Session result now: {wins} win / {losses} loss\n" if en else f"📊 نتيجة الجلسة الآن: {wins} ربح / {losses} خسارة\n")
     result_message += (f"💰 Session net now: {_money_signed(net_profit)}" if en else f"💰 صافي الجلسة الآن: {_money_signed(net_profit)}")
     await safe_send_message(context.bot,
