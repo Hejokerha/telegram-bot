@@ -3404,6 +3404,81 @@ def build_trading_room_selected_pair_message(pair: str, lang: str = "ar") -> str
     )
 
 
+def build_trading_room_admin_entry_reason(trade: dict, lang: str = "ar") -> str:
+    """سبب دخول الصفقة يظهر لحساب الأدمن فقط داخل غرفة جلسة التداول."""
+    try:
+        setup = str(trade.get("setup") or trade.get("setup_kind") or "غير محدد")
+        setup_kind = str(trade.get("setup_kind") or "UNKNOWN")
+        score = trade.get("score")
+        direction = str(trade.get("direction") or "")
+        payout = _normalize_payout_percent(trade.get("payout", 80), 80.0)
+        score_line = f"{int(score)}%" if score is not None else "غير متوفر"
+        if lang == "en":
+            return (
+                "🧠 Admin entry reason\n"
+                f"Pattern: {setup}\n"
+                f"Direction chosen: {direction}\n"
+                f"Internal type: {setup_kind}\n"
+                f"Entry score: {score_line}\n"
+                f"Payout fixed at entry: {payout:g}%"
+            )
+        return (
+            "🧠 سبب دخول الصفقة للأدمن\n"
+            f"النمط: {setup}\n"
+            f"الاتجاه المختار: {direction}\n"
+            f"نوع القراءة الداخلي: {setup_kind}\n"
+            f"قوة الدخول: {score_line}\n"
+            f"نسبة الزوج المثبتة وقت الدخول: {payout:g}%"
+        )
+    except Exception:
+        return "🧠 سبب الدخول غير متوفر حاليًا." if lang != "en" else "🧠 Entry reason is not available right now."
+
+
+def build_trading_room_admin_result_reason(trade: dict, win: bool | None, candle_open: float, candle_close: float, lang: str = "ar") -> str:
+    """سبب الربح/الخسارة يظهر للأدمن فقط اعتمادًا على شمعة الإغلاق الحقيقية."""
+    try:
+        direction = str(trade.get("direction") or "")
+        setup = str(trade.get("setup") or trade.get("setup_kind") or "غير محدد")
+        setup_kind = str(trade.get("setup_kind") or "UNKNOWN")
+        o = float(candle_open)
+        c = float(candle_close)
+        candle_dir_ar = "خضراء صاعدة" if c > o else "حمراء هابطة" if c < o else "دوجي / تعادل"
+        candle_dir_en = "green bullish" if c > o else "red bearish" if c < o else "doji / draw"
+        if win is None:
+            if lang == "en":
+                return (
+                    "🧠 Admin result reason\n"
+                    f"The trade candle closed as {candle_dir_en}. Open: {o:.5f} | Close: {c:.5f}.\n"
+                    "The candle did not close clearly in either direction, so the trade was treated as a draw.\n"
+                    f"Original setup: {setup} ({setup_kind})"
+                )
+            return (
+                "🧠 سبب النتيجة للأدمن\n"
+                f"شمعة الصفقة أغلقت {candle_dir_ar}. الافتتاح: {o:.5f} | الإغلاق: {c:.5f}.\n"
+                "ما كان في إغلاق واضح باتجاه معيّن، لذلك انحسبت تعادل.\n"
+                f"النمط الأصلي: {setup} ({setup_kind})"
+            )
+        matched_ar = "نفس اتجاه الصفقة" if win else "عكس اتجاه الصفقة"
+        matched_en = "in the trade direction" if win else "against the trade direction"
+        if lang == "en":
+            verdict = "won" if win else "lost"
+            return (
+                "🧠 Admin result reason\n"
+                f"The trade {verdict} because the closed candle was {candle_dir_en}, closing {matched_en}.\n"
+                f"Open: {o:.5f} | Close: {c:.5f}.\n"
+                f"Original entry logic: {setup} ({setup_kind})."
+            )
+        verdict = "ربحت" if win else "خسرت"
+        return (
+            "🧠 سبب النتيجة للأدمن\n"
+            f"الصفقة {verdict} لأن شمعة الصفقة المغلقة كانت {candle_dir_ar} وأغلقت {matched_ar}.\n"
+            f"الافتتاح: {o:.5f} | الإغلاق: {c:.5f}.\n"
+            f"منطق الدخول الأصلي: {setup} ({setup_kind})."
+        )
+    except Exception:
+        return "🧠 سبب النتيجة غير متوفر حاليًا." if lang != "en" else "🧠 Result reason is not available right now."
+
+
 def _trading_room_loss_units_for_trade(trade: dict) -> int:
     try:
         if bool((trade or {}).get("recovery_trade")):
@@ -4982,14 +5057,18 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
     if is_recovery_trade:
         amount_line += ("  🔁 Recovery" if en else "  🔁 تعويض")
 
+    trade_message = (
+        f"{entry_text}\n\n"
+        + ("🧭 Duration: M1\n" if en else "🧭 المدة: M1\n")
+        + (f"📌 Direction: {dir_line}\n\n\n" if en else f"📌 الاتجاه: {dir_line}\n\n\n")
+        + f"{amount_line}"
+    )
+    if is_admin(admin_id):
+        trade_message += "\n\n" + build_trading_room_admin_entry_reason(analysis, lang)
+
     await safe_send_message(context.bot,
         chat_id=admin_id,
-        text=(
-            f"{entry_text}\n\n"
-            + ("🧭 Duration: M1\n" if en else "🧭 المدة: M1\n")
-            + (f"📌 Direction: {dir_line}\n\n\n" if en else f"📌 الاتجاه: {dir_line}\n\n\n")
-            + f"{amount_line}"
-        ),
+        text=trade_message,
         reply_markup=get_trading_room_active_keyboard(admin_id)
     )
 
@@ -5122,14 +5201,17 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
             state["trade_ledger"] = history[-100:]
         except Exception:
             pass
+        result_message = (
+            f"{result_line}\n\n"
+            f"{follow_line}\n\n"
+        )
+        if is_admin(admin_id):
+            result_message += build_trading_room_admin_result_reason(trade, None, candle_open, candle_close, lang) + "\n\n"
+        result_message += (f"📊 Session result now: {wins} win / {losses} loss\n" if en else f"📊 نتيجة الجلسة الآن: {wins} ربح / {losses} خسارة\n")
+        result_message += (f"💰 Session net now: {_money_signed(net_profit)}" if en else f"💰 صافي الجلسة الآن: {_money_signed(net_profit)}")
         await safe_send_message(context.bot,
             chat_id=admin_id,
-            text=(
-                f"{result_line}\n\n"
-                f"{follow_line}\n\n"
-                + (f"📊 Session result now: {wins} win / {losses} loss\n" if en else f"📊 نتيجة الجلسة الآن: {wins} ربح / {losses} خسارة\n")
-                + (f"💰 Session net now: {_money_signed(net_profit)}" if en else f"💰 صافي الجلسة الآن: {_money_signed(net_profit)}")
-            ),
+            text=result_message,
             reply_markup=get_trading_room_active_keyboard(admin_id)
         )
         try:
@@ -5238,13 +5320,14 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
     recovery_losses = int(state.get("recovery_losses", 0) or 0)
     net_profit = float(state.get("net_profit", 0.0) or 0.0)
 
+    result_message = f"{result_line}\n\n"
+    if is_admin(admin_id):
+        result_message += build_trading_room_admin_result_reason(trade, win, candle_open, candle_close, lang) + "\n\n"
+    result_message += (f"📊 Session result now: {wins} win / {losses} loss\n" if en else f"📊 نتيجة الجلسة الآن: {wins} ربح / {losses} خسارة\n")
+    result_message += (f"💰 Session net now: {_money_signed(net_profit)}" if en else f"💰 صافي الجلسة الآن: {_money_signed(net_profit)}")
     await safe_send_message(context.bot,
         chat_id=admin_id,
-        text=(
-            f"{result_line}\n\n"
-            + (f"📊 Session result now: {wins} win / {losses} loss\n" if en else f"📊 نتيجة الجلسة الآن: {wins} ربح / {losses} خسارة\n")
-            + (f"💰 Session net now: {_money_signed(net_profit)}" if en else f"💰 صافي الجلسة الآن: {_money_signed(net_profit)}")
-        ),
+        text=result_message,
         reply_markup=get_trading_room_active_keyboard(admin_id)
     )
 
