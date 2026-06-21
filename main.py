@@ -4109,6 +4109,22 @@ def analyze_trading_room_entry(state: dict) -> dict:
     wick_heavy_count = sum(1 for c in closed_parts[-5:] if max(c["upper_wick"], c["lower_wick"]) >= 0.62)
     noisy_market = (doji_count >= 3 and rhythm < 0.55) or (wick_heavy_count >= 4 and abs(m20["pressure"]) < 0.28)
 
+    # فلتر اتجاه قوي: إذا السوق صار ترند/مومنتم واضح، ممنوع نعاكسه إلا بعد كسر حقيقي للزخم.
+    # هذا يمنع المشكلة التي ظهرت بالتجربة: البوت كان يعتبر الاندفاع فرصة انعكاس ويدخل عكس الترند.
+    strong_trend_up = (
+        m60["change"] > 0 and m35["change"] > 0 and m20["change"] > 0
+        and m60["pressure"] >= 0.16 and m35["pressure"] >= 0.22 and m20["pressure"] >= 0.22
+        and m35["momentum"] >= 0.34 and rhythm >= 0.42
+        and cp["upper_wick"] < 0.58
+    )
+    strong_trend_down = (
+        m60["change"] < 0 and m35["change"] < 0 and m20["change"] < 0
+        and m60["pressure"] <= -0.16 and m35["pressure"] <= -0.22 and m20["pressure"] <= -0.22
+        and m35["momentum"] >= 0.34 and rhythm >= 0.42
+        and cp["lower_wick"] < 0.58
+    )
+    market_trend_bias = "CALL" if strong_trend_up else "PUT" if strong_trend_down else None
+
     seconds = now_utc().astimezone(UTC_PLUS_3).second
     direct_allowed = seconds <= TRADING_ROOM_DIRECT_ENTRY_MAX_SECOND
     # دخول الشمعة القادمة لا يرسل مبكرًا. ننتظر آخر ثواني ونفحص مرة ثانية عمليًا لأن الجوب يكرر كل عدة ثوان.
@@ -4132,6 +4148,16 @@ def analyze_trading_room_entry(state: dict) -> dict:
     # 1) استمرار زخم نظيف: مسموح فقط إذا الحركة ليست مستهلكة بشكل مبالغ.
     overextended_up = m35["change"] > 0 and m35["momentum"] >= 0.88 and m20["momentum"] >= 0.82 and cp["upper_wick"] < 0.18
     overextended_down = m35["change"] < 0 and m35["momentum"] >= 0.88 and m20["momentum"] >= 0.82 and cp["lower_wick"] < 0.18
+
+    # ترند/مومنتم قوي: الأولوية تكون مع الاتجاه فقط، وليس عكسه.
+    # إذا ظهرت حركة قوية جدًا، لا نعتبرها تلقائيًا انعكاس؛ ننتظر أو ندخل مع الاتجاه عند تأكيد مناسب.
+    if not noisy_market and strong_trend_up and m10["pressure"] >= -0.12 and cp["upper_wick"] < 0.52:
+        score = 70 + min(12, abs(m35["pressure"]) * 18) + min(10, m35["momentum"] * 12) + min(6, rhythm * 8)
+        add_candidate("STRONG_TREND_CONTINUATION", "CALL", score, "next_candle", "استمرار ترند صاعد قوي", "Strong bullish trend continuation")
+    if not noisy_market and strong_trend_down and m10["pressure"] <= 0.12 and cp["lower_wick"] < 0.52:
+        score = 70 + min(12, abs(m35["pressure"]) * 18) + min(10, m35["momentum"] * 12) + min(6, rhythm * 8)
+        add_candidate("STRONG_TREND_CONTINUATION", "PUT", score, "next_candle", "استمرار ترند هابط قوي", "Strong bearish trend continuation")
+
     if not noisy_market:
         if m35["change"] > 0 and m20["pressure"] >= 0.24 and m20["momentum"] >= 0.42 and rhythm >= 0.44 and not overextended_up and cp["upper_wick"] < 0.48:
             score = 42 + abs(m20["pressure"]) * 22 + m20["momentum"] * 20 + avg_body * 10 + rhythm * 8
@@ -4140,12 +4166,21 @@ def analyze_trading_room_entry(state: dict) -> dict:
             score = 42 + abs(m20["pressure"]) * 22 + m20["momentum"] * 20 + avg_body * 10 + rhythm * 8
             add_candidate("MOMENTUM_CONTINUATION", "PUT", score, "next_candle", "استمرار زخم هابط نظيف", "Clean bearish momentum continuation")
 
-    # 2) انعكاس بعد اندفاع زائد: لا نلحق السعر عندما يتعب، بل نبحث عن ضعف آخر ticks/ذيل.
-    if m35["change"] > 0 and m35["momentum"] >= 0.70 and (m10["pressure"] <= -0.08 or cp["upper_wick"] >= 0.34):
+    # 2) انعكاس بعد اندفاع زائد: لا نعاكس ترند قوي.
+    # الانعكاس مسموح فقط إذا السوق ليس بترند قوي واضح، أو ظهر كسر قوي جدًا للزخم الحالي.
+    hard_bullish_exhaustion = cp["upper_wick"] >= 0.62 and m10["pressure"] <= -0.35 and m20["pressure"] <= 0.05
+    hard_bearish_exhaustion = cp["lower_wick"] >= 0.62 and m10["pressure"] >= 0.35 and m20["pressure"] >= -0.05
+    allow_reversal_against_uptrend = (not strong_trend_up) or hard_bullish_exhaustion
+    allow_reversal_against_downtrend = (not strong_trend_down) or hard_bearish_exhaustion
+    if allow_reversal_against_uptrend and m35["change"] > 0 and m35["momentum"] >= 0.70 and (m10["pressure"] <= -0.08 or cp["upper_wick"] >= 0.34):
         score = 45 + m35["momentum"] * 18 + max(0, -m10["pressure"]) * 18 + cp["upper_wick"] * 18 + min(0.20, avg_body) * 20
+        if strong_trend_up:
+            score -= 18
         add_candidate("OVEREXTENSION_REVERSAL", "PUT", score, "direct" if direct_allowed else "next_candle", "انعكاس بعد اندفاع صاعد زائد", "Reversal after overextended bullish push")
-    if m35["change"] < 0 and m35["momentum"] >= 0.70 and (m10["pressure"] >= 0.08 or cp["lower_wick"] >= 0.34):
+    if allow_reversal_against_downtrend and m35["change"] < 0 and m35["momentum"] >= 0.70 and (m10["pressure"] >= 0.08 or cp["lower_wick"] >= 0.34):
         score = 45 + m35["momentum"] * 18 + max(0, m10["pressure"]) * 18 + cp["lower_wick"] * 18 + min(0.20, avg_body) * 20
+        if strong_trend_down:
+            score -= 18
         add_candidate("OVEREXTENSION_REVERSAL", "CALL", score, "direct" if direct_allowed else "next_candle", "انعكاس بعد اندفاع هابط زائد", "Reversal after overextended bearish push")
 
     # 3) فشل اختراق صغير: السعر يكسر قمة/قاع مصغر ثم يرجع بسرعة.
@@ -4200,15 +4235,24 @@ def analyze_trading_room_entry(state: dict) -> dict:
             return {"ok": False, "reason": "السوق متذبذب وكثرة ذيول/دوجي تمنع الدخول الآن"}
         return {"ok": False, "reason": "لا يوجد نمط دخول منطقي الآن"}
 
-    # فلتر الخطر العام: لا نسمح باستمرار زخم بعد استهلاك قوي، لكن نسمح للانعكاس/فشل الاختراق.
+    # فلتر الخطر العام: لا نسمح باستمرار زخم بعد استهلاك قوي، ولا نسمح بعكس ترند قوي واضح.
     filtered = []
     for c in candidates:
         kind = c["kind"]
         direction = c["direction"]
-        if kind in ("MOMENTUM_CONTINUATION", "COMPRESSION_BREAKOUT", "MOOD_SHIFT"):
-            if direction == "CALL" and overextended_up:
+        if market_trend_bias and direction != market_trend_bias:
+            # إذا السوق ترند/مومنتم قوي، أي فرصة عكس الاتجاه تُرفض.
+            # الاستثناء الوحيد: انعكاس قاسٍ جدًا ومؤكد، لكنه يحتاج Score أعلى بكثير.
+            hard_reversal = (
+                (market_trend_bias == "CALL" and direction == "PUT" and hard_bullish_exhaustion)
+                or (market_trend_bias == "PUT" and direction == "CALL" and hard_bearish_exhaustion)
+            )
+            if not hard_reversal or c.get("score", 0) < 92:
                 continue
-            if direction == "PUT" and overextended_down:
+        if kind in ("MOMENTUM_CONTINUATION", "COMPRESSION_BREAKOUT", "MOOD_SHIFT", "STRONG_TREND_CONTINUATION"):
+            if direction == "CALL" and overextended_up and kind != "STRONG_TREND_CONTINUATION":
+                continue
+            if direction == "PUT" and overextended_down and kind != "STRONG_TREND_CONTINUATION":
                 continue
         # إذا آخر 10 ticks عكس اتجاه المرشح بقوة، نرفضه إلا لو هو انعكاس مؤكد.
         if kind not in ("OVEREXTENSION_REVERSAL", "FAILED_BREAKOUT", "WICK_REJECTION"):
@@ -4242,7 +4286,16 @@ def analyze_trading_room_entry(state: dict) -> dict:
     if state.get("brain_mode") == "danger":
         required_score += 9
 
-    safe_candidates.sort(key=lambda x: (x["score"], 1 if x["kind"] in ("FAILED_BREAKOUT", "OVEREXTENSION_REVERSAL", "WICK_REJECTION") else 0), reverse=True)
+    def _candidate_priority(x: dict) -> tuple:
+        direction = x.get("direction")
+        kind = x.get("kind")
+        trend_bonus = 0
+        if market_trend_bias and direction == market_trend_bias:
+            trend_bonus = 20 if kind == "STRONG_TREND_CONTINUATION" else 12
+        reversal_bonus = 0 if market_trend_bias else (1 if kind in ("FAILED_BREAKOUT", "OVEREXTENSION_REVERSAL", "WICK_REJECTION") else 0)
+        return (int(x.get("score", 0)) + trend_bonus, trend_bonus, reversal_bonus)
+
+    safe_candidates.sort(key=_candidate_priority, reverse=True)
     best = safe_candidates[0]
     if best["score"] < required_score:
         return {"ok": False, "reason": f"قوة النمط غير كافية حسب وضع الجلسة ({best['score']}% / المطلوب {required_score}%)"}
@@ -4267,6 +4320,8 @@ def analyze_trading_room_entry(state: dict) -> dict:
         return {"ok": False, "reason": "تم إلغاء الدخول لأن آخر ثواني ضعفت قبل الإرسال"}
     if best["direction"] == "PUT" and latest["pressure"] > 0.20 and best["kind"] not in ("FAILED_BREAKOUT", "WICK_REJECTION"):
         return {"ok": False, "reason": "تم إلغاء الدخول لأن آخر ثواني ضعفت قبل الإرسال"}
+    if market_trend_bias and best["direction"] != market_trend_bias:
+        return {"ok": False, "reason": "تم إلغاء الدخول لأن الاتجاه العام قوي عكس الصفقة"}
 
     now_dt = now_utc()
     if entry_mode == "direct":
