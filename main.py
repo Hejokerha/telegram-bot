@@ -119,17 +119,24 @@ def parse_id_set_from_env(name: str) -> set[int]:
 
 OTC_LIST_MANAGER_IDS = parse_id_set_from_env("OTC_LIST_MANAGER_IDS")
 
-# مستخدمو ميزة OTC SNIPER الخاصة.
-# الأدمن مضاف دائمًا، ويمكن إضافة IDs أخرى من env باسم OTC_SNIPER_ALLOWED_IDS.
-OTC_SNIPER_ALLOWED_IDS = {ADMIN_TELEGRAM_ID, 6575230269, 1592499902, 6656949901}
-OTC_SNIPER_ALLOWED_IDS.update(parse_id_set_from_env("OTC_SNIPER_ALLOWED_IDS"))
+# ===== OTC SNIPER private access =====
+# هذه الميزة تستخدم نفس منطق OTC Edge Engine كما هو، بدون عكس اتجاه وبدون تغيير حساب Edge Score.
+# هي فقط واجهة مختصرة + مراقبة + نتيجة win/loss للأشخاص المسموحين.
+OTC_SNIPER_EXTRA_IDS = parse_id_set_from_env("OTC_SNIPER_EXTRA_IDS")
+OTC_SNIPER_ALLOWED_IDS = {
+    ADMIN_TELEGRAM_ID,
+    6575230269,
+    1592499902,
+    6656949901,
+} | set(OTC_SNIPER_EXTRA_IDS)
+
 
 def is_otc_sniper_user(user_id: int) -> bool:
     try:
-        uid = int(user_id)
-        return uid == int(ADMIN_TELEGRAM_ID) or uid in OTC_SNIPER_ALLOWED_IDS or is_admin(uid)
+        return int(user_id) in OTC_SNIPER_ALLOWED_IDS or is_admin(int(user_id))
     except Exception:
         return False
+
 
 DATABASE_URL = "https://telegram-bot-f0229-default-rtdb.firebaseio.com"
 
@@ -403,23 +410,12 @@ main_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
-otc_sniper_main_keyboard = ReplyKeyboardMarkup(
-    [
-        ["📊 توليد إشارات"],
-        ["🧠 غرفة جلسة تداول"],
-        ["OTC SNIPER"],
-        ["👤 حالة حسابي", "🎥 مشاهدة فيديو شرح البوت"],
-        ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
-    ],
-    resize_keyboard=True
-)
-
 admin_main_keyboard = ReplyKeyboardMarkup(
     [
         ["📥 الطلبات المعلقة", "📋 كافة المستخدمين"],
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
-        ["🧠 غرفة جلسة تداول", "OTC SNIPER"],
+        ["🧠 غرفة جلسة تداول", "🧠 OTC Edge Engine"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
         ["📢 رسالة جماعية"],
@@ -448,9 +444,19 @@ admin_otc_stats_keyboard = ReplyKeyboardMarkup(
 admin_otc_edge_keyboard = ReplyKeyboardMarkup(
     [
         ["🔎 فحص السوق الآن", "🚀 مراقبة كل السوق"],
-        ["🎯 مراقبة زوج محدد", "🛑 إيقاف OTC SNIPER"],
-        ["📋 حالة OTC SNIPER", "📊 تقرير الأنماط"],
+        ["🎯 مراقبة زوج محدد", "🛑 إيقاف مراقبة Edge"],
+        ["📋 حالة مراقبة Edge", "📊 تقرير الأنماط"],
         ["🧪 فحص زوج محدد"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+otc_sniper_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🎯 مراقبة زوج SNIPER"],
+        ["🚀 مراقبة كل السوق SNIPER"],
+        ["🛑 إيقاف OTC SNIPER", "📋 حالة OTC SNIPER"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -7779,55 +7785,24 @@ OTC_EDGE_ENTRY_LAST_ALERT_SECOND = int(os.getenv(
     str(max(1, OTC_EDGE_ENTRY_WINDOW_SECONDS - OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS))
 ))
 
-def _default_otc_edge_watcher_state(owner_id: int | None = None) -> dict:
-    try:
-        owner_id = int(owner_id or ADMIN_TELEGRAM_ID)
-    except Exception:
-        owner_id = ADMIN_TELEGRAM_ID
-    return {
-        "enabled": False,
-        "mode": "all",  # all | pairs
-        "pairs": [],
-        "chat_id": owner_id,
-        "started_at": None,
-        "started_by": owner_id,
-        "last_scan_at": None,
-        "last_alert_at": None,
-        "last_result_at": None,
-        "last_candidate": None,
-        "last_error": None,
-        "last_alerts": {},
-        "alert_times": [],
-        "alerts_sent": 0,
-        "results_sent": 0,
-        "active_trade_until_ts": 0.0,
-        "active_trade": None,
-        "entry_window_skips": 0,
-    }
-
-
-# حالة منفصلة لكل مستخدم OTC SNIPER حتى يقدر كل شخص يراقب زوجًا مختلفًا بدون ما يقطع على غيره.
-_otc_edge_watcher_states: dict[int, dict] = {}
-
-
-def _get_otc_edge_watcher_state(owner_id: int | None = None) -> dict:
-    try:
-        owner_id = int(owner_id or ADMIN_TELEGRAM_ID)
-    except Exception:
-        owner_id = ADMIN_TELEGRAM_ID
-    state = _otc_edge_watcher_states.get(owner_id)
-    if not isinstance(state, dict):
-        state = _default_otc_edge_watcher_state(owner_id)
-        _otc_edge_watcher_states[owner_id] = state
-    return state
-
-
-def _iter_otc_edge_watcher_states():
-    return list(_otc_edge_watcher_states.items())
-
-
-# توافق مع أي كود قديم كان يقرأ الحالة الافتراضية للأدمن مباشرة.
-_otc_edge_watcher_state = _get_otc_edge_watcher_state(ADMIN_TELEGRAM_ID)
+_otc_edge_watcher_state = {
+    "enabled": False,
+    "mode": "all",  # all | pairs
+    "pairs": [],
+    "chat_id": ADMIN_TELEGRAM_ID,
+    "started_at": None,
+    "started_by": None,
+    "last_scan_at": None,
+    "last_alert_at": None,
+    "last_candidate": None,
+    "last_error": None,
+    "last_alerts": {},
+    "alert_times": [],
+    "alerts_sent": 0,
+    "active_trade_until_ts": 0.0,
+    "active_trade": None,
+    "entry_window_skips": 0,
+}
 
 
 def _otc_edge_direction_icon(direction: str) -> str:
@@ -8227,24 +8202,25 @@ def scan_otc_edge_market(limit: int | None = None, include_weak: bool = False) -
         return results
 
 
-def build_otc_edge_menu_message(owner_id: int | None = None) -> str:
-    state = _get_otc_edge_watcher_state(owner_id or ADMIN_TELEGRAM_ID)
-    watcher_status = "شغالة ✅" if state.get("enabled") else "متوقفة ⏸"
+def build_otc_edge_menu_message() -> str:
+    watcher_status = "شغالة ✅" if _otc_edge_watcher_state.get("enabled") else "متوقفة ⏸"
     return (
-        "🎯 OTC SNIPER\n"
+        "🧠 OTC Edge Engine - Admin Only\n"
         "━━━━━━━━━━━━━━\n\n"
-        "هذا القسم خاص ومتاح فقط للحسابات المسموحة.\n"
-        "يفحص بث Quotex OTC المباشر، ويرسل لك تنبيه دخول مختصر عند ظهور فرصة قوية.\n\n"
-        f"👁 حالة المراقبة: {watcher_status}\n\n"
+        "هذا القسم خاص بالأدمن فقط.\n"
+        "وظيفته كشف الأنماط السلوكية المتكررة في OTC من بث Quotex Live، بدون نشر للمستخدمين وبدون تغيير نظام الإشارات.\n\n"
+        f"👁 حالة المراقبة التلقائية: {watcher_status}\n\n"
         "الأزرار:\n"
-        "🔎 فحص السوق الآن: يعرض أفضل الأزواج الحالية حتى تختار واحدًا.\n"
-        "🚀 مراقبة كل السوق: يرسل الزوج + الاتجاه عند ظهور فرصة.\n"
-        "🎯 مراقبة زوج محدد: تختار زوجًا، والتنبيه بعدها يكون CALL أو PUT فقط.\n"
-        "📋 حالة OTC SNIPER: يعرض وضع المراقبة والصفقة الحالية إن وجدت.\n\n"
-        "بعد كل تنبيه دخول، البوت ينتظر إغلاق نفس شمعة M1 ثم يرسل فقط: win أو loss.\n"
-        "⚠️ القراءة احتمالية وليست ضمان ربح."
+        "🔎 فحص السوق الآن: يعرض أفضل الفرص الحالية فورًا.\n"
+        "🚀 مراقبة كل السوق: البوت يراقب كل الأزواج ويرسل لك فرصة مباشرة عند ظهور Edge قوي.\n"
+        "🎯 مراقبة زوج محدد: تختار زوجًا أو عدة أزواج، والبوت ينبهك فقط عليها.\n"
+        "📋 حالة مراقبة Edge: يعرض وضع المراقبة والآخر فرصة رآها البوت.\n"
+        "📊 تقرير الأنماط: يلخص نتائج الأنماط السابقة المسجلة إن وجدت.\n"
+        "🧪 فحص زوج محدد: يعطيك قراءة تفصيلية مرة واحدة لزوج واحد.\n\n"
+        "قاعدة الدخول من تنبيه المراقبة:\n"
+        f"ادخل فقط خلال صلاحية التنبيه، والصفقة تكون على إغلاق شمعة M1 الحالية حتى يطابق الدخول تحليل البوت.\n\n"
+        "⚠️ هذه قراءة احتمالية وليست ضمان ربح."
     )
-
 
 def format_otc_edge_item(item: dict, rank: int | None = None, detailed: bool = False) -> str:
     try:
@@ -8287,7 +8263,7 @@ def build_otc_edge_scan_message() -> str:
         results = scan_otc_edge_market(limit=OTC_EDGE_TOP_LIMIT, include_weak=False)
         now_text = now_utc().astimezone(UTC_PLUS_3).strftime("%H:%M:%S")
         header = (
-            "🎯 OTC SNIPER - فحص السوق\n"
+            "🧠 OTC Edge Engine - فحص السوق\n"
             "━━━━━━━━━━━━━━\n"
             f"⏰ وقت الفحص: {now_text} UTC+3\n"
             f"📡 بث Quotex: {'متصل ✅' if connected else 'غير متصل ⚠️'} | started={started}\n"
@@ -8303,11 +8279,11 @@ def build_otc_edge_scan_message() -> str:
         for idx, item in enumerate(results, start=1):
             lines.append(format_otc_edge_item(item, rank=idx, detailed=(idx == 1)))
             lines.append("────────────")
-        lines.append("⚠️ خاص بـ OTC SNIPER: هذه قراءة احتمالية من سلوك السوق وليست ضمانًا أو اختراقًا للمنصة.")
+        lines.append("⚠️ خاص بالأدمن: هذه قراءة احتمالية من سلوك السوق وليست ضمانًا أو اختراقًا للمنصة.")
         return "\n".join(lines)[:3900]
     except Exception as e:
         logger.exception("Could not build OTC Edge scan message: %s", e)
-        return "تعذر إنشاء تقرير OTC SNIPER. راجع اللوج."
+        return "تعذر إنشاء تقرير OTC Edge. راجع اللوج."
 
 
 def build_otc_edge_single_pair_message(pair_text: str) -> str:
@@ -8325,16 +8301,16 @@ def build_otc_edge_single_pair_message(pair_text: str) -> str:
         result = analyze_otc_edge_pair(pair_text, symbol=symbol, include_history=True)
         if not result.get("ok"):
             return (
-                "🧪 فحص زوج OTC SNIPER\n"
+                "🧪 فحص زوج OTC Edge\n"
                 "━━━━━━━━━━━━━━\n"
                 f"الزوج: {pair_text}\n\n"
                 f"❌ لا توجد قراءة صالحة الآن.\nالسبب: {result.get('reason')}"
             )
         return (
-            "🧪 فحص زوج OTC SNIPER\n"
+            "🧪 فحص زوج OTC Edge\n"
             "━━━━━━━━━━━━━━\n"
             + format_otc_edge_item(result, detailed=True)
-            + "\n\n⚠️ خاص بـ OTC SNIPER. لا تعتمد عليه كضمان ربح؛ استخدمه كفلتر جودة."
+            + "\n\n⚠️ خاص بالأدمن فقط. لا تعتمد عليه كضمان ربح؛ استخدمه كفلتر جودة."
         )[:3900]
     except Exception as e:
         logger.exception("Could not build OTC Edge single pair message: %s", e)
@@ -8343,12 +8319,11 @@ def build_otc_edge_single_pair_message(pair_text: str) -> str:
 
 
 
-def _otc_edge_watch_mode_text(state: dict | None = None) -> str:
+def _otc_edge_watch_mode_text() -> str:
     try:
-        state = state or _get_otc_edge_watcher_state(ADMIN_TELEGRAM_ID)
-        mode = str(state.get("mode") or "all")
+        mode = str(_otc_edge_watcher_state.get("mode") or "all")
         if mode == "pairs":
-            pairs = list(state.get("pairs") or [])
+            pairs = list(_otc_edge_watcher_state.get("pairs") or [])
             if not pairs:
                 return "أزواج محددة: لا يوجد"
             if len(pairs) == 1:
@@ -8416,59 +8391,48 @@ def parse_otc_edge_watch_pairs(text: str) -> tuple[list[str], list[str]]:
 
 def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pairs: list[str] | None = None) -> str:
     try:
-        owner_id = int(started_by or chat_id or ADMIN_TELEGRAM_ID)
-        if not is_otc_sniper_user(owner_id):
-            return "❌ هذه الميزة خاصة وغير مفعلة لحسابك."
-
         pairs = list(dict.fromkeys(pairs or []))
         if mode == "pairs" and not pairs:
             return "❌ لم يتم تشغيل المراقبة لأن قائمة الأزواج فارغة."
 
-        state = _get_otc_edge_watcher_state(owner_id)
-        state.update({
+        _otc_edge_watcher_state.update({
             "enabled": True,
             "mode": "pairs" if mode == "pairs" else "all",
             "pairs": pairs,
             "chat_id": int(chat_id),
-            "started_by": owner_id,
+            "started_by": int(started_by),
             "started_at": now_iso(),
             "last_scan_at": None,
             "last_alert_at": None,
-            "last_result_at": None,
             "last_candidate": None,
             "last_error": None,
             "last_alerts": {},
             "alert_times": [],
             "alerts_sent": 0,
-            "results_sent": 0,
             "active_trade_until_ts": 0.0,
             "active_trade": None,
             "entry_window_skips": 0,
         })
-        return build_otc_edge_watcher_status_message(owner_id=owner_id, prefix="✅ تم تشغيل OTC SNIPER.")
+        return build_otc_edge_watcher_status_message(prefix="✅ تم تشغيل مراقبة Edge.")
     except Exception as e:
         logger.exception("Could not start OTC Edge watcher: %s", e)
-        return f"❌ تعذر تشغيل OTC SNIPER: {e}"
+        return f"❌ تعذر تشغيل مراقبة Edge: {e}"
 
 
-def stop_otc_edge_watcher(owner_id: int | None = None) -> str:
+def stop_otc_edge_watcher() -> str:
     try:
-        owner_id = int(owner_id or ADMIN_TELEGRAM_ID)
-        state = _get_otc_edge_watcher_state(owner_id)
-        was_enabled = bool(state.get("enabled"))
-        state["enabled"] = False
-        state["last_error"] = None
-        state["active_trade_until_ts"] = 0.0
-        state["active_trade"] = None
-        return "🛑 تم إيقاف OTC SNIPER." if was_enabled else "OTC SNIPER متوقف أصلًا."
+        was_enabled = bool(_otc_edge_watcher_state.get("enabled"))
+        _otc_edge_watcher_state["enabled"] = False
+        _otc_edge_watcher_state["last_error"] = None
+        return "🛑 تم إيقاف مراقبة OTC Edge." if was_enabled else "مراقبة OTC Edge متوقفة أصلًا."
     except Exception as e:
         return f"تعذر إيقاف المراقبة: {e}"
 
 
-def _otc_edge_alert_rate_limited(state: dict, now_ts: float) -> bool:
+def _otc_edge_alert_rate_limited(now_ts: float) -> bool:
     try:
-        times = [float(t) for t in (state.get("alert_times") or []) if now_ts - float(t) < 3600]
-        state["alert_times"] = times
+        times = [float(t) for t in (_otc_edge_watcher_state.get("alert_times") or []) if now_ts - float(t) < 3600]
+        _otc_edge_watcher_state["alert_times"] = times
         return len(times) >= int(OTC_EDGE_WATCHER_MAX_ALERTS_PER_HOUR)
     except Exception:
         return False
@@ -8538,107 +8502,69 @@ def _otc_edge_entry_window_status() -> tuple[bool, str, dict]:
         return True, f"تعذر فحص بوابة التوقيت: {e}", _otc_edge_current_candle_timing()
 
 
-def _otc_edge_entry_window_ok(state: dict | None = None) -> bool:
+def _otc_edge_entry_window_ok() -> bool:
     ok, reason, timing = _otc_edge_entry_window_status()
     if not ok:
         try:
-            state = state or _get_otc_edge_watcher_state(ADMIN_TELEGRAM_ID)
-            state["last_timing_skip"] = reason
-            state["last_timing_skip_at"] = now_iso()
+            _otc_edge_watcher_state["last_timing_skip"] = reason
+            _otc_edge_watcher_state["last_timing_skip_at"] = now_iso()
         except Exception:
             pass
     return bool(ok)
 
 
-def _otc_edge_active_trade_remaining(state: dict | None = None, now_ts: float | None = None) -> int:
+def _otc_edge_active_trade_remaining(now_ts: float | None = None) -> int:
     try:
-        state = state or _get_otc_edge_watcher_state(ADMIN_TELEGRAM_ID)
         now_ts = float(now_ts or time_module.time())
-        until_ts = float(state.get("active_trade_until_ts") or 0)
+        until_ts = float(_otc_edge_watcher_state.get("active_trade_until_ts") or 0)
         remain = int(round(until_ts - now_ts))
-        return max(0, remain)
+        if remain <= 0:
+            _otc_edge_watcher_state["active_trade_until_ts"] = 0.0
+            _otc_edge_watcher_state["active_trade"] = None
+            return 0
+        return remain
     except Exception:
         return 0
 
 
-def _otc_edge_set_active_trade_lock(state: dict, item: dict, now_ts: float | None = None):
+def _otc_edge_set_active_trade_lock(item: dict, now_ts: float | None = None):
     try:
         now_ts = float(now_ts or time_module.time())
         timing = _otc_edge_current_candle_timing()
-        symbol = item.get("symbol") or get_otc_symbol_for_pair(item.get("pair"))
-        entry_price = float(item.get("price"))
-        entry_ts = float(now_ts)
-
-        try:
-            # استخدم وقت آخر tick إذا كان متاحًا حتى يكون bucket الشمعة مطابقًا لبث Quotex قدر الإمكان.
-            rows, last_tick, candles = _get_otc_rows_and_candles(symbol)
-            tick_ts = float((last_tick or {}).get("time") or (last_tick or {}).get("ts") or (last_tick or {}).get("timestamp") or 0)
-            if tick_ts > 1e12:
-                tick_ts = tick_ts / 1000.0
-            if tick_ts:
-                entry_ts = tick_ts
-        except Exception:
-            pass
-
-        entry_bucket_ts = int(float(entry_ts) // int(OTC_EDGE_CANDLE_SECONDS)) * int(OTC_EDGE_CANDLE_SECONDS)
-        close_bucket_ts = entry_bucket_ts + int(OTC_EDGE_CANDLE_SECONDS)
-
         if _otc_edge_timing_mode() == "m1_candle_close":
             # القفل يطابق الصفقة: حتى إغلاق الشمعة الحالية + هامش صغير.
-            lock_seconds = max(1, int(max(0, close_bucket_ts - time_module.time())) + int(OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS))
-            close_dt = datetime.fromtimestamp(close_bucket_ts, tz=UTC).astimezone(UTC_PLUS_3)
-            close_at = close_dt.isoformat()
-            close_text = close_dt.strftime("%H:%M:%S")
+            lock_seconds = max(1, int(float(timing.get("remaining", 0) or 0)) + int(OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS))
+            close_at = timing.get("close_dt").isoformat() if timing.get("close_dt") else None
         else:
             lock_seconds = max(int(OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS), int(OTC_EDGE_WATCHER_TRADE_LOCK_SECONDS))
-            close_dt = now_utc().astimezone(UTC_PLUS_3) + timedelta(seconds=lock_seconds)
-            close_at = close_dt.isoformat()
-            close_text = close_dt.strftime("%H:%M:%S")
+            close_at = (now_utc().astimezone(UTC_PLUS_3) + timedelta(seconds=lock_seconds)).isoformat()
 
-        state["active_trade_until_ts"] = time_module.time() + lock_seconds
-        state["active_trade"] = {
+        _otc_edge_watcher_state["active_trade_until_ts"] = now_ts + lock_seconds
+        _otc_edge_watcher_state["active_trade"] = {
             "pair": item.get("pair"),
-            "symbol": symbol,
             "direction": item.get("direction"),
             "score": item.get("score"),
             "payout": item.get("payout"),
             "pattern": item.get("pattern"),
             "started_at": now_iso(),
-            "entry_ts": entry_ts,
-            "entry_bucket_ts": entry_bucket_ts,
-            "entry_price": entry_price,
             "timing_mode": _otc_edge_timing_mode(),
             "close_at": close_at,
-            "close_text": close_text,
-            "close_bucket_ts": close_bucket_ts,
+            "close_text": timing.get("close_text"),
             "entry_second": round(float(timing.get("second", 0) or 0), 1),
             "lock_seconds": lock_seconds,
-            "result_sent": False,
-            "result_attempts": 0,
         }
-    except Exception as e:
-        logger.exception("Could not set OTC SNIPER active trade: %s", e)
-
-
-def _otc_edge_has_pending_trade(state: dict) -> bool:
-    try:
-        trade = state.get("active_trade") or {}
-        return bool(trade) and not bool(trade.get("result_sent"))
     except Exception:
-        return False
+        pass
 
 
-def _otc_edge_can_alert(state: dict, item: dict, now_ts: float) -> bool:
+def _otc_edge_can_alert(item: dict, now_ts: float) -> bool:
     try:
         if not item or not item.get("ok"):
             return False
-        # لا نرسل صفقة جديدة حتى نحسب نتيجة الصفقة السابقة ونرسل win/loss.
-        if _otc_edge_has_pending_trade(state):
+        if _otc_edge_active_trade_remaining(now_ts) > 0:
             return False
-        if _otc_edge_active_trade_remaining(state, now_ts) > 0:
-            return False
-        if not _otc_edge_entry_window_ok(state):
-            state["entry_window_skips"] = int(state.get("entry_window_skips", 0) or 0) + 1
+        if not _otc_edge_entry_window_ok():
+            _otc_edge_watcher_state["entry_window_skips"] = int(_otc_edge_watcher_state.get("entry_window_skips", 0) or 0) + 1
             return False
         if int(item.get("score", 0) or 0) < int(OTC_EDGE_WATCHER_MIN_SCORE):
             return False
@@ -8646,10 +8572,10 @@ def _otc_edge_can_alert(state: dict, item: dict, now_ts: float) -> bool:
             return False
         if float(item.get("tick_age", 999) or 999) > max(3, int(OTC_EDGE_TICK_MAX_AGE_SECONDS)):
             return False
-        if _otc_edge_alert_rate_limited(state, now_ts):
+        if _otc_edge_alert_rate_limited(now_ts):
             return False
         key = f"{item.get('pair')}|{item.get('direction')}|{item.get('pattern')}"
-        last_alerts = state.setdefault("last_alerts", {})
+        last_alerts = _otc_edge_watcher_state.setdefault("last_alerts", {})
         last_ts = float(last_alerts.get(key, 0) or 0)
         if now_ts - last_ts < int(OTC_EDGE_WATCHER_COOLDOWN_SECONDS):
             return False
@@ -8659,12 +8585,12 @@ def _otc_edge_can_alert(state: dict, item: dict, now_ts: float) -> bool:
         return False
 
 
-def _otc_edge_collect_watcher_candidates(state: dict) -> list[dict]:
+def _otc_edge_collect_watcher_candidates() -> list[dict]:
     try:
-        mode = str(state.get("mode") or "all")
+        mode = str(_otc_edge_watcher_state.get("mode") or "all")
         candidates = []
         if mode == "pairs":
-            for pair in list(state.get("pairs") or []):
+            for pair in list(_otc_edge_watcher_state.get("pairs") or []):
                 symbol = get_otc_symbol_for_pair(pair)
                 if not symbol:
                     resolved_pair, resolved_symbol = _otc_edge_resolve_pair_text(pair)
@@ -8682,47 +8608,79 @@ def _otc_edge_collect_watcher_candidates(state: dict) -> list[dict]:
         candidates.sort(key=lambda x: (int(x.get("score", 0) or 0), int(x.get("payout", 0) or 0)), reverse=True)
         return candidates
     except Exception as e:
-        state["last_error"] = str(e)
-        logger.exception("OTC SNIPER collect failed: %s", e)
+        _otc_edge_watcher_state["last_error"] = str(e)
+        logger.exception("OTC Edge watcher collect failed: %s", e)
         return []
 
 
-def build_otc_edge_entry_alert_message(item: dict, state: dict | None = None) -> str:
-    """رسالة دخول مختصرة جدًا مثل طلب الأدمن.
-    إذا كان المستخدم يراقب زوجًا واحدًا، نرسل الاتجاه فقط.
-    إذا كان يراقب كل السوق أو أكثر من زوج، نضيف اسم الزوج حتى يعرف أين يدخل.
-    """
+def build_otc_edge_entry_alert_message(item: dict) -> str:
     try:
-        state = state or _get_otc_edge_watcher_state(ADMIN_TELEGRAM_ID)
-        direction_line = _otc_edge_direction_icon(item.get("direction"))
-        mode = str(state.get("mode") or "all")
-        pairs = list(state.get("pairs") or [])
-        if mode == "pairs" and len(pairs) == 1:
-            return direction_line
-        return f"{item.get('pair')}\n{direction_line}"
-    except Exception:
-        return _otc_edge_direction_icon((item or {}).get("direction"))
+        timing = _otc_edge_current_candle_timing()
+        now_text = timing.get("now", now_utc().astimezone(UTC_PLUS_3)).strftime("%H:%M:%S")
+        mode_text = _otc_edge_watch_mode_text()
+        score = int(item.get("score", 0) or 0)
+        tick_age = item.get("tick_age")
+        metrics = item.get("metrics") or {}
+        timing_mode = _otc_edge_timing_mode()
+
+        if timing_mode == "m1_candle_close":
+            remaining = int(float(timing.get("remaining", 0) or 0))
+            sec = float(timing.get("second", 0) or 0)
+            timing_lines = (
+                "🕯 نظام الصفقة: M1 Candle Close\n"
+                f"🟢 الدخول: الآن خلال {OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS} ثواني فقط\n"
+                f"🏁 انتهاء الصفقة: {timing.get('close_text')} UTC+3\n"
+                f"⏱ المتبقي لإغلاق الشمعة: {remaining} ثانية | الثانية الحالية: {sec:.1f}\n"
+                f"🚫 لا تدخل إذا وصلت بعد الثانية {OTC_EDGE_ENTRY_WINDOW_SECONDS} من الشمعة.\n"
+            )
+        else:
+            timing_lines = (
+                "🕐 نظام الصفقة: Fixed 60s\n"
+                f"🟢 الدخول: الآن خلال {OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS} ثواني فقط\n"
+                f"🏁 انتهاء الصفقة: بعد {OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS} ثانية من لحظة دخولك\n"
+            )
+
+        return (
+            "🚨 OTC Edge Alert - فرصة مباشرة\n"
+            "━━━━━━━━━━━━━━\n"
+            f"⏰ وقت التنبيه: {now_text} UTC+3\n"
+            f"👁 المراقبة: {mode_text}\n\n"
+            "✅ قرار الدخول: ادخل الآن فقط إذا كنت جاهزًا\n"
+            f"⏳ صلاحية التنبيه: {OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS} ثواني\n"
+            f"{timing_lines}"
+            f"🔒 لن يتم إرسال فرصة جديدة قبل انتهاء هذه الصفقة.\n\n"
+            f"💱 الزوج: {item.get('pair')}\n"
+            f"📌 الاتجاه: {_otc_edge_direction_icon(item.get('direction'))}\n"
+            f"📊 Edge Score: {score}% | payout: {item.get('payout', 0)}%\n"
+            f"🧩 النمط: {item.get('reason')}\n"
+            f"💵 السعر الآن: {_otc_edge_price_text(item.get('pair', ''), item.get('price'))}\n"
+            f"⏱ عمر آخر tick: {tick_age} ثانية\n\n"
+            f"🔍 القراءة: {item.get('detail')}\n"
+            f"⚠️ إلغاء الدخول إذا تأخرت، أو السعر عكس بقوة، أو ظهرت شمعة رفض ضد الاتجاه.\n"
+            f"📐 p35={metrics.get('pressure_35')} | m35={metrics.get('momentum_35')} | p12={metrics.get('pressure_12')}"
+        )[:3900]
+    except Exception as e:
+        return f"🚨 OTC Edge Alert\nتعذر تنسيق التنبيه: {e}"
 
 
-def build_otc_edge_watcher_status_message(owner_id: int | None = None, prefix: str | None = None) -> str:
+def build_otc_edge_watcher_status_message(prefix: str | None = None) -> str:
     try:
-        state = _get_otc_edge_watcher_state(owner_id or ADMIN_TELEGRAM_ID)
-        enabled = bool(state.get("enabled"))
+        enabled = bool(_otc_edge_watcher_state.get("enabled"))
         connected = bool(getattr(quotex_otc_feed, "connected", False)) if "quotex_otc_feed" in globals() else False
         started = bool(getattr(quotex_otc_feed, "started", False)) if "quotex_otc_feed" in globals() else False
-        started_at = state.get("started_at")
-        last_scan_at = state.get("last_scan_at")
-        last_alert_at = state.get("last_alert_at")
-        last_candidate = state.get("last_candidate") or {}
+        started_at = _otc_edge_watcher_state.get("started_at")
+        last_scan_at = _otc_edge_watcher_state.get("last_scan_at")
+        last_alert_at = _otc_edge_watcher_state.get("last_alert_at")
+        last_candidate = _otc_edge_watcher_state.get("last_candidate") or {}
         lines = []
         if prefix:
             lines.append(str(prefix))
             lines.append("")
         lines.extend([
-            "📋 حالة OTC SNIPER",
+            "📋 حالة مراقبة OTC Edge",
             "━━━━━━━━━━━━━━",
             f"الحالة: {'شغالة ✅' if enabled else 'متوقفة ⏸'}",
-            f"الوضع: {_otc_edge_watch_mode_text(state)}",
+            f"الوضع: {_otc_edge_watch_mode_text()}",
             f"📡 بث Quotex: {'متصل ✅' if connected else 'غير متصل ⚠️'} | started={started}",
             f"🎯 حد التنبيه: Edge {OTC_EDGE_WATCHER_MIN_SCORE}% | payout {OTC_EDGE_WATCHER_MIN_PAYOUT}%",
             f"⏱ الفحص كل: {OTC_EDGE_WATCHER_SCAN_SECONDS} ثواني",
@@ -8730,11 +8688,11 @@ def build_otc_edge_watcher_status_message(owner_id: int | None = None, prefix: s
             f"🧭 وضع التوقيت: {'إغلاق شمعة M1 ✅' if _otc_edge_timing_mode() == 'm1_candle_close' else 'Fixed 60s'}",
             f"🪟 نافذة التنبيه: من الثانية {OTC_EDGE_ENTRY_MIN_SECOND} إلى {min(OTC_EDGE_ENTRY_LAST_ALERT_SECOND, OTC_EDGE_ENTRY_WINDOW_SECONDS - OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS)} | الدخول مسموح حتى الثانية {OTC_EDGE_ENTRY_WINDOW_SECONDS}",
             f"🔒 القفل بعد التنبيه: حتى نهاية الصفقة الحالية",
-            f"📨 تنبيهات مرسلة منذ التشغيل: {state.get('alerts_sent', 0)}",
+            f"📨 تنبيهات مرسلة منذ التشغيل: {_otc_edge_watcher_state.get('alerts_sent', 0)}",
         ])
-        remain = _otc_edge_active_trade_remaining(state, time_module.time())
+        remain = _otc_edge_active_trade_remaining(time_module.time())
         if remain > 0:
-            active_trade = state.get("active_trade") or {}
+            active_trade = _otc_edge_watcher_state.get("active_trade") or {}
             close_extra = ""
             if active_trade.get("close_text"):
                 close_extra = f" | الإغلاق: {active_trade.get('close_text')} UTC+3"
@@ -8743,10 +8701,10 @@ def build_otc_edge_watcher_status_message(owner_id: int | None = None, prefix: s
                 "🔒 صفقة حالية تحت المتابعة:",
                 f"• {active_trade.get('pair')} {_otc_edge_direction_icon(active_trade.get('direction'))} | باقي تقريبًا {remain} ثانية{close_extra}",
             ])
-        if state.get("last_timing_skip"):
+        if _otc_edge_watcher_state.get("last_timing_skip"):
             lines.extend([
                 "",
-                f"⏳ آخر منع بسبب التوقيت: {state.get('last_timing_skip')}",
+                f"⏳ آخر منع بسبب التوقيت: {_otc_edge_watcher_state.get('last_timing_skip')}",
             ])
         if started_at:
             lines.append(f"بدأت: {format_dt_ar(started_at)}")
@@ -8760,134 +8718,50 @@ def build_otc_edge_watcher_status_message(owner_id: int | None = None, prefix: s
                 "آخر فرصة رآها البوت:",
                 f"• {last_candidate.get('pair')} {_otc_edge_direction_icon(last_candidate.get('direction'))} | {last_candidate.get('score')}% | payout {last_candidate.get('payout')}%",
             ])
-        if state.get("last_error"):
-            lines.append(f"⚠️ آخر خطأ: {state.get('last_error')}")
+        if _otc_edge_watcher_state.get("last_error"):
+            lines.append(f"⚠️ آخر خطأ: {_otc_edge_watcher_state.get('last_error')}")
         return "\n".join(lines)[:3900]
     except Exception as e:
         return f"تعذر عرض حالة المراقبة: {e}"
 
 
-def _otc_edge_get_candle_by_bucket(symbol: str, bucket_ts: float) -> dict:
-    try:
-        with quotex_otc_feed.lock:
-            candle = (quotex_otc_feed.candles.get(symbol) or {}).get(int(bucket_ts))
-            return dict(candle) if candle else {}
-    except Exception:
-        return {}
-
-
-def _otc_edge_result_from_prices(direction: str, entry_price, close_price) -> str:
-    try:
-        direction = str(direction or "").upper()
-        entry = float(entry_price)
-        close = float(close_price)
-        diff = close - entry
-        if abs(diff) <= float(OTC_LIVE_TIE_EPSILON):
-            return "loss"
-        if direction == "CALL":
-            return "win" if diff > 0 else "loss"
-        if direction == "PUT":
-            return "win" if diff < 0 else "loss"
-    except Exception:
-        return "loss"
-    return "loss"
-
-
-async def _otc_edge_check_active_trade_result(context: ContextTypes.DEFAULT_TYPE, owner_id: int, state: dict):
-    try:
-        trade = state.get("active_trade") or {}
-        if not trade or bool(trade.get("result_sent")):
-            return
-
-        now_ts = time_module.time()
-        close_bucket_ts = float(trade.get("close_bucket_ts") or 0)
-        # انتظر إغلاق الشمعة + هامش صغير حتى يتحدث close في كاش Quotex.
-        if close_bucket_ts and now_ts < close_bucket_ts + int(OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS):
-            return
-
-        symbol = str(trade.get("symbol") or "")
-        candle = _otc_edge_get_candle_by_bucket(symbol, float(trade.get("entry_bucket_ts") or 0))
-
-        # إذا لم تصل الشمعة بعد، انتظر قليلًا. لا نرسل صفقة جديدة قبل حسم النتيجة.
-        attempts = int(trade.get("result_attempts", 0) or 0) + 1
-        trade["result_attempts"] = attempts
-        state["active_trade"] = trade
-
-        if not candle or candle.get("close") is None:
-            if attempts < 8:
-                return
-            # بعد عدة محاولات، لا نترك المستخدم معلقًا للأبد.
-            result = "loss"
-            close_price = None
-        else:
-            close_price = candle.get("close")
-            result = _otc_edge_result_from_prices(trade.get("direction"), trade.get("entry_price"), close_price)
-
-        chat_id = int(state.get("chat_id") or owner_id or ADMIN_TELEGRAM_ID)
-        sent = await safe_send_message(context.bot, chat_id=chat_id, text=result)
-        if sent is not None:
-            trade["result_sent"] = True
-            trade["result"] = result
-            trade["close_price"] = close_price
-            trade["result_at"] = now_iso()
-            state["last_result_at"] = now_iso()
-            state["results_sent"] = int(state.get("results_sent", 0) or 0) + 1
-            state["active_trade"] = None
-            state["active_trade_until_ts"] = 0.0
-    except Exception as e:
-        state["last_error"] = str(e)
-        logger.exception("OTC SNIPER result check failed | owner=%s | error=%s", owner_id, e)
-
-
 async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        # كل مستخدم مسموح له عنده مراقبة مستقلة.
-        for owner_id, state in _iter_otc_edge_watcher_states():
-            try:
-                if not bool(state.get("enabled")):
-                    continue
+        if not bool(_otc_edge_watcher_state.get("enabled")):
+            return
+        _otc_edge_watcher_state["last_scan_at"] = now_iso()
 
-                await _otc_edge_check_active_trade_result(context, int(owner_id), state)
+        candidates = _otc_edge_collect_watcher_candidates()
+        if candidates:
+            _otc_edge_watcher_state["last_candidate"] = {
+                "pair": candidates[0].get("pair"),
+                "direction": candidates[0].get("direction"),
+                "score": candidates[0].get("score"),
+                "payout": candidates[0].get("payout"),
+                "pattern": candidates[0].get("pattern"),
+            }
 
-                # إذا ما زالت صفقة تحت الانتظار أو لم تُحسم نتيجتها بعد، لا نرسل صفقة جديدة.
-                if _otc_edge_has_pending_trade(state) or _otc_edge_active_trade_remaining(state, time_module.time()) > 0:
-                    continue
-
-                state["last_scan_at"] = now_iso()
-
-                candidates = _otc_edge_collect_watcher_candidates(state)
-                if candidates:
-                    state["last_candidate"] = {
-                        "pair": candidates[0].get("pair"),
-                        "direction": candidates[0].get("direction"),
-                        "score": candidates[0].get("score"),
-                        "payout": candidates[0].get("payout"),
-                        "pattern": candidates[0].get("pattern"),
-                    }
-
-                now_ts = time_module.time()
-                for item in candidates:
-                    if not _otc_edge_can_alert(state, item, now_ts):
-                        continue
-                    chat_id = int(state.get("chat_id") or owner_id or ADMIN_TELEGRAM_ID)
-                    sent = await safe_send_message(
-                        context.bot,
-                        chat_id=chat_id,
-                        text=build_otc_edge_entry_alert_message(item, state),
-                    )
-                    if sent:
-                        _otc_edge_set_active_trade_lock(state, item, now_ts)
-                        state["last_alert_at"] = now_iso()
-                        state["alerts_sent"] = int(state.get("alerts_sent", 0) or 0) + 1
-                        times = list(state.get("alert_times") or [])
-                        times.append(now_ts)
-                        state["alert_times"] = [float(t) for t in times if now_ts - float(t) < 3600]
-                    break
-            except Exception as inner_e:
-                state["last_error"] = str(inner_e)
-                logger.exception("OTC SNIPER per-user job error | owner=%s | error=%s", owner_id, inner_e)
+        now_ts = time_module.time()
+        for item in candidates:
+            if not _otc_edge_can_alert(item, now_ts):
+                continue
+            chat_id = int(_otc_edge_watcher_state.get("chat_id") or ADMIN_TELEGRAM_ID)
+            sent = await safe_send_message(
+                context.bot,
+                chat_id=chat_id,
+                text=build_otc_edge_entry_alert_message(item),
+            )
+            if sent:
+                _otc_edge_set_active_trade_lock(item, now_ts)
+                _otc_edge_watcher_state["last_alert_at"] = now_iso()
+                _otc_edge_watcher_state["alerts_sent"] = int(_otc_edge_watcher_state.get("alerts_sent", 0) or 0) + 1
+                times = list(_otc_edge_watcher_state.get("alert_times") or [])
+                times.append(now_ts)
+                _otc_edge_watcher_state["alert_times"] = [float(t) for t in times if now_ts - float(t) < 3600]
+            break
     except Exception as e:
-        logger.exception("OTC SNIPER watcher job error: %s", e)
+        _otc_edge_watcher_state["last_error"] = str(e)
+        logger.exception("OTC Edge watcher job error: %s", e)
 
 
 def build_otc_edge_patterns_report() -> str:
@@ -8896,7 +8770,7 @@ def build_otc_edge_patterns_report() -> str:
         decided = [t for t in trades if str(t.get("result")) in {"win", "loss"}]
         if not decided:
             return (
-                "📊 تقرير الأنماط - OTC SNIPER\n"
+                "📊 تقرير الأنماط - OTC Edge\n"
                 "━━━━━━━━━━━━━━\n\n"
                 "لا توجد نتائج OTC Live كافية محفوظة بعد لبناء تقرير تاريخي.\n"
                 "يمكنك استخدام زر 🔎 فحص السوق الآن للحصول على قراءة مباشرة من الكاش الحي."
@@ -8924,7 +8798,7 @@ def build_otc_edge_patterns_report() -> str:
         best_dirs = sorted(direction_stats.values(), key=lambda v: (_rate(v), v["total"]), reverse=True)[:8]
 
         lines = [
-            "📊 تقرير الأنماط - OTC SNIPER",
+            "📊 تقرير الأنماط - OTC Edge",
             "━━━━━━━━━━━━━━",
             f"آخر نتائج محسوبة: {len(decided)} صفقة",
             "",
@@ -11386,17 +11260,58 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
     if lang is None:
         lang = get_user_language(user_id)
 
+    sniper_allowed = is_otc_sniper_user(user_id)
+
     if is_otc_list_manager(user_id) and not is_admin(user_id):
-        return otc_list_manager_keyboard if lang != "en" else main_keyboard_en
+        if lang == "en":
+            return main_keyboard_en
+        rows = [
+            ["📊 توليد إشارات"],
+            ["🧠 غرفة جلسة تداول"],
+        ]
+        if sniper_allowed:
+            rows.append(["OTC SNIPER"])
+        rows.extend([
+            ["👤 حالة حسابي", "🎥 مشاهدة فيديو شرح البوت"],
+            ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
+            ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
+        ])
+        return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
     if is_admin(user_id):
+        if lang == "en":
+            rows = [
+                ["📊 Generate Signals"],
+                ["🧠 Trading Session Room"],
+            ]
+            if sniper_allowed:
+                rows.append(["OTC SNIPER"])
+            rows.extend([
+                ["👤 My Account", "📞 Contact Support"],
+                ["🌐 Change Language", "🛠 Admin Panel"],
+            ])
+            return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+        rows = [
+            ["📊 توليد إشارات"],
+            ["🧠 غرفة جلسة تداول"],
+        ]
+        if sniper_allowed:
+            rows.append(["OTC SNIPER"])
+        rows.extend([
+            ["👤 حالة حسابي", "📞 تواصل مع المسؤول"],
+            ["🌐 تغيير اللغة", "🛠 لوحة الأدمن"],
+        ])
+        return ReplyKeyboardMarkup(rows, resize_keyboard=True)
+
+    if sniper_allowed:
         if lang == "en":
             return ReplyKeyboardMarkup(
                 [
                     ["📊 Generate Signals"],
                     ["🧠 Trading Session Room"],
                     ["OTC SNIPER"],
-                    ["👤 My Account", "📞 Contact Support"],
-                    ["🌐 Change Language", "🛠 Admin Panel"],
+                    ["👤 My Account", "🎥 Watch Bot Tutorial"],
+                    ["📞 Contact Support", "🌐 Change Language"],
                 ],
                 resize_keyboard=True
             )
@@ -11405,22 +11320,12 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
                 ["📊 توليد إشارات"],
                 ["🧠 غرفة جلسة تداول"],
                 ["OTC SNIPER"],
-                ["👤 حالة حسابي", "📞 تواصل مع المسؤول"],
-                ["🌐 تغيير اللغة", "🛠 لوحة الأدمن"],
+                ["👤 حالة حسابي", "🎥 مشاهدة فيديو شرح البوت"],
+                ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
             ],
             resize_keyboard=True
         )
-    if is_otc_sniper_user(user_id):
-        return otc_sniper_main_keyboard if lang != "en" else ReplyKeyboardMarkup(
-            [
-                ["📊 Generate Signals"],
-                ["🧠 Trading Session Room"],
-                ["OTC SNIPER"],
-                ["👤 My Account", "🎥 Watch Bot Tutorial"],
-                ["📞 Contact Support", "🌐 Change Language"],
-            ],
-            resize_keyboard=True
-        )
+
     return main_keyboard_en if lang == "en" else main_keyboard
 
 
@@ -12182,14 +12087,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_welcome_flow(update, lang)
         return
 
-    # مستخدمو OTC SNIPER الخاص يظهر لهم الزر حتى لو لم يكونوا ضمن تفعيل الإشارات العادي.
-    if is_otc_sniper_user(user.id):
-        await update.message.reply_text(
-            f"✅ أهلًا {user.first_name}\nتم تفعيل OTC SNIPER لحسابك.",
-            reply_markup=build_main_menu_for_user(user.id, lang)
-        )
-        return
-
     if is_approved(user.id):
         if lang == "en":
             await update.message.reply_text(
@@ -12523,6 +12420,385 @@ def translate_real_signal_message_to_en(msg: str) -> str:
         out = out.replace(ar, en)
     return out
 
+
+
+
+# ===== OTC SNIPER private wrapper =====
+# مهم: هذا القسم لا يغيّر منطق OTC Edge Engine ولا يعكس الاتجاه.
+# يستخدم analyze_otc_edge_pair / scan_otc_edge_market كما هي، ثم يرسل تنبيهًا مختصرًا ونتيجة الصفقة.
+_otc_sniper_sessions = {}
+
+
+def _otc_sniper_state(user_id: int) -> dict:
+    uid = int(user_id)
+    state = _otc_sniper_sessions.setdefault(uid, {
+        "enabled": False,
+        "mode": "pairs",
+        "pairs": [],
+        "chat_id": uid,
+        "started_at": None,
+        "last_scan_at": None,
+        "last_alert_at": None,
+        "last_candidate": None,
+        "last_error": None,
+        "alerts_sent": 0,
+        "active_trade_until_ts": 0.0,
+        "active_trade": None,
+        "last_alerts": {},
+        "alert_times": [],
+    })
+    return state
+
+
+def _otc_sniper_job_name(user_id: int) -> str:
+    return f"otc_sniper_watch_{int(user_id)}"
+
+
+def _otc_sniper_remove_jobs(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    try:
+        for job in context.job_queue.get_jobs_by_name(_otc_sniper_job_name(user_id)):
+            job.schedule_removal()
+    except Exception:
+        pass
+
+
+def build_otc_sniper_menu_message(user_id: int) -> str:
+    state = _otc_sniper_state(user_id)
+    status = "شغال ✅" if state.get("enabled") else "متوقف ⏸"
+    return (
+        "🎯 OTC SNIPER\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "هذه نسخة مختصرة من OTC Edge Engine.\n"
+        "نفس منطق التحليل والاتجاه بدون أي عكس أو تعديل.\n\n"
+        f"الحالة: {status}\n\n"
+        "الأفضل تختار زوج واحد للمراقبة، وعند ظهور فرصة قوية سيصلك فقط:\n"
+        "🟢 CALL\n"
+        "أو\n"
+        "🔴 PUT\n\n"
+        "وبعد إغلاق شمعة M1 سيصلك:\n"
+        "win أو loss"
+    )
+
+
+def _otc_sniper_collect_candidates(user_id: int) -> list[dict]:
+    state = _otc_sniper_state(user_id)
+    try:
+        mode = str(state.get("mode") or "pairs")
+        candidates = []
+        if mode == "pairs":
+            for pair in list(state.get("pairs") or []):
+                symbol = get_otc_symbol_for_pair(pair)
+                if not symbol:
+                    resolved_pair, resolved_symbol = _otc_edge_resolve_pair_text(pair)
+                    pair = resolved_pair or pair
+                    symbol = resolved_symbol
+                if not symbol:
+                    continue
+                item = analyze_otc_edge_pair(pair, symbol=symbol, include_history=True)
+                if item.get("ok"):
+                    candidates.append(item)
+        else:
+            candidates = scan_otc_edge_market(limit=OTC_EDGE_WATCHER_TOP_ALERT_POOL, include_weak=False)
+
+        candidates = [c for c in candidates if c.get("ok")]
+        candidates.sort(key=lambda x: (int(x.get("score", 0) or 0), int(x.get("payout", 0) or 0)), reverse=True)
+        return candidates
+    except Exception as e:
+        state["last_error"] = str(e)
+        logger.exception("OTC SNIPER collect failed: %s", e)
+        return []
+
+
+def _otc_sniper_active_remaining(user_id: int, now_ts: float | None = None) -> int:
+    state = _otc_sniper_state(user_id)
+    try:
+        now_ts = float(now_ts or time_module.time())
+        return max(0, int(float(state.get("active_trade_until_ts", 0) or 0) - now_ts))
+    except Exception:
+        return 0
+
+
+def _otc_sniper_rate_limited(user_id: int, now_ts: float) -> bool:
+    state = _otc_sniper_state(user_id)
+    try:
+        times = [float(t) for t in list(state.get("alert_times") or []) if now_ts - float(t) < 3600]
+        state["alert_times"] = times
+        return len(times) >= int(OTC_EDGE_WATCHER_MAX_ALERTS_PER_HOUR)
+    except Exception:
+        return False
+
+
+def _otc_sniper_can_alert(user_id: int, item: dict, now_ts: float) -> bool:
+    state = _otc_sniper_state(user_id)
+    try:
+        if _otc_sniper_active_remaining(user_id, now_ts) > 0:
+            return False
+        # نفس بوابة توقيت OTC Edge الموجودة، بدون تغيير التحليل أو الاتجاه.
+        if not _otc_edge_entry_window_ok():
+            return False
+        if int(item.get("score", 0) or 0) < int(OTC_EDGE_WATCHER_MIN_SCORE):
+            return False
+        if int(item.get("payout", 0) or 0) < int(OTC_EDGE_WATCHER_MIN_PAYOUT):
+            return False
+        if float(item.get("tick_age", 999) or 999) > max(3, int(OTC_EDGE_TICK_MAX_AGE_SECONDS)):
+            return False
+        if _otc_sniper_rate_limited(user_id, now_ts):
+            return False
+        key = f"{item.get('pair')}|{item.get('direction')}|{item.get('pattern')}"
+        last_alerts = state.setdefault("last_alerts", {})
+        last_ts = float(last_alerts.get(key, 0) or 0)
+        if now_ts - last_ts < int(OTC_EDGE_WATCHER_COOLDOWN_SECONDS):
+            return False
+        last_alerts[key] = now_ts
+        return True
+    except Exception:
+        return False
+
+
+def _otc_sniper_latest_entry(symbol: str, fallback_price=None) -> tuple[float | None, float]:
+    try:
+        snap = quotex_otc_feed.snapshot(symbol) if "quotex_otc_feed" in globals() else {}
+        price = snap.get("price")
+        ts = snap.get("time") or snap.get("ts") or snap.get("timestamp") or time_module.time()
+        if price is None:
+            price = fallback_price
+        ts = float(ts)
+        if ts > 1e12:
+            ts = ts / 1000.0
+        return (float(price) if price is not None else None), ts
+    except Exception:
+        try:
+            return (float(fallback_price) if fallback_price is not None else None), time_module.time()
+        except Exception:
+            return None, time_module.time()
+
+
+def _otc_sniper_result_delay(entry_ts: float) -> tuple[float, str, float]:
+    try:
+        timing = _otc_edge_current_candle_timing()
+        if _otc_edge_timing_mode() == "m1_candle_close":
+            close_dt = timing.get("close")
+            close_ts = close_dt.timestamp() if hasattr(close_dt, "timestamp") else (int(float(entry_ts) // 60) * 60 + 60)
+            delay = max(1.0, close_ts - time_module.time() + int(OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS))
+            return delay, str(timing.get("close_text") or ""), float(close_ts)
+        delay = max(1.0, float(OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS) + int(OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS))
+        close_ts = time_module.time() + delay
+        return delay, "", close_ts
+    except Exception:
+        close_ts = int(float(entry_ts) // 60) * 60 + 60
+        delay = max(1.0, close_ts - time_module.time() + 3)
+        return delay, "", float(close_ts)
+
+
+def _otc_sniper_alert_text(user_id: int, item: dict) -> str:
+    try:
+        state = _otc_sniper_state(user_id)
+        direction_text = _otc_edge_direction_icon(item.get("direction"))
+        # إذا مراقبة زوج واحد فقط، لا نزعج المستخدم باسم الزوج. أما مراقبة كل السوق/عدة أزواج فتحتاج اسم الزوج.
+        pairs = list(state.get("pairs") or [])
+        if str(state.get("mode")) == "pairs" and len(pairs) == 1:
+            return direction_text
+        return f"{item.get('pair')}\n{direction_text}"
+    except Exception:
+        return _otc_edge_direction_icon(item.get("direction"))
+
+
+def _otc_sniper_store_active_trade(user_id: int, item: dict, entry_price: float | None, entry_ts: float, close_ts: float, close_text: str):
+    state = _otc_sniper_state(user_id)
+    state["active_trade_until_ts"] = float(close_ts) + int(OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS)
+    state["active_trade"] = {
+        "pair": item.get("pair"),
+        "symbol": item.get("symbol"),
+        "direction": str(item.get("direction") or "").upper(),
+        "entry_price": entry_price,
+        "entry_ts": entry_ts,
+        "close_ts": close_ts,
+        "close_text": close_text,
+        "score": item.get("score"),
+        "payout": item.get("payout"),
+        "pattern": item.get("pattern"),
+    }
+
+
+def _otc_sniper_close_price(symbol: str, entry_ts: float):
+    try:
+        candle = quotex_otc_feed.candle(symbol, entry_ts) if "quotex_otc_feed" in globals() else {}
+        if candle and candle.get("close") is not None:
+            return float(candle.get("close")), candle
+    except Exception:
+        pass
+    try:
+        snap = quotex_otc_feed.snapshot(symbol) if "quotex_otc_feed" in globals() else {}
+        if snap and snap.get("price") is not None:
+            return float(snap.get("price")), {}
+    except Exception:
+        pass
+    return None, {}
+
+
+async def otc_sniper_result_job(context: ContextTypes.DEFAULT_TYPE):
+    user_id = None
+    try:
+        data = context.job.data or {}
+        user_id = int(data.get("user_id"))
+        trade = dict(data.get("trade") or {})
+        state = _otc_sniper_state(user_id)
+        symbol = str(trade.get("symbol") or "")
+        direction = str(trade.get("direction") or "").upper()
+        entry_price = trade.get("entry_price")
+        entry_ts = float(trade.get("entry_ts") or time_module.time())
+        close_price, candle = _otc_sniper_close_price(symbol, entry_ts)
+
+        result = resolve_candle_direction_result(direction, entry_price, close_price)
+        # المطلوب أن تصل النتيجة win/loss فقط. إذا صار تعادل نعتبره loss حتى لا يرسل نص ثالث.
+        result_text = "win" if result == "win" else "loss"
+
+        await safe_send_message(context.bot, chat_id=user_id, text=result_text)
+
+        state["active_trade_until_ts"] = 0.0
+        state["active_trade"] = None
+        state["last_result"] = {
+            "pair": trade.get("pair"),
+            "direction": direction,
+            "entry_price": entry_price,
+            "close_price": close_price,
+            "result": result_text,
+            "closed_at": now_iso(),
+            "candle_ticks": candle.get("ticks") if isinstance(candle, dict) else None,
+        }
+        logger.info(
+            "OTC SNIPER result | user=%s | pair=%s | direction=%s | entry=%s | close=%s | result=%s",
+            user_id, trade.get("pair"), direction, entry_price, close_price, result_text,
+        )
+    except Exception as e:
+        logger.exception("OTC SNIPER result job error: %s", e)
+        if user_id:
+            try:
+                await safe_send_message(context.bot, chat_id=user_id, text="loss")
+            except Exception:
+                pass
+
+
+async def otc_sniper_watcher_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        data = context.job.data or {}
+        user_id = int(data.get("user_id"))
+        state = _otc_sniper_state(user_id)
+        if not bool(state.get("enabled")):
+            return
+        state["last_scan_at"] = now_iso()
+
+        candidates = _otc_sniper_collect_candidates(user_id)
+        if candidates:
+            state["last_candidate"] = {
+                "pair": candidates[0].get("pair"),
+                "direction": candidates[0].get("direction"),
+                "score": candidates[0].get("score"),
+                "payout": candidates[0].get("payout"),
+                "pattern": candidates[0].get("pattern"),
+            }
+
+        now_ts = time_module.time()
+        for item in candidates:
+            if not _otc_sniper_can_alert(user_id, item, now_ts):
+                continue
+
+            # لا نغيّر الاتجاه هنا نهائيًا. الاتجاه هو نفسه الخارج من OTC Edge Engine.
+            entry_price, entry_ts = _otc_sniper_latest_entry(str(item.get("symbol") or ""), item.get("price"))
+            if entry_price is None:
+                continue
+            delay, close_text, close_ts = _otc_sniper_result_delay(entry_ts)
+            sent = await safe_send_message(context.bot, chat_id=user_id, text=_otc_sniper_alert_text(user_id, item))
+            if sent:
+                _otc_sniper_store_active_trade(user_id, item, entry_price, entry_ts, close_ts, close_text)
+                trade = dict(_otc_sniper_state(user_id).get("active_trade") or {})
+                context.job_queue.run_once(
+                    otc_sniper_result_job,
+                    when=delay,
+                    data={"user_id": user_id, "trade": trade},
+                    name=f"otc_sniper_result_{user_id}_{int(entry_ts)}",
+                )
+                state["last_alert_at"] = now_iso()
+                state["alerts_sent"] = int(state.get("alerts_sent", 0) or 0) + 1
+                times = list(state.get("alert_times") or [])
+                times.append(now_ts)
+                state["alert_times"] = [float(t) for t in times if now_ts - float(t) < 3600]
+            break
+    except Exception as e:
+        try:
+            user_id = int((context.job.data or {}).get("user_id"))
+            _otc_sniper_state(user_id)["last_error"] = str(e)
+        except Exception:
+            pass
+        logger.exception("OTC SNIPER watcher job error: %s", e)
+
+
+def start_otc_sniper(context: ContextTypes.DEFAULT_TYPE, user_id: int, mode: str = "pairs", pairs: list[str] | None = None) -> str:
+    uid = int(user_id)
+    if not is_otc_sniper_user(uid):
+        return "⛔ ليس لديك صلاحية OTC SNIPER."
+    state = _otc_sniper_state(uid)
+    state.update({
+        "enabled": True,
+        "mode": str(mode or "pairs"),
+        "pairs": list(pairs or []),
+        "chat_id": uid,
+        "started_at": now_iso(),
+        "last_error": None,
+        "last_alerts": {},
+        "alert_times": [],
+        "active_trade_until_ts": 0.0,
+        "active_trade": None,
+    })
+    _otc_sniper_remove_jobs(context, uid)
+    context.job_queue.run_repeating(
+        otc_sniper_watcher_job,
+        interval=OTC_EDGE_WATCHER_SCAN_SECONDS,
+        first=1,
+        data={"user_id": uid},
+        name=_otc_sniper_job_name(uid),
+    )
+    if state["mode"] == "pairs":
+        pairs_text = "\n".join(f"• {p}" for p in state.get("pairs") or [])
+        return "✅ تم تشغيل OTC SNIPER على الزوج/الأزواج:\n" + pairs_text
+    return "✅ تم تشغيل OTC SNIPER على كل السوق."
+
+
+def stop_otc_sniper(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
+    uid = int(user_id)
+    state = _otc_sniper_state(uid)
+    state["enabled"] = False
+    state["active_trade_until_ts"] = 0.0
+    state["active_trade"] = None
+    _otc_sniper_remove_jobs(context, uid)
+    return "🛑 تم إيقاف OTC SNIPER."
+
+
+def build_otc_sniper_status(user_id: int) -> str:
+    state = _otc_sniper_state(user_id)
+    lines = [
+        "📋 حالة OTC SNIPER",
+        "━━━━━━━━━━━━━━",
+        f"الحالة: {'شغال ✅' if state.get('enabled') else 'متوقف ⏸'}",
+        f"الوضع: {'كل السوق' if state.get('mode') == 'all' else 'زوج محدد'}",
+        f"تنبيهات مرسلة: {state.get('alerts_sent', 0)}",
+    ]
+    if state.get("pairs"):
+        lines.append("الأزواج:")
+        lines.extend([f"• {p}" for p in list(state.get("pairs") or [])[:10]])
+    remain = _otc_sniper_active_remaining(user_id)
+    if remain > 0:
+        tr = state.get("active_trade") or {}
+        lines.append(f"🔒 صفقة حالية: {tr.get('pair')} {_otc_edge_direction_icon(tr.get('direction'))} | باقي {remain} ثانية")
+    if state.get("last_candidate"):
+        c = state.get("last_candidate") or {}
+        lines.append(f"آخر فرصة: {c.get('pair')} {_otc_edge_direction_icon(c.get('direction'))} | {c.get('score')}%")
+    if state.get("last_result"):
+        r = state.get("last_result") or {}
+        lines.append(f"آخر نتيجة: {r.get('result')} | {r.get('pair')}")
+    if state.get("last_error"):
+        lines.append(f"آخر خطأ: {state.get('last_error')}")
+    return "\n".join(lines)[:3900]
 
 async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
@@ -13353,68 +13629,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await handle_trading_room_message(update, context):
         return
 
-    # OTC SNIPER must work before the English fallback because its buttons are shared/private.
-    if text in {"OTC SNIPER", "🧠 OTC Edge Engine"}:
-        if not is_otc_sniper_user(user.id):
-            await update.message.reply_text("❌ هذه الميزة خاصة وغير مفعلة لحسابك.", reply_markup=build_main_menu_for_user(user.id))
-            return
-        reset_signal_state(context)
-        await update.message.reply_text(
-            build_otc_edge_menu_message(owner_id=user.id),
-            reply_markup=admin_otc_edge_keyboard
-        )
-        return
-
-    if is_otc_sniper_user(user.id):
-        if text == "🔎 فحص السوق الآن":
-            await update.message.reply_text("🔎 جاري فحص سلوك أزواج OTC الحية...")
-            await update.message.reply_text(build_otc_edge_scan_message(), reply_markup=admin_otc_edge_keyboard)
-            return
-        if text == "🚀 مراقبة كل السوق":
-            await update.message.reply_text(start_otc_edge_watcher(user.id, user.id, mode="all"), reply_markup=admin_otc_edge_keyboard)
-            return
-        if text == "🎯 مراقبة زوج محدد":
-            context.user_data["step"] = "otc_edge_watch_waiting_pair"
-            await update.message.reply_text(
-                "🎯 أرسل الزوج الذي تريد مراقبته.\n\nمثال:\nGBP/NZD (OTC)\n\nيمكنك أيضًا إرسال عدة أزواج، كل زوج بسطر منفصل.",
-                reply_markup=admin_otc_edge_keyboard
-            )
-            return
-        if text in {"🛑 إيقاف OTC SNIPER", "🛑 إيقاف مراقبة Edge"}:
-            await update.message.reply_text(stop_otc_edge_watcher(user.id), reply_markup=admin_otc_edge_keyboard)
-            return
-        if text in {"📋 حالة OTC SNIPER", "📋 حالة مراقبة Edge"}:
-            await update.message.reply_text(build_otc_edge_watcher_status_message(owner_id=user.id), reply_markup=admin_otc_edge_keyboard)
-            return
-        if step == "otc_edge_watch_waiting_pair":
-            pairs, errors = parse_otc_edge_watch_pairs(text)
-            context.user_data["step"] = None
-            if not pairs:
-                err_text = "\n".join(f"• {x}" for x in errors[:8]) if errors else "لم أستطع قراءة الزوج."
-                await update.message.reply_text(
-                    "❌ لم يتم تشغيل المراقبة.\n"
-                    f"الأزواج غير المفهومة:\n{err_text}\n\n"
-                    "أرسل مثالًا بهذا الشكل:\nGBP/NZD (OTC)",
-                    reply_markup=admin_otc_edge_keyboard
-                )
-                return
-            msg = start_otc_edge_watcher(user.id, user.id, mode="pairs", pairs=pairs)
-            if errors:
-                msg += "\n\n⚠️ تم تجاهل بعض المدخلات غير المفهومة:\n" + "\n".join(f"• {x}" for x in errors[:6])
-            await update.message.reply_text(msg, reply_markup=admin_otc_edge_keyboard)
-            return
-        if text == "📊 تقرير الأنماط":
-            await update.message.reply_text(build_otc_edge_patterns_report(), reply_markup=admin_otc_edge_keyboard)
-            return
-        if text == "🧪 فحص زوج محدد":
-            context.user_data["step"] = "otc_edge_waiting_pair"
-            await update.message.reply_text("🧪 أرسل اسم الزوج لفحص Edge عليه، مثال:\nUSD/BRL (OTC)", reply_markup=admin_otc_edge_keyboard)
-            return
-        if step == "otc_edge_waiting_pair":
-            context.user_data["step"] = None
-            await update.message.reply_text(build_otc_edge_single_pair_message(text), reply_markup=admin_otc_edge_keyboard)
-            return
-
     if lang == "en":
         await handle_message_en(update, context)
         return
@@ -13426,6 +13640,50 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+
+    # ===== OTC SNIPER private access =====
+    if text == "OTC SNIPER":
+        if not is_otc_sniper_user(user.id):
+            await update.message.reply_text("⛔ هذه الميزة خاصة.", reply_markup=build_main_menu_for_user(user.id))
+            return
+        reset_signal_state(context)
+        await update.message.reply_text(build_otc_sniper_menu_message(user.id), reply_markup=otc_sniper_keyboard)
+        return
+
+    if is_otc_sniper_user(user.id):
+        if text == "🎯 مراقبة زوج SNIPER":
+            context.user_data["step"] = "otc_sniper_waiting_pair"
+            await update.message.reply_text(
+                "🎯 أرسل الزوج الذي تريد مراقبته.\n\nمثال:\nUSD/BDT (OTC)\n\nأو عدة أزواج، كل زوج بسطر.",
+                reply_markup=otc_sniper_keyboard
+            )
+            return
+        if text == "🚀 مراقبة كل السوق SNIPER":
+            await update.message.reply_text(start_otc_sniper(context, user.id, mode="all"), reply_markup=otc_sniper_keyboard)
+            return
+        if text == "🛑 إيقاف OTC SNIPER":
+            await update.message.reply_text(stop_otc_sniper(context, user.id), reply_markup=otc_sniper_keyboard)
+            return
+        if text == "📋 حالة OTC SNIPER":
+            await update.message.reply_text(build_otc_sniper_status(user.id), reply_markup=otc_sniper_keyboard)
+            return
+        if step == "otc_sniper_waiting_pair":
+            pairs, errors = parse_otc_edge_watch_pairs(text)
+            context.user_data["step"] = None
+            if not pairs:
+                err_text = "\n".join(f"• {x}" for x in errors[:8]) if errors else "لم أستطع قراءة الزوج."
+                await update.message.reply_text(
+                    "❌ لم يتم تشغيل OTC SNIPER.\n"
+                    f"الأزواج غير المفهومة:\n{err_text}\n\n"
+                    "أرسل مثالًا بهذا الشكل:\nUSD/BDT (OTC)",
+                    reply_markup=otc_sniper_keyboard
+                )
+                return
+            msg = start_otc_sniper(context, user.id, mode="pairs", pairs=pairs)
+            if errors:
+                msg += "\n\n⚠️ تم تجاهل بعض المدخلات غير المفهومة:\n" + "\n".join(f"• {x}" for x in errors[:6])
+            await update.message.reply_text(msg, reply_markup=otc_sniper_keyboard)
+            return
 
     # ===== SIGNAL-ONLY ACCESS GATE =====
     # غير المفعّل يُمنع فقط من الإشارات، وليس من أزرار البداية أو التجربة.
@@ -14271,99 +14529,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-    # ===== OTC SNIPER private feature =====
-    if text in {"OTC SNIPER", "🧠 OTC Edge Engine"}:
-        if not is_otc_sniper_user(user.id):
-            await update.message.reply_text("❌ هذه الميزة خاصة وغير مفعلة لحسابك.", reply_markup=build_main_menu_for_user(user.id))
-            return
-        reset_signal_state(context)
-        await update.message.reply_text(
-            build_otc_edge_menu_message(owner_id=user.id),
-            reply_markup=admin_otc_edge_keyboard
-        )
-        return
-
-    if is_otc_sniper_user(user.id):
-        if text == "🔎 فحص السوق الآن":
-            await update.message.reply_text("🔎 جاري فحص سلوك أزواج OTC الحية...")
-            await update.message.reply_text(
-                build_otc_edge_scan_message(),
-                reply_markup=admin_otc_edge_keyboard
-            )
-            return
-
-        if text == "🚀 مراقبة كل السوق":
-            await update.message.reply_text(
-                start_otc_edge_watcher(user.id, user.id, mode="all"),
-                reply_markup=admin_otc_edge_keyboard
-            )
-            return
-
-        if text == "🎯 مراقبة زوج محدد":
-            context.user_data["step"] = "otc_edge_watch_waiting_pair"
-            await update.message.reply_text(
-                "🎯 أرسل الزوج الذي تريد مراقبته.\n\n"
-                "مثال:\nGBP/NZD (OTC)\n\n"
-                "يمكنك أيضًا إرسال عدة أزواج، كل زوج بسطر منفصل.",
-                reply_markup=admin_otc_edge_keyboard
-            )
-            return
-
-        if text in {"🛑 إيقاف OTC SNIPER", "🛑 إيقاف مراقبة Edge"}:
-            await update.message.reply_text(
-                stop_otc_edge_watcher(user.id),
-                reply_markup=admin_otc_edge_keyboard
-            )
-            return
-
-        if text in {"📋 حالة OTC SNIPER", "📋 حالة مراقبة Edge"}:
-            await update.message.reply_text(
-                build_otc_edge_watcher_status_message(owner_id=user.id),
-                reply_markup=admin_otc_edge_keyboard
-            )
-            return
-
-        if step == "otc_edge_watch_waiting_pair":
-            pairs, errors = parse_otc_edge_watch_pairs(text)
-            context.user_data["step"] = None
-            if not pairs:
-                err_text = "\n".join(f"• {x}" for x in errors[:8]) if errors else "لم أستطع قراءة الزوج."
-                await update.message.reply_text(
-                    "❌ لم يتم تشغيل المراقبة.\n"
-                    f"الأزواج غير المفهومة:\n{err_text}\n\n"
-                    "أرسل مثالًا بهذا الشكل:\nGBP/NZD (OTC)",
-                    reply_markup=admin_otc_edge_keyboard
-                )
-                return
-            msg = start_otc_edge_watcher(user.id, user.id, mode="pairs", pairs=pairs)
-            if errors:
-                msg += "\n\n⚠️ تم تجاهل بعض المدخلات غير المفهومة:\n" + "\n".join(f"• {x}" for x in errors[:6])
-            await update.message.reply_text(msg, reply_markup=admin_otc_edge_keyboard)
-            return
-
-        if text == "📊 تقرير الأنماط":
-            await update.message.reply_text(
-                build_otc_edge_patterns_report(),
-                reply_markup=admin_otc_edge_keyboard
-            )
-            return
-
-        if text == "🧪 فحص زوج محدد":
-            context.user_data["step"] = "otc_edge_waiting_pair"
-            await update.message.reply_text(
-                "🧪 أرسل اسم الزوج لفحص Edge عليه، مثال:\nUSD/BRL (OTC)",
-                reply_markup=admin_otc_edge_keyboard
-            )
-            return
-
-        if step == "otc_edge_waiting_pair":
-            context.user_data["step"] = None
-            await update.message.reply_text(
-                build_otc_edge_single_pair_message(text),
-                reply_markup=admin_otc_edge_keyboard
-            )
-            return
-
     # ===== Admin panel =====
     if is_admin(user.id):
         if text == "🛠 لوحة الأدمن":
@@ -15059,7 +15224,7 @@ def main():
     logger.info("OTC Live auto publish channel is removed/disabled by owner request.")
 
     job_queue = app.job_queue
-    # مراقبة OTC SNIPER خاصة بالمستخدمين المسموحين فقط. لا تنشر على أي قناة.
+    # مراقبة OTC Edge خاصة بالأدمن فقط. لا ترسل للمستخدمين ولا تنشر على أي قناة.
     job_queue.run_repeating(
         otc_edge_watcher_job,
         interval=OTC_EDGE_WATCHER_SCAN_SECONDS,
