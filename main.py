@@ -396,7 +396,7 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["📥 الطلبات المعلقة", "📋 كافة المستخدمين"],
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
-        ["🧠 غرفة جلسة تداول"],
+        ["🧠 غرفة جلسة تداول", "🧠 OTC Edge Engine"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
         ["📢 رسالة جماعية"],
@@ -417,6 +417,15 @@ admin_channels_keyboard = ReplyKeyboardMarkup(
 admin_otc_stats_keyboard = ReplyKeyboardMarkup(
     [
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+admin_otc_edge_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🔎 فحص السوق الآن", "📊 تقرير الأنماط"],
+        ["🧪 فحص زوج محدد"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -7710,6 +7719,584 @@ def update_otc_live_learning_after_result(signal: dict, result: str):
 
 
 
+# ===== Admin-only OTC Edge Engine =====
+# هذا القسم لا يظهر للمستخدمين. وظيفته قراءة سلوك سوق OTC المباشر من كاش Quotex
+# واستخراج فرص إحصائية/أنماط متكررة بدون أي محاولة اختراق أو تجاوز للمنصة.
+OTC_EDGE_MIN_TICKS = int(os.getenv("OTC_EDGE_MIN_TICKS", "60"))
+OTC_EDGE_MIN_CANDLES = int(os.getenv("OTC_EDGE_MIN_CANDLES", "6"))
+OTC_EDGE_MIN_SCORE = int(os.getenv("OTC_EDGE_MIN_SCORE", "70"))
+OTC_EDGE_WATCH_SCORE = int(os.getenv("OTC_EDGE_WATCH_SCORE", "60"))
+OTC_EDGE_TOP_LIMIT = int(os.getenv("OTC_EDGE_TOP_LIMIT", "6"))
+OTC_EDGE_MIN_PAYOUT = int(os.getenv("OTC_EDGE_MIN_PAYOUT", str(OTC_LIVE_MIN_PAYOUT)))
+OTC_EDGE_TICK_MAX_AGE_SECONDS = int(os.getenv("OTC_EDGE_TICK_MAX_AGE_SECONDS", "20"))
+OTC_EDGE_HISTORY_LIMIT = int(os.getenv("OTC_EDGE_HISTORY_LIMIT", "80"))
+
+
+def _otc_edge_direction_icon(direction: str) -> str:
+    direction = str(direction or "").upper()
+    if direction == "CALL":
+        return "🟢 CALL"
+    if direction == "PUT":
+        return "🔴 PUT"
+    return "⚪ غير محدد"
+
+
+def _otc_edge_float(value, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return float(default)
+
+
+def _otc_edge_movement_metrics(prices: list[float]) -> dict:
+    try:
+        values = [float(x) for x in prices if x is not None]
+        if len(values) < 3:
+            return {"range": 0.0, "change": 0.0, "pressure": 0.0, "momentum": 0.0, "up": 0, "down": 0, "density": 0.0}
+        rng = max(values) - min(values)
+        change = values[-1] - values[0]
+        up = sum(1 for a, b in zip(values, values[1:]) if b > a)
+        down = sum(1 for a, b in zip(values, values[1:]) if b < a)
+        total_directional = max(1, up + down)
+        pressure = (up - down) / total_directional
+        momentum = min(abs(change) / rng, 1.0) if rng > 0 else 0.0
+        density = (up + down) / max(1, len(values) - 1)
+        return {
+            "range": rng,
+            "change": change,
+            "pressure": pressure,
+            "momentum": momentum,
+            "up": up,
+            "down": down,
+            "density": density,
+        }
+    except Exception:
+        return {"range": 0.0, "change": 0.0, "pressure": 0.0, "momentum": 0.0, "up": 0, "down": 0, "density": 0.0}
+
+
+def _otc_edge_candle_parts(candle: dict) -> dict:
+    try:
+        o = float(candle.get("open"))
+        h = float(candle.get("high"))
+        l = float(candle.get("low"))
+        cl = float(candle.get("close"))
+        rng = max(h - l, 0.0)
+        body = abs(cl - o)
+        return {
+            "open": o,
+            "high": h,
+            "low": l,
+            "close": cl,
+            "range": rng,
+            "body": body,
+            "body_ratio": body / rng if rng > 0 else 0.0,
+            "upper_wick": (h - max(o, cl)) / rng if rng > 0 else 0.0,
+            "lower_wick": (min(o, cl) - l) / rng if rng > 0 else 0.0,
+            "dir": 1 if cl > o else -1 if cl < o else 0,
+        }
+    except Exception:
+        return {
+            "open": 0.0,
+            "high": 0.0,
+            "low": 0.0,
+            "close": 0.0,
+            "range": 0.0,
+            "body": 0.0,
+            "body_ratio": 0.0,
+            "upper_wick": 0.0,
+            "lower_wick": 0.0,
+            "dir": 0,
+        }
+
+
+def _otc_edge_price_text(pair: str, price) -> str:
+    try:
+        return _safe_price_text(pair, float(price))
+    except Exception:
+        try:
+            return f"{float(price):.5f}"
+        except Exception:
+            return str(price)
+
+
+def _otc_edge_history_bias(pair: str, direction: str, limit: int | None = None) -> dict:
+    """قراءة سريعة من نتائج OTC Live المسجلة سابقًا إذا كانت موجودة.
+    ليست شرطًا للدخول؛ فقط تعطي سياق للأدمن.
+    """
+    try:
+        limit = int(limit or OTC_EDGE_HISTORY_LIMIT)
+        trades = get_otc_live_trades(limit=limit) if "get_otc_live_trades" in globals() else []
+        decided = [t for t in trades if str(t.get("result")) in {"win", "loss"}]
+        same_pair = [t for t in decided if str(t.get("pair")) == str(pair)]
+        same_direction = [t for t in same_pair if str(t.get("direction", "")).upper() == str(direction).upper()]
+
+        def _wr(rows):
+            if not rows:
+                return None
+            wins = sum(1 for t in rows if str(t.get("result")) == "win")
+            return round((wins / max(1, len(rows))) * 100, 1)
+
+        return {
+            "total": len(decided),
+            "pair_count": len(same_pair),
+            "pair_wr": _wr(same_pair),
+            "direction_count": len(same_direction),
+            "direction_wr": _wr(same_direction),
+        }
+    except Exception as e:
+        logger.debug("OTC Edge history bias unavailable: %s", e)
+        return {"total": 0, "pair_count": 0, "pair_wr": None, "direction_count": 0, "direction_wr": None}
+
+
+def analyze_otc_edge_pair(pair: str, symbol: str | None = None, include_history: bool = True) -> dict:
+    """يحلل زوج OTC واحد ويُرجع أفضل Edge سلوكي حالي.
+    لا ينفذ صفقات ولا يغيّر منطق المستخدمين، فقط قراءة أدمن.
+    """
+    try:
+        normalized = normalize_otc_currency_pair_name(pair, symbol) if symbol else normalize_pair_name_basic(pair)
+        if not normalized or not is_valid_otc_currency_pair_name(normalized):
+            return {"ok": False, "pair": pair, "reason": "اسم الزوج غير صالح أو ليس من أزواج Currencies المسموحة."}
+
+        symbol = symbol or get_otc_symbol_for_pair(normalized)
+        if not symbol:
+            return {"ok": False, "pair": normalized, "reason": "الزوج غير متاح الآن في خريطة OTC Live أو لم يصل instruments/list بعد."}
+
+        rows, last_tick, candles = _get_otc_rows_and_candles(symbol)
+        if len(rows) < OTC_EDGE_MIN_TICKS or len(candles) < OTC_EDGE_MIN_CANDLES or not last_tick:
+            return {
+                "ok": False,
+                "pair": normalized,
+                "symbol": symbol,
+                "reason": f"بيانات غير كافية للـ Edge: ticks={len(rows)} / candles={len(candles)}.",
+            }
+
+        try:
+            tick_ts = float(last_tick.get("time") or last_tick.get("ts") or last_tick.get("timestamp") or 0)
+            if tick_ts > 1e12:
+                tick_ts = tick_ts / 1000.0
+            tick_age = time_module.time() - tick_ts if tick_ts else 9999
+        except Exception:
+            tick_age = 9999
+
+        if tick_age > OTC_EDGE_TICK_MAX_AGE_SECONDS:
+            return {
+                "ok": False,
+                "pair": normalized,
+                "symbol": symbol,
+                "reason": f"آخر tick قديم منذ {int(tick_age)} ثانية؛ لا نعطي قراءة Edge على بيانات قديمة.",
+            }
+
+        instrument = quotex_otc_feed.instrument(symbol) if "quotex_otc_feed" in globals() else {}
+        payout = int(float((instrument or {}).get("payout", 0) or 0))
+        is_otc = bool((instrument or {}).get("is_otc", True))
+        if instrument and (not is_otc or payout < OTC_EDGE_MIN_PAYOUT):
+            return {
+                "ok": False,
+                "pair": normalized,
+                "symbol": symbol,
+                "reason": f"payout غير مناسب أو الزوج ليس OTC الآن. payout={payout}%",
+            }
+
+        current_price = float(last_tick.get("price"))
+        prices = [float(r[1]) for r in rows if len(r) >= 2]
+        p90 = prices[-90:] if len(prices) >= 90 else prices
+        p60 = prices[-60:] if len(prices) >= 60 else prices
+        p35 = prices[-35:] if len(prices) >= 35 else prices
+        p20 = prices[-20:] if len(prices) >= 20 else prices
+        p12 = prices[-12:] if len(prices) >= 12 else prices
+        m90 = _otc_edge_movement_metrics(p90)
+        m60 = _otc_edge_movement_metrics(p60)
+        m35 = _otc_edge_movement_metrics(p35)
+        m20 = _otc_edge_movement_metrics(p20)
+        m12 = _otc_edge_movement_metrics(p12)
+
+        closed = candles[-9:-1] if len(candles) >= 9 else candles[:-1]
+        current_candle = candles[-1] if candles else {}
+        cp = _otc_edge_candle_parts(current_candle)
+        closed_parts = [_otc_edge_candle_parts(c) for c in closed if c]
+        if len(closed_parts) < 4:
+            return {"ok": False, "pair": normalized, "symbol": symbol, "reason": "شموع مغلقة غير كافية للقراءة."}
+
+        recent_parts = closed_parts[-6:]
+        avg_body = sum(c["body_ratio"] for c in recent_parts) / max(1, len(recent_parts))
+        avg_range = sum(c["range"] for c in recent_parts) / max(1, len(recent_parts))
+        dirs = [c["dir"] for c in recent_parts]
+        rhythm = abs(sum(dirs[-5:])) / max(1, len(dirs[-5:])) if dirs else 0.0
+        doji_count = sum(1 for c in recent_parts if c["body_ratio"] <= 0.16)
+        wick_heavy = sum(1 for c in recent_parts if max(c["upper_wick"], c["lower_wick"]) >= 0.62)
+        recent_high = max(c["high"] for c in recent_parts)
+        recent_low = min(c["low"] for c in recent_parts)
+        same_dir_4 = sum(dirs[-4:]) if len(dirs) >= 4 else 0
+        noisy = (doji_count >= 3 and rhythm < 0.50) or (wick_heavy >= 4 and abs(m20["pressure"]) < 0.25)
+
+        candidates = []
+
+        def add_candidate(kind: str, direction: str, score: float, reason: str, detail: str, risk: str):
+            direction = str(direction or "").upper()
+            if direction not in {"CALL", "PUT"}:
+                return
+            score = int(round(max(0, min(100, score))))
+            candidates.append({
+                "kind": kind,
+                "direction": direction,
+                "score": score,
+                "reason": reason,
+                "detail": detail,
+                "risk": risk,
+            })
+
+        # 1) استمرار زخم: ضغط تيكات واضح + شموع لها جسم محترم.
+        trend_call = m60["change"] > 0 and m35["change"] > 0 and m20["change"] > 0 and m35["pressure"] >= 0.22
+        trend_put = m60["change"] < 0 and m35["change"] < 0 and m20["change"] < 0 and m35["pressure"] <= -0.22
+        if not noisy and (trend_call or trend_put) and m35["momentum"] >= 0.30 and avg_body >= 0.24:
+            direction = "CALL" if trend_call else "PUT"
+            score = 54 + abs(m35["pressure"]) * 18 + m35["momentum"] * 14 + avg_body * 9 + rhythm * 5
+            if cp["body_ratio"] < 0.12:
+                score -= 5
+            add_candidate(
+                "MOMENTUM_CONTINUATION",
+                direction,
+                score,
+                "استمرار زخم قصير",
+                "آخر التيكات والشموع تتحرك بضغط واضح في نفس الاتجاه، والسوق ليس عشوائيًا جدًا.",
+                "يفشل إذا آخر ثواني قبل الدخول قلبت عكس الضغط أو ظهرت شمعة رفض قوية.",
+            )
+
+        # 2) سحب سيولة/رفض من قمة أو قاع قريب.
+        if cp["high"] > recent_high and current_price < recent_high and cp["upper_wick"] >= 0.42:
+            score = 60 + cp["upper_wick"] * 16 + max(0, -m12["pressure"]) * 14 + min(cp["body_ratio"], 0.6) * 8
+            add_candidate(
+                "LIQUIDITY_SWEEP_REVERSAL",
+                "PUT",
+                score,
+                "سحب سيولة من قمة قريبة",
+                "السعر ضرب قمة قريبة ثم رجع تحتها مع ذيل علوي، وهذا يوحي بفشل الاختراق مؤقتًا.",
+                "يفشل إذا عاد السعر وقبل التداول فوق القمة بدل الرفض.",
+            )
+        if cp["low"] < recent_low and current_price > recent_low and cp["lower_wick"] >= 0.42:
+            score = 60 + cp["lower_wick"] * 16 + max(0, m12["pressure"]) * 14 + min(cp["body_ratio"], 0.6) * 8
+            add_candidate(
+                "LIQUIDITY_SWEEP_REVERSAL",
+                "CALL",
+                score,
+                "سحب سيولة من قاع قريب",
+                "السعر ضرب قاع قريب ثم رجع فوقه مع ذيل سفلي، وهذا يوحي بفشل الهبوط مؤقتًا.",
+                "يفشل إذا عاد السعر وقبل التداول تحت القاع بدل الرفض.",
+            )
+
+        # 3) تمدد زائد ثم بداية ضعف: ليس عكس ترند عشوائي، لازم تظهر علامة استهلاك.
+        over_up = same_dir_4 >= 3 and m90["change"] > 0 and m60["momentum"] >= 0.45 and (cp["upper_wick"] >= 0.36 or m12["pressure"] < -0.25)
+        over_down = same_dir_4 <= -3 and m90["change"] < 0 and m60["momentum"] >= 0.45 and (cp["lower_wick"] >= 0.36 or m12["pressure"] > 0.25)
+        if over_up:
+            score = 56 + m60["momentum"] * 17 + cp["upper_wick"] * 12 + max(0, -m12["pressure"]) * 12
+            add_candidate(
+                "OVEREXTENSION_PULLBACK",
+                "PUT",
+                score,
+                "تمدد صعودي زائد مع بداية ضعف",
+                "الصعود ظهر مستهلكًا، ومعه ذيل/ضغط معاكس يوحي بتصحيح قصير.",
+                "يفشل إذا كان التمدد تسارع ترند حقيقي وليس استهلاكًا.",
+            )
+        if over_down:
+            score = 56 + m60["momentum"] * 17 + cp["lower_wick"] * 12 + max(0, m12["pressure"]) * 12
+            add_candidate(
+                "OVEREXTENSION_PULLBACK",
+                "CALL",
+                score,
+                "تمدد هبوطي زائد مع بداية ضعف",
+                "الهبوط ظهر مستهلكًا، ومعه ذيل/ضغط معاكس يوحي بتصحيح قصير.",
+                "يفشل إذا كان التمدد تسارع ترند حقيقي وليس استهلاكًا.",
+            )
+
+        # 4) ضغط/تجميع ثم كسر صغير: قراءة اختراق ضغط ضيق.
+        recent_ranges = [c["range"] for c in recent_parts if c["range"] > 0]
+        median_range = median(recent_ranges) if recent_ranges else avg_range
+        compressed = avg_range > 0 and median_range > 0 and (max(c["high"] for c in recent_parts[-4:]) - min(c["low"] for c in recent_parts[-4:])) <= median_range * 2.4
+        if not noisy and compressed and m12["momentum"] >= 0.42 and abs(m12["pressure"]) >= 0.35:
+            direction = "CALL" if m12["pressure"] > 0 else "PUT"
+            score = 55 + m12["momentum"] * 18 + abs(m12["pressure"]) * 16 + m12["density"] * 6
+            add_candidate(
+                "COMPRESSION_RELEASE",
+                direction,
+                score,
+                "خروج من ضغط قصير",
+                "السعر كان مضغوطًا ثم بدأت التيكات تطلع من النطاق باتجاه واضح.",
+                "يفشل إذا كان الخروج كسرًا وهميًا ورجع السعر داخل النطاق.",
+            )
+
+        # 5) تبدل مزاج: ضغط كبير باتجاه ثم آخر تيكات انقلبت.
+        if m60["pressure"] >= 0.30 and m12["pressure"] <= -0.42 and cp["upper_wick"] >= 0.25:
+            score = 58 + abs(m12["pressure"]) * 16 + cp["upper_wick"] * 10 + m12["momentum"] * 10
+            add_candidate(
+                "MOOD_SHIFT",
+                "PUT",
+                score,
+                "تبدل مزاج من شراء إلى بيع",
+                "الضغط الأكبر كان صاعدًا لكن آخر الحركة انقلبت بوضوح مع رفض علوي.",
+                "يفشل إذا كان الانقلاب مجرد نفس قصير ضمن الترند الصاعد.",
+            )
+        if m60["pressure"] <= -0.30 and m12["pressure"] >= 0.42 and cp["lower_wick"] >= 0.25:
+            score = 58 + abs(m12["pressure"]) * 16 + cp["lower_wick"] * 10 + m12["momentum"] * 10
+            add_candidate(
+                "MOOD_SHIFT",
+                "CALL",
+                score,
+                "تبدل مزاج من بيع إلى شراء",
+                "الضغط الأكبر كان هابطًا لكن آخر الحركة انقلبت بوضوح مع رفض سفلي.",
+                "يفشل إذا كان الانقلاب مجرد نفس قصير ضمن الترند الهابط.",
+            )
+
+        if noisy:
+            for c in candidates:
+                c["score"] = max(0, int(c["score"]) - 10)
+                c["risk"] += " السوق فيه ضوضاء/ذيول كثيرة لذلك تم تخفيض التقييم."
+
+        if not candidates:
+            return {
+                "ok": False,
+                "pair": normalized,
+                "symbol": symbol,
+                "price": current_price,
+                "payout": payout,
+                "reason": "لا يوجد Edge واضح الآن. الحركة إما عشوائية أو بدون نمط قوي.",
+                "metrics": {
+                    "pressure": round(m35["pressure"], 2),
+                    "momentum": round(m35["momentum"], 2),
+                    "avg_body": round(avg_body, 2),
+                    "rhythm": round(rhythm, 2),
+                    "noise": noisy,
+                },
+            }
+
+        candidates.sort(key=lambda x: (int(x.get("score", 0)), x.get("kind", "")), reverse=True)
+        best = candidates[0]
+        history = _otc_edge_history_bias(normalized, best["direction"]) if include_history else {}
+
+        status = "edge" if best["score"] >= OTC_EDGE_MIN_SCORE else "watch" if best["score"] >= OTC_EDGE_WATCH_SCORE else "weak"
+        return {
+            "ok": True,
+            "status": status,
+            "pair": normalized,
+            "symbol": symbol,
+            "direction": best["direction"],
+            "score": int(best["score"]),
+            "pattern": best["kind"],
+            "reason": best["reason"],
+            "detail": best["detail"],
+            "risk": best["risk"],
+            "price": current_price,
+            "payout": payout,
+            "tick_age": round(tick_age, 1),
+            "metrics": {
+                "pressure_35": round(m35["pressure"], 2),
+                "momentum_35": round(m35["momentum"], 2),
+                "pressure_12": round(m12["pressure"], 2),
+                "momentum_12": round(m12["momentum"], 2),
+                "avg_body": round(avg_body, 2),
+                "rhythm": round(rhythm, 2),
+                "doji_count": doji_count,
+                "wick_heavy": wick_heavy,
+                "noisy": noisy,
+            },
+            "history": history,
+            "candidates": candidates[:3],
+        }
+    except Exception as e:
+        logger.exception("OTC Edge pair analysis failed | pair=%s | symbol=%s | error=%s", pair, symbol, e)
+        return {"ok": False, "pair": pair, "symbol": symbol, "reason": f"تعذر تحليل الزوج: {e}"}
+
+
+def scan_otc_edge_market(limit: int | None = None, include_weak: bool = False) -> list[dict]:
+    results = []
+    try:
+        pair_map = get_otc_analysis_pair_map()
+        for pair, symbol in pair_map.items():
+            normalized = normalize_otc_currency_pair_name(pair, symbol)
+            if not normalized or not is_valid_otc_currency_pair_name(normalized):
+                continue
+            item = analyze_otc_edge_pair(normalized, symbol, include_history=False)
+            if not item.get("ok"):
+                continue
+            if not include_weak and item.get("status") == "weak":
+                continue
+            results.append(item)
+        results.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("payout", 0) or 0)), reverse=True)
+        if limit and int(limit) > 0:
+            return results[:int(limit)]
+        return results
+    except Exception as e:
+        logger.exception("OTC Edge market scan failed: %s", e)
+        return results
+
+
+def build_otc_edge_menu_message() -> str:
+    return (
+        "🧠 OTC Edge Engine - Admin Only\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "هذا القسم خاص بالأدمن فقط.\n"
+        "وظيفته كشف الأنماط السلوكية المتكررة في OTC من بث Quotex Live، بدون نشر للمستخدمين وبدون تغيير نظام الإشارات.\n\n"
+        "الأزرار:\n"
+        "🔎 فحص السوق الآن: يبحث عن أقوى Edge بين الأزواج المتاحة.\n"
+        "📊 تقرير الأنماط: يلخص نتائج الأنماط السابقة المسجلة إن وجدت.\n"
+        "🧪 فحص زوج محدد: يعطيك قراءة تفصيلية لزوج واحد.\n\n"
+        "⚠️ هذه قراءة احتمالية وليست ضمان ربح."
+    )
+
+
+def format_otc_edge_item(item: dict, rank: int | None = None, detailed: bool = False) -> str:
+    try:
+        prefix = f"#{rank} " if rank else ""
+        score = int(item.get("score", 0) or 0)
+        status_icon = "✅" if score >= OTC_EDGE_MIN_SCORE else "👀" if score >= OTC_EDGE_WATCH_SCORE else "⚠️"
+        metrics = item.get("metrics") or {}
+        history = item.get("history") or {}
+        history_line = ""
+        if history.get("direction_wr") is not None and int(history.get("direction_count", 0) or 0) >= 3:
+            history_line = f"\n📚 تاريخ قريب لنفس الزوج/الاتجاه: {history.get('direction_wr')}% من {history.get('direction_count')} صفقات"
+        elif history.get("pair_wr") is not None and int(history.get("pair_count", 0) or 0) >= 3:
+            history_line = f"\n📚 تاريخ قريب لنفس الزوج: {history.get('pair_wr')}% من {history.get('pair_count')} صفقات"
+
+        text = (
+            f"{prefix}{status_icon} {item.get('pair')}\n"
+            f"📌 الاتجاه: {_otc_edge_direction_icon(item.get('direction'))}\n"
+            f"📊 Edge Score: {score}% | payout: {item.get('payout', 0)}%\n"
+            f"🧩 النمط: {item.get('reason')}\n"
+            f"💵 السعر: {_otc_edge_price_text(item.get('pair', ''), item.get('price'))}\n"
+        )
+        if detailed:
+            text += (
+                f"⏱ عمر آخر tick: {item.get('tick_age')} ثانية\n"
+                f"🔍 القراءة: {item.get('detail')}\n"
+                f"⚠️ متى يفشل؟ {item.get('risk')}\n"
+                f"📐 metrics: pressure35={metrics.get('pressure_35')} | momentum35={metrics.get('momentum_35')} | "
+                f"pressure12={metrics.get('pressure_12')} | rhythm={metrics.get('rhythm')} | avg_body={metrics.get('avg_body')}"
+                f"{history_line}\n"
+            )
+        return text.strip()
+    except Exception as e:
+        return f"تعذر تنسيق نتيجة Edge: {e}"
+
+
+def build_otc_edge_scan_message() -> str:
+    try:
+        connected = bool(getattr(quotex_otc_feed, "connected", False)) if "quotex_otc_feed" in globals() else False
+        started = bool(getattr(quotex_otc_feed, "started", False)) if "quotex_otc_feed" in globals() else False
+        results = scan_otc_edge_market(limit=OTC_EDGE_TOP_LIMIT, include_weak=False)
+        now_text = now_utc().astimezone(UTC_PLUS_3).strftime("%H:%M:%S")
+        header = (
+            "🧠 OTC Edge Engine - فحص السوق\n"
+            "━━━━━━━━━━━━━━\n"
+            f"⏰ وقت الفحص: {now_text} UTC+3\n"
+            f"📡 بث Quotex: {'متصل ✅' if connected else 'غير متصل ⚠️'} | started={started}\n"
+            f"🎯 حد Edge: {OTC_EDGE_MIN_SCORE}% | حد المراقبة: {OTC_EDGE_WATCH_SCORE}%\n\n"
+        )
+        if not results:
+            return header + (
+                "❌ لا يوجد Edge واضح الآن.\n\n"
+                "المعنى: السوق إما عشوائي، أو البيانات غير كافية، أو payout أقل من الحد، أو لا يوجد نمط يستحق الدخول.\n"
+                "الأفضل تنتظر 30-60 ثانية وتعيد الفحص."
+            )
+        lines = [header, "أفضل الفرص الحالية:\n"]
+        for idx, item in enumerate(results, start=1):
+            lines.append(format_otc_edge_item(item, rank=idx, detailed=(idx == 1)))
+            lines.append("────────────")
+        lines.append("⚠️ خاص بالأدمن: هذه قراءة احتمالية من سلوك السوق وليست ضمانًا أو اختراقًا للمنصة.")
+        return "\n".join(lines)[:3900]
+    except Exception as e:
+        logger.exception("Could not build OTC Edge scan message: %s", e)
+        return "تعذر إنشاء تقرير OTC Edge. راجع اللوج."
+
+
+def build_otc_edge_single_pair_message(pair_text: str) -> str:
+    try:
+        pair_text = str(pair_text or "").strip()
+        symbol = get_otc_symbol_for_pair(pair_text)
+        if not symbol:
+            # محاولة ثانية لو كتب الرمز الداخلي بدل اسم الزوج.
+            normalized_symbol = normalize_otc_pair_input(pair_text)
+            pair_map = get_otc_analysis_pair_map()
+            reverse = {v: k for k, v in pair_map.items()}
+            if normalized_symbol in reverse:
+                pair_text = reverse[normalized_symbol]
+                symbol = normalized_symbol
+        result = analyze_otc_edge_pair(pair_text, symbol=symbol, include_history=True)
+        if not result.get("ok"):
+            return (
+                "🧪 فحص زوج OTC Edge\n"
+                "━━━━━━━━━━━━━━\n"
+                f"الزوج: {pair_text}\n\n"
+                f"❌ لا توجد قراءة صالحة الآن.\nالسبب: {result.get('reason')}"
+            )
+        return (
+            "🧪 فحص زوج OTC Edge\n"
+            "━━━━━━━━━━━━━━\n"
+            + format_otc_edge_item(result, detailed=True)
+            + "\n\n⚠️ خاص بالأدمن فقط. لا تعتمد عليه كضمان ربح؛ استخدمه كفلتر جودة."
+        )[:3900]
+    except Exception as e:
+        logger.exception("Could not build OTC Edge single pair message: %s", e)
+        return f"تعذر فحص الزوج: {e}"
+
+
+def build_otc_edge_patterns_report() -> str:
+    try:
+        trades = get_otc_live_trades(limit=OTC_EDGE_HISTORY_LIMIT) if "get_otc_live_trades" in globals() else []
+        decided = [t for t in trades if str(t.get("result")) in {"win", "loss"}]
+        if not decided:
+            return (
+                "📊 تقرير الأنماط - OTC Edge\n"
+                "━━━━━━━━━━━━━━\n\n"
+                "لا توجد نتائج OTC Live كافية محفوظة بعد لبناء تقرير تاريخي.\n"
+                "يمكنك استخدام زر 🔎 فحص السوق الآن للحصول على قراءة مباشرة من الكاش الحي."
+            )
+
+        pair_stats = {}
+        direction_stats = {}
+        for t in decided:
+            pair = str(t.get("pair") or "unknown")
+            direction = str(t.get("direction") or "unknown").upper()
+            result = str(t.get("result"))
+            p = pair_stats.setdefault(pair, {"total": 0, "wins": 0, "losses": 0})
+            d = direction_stats.setdefault(f"{pair} {direction}", {"pair": pair, "direction": direction, "total": 0, "wins": 0, "losses": 0})
+            for bucket in (p, d):
+                bucket["total"] += 1
+                if result == "win":
+                    bucket["wins"] += 1
+                elif result == "loss":
+                    bucket["losses"] += 1
+
+        def _rate(row):
+            return round(row["wins"] / max(1, row["total"]) * 100, 1)
+
+        best_pairs = sorted(pair_stats.items(), key=lambda kv: (_rate(kv[1]), kv[1]["total"]), reverse=True)[:8]
+        best_dirs = sorted(direction_stats.values(), key=lambda v: (_rate(v), v["total"]), reverse=True)[:8]
+
+        lines = [
+            "📊 تقرير الأنماط - OTC Edge",
+            "━━━━━━━━━━━━━━",
+            f"آخر نتائج محسوبة: {len(decided)} صفقة",
+            "",
+            "أفضل الأزواج تاريخيًا في آخر النتائج:",
+        ]
+        for pair, stat in best_pairs:
+            lines.append(f"• {pair}: {_rate(stat)}% | {stat['wins']}W/{stat['losses']}L من {stat['total']}")
+
+        lines.append("")
+        lines.append("أفضل زوج + اتجاه:")
+        for stat in best_dirs:
+            if stat["total"] < 2:
+                continue
+            lines.append(f"• {stat['pair']} {_otc_edge_direction_icon(stat['direction'])}: {_rate(stat)}% من {stat['total']}")
+
+        lines.append("")
+        lines.append("ملاحظة: هذا التقرير يعتمد على النتائج المحفوظة فقط، وليس كشفًا لخوارزمية المنصة.")
+        return "\n".join(lines)[:3900]
+    except Exception as e:
+        logger.exception("Could not build OTC Edge patterns report: %s", e)
+        return "تعذر إنشاء تقرير الأنماط. راجع اللوج."
+
+
+
 def format_otc_dynamic_universe_status() -> str:
     try:
         live_map = get_otc_analysis_pair_map()
@@ -12874,7 +13461,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== Common buttons =====
     if text == "🔙 رجوع":
-        if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message", "otc_list_waiting_text", "otc_pair_diagnostics_waiting", "otc_candle_diagnostics_waiting", "trading_room_waiting_balance"}:
+        if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message", "otc_list_waiting_text", "otc_pair_diagnostics_waiting", "otc_candle_diagnostics_waiting", "otc_edge_waiting_pair", "trading_room_waiting_balance"}:
             context.user_data["step"] = None
             await update.message.reply_text("تم الرجوع.", reply_markup=admin_main_keyboard)
             return
@@ -12973,6 +13560,45 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "🔴 إيقاف البوت":
             set_bot_enabled(False)
             await update.message.reply_text("🛠 تم إيقاف البوت للعامة", reply_markup=admin_main_keyboard)
+            return
+
+        if text == "🧠 OTC Edge Engine":
+            reset_signal_state(context)
+            await update.message.reply_text(
+                build_otc_edge_menu_message(),
+                reply_markup=admin_otc_edge_keyboard
+            )
+            return
+
+        if text == "🔎 فحص السوق الآن":
+            await update.message.reply_text("🔎 جاري فحص سلوك أزواج OTC الحية...")
+            await update.message.reply_text(
+                build_otc_edge_scan_message(),
+                reply_markup=admin_otc_edge_keyboard
+            )
+            return
+
+        if text == "📊 تقرير الأنماط":
+            await update.message.reply_text(
+                build_otc_edge_patterns_report(),
+                reply_markup=admin_otc_edge_keyboard
+            )
+            return
+
+        if text == "🧪 فحص زوج محدد":
+            context.user_data["step"] = "otc_edge_waiting_pair"
+            await update.message.reply_text(
+                "🧪 أرسل اسم الزوج لفحص Edge عليه، مثال:\nUSD/BRL (OTC)\n\nأو أرسل الرمز الداخلي مثل: BRLUSD_otc",
+                reply_markup=admin_otc_edge_keyboard
+            )
+            return
+
+        if step == "otc_edge_waiting_pair":
+            context.user_data["step"] = None
+            await update.message.reply_text(
+                build_otc_edge_single_pair_message(text),
+                reply_markup=admin_otc_edge_keyboard
+            )
             return
 
         if text == "📊 إحصائيات البوت":
