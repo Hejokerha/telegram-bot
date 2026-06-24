@@ -119,25 +119,6 @@ def parse_id_set_from_env(name: str) -> set[int]:
 
 OTC_LIST_MANAGER_IDS = parse_id_set_from_env("OTC_LIST_MANAGER_IDS")
 
-# ===== OTC SNIPER private access =====
-# هذه الميزة تستخدم نفس منطق OTC Edge Engine كما هو، بدون عكس اتجاه وبدون تغيير حساب Edge Score.
-# هي فقط واجهة مختصرة + مراقبة + نتيجة win/loss للأشخاص المسموحين.
-OTC_SNIPER_EXTRA_IDS = parse_id_set_from_env("OTC_SNIPER_EXTRA_IDS")
-OTC_SNIPER_ALLOWED_IDS = {
-    ADMIN_TELEGRAM_ID,
-    6575230269,
-    1592499902,
-    6656949901,
-} | set(OTC_SNIPER_EXTRA_IDS)
-
-
-def is_otc_sniper_user(user_id: int) -> bool:
-    try:
-        return int(user_id) in OTC_SNIPER_ALLOWED_IDS or is_admin(int(user_id))
-    except Exception:
-        return False
-
-
 DATABASE_URL = "https://telegram-bot-f0229-default-rtdb.firebaseio.com"
 
 WELCOME_MESSAGE = """
@@ -447,16 +428,6 @@ admin_otc_edge_keyboard = ReplyKeyboardMarkup(
         ["🎯 مراقبة زوج محدد", "🛑 إيقاف مراقبة Edge"],
         ["📋 حالة مراقبة Edge", "📊 تقرير الأنماط"],
         ["🧪 فحص زوج محدد"],
-        ["⬅️ رجوع"],
-    ],
-    resize_keyboard=True
-)
-
-otc_sniper_keyboard = ReplyKeyboardMarkup(
-    [
-        ["🎯 مراقبة زوج SNIPER"],
-        ["🚀 مراقبة كل السوق SNIPER"],
-        ["🛑 إيقاف OTC SNIPER", "📋 حالة OTC SNIPER"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -11260,58 +11231,16 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
     if lang is None:
         lang = get_user_language(user_id)
 
-    sniper_allowed = is_otc_sniper_user(user_id)
-
     if is_otc_list_manager(user_id) and not is_admin(user_id):
-        if lang == "en":
-            return main_keyboard_en
-        rows = [
-            ["📊 توليد إشارات"],
-            ["🧠 غرفة جلسة تداول"],
-        ]
-        if sniper_allowed:
-            rows.append(["OTC SNIPER"])
-        rows.extend([
-            ["👤 حالة حسابي", "🎥 مشاهدة فيديو شرح البوت"],
-            ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
-            ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
-        ])
-        return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
+        return otc_list_manager_keyboard if lang != "en" else main_keyboard_en
     if is_admin(user_id):
-        if lang == "en":
-            rows = [
-                ["📊 Generate Signals"],
-                ["🧠 Trading Session Room"],
-            ]
-            if sniper_allowed:
-                rows.append(["OTC SNIPER"])
-            rows.extend([
-                ["👤 My Account", "📞 Contact Support"],
-                ["🌐 Change Language", "🛠 Admin Panel"],
-            ])
-            return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-        rows = [
-            ["📊 توليد إشارات"],
-            ["🧠 غرفة جلسة تداول"],
-        ]
-        if sniper_allowed:
-            rows.append(["OTC SNIPER"])
-        rows.extend([
-            ["👤 حالة حسابي", "📞 تواصل مع المسؤول"],
-            ["🌐 تغيير اللغة", "🛠 لوحة الأدمن"],
-        ])
-        return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
-    if sniper_allowed:
         if lang == "en":
             return ReplyKeyboardMarkup(
                 [
                     ["📊 Generate Signals"],
                     ["🧠 Trading Session Room"],
-                    ["OTC SNIPER"],
-                    ["👤 My Account", "🎥 Watch Bot Tutorial"],
-                    ["📞 Contact Support", "🌐 Change Language"],
+                    ["👤 My Account", "📞 Contact Support"],
+                    ["🌐 Change Language", "🛠 Admin Panel"],
                 ],
                 resize_keyboard=True
             )
@@ -11319,13 +11248,11 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
             [
                 ["📊 توليد إشارات"],
                 ["🧠 غرفة جلسة تداول"],
-                ["OTC SNIPER"],
-                ["👤 حالة حسابي", "🎥 مشاهدة فيديو شرح البوت"],
-                ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
+                ["👤 حالة حسابي", "📞 تواصل مع المسؤول"],
+                ["🌐 تغيير اللغة", "🛠 لوحة الأدمن"],
             ],
             resize_keyboard=True
         )
-
     return main_keyboard_en if lang == "en" else main_keyboard
 
 
@@ -12421,385 +12348,6 @@ def translate_real_signal_message_to_en(msg: str) -> str:
     return out
 
 
-
-
-# ===== OTC SNIPER private wrapper =====
-# مهم: هذا القسم لا يغيّر منطق OTC Edge Engine ولا يعكس الاتجاه.
-# يستخدم analyze_otc_edge_pair / scan_otc_edge_market كما هي، ثم يرسل تنبيهًا مختصرًا ونتيجة الصفقة.
-_otc_sniper_sessions = {}
-
-
-def _otc_sniper_state(user_id: int) -> dict:
-    uid = int(user_id)
-    state = _otc_sniper_sessions.setdefault(uid, {
-        "enabled": False,
-        "mode": "pairs",
-        "pairs": [],
-        "chat_id": uid,
-        "started_at": None,
-        "last_scan_at": None,
-        "last_alert_at": None,
-        "last_candidate": None,
-        "last_error": None,
-        "alerts_sent": 0,
-        "active_trade_until_ts": 0.0,
-        "active_trade": None,
-        "last_alerts": {},
-        "alert_times": [],
-    })
-    return state
-
-
-def _otc_sniper_job_name(user_id: int) -> str:
-    return f"otc_sniper_watch_{int(user_id)}"
-
-
-def _otc_sniper_remove_jobs(context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    try:
-        for job in context.job_queue.get_jobs_by_name(_otc_sniper_job_name(user_id)):
-            job.schedule_removal()
-    except Exception:
-        pass
-
-
-def build_otc_sniper_menu_message(user_id: int) -> str:
-    state = _otc_sniper_state(user_id)
-    status = "شغال ✅" if state.get("enabled") else "متوقف ⏸"
-    return (
-        "🎯 OTC SNIPER\n"
-        "━━━━━━━━━━━━━━\n\n"
-        "هذه نسخة مختصرة من OTC Edge Engine.\n"
-        "نفس منطق التحليل والاتجاه بدون أي عكس أو تعديل.\n\n"
-        f"الحالة: {status}\n\n"
-        "الأفضل تختار زوج واحد للمراقبة، وعند ظهور فرصة قوية سيصلك فقط:\n"
-        "🟢 CALL\n"
-        "أو\n"
-        "🔴 PUT\n\n"
-        "وبعد إغلاق شمعة M1 سيصلك:\n"
-        "win أو loss"
-    )
-
-
-def _otc_sniper_collect_candidates(user_id: int) -> list[dict]:
-    state = _otc_sniper_state(user_id)
-    try:
-        mode = str(state.get("mode") or "pairs")
-        candidates = []
-        if mode == "pairs":
-            for pair in list(state.get("pairs") or []):
-                symbol = get_otc_symbol_for_pair(pair)
-                if not symbol:
-                    resolved_pair, resolved_symbol = _otc_edge_resolve_pair_text(pair)
-                    pair = resolved_pair or pair
-                    symbol = resolved_symbol
-                if not symbol:
-                    continue
-                item = analyze_otc_edge_pair(pair, symbol=symbol, include_history=True)
-                if item.get("ok"):
-                    candidates.append(item)
-        else:
-            candidates = scan_otc_edge_market(limit=OTC_EDGE_WATCHER_TOP_ALERT_POOL, include_weak=False)
-
-        candidates = [c for c in candidates if c.get("ok")]
-        candidates.sort(key=lambda x: (int(x.get("score", 0) or 0), int(x.get("payout", 0) or 0)), reverse=True)
-        return candidates
-    except Exception as e:
-        state["last_error"] = str(e)
-        logger.exception("OTC SNIPER collect failed: %s", e)
-        return []
-
-
-def _otc_sniper_active_remaining(user_id: int, now_ts: float | None = None) -> int:
-    state = _otc_sniper_state(user_id)
-    try:
-        now_ts = float(now_ts or time_module.time())
-        return max(0, int(float(state.get("active_trade_until_ts", 0) or 0) - now_ts))
-    except Exception:
-        return 0
-
-
-def _otc_sniper_rate_limited(user_id: int, now_ts: float) -> bool:
-    state = _otc_sniper_state(user_id)
-    try:
-        times = [float(t) for t in list(state.get("alert_times") or []) if now_ts - float(t) < 3600]
-        state["alert_times"] = times
-        return len(times) >= int(OTC_EDGE_WATCHER_MAX_ALERTS_PER_HOUR)
-    except Exception:
-        return False
-
-
-def _otc_sniper_can_alert(user_id: int, item: dict, now_ts: float) -> bool:
-    state = _otc_sniper_state(user_id)
-    try:
-        if _otc_sniper_active_remaining(user_id, now_ts) > 0:
-            return False
-        # نفس بوابة توقيت OTC Edge الموجودة، بدون تغيير التحليل أو الاتجاه.
-        if not _otc_edge_entry_window_ok():
-            return False
-        if int(item.get("score", 0) or 0) < int(OTC_EDGE_WATCHER_MIN_SCORE):
-            return False
-        if int(item.get("payout", 0) or 0) < int(OTC_EDGE_WATCHER_MIN_PAYOUT):
-            return False
-        if float(item.get("tick_age", 999) or 999) > max(3, int(OTC_EDGE_TICK_MAX_AGE_SECONDS)):
-            return False
-        if _otc_sniper_rate_limited(user_id, now_ts):
-            return False
-        key = f"{item.get('pair')}|{item.get('direction')}|{item.get('pattern')}"
-        last_alerts = state.setdefault("last_alerts", {})
-        last_ts = float(last_alerts.get(key, 0) or 0)
-        if now_ts - last_ts < int(OTC_EDGE_WATCHER_COOLDOWN_SECONDS):
-            return False
-        last_alerts[key] = now_ts
-        return True
-    except Exception:
-        return False
-
-
-def _otc_sniper_latest_entry(symbol: str, fallback_price=None) -> tuple[float | None, float]:
-    try:
-        snap = quotex_otc_feed.snapshot(symbol) if "quotex_otc_feed" in globals() else {}
-        price = snap.get("price")
-        ts = snap.get("time") or snap.get("ts") or snap.get("timestamp") or time_module.time()
-        if price is None:
-            price = fallback_price
-        ts = float(ts)
-        if ts > 1e12:
-            ts = ts / 1000.0
-        return (float(price) if price is not None else None), ts
-    except Exception:
-        try:
-            return (float(fallback_price) if fallback_price is not None else None), time_module.time()
-        except Exception:
-            return None, time_module.time()
-
-
-def _otc_sniper_result_delay(entry_ts: float) -> tuple[float, str, float]:
-    try:
-        timing = _otc_edge_current_candle_timing()
-        if _otc_edge_timing_mode() == "m1_candle_close":
-            close_dt = timing.get("close")
-            close_ts = close_dt.timestamp() if hasattr(close_dt, "timestamp") else (int(float(entry_ts) // 60) * 60 + 60)
-            delay = max(1.0, close_ts - time_module.time() + int(OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS))
-            return delay, str(timing.get("close_text") or ""), float(close_ts)
-        delay = max(1.0, float(OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS) + int(OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS))
-        close_ts = time_module.time() + delay
-        return delay, "", close_ts
-    except Exception:
-        close_ts = int(float(entry_ts) // 60) * 60 + 60
-        delay = max(1.0, close_ts - time_module.time() + 3)
-        return delay, "", float(close_ts)
-
-
-def _otc_sniper_alert_text(user_id: int, item: dict) -> str:
-    try:
-        state = _otc_sniper_state(user_id)
-        direction_text = _otc_edge_direction_icon(item.get("direction"))
-        # إذا مراقبة زوج واحد فقط، لا نزعج المستخدم باسم الزوج. أما مراقبة كل السوق/عدة أزواج فتحتاج اسم الزوج.
-        pairs = list(state.get("pairs") or [])
-        if str(state.get("mode")) == "pairs" and len(pairs) == 1:
-            return direction_text
-        return f"{item.get('pair')}\n{direction_text}"
-    except Exception:
-        return _otc_edge_direction_icon(item.get("direction"))
-
-
-def _otc_sniper_store_active_trade(user_id: int, item: dict, entry_price: float | None, entry_ts: float, close_ts: float, close_text: str):
-    state = _otc_sniper_state(user_id)
-    state["active_trade_until_ts"] = float(close_ts) + int(OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS)
-    state["active_trade"] = {
-        "pair": item.get("pair"),
-        "symbol": item.get("symbol"),
-        "direction": str(item.get("direction") or "").upper(),
-        "entry_price": entry_price,
-        "entry_ts": entry_ts,
-        "close_ts": close_ts,
-        "close_text": close_text,
-        "score": item.get("score"),
-        "payout": item.get("payout"),
-        "pattern": item.get("pattern"),
-    }
-
-
-def _otc_sniper_close_price(symbol: str, entry_ts: float):
-    try:
-        candle = quotex_otc_feed.candle(symbol, entry_ts) if "quotex_otc_feed" in globals() else {}
-        if candle and candle.get("close") is not None:
-            return float(candle.get("close")), candle
-    except Exception:
-        pass
-    try:
-        snap = quotex_otc_feed.snapshot(symbol) if "quotex_otc_feed" in globals() else {}
-        if snap and snap.get("price") is not None:
-            return float(snap.get("price")), {}
-    except Exception:
-        pass
-    return None, {}
-
-
-async def otc_sniper_result_job(context: ContextTypes.DEFAULT_TYPE):
-    user_id = None
-    try:
-        data = context.job.data or {}
-        user_id = int(data.get("user_id"))
-        trade = dict(data.get("trade") or {})
-        state = _otc_sniper_state(user_id)
-        symbol = str(trade.get("symbol") or "")
-        direction = str(trade.get("direction") or "").upper()
-        entry_price = trade.get("entry_price")
-        entry_ts = float(trade.get("entry_ts") or time_module.time())
-        close_price, candle = _otc_sniper_close_price(symbol, entry_ts)
-
-        result = resolve_candle_direction_result(direction, entry_price, close_price)
-        # المطلوب أن تصل النتيجة win/loss فقط. إذا صار تعادل نعتبره loss حتى لا يرسل نص ثالث.
-        result_text = "win" if result == "win" else "loss"
-
-        await safe_send_message(context.bot, chat_id=user_id, text=result_text)
-
-        state["active_trade_until_ts"] = 0.0
-        state["active_trade"] = None
-        state["last_result"] = {
-            "pair": trade.get("pair"),
-            "direction": direction,
-            "entry_price": entry_price,
-            "close_price": close_price,
-            "result": result_text,
-            "closed_at": now_iso(),
-            "candle_ticks": candle.get("ticks") if isinstance(candle, dict) else None,
-        }
-        logger.info(
-            "OTC SNIPER result | user=%s | pair=%s | direction=%s | entry=%s | close=%s | result=%s",
-            user_id, trade.get("pair"), direction, entry_price, close_price, result_text,
-        )
-    except Exception as e:
-        logger.exception("OTC SNIPER result job error: %s", e)
-        if user_id:
-            try:
-                await safe_send_message(context.bot, chat_id=user_id, text="loss")
-            except Exception:
-                pass
-
-
-async def otc_sniper_watcher_job(context: ContextTypes.DEFAULT_TYPE):
-    try:
-        data = context.job.data or {}
-        user_id = int(data.get("user_id"))
-        state = _otc_sniper_state(user_id)
-        if not bool(state.get("enabled")):
-            return
-        state["last_scan_at"] = now_iso()
-
-        candidates = _otc_sniper_collect_candidates(user_id)
-        if candidates:
-            state["last_candidate"] = {
-                "pair": candidates[0].get("pair"),
-                "direction": candidates[0].get("direction"),
-                "score": candidates[0].get("score"),
-                "payout": candidates[0].get("payout"),
-                "pattern": candidates[0].get("pattern"),
-            }
-
-        now_ts = time_module.time()
-        for item in candidates:
-            if not _otc_sniper_can_alert(user_id, item, now_ts):
-                continue
-
-            # لا نغيّر الاتجاه هنا نهائيًا. الاتجاه هو نفسه الخارج من OTC Edge Engine.
-            entry_price, entry_ts = _otc_sniper_latest_entry(str(item.get("symbol") or ""), item.get("price"))
-            if entry_price is None:
-                continue
-            delay, close_text, close_ts = _otc_sniper_result_delay(entry_ts)
-            sent = await safe_send_message(context.bot, chat_id=user_id, text=_otc_sniper_alert_text(user_id, item))
-            if sent:
-                _otc_sniper_store_active_trade(user_id, item, entry_price, entry_ts, close_ts, close_text)
-                trade = dict(_otc_sniper_state(user_id).get("active_trade") or {})
-                context.job_queue.run_once(
-                    otc_sniper_result_job,
-                    when=delay,
-                    data={"user_id": user_id, "trade": trade},
-                    name=f"otc_sniper_result_{user_id}_{int(entry_ts)}",
-                )
-                state["last_alert_at"] = now_iso()
-                state["alerts_sent"] = int(state.get("alerts_sent", 0) or 0) + 1
-                times = list(state.get("alert_times") or [])
-                times.append(now_ts)
-                state["alert_times"] = [float(t) for t in times if now_ts - float(t) < 3600]
-            break
-    except Exception as e:
-        try:
-            user_id = int((context.job.data or {}).get("user_id"))
-            _otc_sniper_state(user_id)["last_error"] = str(e)
-        except Exception:
-            pass
-        logger.exception("OTC SNIPER watcher job error: %s", e)
-
-
-def start_otc_sniper(context: ContextTypes.DEFAULT_TYPE, user_id: int, mode: str = "pairs", pairs: list[str] | None = None) -> str:
-    uid = int(user_id)
-    if not is_otc_sniper_user(uid):
-        return "⛔ ليس لديك صلاحية OTC SNIPER."
-    state = _otc_sniper_state(uid)
-    state.update({
-        "enabled": True,
-        "mode": str(mode or "pairs"),
-        "pairs": list(pairs or []),
-        "chat_id": uid,
-        "started_at": now_iso(),
-        "last_error": None,
-        "last_alerts": {},
-        "alert_times": [],
-        "active_trade_until_ts": 0.0,
-        "active_trade": None,
-    })
-    _otc_sniper_remove_jobs(context, uid)
-    context.job_queue.run_repeating(
-        otc_sniper_watcher_job,
-        interval=OTC_EDGE_WATCHER_SCAN_SECONDS,
-        first=1,
-        data={"user_id": uid},
-        name=_otc_sniper_job_name(uid),
-    )
-    if state["mode"] == "pairs":
-        pairs_text = "\n".join(f"• {p}" for p in state.get("pairs") or [])
-        return "✅ تم تشغيل OTC SNIPER على الزوج/الأزواج:\n" + pairs_text
-    return "✅ تم تشغيل OTC SNIPER على كل السوق."
-
-
-def stop_otc_sniper(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> str:
-    uid = int(user_id)
-    state = _otc_sniper_state(uid)
-    state["enabled"] = False
-    state["active_trade_until_ts"] = 0.0
-    state["active_trade"] = None
-    _otc_sniper_remove_jobs(context, uid)
-    return "🛑 تم إيقاف OTC SNIPER."
-
-
-def build_otc_sniper_status(user_id: int) -> str:
-    state = _otc_sniper_state(user_id)
-    lines = [
-        "📋 حالة OTC SNIPER",
-        "━━━━━━━━━━━━━━",
-        f"الحالة: {'شغال ✅' if state.get('enabled') else 'متوقف ⏸'}",
-        f"الوضع: {'كل السوق' if state.get('mode') == 'all' else 'زوج محدد'}",
-        f"تنبيهات مرسلة: {state.get('alerts_sent', 0)}",
-    ]
-    if state.get("pairs"):
-        lines.append("الأزواج:")
-        lines.extend([f"• {p}" for p in list(state.get("pairs") or [])[:10]])
-    remain = _otc_sniper_active_remaining(user_id)
-    if remain > 0:
-        tr = state.get("active_trade") or {}
-        lines.append(f"🔒 صفقة حالية: {tr.get('pair')} {_otc_edge_direction_icon(tr.get('direction'))} | باقي {remain} ثانية")
-    if state.get("last_candidate"):
-        c = state.get("last_candidate") or {}
-        lines.append(f"آخر فرصة: {c.get('pair')} {_otc_edge_direction_icon(c.get('direction'))} | {c.get('score')}%")
-    if state.get("last_result"):
-        r = state.get("last_result") or {}
-        lines.append(f"آخر نتيجة: {r.get('result')} | {r.get('pair')}")
-    if state.get("last_error"):
-        lines.append(f"آخر خطأ: {state.get('last_error')}")
-    return "\n".join(lines)[:3900]
-
 async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     text = update.message.text.strip()
@@ -13640,50 +13188,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
-
-    # ===== OTC SNIPER private access =====
-    if text == "OTC SNIPER":
-        if not is_otc_sniper_user(user.id):
-            await update.message.reply_text("⛔ هذه الميزة خاصة.", reply_markup=build_main_menu_for_user(user.id))
-            return
-        reset_signal_state(context)
-        await update.message.reply_text(build_otc_sniper_menu_message(user.id), reply_markup=otc_sniper_keyboard)
-        return
-
-    if is_otc_sniper_user(user.id):
-        if text == "🎯 مراقبة زوج SNIPER":
-            context.user_data["step"] = "otc_sniper_waiting_pair"
-            await update.message.reply_text(
-                "🎯 أرسل الزوج الذي تريد مراقبته.\n\nمثال:\nUSD/BDT (OTC)\n\nأو عدة أزواج، كل زوج بسطر.",
-                reply_markup=otc_sniper_keyboard
-            )
-            return
-        if text == "🚀 مراقبة كل السوق SNIPER":
-            await update.message.reply_text(start_otc_sniper(context, user.id, mode="all"), reply_markup=otc_sniper_keyboard)
-            return
-        if text == "🛑 إيقاف OTC SNIPER":
-            await update.message.reply_text(stop_otc_sniper(context, user.id), reply_markup=otc_sniper_keyboard)
-            return
-        if text == "📋 حالة OTC SNIPER":
-            await update.message.reply_text(build_otc_sniper_status(user.id), reply_markup=otc_sniper_keyboard)
-            return
-        if step == "otc_sniper_waiting_pair":
-            pairs, errors = parse_otc_edge_watch_pairs(text)
-            context.user_data["step"] = None
-            if not pairs:
-                err_text = "\n".join(f"• {x}" for x in errors[:8]) if errors else "لم أستطع قراءة الزوج."
-                await update.message.reply_text(
-                    "❌ لم يتم تشغيل OTC SNIPER.\n"
-                    f"الأزواج غير المفهومة:\n{err_text}\n\n"
-                    "أرسل مثالًا بهذا الشكل:\nUSD/BDT (OTC)",
-                    reply_markup=otc_sniper_keyboard
-                )
-                return
-            msg = start_otc_sniper(context, user.id, mode="pairs", pairs=pairs)
-            if errors:
-                msg += "\n\n⚠️ تم تجاهل بعض المدخلات غير المفهومة:\n" + "\n".join(f"• {x}" for x in errors[:6])
-            await update.message.reply_text(msg, reply_markup=otc_sniper_keyboard)
-            return
 
     # ===== SIGNAL-ONLY ACCESS GATE =====
     # غير المفعّل يُمنع فقط من الإشارات، وليس من أزرار البداية أو التجربة.
