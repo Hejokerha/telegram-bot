@@ -7737,9 +7737,24 @@ OTC_EDGE_WATCHER_SCAN_SECONDS = int(os.getenv("OTC_EDGE_WATCHER_SCAN_SECONDS", "
 OTC_EDGE_WATCHER_MIN_SCORE = int(os.getenv("OTC_EDGE_WATCHER_MIN_SCORE", "78"))
 OTC_EDGE_WATCHER_MIN_PAYOUT = int(os.getenv("OTC_EDGE_WATCHER_MIN_PAYOUT", "85"))
 OTC_EDGE_WATCHER_COOLDOWN_SECONDS = int(os.getenv("OTC_EDGE_WATCHER_COOLDOWN_SECONDS", "75"))
-OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS = int(os.getenv("OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS", "10"))
+OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS = int(os.getenv("OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS", "5"))
 OTC_EDGE_WATCHER_MAX_ALERTS_PER_HOUR = int(os.getenv("OTC_EDGE_WATCHER_MAX_ALERTS_PER_HOUR", "25"))
 OTC_EDGE_WATCHER_TOP_ALERT_POOL = int(os.getenv("OTC_EDGE_WATCHER_TOP_ALERT_POOL", "8"))
+# ===== OTC Edge Timing Gate =====
+# لا نغيّر عقل التحليل ولا Edge Score. هذه طبقة توقيت فقط حتى يكون الدخول والانتهاء مطابقين لطريقة الصفقة.
+# الوضع الافتراضي: الصفقة تنتهي عند إغلاق شمعة M1 الحالية، لذلك لا نرسل التنبيه إلا ببداية الشمعة.
+OTC_EDGE_TIMING_MODE = os.getenv("OTC_EDGE_TIMING_MODE", "m1_candle_close").strip().lower()
+OTC_EDGE_CANDLE_SECONDS = int(os.getenv("OTC_EDGE_CANDLE_SECONDS", "60"))
+OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS = int(os.getenv("OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS", "60"))
+OTC_EDGE_WATCHER_TRADE_LOCK_SECONDS = int(os.getenv("OTC_EDGE_WATCHER_TRADE_LOCK_SECONDS", str(OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS + 10)))
+OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS = int(os.getenv("OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS", "3"))
+OTC_EDGE_ENTRY_WINDOW_ENABLED = os.getenv("OTC_EDGE_ENTRY_WINDOW_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+OTC_EDGE_ENTRY_MIN_SECOND = int(os.getenv("OTC_EDGE_ENTRY_MIN_SECOND", "3"))
+OTC_EDGE_ENTRY_WINDOW_SECONDS = int(os.getenv("OTC_EDGE_ENTRY_WINDOW_SECONDS", "30"))
+OTC_EDGE_ENTRY_LAST_ALERT_SECOND = int(os.getenv(
+    "OTC_EDGE_ENTRY_LAST_ALERT_SECOND",
+    str(max(1, OTC_EDGE_ENTRY_WINDOW_SECONDS - OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS))
+))
 
 _otc_edge_watcher_state = {
     "enabled": False,
@@ -7755,6 +7770,9 @@ _otc_edge_watcher_state = {
     "last_alerts": {},
     "alert_times": [],
     "alerts_sent": 0,
+    "active_trade_until_ts": 0.0,
+    "active_trade": None,
+    "entry_window_skips": 0,
 }
 
 
@@ -8171,7 +8189,7 @@ def build_otc_edge_menu_message() -> str:
         "📊 تقرير الأنماط: يلخص نتائج الأنماط السابقة المسجلة إن وجدت.\n"
         "🧪 فحص زوج محدد: يعطيك قراءة تفصيلية مرة واحدة لزوج واحد.\n\n"
         "قاعدة الدخول من تنبيه المراقبة:\n"
-        f"ادخل خلال أول {OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS} ثواني فقط، مدة الصفقة M1، وإذا تأخرت تجاهل التنبيه.\n\n"
+        f"ادخل فقط خلال صلاحية التنبيه، والصفقة تكون على إغلاق شمعة M1 الحالية حتى يطابق الدخول تحليل البوت.\n\n"
         "⚠️ هذه قراءة احتمالية وليست ضمان ربح."
     )
 
@@ -8362,6 +8380,9 @@ def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pai
             "last_alerts": {},
             "alert_times": [],
             "alerts_sent": 0,
+            "active_trade_until_ts": 0.0,
+            "active_trade": None,
+            "entry_window_skips": 0,
         })
         return build_otc_edge_watcher_status_message(prefix="✅ تم تشغيل مراقبة Edge.")
     except Exception as e:
@@ -8388,9 +8409,133 @@ def _otc_edge_alert_rate_limited(now_ts: float) -> bool:
         return False
 
 
+def _otc_edge_timing_mode() -> str:
+    """وضع توقيت الإشارة. الافتراضي يطابق إغلاق شمعة M1 الحالية."""
+    try:
+        mode = str(OTC_EDGE_TIMING_MODE or "m1_candle_close").strip().lower()
+        if mode in {"fixed", "fixed_60", "fixed_60s", "60s"}:
+            return "fixed_60s"
+        return "m1_candle_close"
+    except Exception:
+        return "m1_candle_close"
+
+
+def _otc_edge_current_candle_timing() -> dict:
+    """تفاصيل توقيت شمعة M1 الحالية حسب UTC+3.
+    نعتمدها فقط للبوابة الزمنية، بدون أي تغيير على حساب Edge نفسه.
+    """
+    try:
+        dt = now_utc().astimezone(UTC_PLUS_3)
+        second = float(dt.second) + (float(dt.microsecond) / 1_000_000.0)
+        candle_seconds = max(30, int(OTC_EDGE_CANDLE_SECONDS))
+        minute_start = dt.replace(second=0, microsecond=0)
+        close_dt = minute_start + timedelta(seconds=candle_seconds)
+        remaining = max(0.0, (close_dt - dt).total_seconds())
+        return {
+            "now": dt,
+            "second": second,
+            "remaining": remaining,
+            "close_dt": close_dt,
+            "close_text": close_dt.strftime("%H:%M:%S"),
+        }
+    except Exception:
+        dt = now_utc().astimezone(UTC_PLUS_3)
+        return {"now": dt, "second": 999.0, "remaining": 0.0, "close_dt": dt, "close_text": dt.strftime("%H:%M:%S")}
+
+
+def _otc_edge_entry_window_status() -> tuple[bool, str, dict]:
+    """بوابة توقيت للدخول. لا تغيّر اتجاه الصفقة ولا النمط، فقط تمنع التنبيه المتأخر."""
+    try:
+        if not OTC_EDGE_ENTRY_WINDOW_ENABLED:
+            return True, "فلتر توقيت الدخول متوقف", _otc_edge_current_candle_timing()
+
+        timing = _otc_edge_current_candle_timing()
+        if _otc_edge_timing_mode() != "m1_candle_close":
+            # في وضع 60 ثانية ثابتة نستخدم الفلتر كحماية اختيارية فقط.
+            return True, "وضع 60 ثانية ثابتة", timing
+
+        sec = float(timing.get("second", 999.0) or 999.0)
+        remaining = float(timing.get("remaining", 0.0) or 0.0)
+        min_second = max(0, int(OTC_EDGE_ENTRY_MIN_SECOND))
+        # آخر ثانية نسمح فيها بإرسال التنبيه، حتى تبقى صلاحية التنبيه داخل أول 30 ثانية.
+        latest_alert_second = min(
+            max(min_second, int(OTC_EDGE_ENTRY_LAST_ALERT_SECOND)),
+            max(min_second, int(OTC_EDGE_ENTRY_WINDOW_SECONDS) - int(OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS)),
+        )
+        if sec < min_second:
+            return False, f"بداية الشمعة مبكرة جدًا: الثانية {sec:.1f} أقل من {min_second}", timing
+        if sec > latest_alert_second:
+            return False, f"توقيت متأخر: الثانية {sec:.1f} بعد حد التنبيه {latest_alert_second}", timing
+        if remaining <= int(OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS):
+            return False, f"الوقت المتبقي للإغلاق قليل جدًا: {remaining:.1f} ثانية", timing
+        return True, "داخل نافذة الدخول المطابقة لإغلاق شمعة M1", timing
+    except Exception as e:
+        return True, f"تعذر فحص بوابة التوقيت: {e}", _otc_edge_current_candle_timing()
+
+
+def _otc_edge_entry_window_ok() -> bool:
+    ok, reason, timing = _otc_edge_entry_window_status()
+    if not ok:
+        try:
+            _otc_edge_watcher_state["last_timing_skip"] = reason
+            _otc_edge_watcher_state["last_timing_skip_at"] = now_iso()
+        except Exception:
+            pass
+    return bool(ok)
+
+
+def _otc_edge_active_trade_remaining(now_ts: float | None = None) -> int:
+    try:
+        now_ts = float(now_ts or time_module.time())
+        until_ts = float(_otc_edge_watcher_state.get("active_trade_until_ts") or 0)
+        remain = int(round(until_ts - now_ts))
+        if remain <= 0:
+            _otc_edge_watcher_state["active_trade_until_ts"] = 0.0
+            _otc_edge_watcher_state["active_trade"] = None
+            return 0
+        return remain
+    except Exception:
+        return 0
+
+
+def _otc_edge_set_active_trade_lock(item: dict, now_ts: float | None = None):
+    try:
+        now_ts = float(now_ts or time_module.time())
+        timing = _otc_edge_current_candle_timing()
+        if _otc_edge_timing_mode() == "m1_candle_close":
+            # القفل يطابق الصفقة: حتى إغلاق الشمعة الحالية + هامش صغير.
+            lock_seconds = max(1, int(float(timing.get("remaining", 0) or 0)) + int(OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS))
+            close_at = timing.get("close_dt").isoformat() if timing.get("close_dt") else None
+        else:
+            lock_seconds = max(int(OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS), int(OTC_EDGE_WATCHER_TRADE_LOCK_SECONDS))
+            close_at = (now_utc().astimezone(UTC_PLUS_3) + timedelta(seconds=lock_seconds)).isoformat()
+
+        _otc_edge_watcher_state["active_trade_until_ts"] = now_ts + lock_seconds
+        _otc_edge_watcher_state["active_trade"] = {
+            "pair": item.get("pair"),
+            "direction": item.get("direction"),
+            "score": item.get("score"),
+            "payout": item.get("payout"),
+            "pattern": item.get("pattern"),
+            "started_at": now_iso(),
+            "timing_mode": _otc_edge_timing_mode(),
+            "close_at": close_at,
+            "close_text": timing.get("close_text"),
+            "entry_second": round(float(timing.get("second", 0) or 0), 1),
+            "lock_seconds": lock_seconds,
+        }
+    except Exception:
+        pass
+
+
 def _otc_edge_can_alert(item: dict, now_ts: float) -> bool:
     try:
         if not item or not item.get("ok"):
+            return False
+        if _otc_edge_active_trade_remaining(now_ts) > 0:
+            return False
+        if not _otc_edge_entry_window_ok():
+            _otc_edge_watcher_state["entry_window_skips"] = int(_otc_edge_watcher_state.get("entry_window_skips", 0) or 0) + 1
             return False
         if int(item.get("score", 0) or 0) < int(OTC_EDGE_WATCHER_MIN_SCORE):
             return False
@@ -8441,11 +8586,31 @@ def _otc_edge_collect_watcher_candidates() -> list[dict]:
 
 def build_otc_edge_entry_alert_message(item: dict) -> str:
     try:
-        now_text = now_utc().astimezone(UTC_PLUS_3).strftime("%H:%M:%S")
+        timing = _otc_edge_current_candle_timing()
+        now_text = timing.get("now", now_utc().astimezone(UTC_PLUS_3)).strftime("%H:%M:%S")
         mode_text = _otc_edge_watch_mode_text()
         score = int(item.get("score", 0) or 0)
         tick_age = item.get("tick_age")
         metrics = item.get("metrics") or {}
+        timing_mode = _otc_edge_timing_mode()
+
+        if timing_mode == "m1_candle_close":
+            remaining = int(float(timing.get("remaining", 0) or 0))
+            sec = float(timing.get("second", 0) or 0)
+            timing_lines = (
+                "🕯 نظام الصفقة: M1 Candle Close\n"
+                f"🟢 الدخول: الآن خلال {OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS} ثواني فقط\n"
+                f"🏁 انتهاء الصفقة: {timing.get('close_text')} UTC+3\n"
+                f"⏱ المتبقي لإغلاق الشمعة: {remaining} ثانية | الثانية الحالية: {sec:.1f}\n"
+                f"🚫 لا تدخل إذا وصلت بعد الثانية {OTC_EDGE_ENTRY_WINDOW_SECONDS} من الشمعة.\n"
+            )
+        else:
+            timing_lines = (
+                "🕐 نظام الصفقة: Fixed 60s\n"
+                f"🟢 الدخول: الآن خلال {OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS} ثواني فقط\n"
+                f"🏁 انتهاء الصفقة: بعد {OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS} ثانية من لحظة دخولك\n"
+            )
+
         return (
             "🚨 OTC Edge Alert - فرصة مباشرة\n"
             "━━━━━━━━━━━━━━\n"
@@ -8453,7 +8618,8 @@ def build_otc_edge_entry_alert_message(item: dict) -> str:
             f"👁 المراقبة: {mode_text}\n\n"
             "✅ قرار الدخول: ادخل الآن فقط إذا كنت جاهزًا\n"
             f"⏳ صلاحية التنبيه: {OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS} ثواني\n"
-            "🕐 مدة الصفقة: M1 / دقيقة واحدة\n\n"
+            f"{timing_lines}"
+            f"🔒 لن يتم إرسال فرصة جديدة قبل انتهاء هذه الصفقة.\n\n"
             f"💱 الزوج: {item.get('pair')}\n"
             f"📌 الاتجاه: {_otc_edge_direction_icon(item.get('direction'))}\n"
             f"📊 Edge Score: {score}% | payout: {item.get('payout', 0)}%\n"
@@ -8490,8 +8656,27 @@ def build_otc_edge_watcher_status_message(prefix: str | None = None) -> str:
             f"🎯 حد التنبيه: Edge {OTC_EDGE_WATCHER_MIN_SCORE}% | payout {OTC_EDGE_WATCHER_MIN_PAYOUT}%",
             f"⏱ الفحص كل: {OTC_EDGE_WATCHER_SCAN_SECONDS} ثواني",
             f"🧊 منع تكرار نفس النمط: {OTC_EDGE_WATCHER_COOLDOWN_SECONDS} ثانية",
+            f"🧭 وضع التوقيت: {'إغلاق شمعة M1 ✅' if _otc_edge_timing_mode() == 'm1_candle_close' else 'Fixed 60s'}",
+            f"🪟 نافذة التنبيه: من الثانية {OTC_EDGE_ENTRY_MIN_SECOND} إلى {min(OTC_EDGE_ENTRY_LAST_ALERT_SECOND, OTC_EDGE_ENTRY_WINDOW_SECONDS - OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS)} | الدخول مسموح حتى الثانية {OTC_EDGE_ENTRY_WINDOW_SECONDS}",
+            f"🔒 القفل بعد التنبيه: حتى نهاية الصفقة الحالية",
             f"📨 تنبيهات مرسلة منذ التشغيل: {_otc_edge_watcher_state.get('alerts_sent', 0)}",
         ])
+        remain = _otc_edge_active_trade_remaining(time_module.time())
+        if remain > 0:
+            active_trade = _otc_edge_watcher_state.get("active_trade") or {}
+            close_extra = ""
+            if active_trade.get("close_text"):
+                close_extra = f" | الإغلاق: {active_trade.get('close_text')} UTC+3"
+            lines.extend([
+                "",
+                "🔒 صفقة حالية تحت المتابعة:",
+                f"• {active_trade.get('pair')} {_otc_edge_direction_icon(active_trade.get('direction'))} | باقي تقريبًا {remain} ثانية{close_extra}",
+            ])
+        if _otc_edge_watcher_state.get("last_timing_skip"):
+            lines.extend([
+                "",
+                f"⏳ آخر منع بسبب التوقيت: {_otc_edge_watcher_state.get('last_timing_skip')}",
+            ])
         if started_at:
             lines.append(f"بدأت: {format_dt_ar(started_at)}")
         if last_scan_at:
@@ -8538,6 +8723,7 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                 text=build_otc_edge_entry_alert_message(item),
             )
             if sent:
+                _otc_edge_set_active_trade_lock(item, now_ts)
                 _otc_edge_watcher_state["last_alert_at"] = now_iso()
                 _otc_edge_watcher_state["alerts_sent"] = int(_otc_edge_watcher_state.get("alerts_sent", 0) or 0) + 1
                 times = list(_otc_edge_watcher_state.get("alert_times") or [])
