@@ -7786,6 +7786,10 @@ OTC_EDGE_ENTRY_LAST_ALERT_SECOND = int(os.getenv(
     "OTC_EDGE_ENTRY_LAST_ALERT_SECOND",
     str(max(1, OTC_EDGE_ENTRY_WINDOW_SECONDS - OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS))
 ))
+# أثناء اختبار الزوج قبل إرسال الصفقات للمستخدم: لا نترك المستخدم ينتظر بصمت طويلًا.
+OTC_EDGE_CALIBRATION_PROGRESS_SECONDS = int(os.getenv("OTC_EDGE_CALIBRATION_PROGRESS_SECONDS", "120"))
+OTC_EDGE_CALIBRATION_NO_TRADE_TIMEOUT_SECONDS = int(os.getenv("OTC_EDGE_CALIBRATION_NO_TRADE_TIMEOUT_SECONDS", "600"))
+
 
 _otc_edge_watcher_state = {
     "enabled": False,
@@ -8411,6 +8415,8 @@ def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pai
                 "pending_trade": None,
                 "reverse_direction": False,
                 "ready_message_sent": False,
+                "last_progress_at": time_module.time(),
+                "no_trade_since": time_module.time(),
                 "started_at": now_iso(),
             }
 
@@ -8608,6 +8614,40 @@ def _otc_edge_calibration_counts(calibration: dict) -> tuple[int, int, int]:
     wins = sum(1 for t in trades if str(t.get("result")) == "win")
     losses = sum(1 for t in trades if str(t.get("result")) == "loss")
     return wins, losses, len(trades)
+
+
+async def _otc_edge_send_calibration_progress_if_needed(context: ContextTypes.DEFAULT_TYPE, calibration: dict, now_ts: float):
+    """يرسل تحديثًا بسيطًا أثناء اختبار الزوج حتى لا يبقى المستخدم منتظرًا بلا أي رد."""
+    try:
+        interval = max(30, int(OTC_EDGE_CALIBRATION_PROGRESS_SECONDS))
+        last = float(calibration.get("last_progress_at") or 0)
+        if now_ts - last < interval:
+            return
+        calibration["last_progress_at"] = now_ts
+        wins, losses, total = _otc_edge_calibration_counts(calibration)
+        target = int(calibration.get("target", 10) or 10)
+        pair_text = ", ".join(_otc_edge_watcher_state.get("pairs") or []) or "الزوج المحدد"
+        await safe_send_message(
+            context.bot,
+            chat_id=int(_otc_edge_watcher_state.get("chat_id") or ADMIN_TELEGRAM_ID),
+            text=(
+                "⏳ لا يزال البوت يختبر الزوج داخليًا.\n"
+                f"الزوج: {pair_text}\n"
+                f"التقدم: {total}/{target} | win={wins} / loss={losses}\n"
+                "لن يتم إرسال صفقات دخول قبل انتهاء الاختبار."
+            ),
+        )
+    except Exception as e:
+        logger.debug("Could not send OTC Edge calibration progress: %s", e)
+
+
+def _otc_edge_calibration_waiting_too_long(calibration: dict, now_ts: float) -> bool:
+    try:
+        timeout = max(120, int(OTC_EDGE_CALIBRATION_NO_TRADE_TIMEOUT_SECONDS))
+        no_trade_since = float(calibration.get("no_trade_since") or now_ts)
+        return bool(now_ts - no_trade_since >= timeout)
+    except Exception:
+        return False
 
 
 def _otc_edge_alert_rate_limited(now_ts: float) -> bool:
@@ -8903,6 +8943,9 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
 
         calibration = _otc_edge_watcher_state.get("calibration") or None
         if calibration and calibration.get("status") == "testing":
+            if not calibration.get("no_trade_since"):
+                calibration["no_trade_since"] = now_ts
+            await _otc_edge_send_calibration_progress_if_needed(context, calibration, now_ts)
             pending = calibration.get("pending_trade")
             if pending and now_ts >= float(pending.get("close_ts", 0) or 0) + int(OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS):
                 finished = _otc_edge_finalize_virtual_trade(pending)
@@ -8911,6 +8954,7 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                     trades.append(finished)
                     calibration["trades"] = trades
                     calibration["pending_trade"] = None
+                    calibration["no_trade_since"] = now_ts
                     _otc_edge_watcher_state["active_trade_until_ts"] = 0.0
                     _otc_edge_watcher_state["active_trade"] = None
 
@@ -8932,6 +8976,23 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                         return
 
             if calibration.get("pending_trade"):
+                return
+
+            if _otc_edge_calibration_waiting_too_long(calibration, now_ts):
+                pair_text = ", ".join(_otc_edge_watcher_state.get("pairs") or []) or "الزوج المحدد"
+                await safe_send_message(
+                    context.bot,
+                    chat_id=int(_otc_edge_watcher_state.get("chat_id") or ADMIN_TELEGRAM_ID),
+                    text=(
+                        "⚠️ هذا الزوج لا يعطي فرص اختبار كافية الآن.\n"
+                        f"الزوج: {pair_text}\n"
+                        "أوقفته مؤقتًا حتى لا يبقى البوت منتظرًا بصمت. جرّب زوجًا آخر أو أعد تشغيل المراقبة لاحقًا."
+                    ),
+                )
+                _otc_edge_watcher_state["enabled"] = False
+                _otc_edge_watcher_state["calibration"] = None
+                _otc_edge_watcher_state["active_trade_until_ts"] = 0.0
+                _otc_edge_watcher_state["active_trade"] = None
                 return
 
         if calibration and calibration.get("status") == "waiting_ready":
