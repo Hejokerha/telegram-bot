@@ -397,7 +397,8 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
         ["🧠 غرفة جلسة تداول", "🧠 OTC Edge Engine"],
-        ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
+        ["📡 قناة 3 شموع", "🧾 فحص ليستة OTC"],
+        ["📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
         ["📢 رسالة جماعية"],
         ["⬅️ رجوع"],
@@ -428,6 +429,16 @@ admin_otc_edge_keyboard = ReplyKeyboardMarkup(
         ["🎯 مراقبة زوج محدد", "🛑 إيقاف مراقبة Edge"],
         ["📋 حالة مراقبة Edge", "📊 تقرير الأنماط"],
         ["🧪 فحص زوج محدد"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+three_candle_admin_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🟢 تشغيل نشر القناة", "🔴 إيقاف نشر القناة"],
+        ["🎯 حد صفقات اليوم", "♾ نشر مفتوح"],
+        ["📊 ملخص القناة", "📋 حالة القناة"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -8807,6 +8818,7 @@ THREE_CANDLE_RESULT_DELAY_SECONDS = int(os.getenv("THREE_CANDLE_RESULT_DELAY_SEC
 THREE_CANDLE_PAIR_LOSS_LIMIT = int(os.getenv("THREE_CANDLE_PAIR_LOSS_LIMIT", "2"))
 THREE_CANDLE_PAIR_COOLDOWN_SECONDS = int(os.getenv("THREE_CANDLE_PAIR_COOLDOWN_SECONDS", "1800"))
 THREE_CANDLE_TIE_EPSILON = float(os.getenv("THREE_CANDLE_TIE_EPSILON", str(OTC_LIVE_TIE_EPSILON)))
+THREE_CANDLE_DAILY_LIMIT_DEFAULT = int(os.getenv("THREE_CANDLE_DAILY_LIMIT", "0"))  # 0 = مفتوح
 
 _three_candle_channel_state = {
     "pending_trade": None,
@@ -8815,6 +8827,8 @@ _three_candle_channel_state = {
     "pair_cooldowns": {},
     "signals_sent": 0,
     "results_sent": 0,
+    "cancelled_sent": 0,
+    "today_signals": 0,
     "last_scan_at": None,
     "last_error": None,
 }
@@ -8832,8 +8846,94 @@ def _three_candle_channel_id():
     return raw
 
 
+def _three_candle_settings_ref():
+    return system_ref().child("three_candle_channel").child("settings")
+
+
+def _three_candle_results_ref():
+    return system_ref().child("three_candle_channel").child("results")
+
+
+def _three_candle_daily_ref(day_key: str | None = None):
+    return system_ref().child("three_candle_channel").child("daily").child(day_key or get_utc3_day_key())
+
+
+def _three_candle_get_settings() -> dict:
+    default = {
+        "enabled": bool(THREE_CANDLE_CHANNEL_ENABLED),
+        "daily_limit": int(THREE_CANDLE_DAILY_LIMIT_DEFAULT),
+    }
+    try:
+        data = _three_candle_settings_ref().get() or {}
+        if not isinstance(data, dict):
+            data = {}
+        return {
+            "enabled": bool(data.get("enabled", default["enabled"])),
+            "daily_limit": int(data.get("daily_limit", default["daily_limit"]) or 0),
+        }
+    except Exception as e:
+        logger.exception("Could not read three-candle channel settings: %s", e)
+        return default
+
+
+def _three_candle_set_enabled(enabled: bool) -> bool:
+    try:
+        _three_candle_settings_ref().update({"enabled": bool(enabled), "updated_at": now_iso()})
+        return True
+    except Exception as e:
+        logger.exception("Could not update three-candle enabled: %s", e)
+        return False
+
+
+def _three_candle_set_daily_limit(limit: int) -> bool:
+    try:
+        _three_candle_settings_ref().update({"daily_limit": max(0, int(limit)), "updated_at": now_iso()})
+        return True
+    except Exception as e:
+        logger.exception("Could not update three-candle daily limit: %s", e)
+        return False
+
+
+def _three_candle_today_signal_count() -> int:
+    try:
+        return int((_three_candle_daily_ref().get() or {}).get("signals", 0) or 0)
+    except Exception:
+        return int(_three_candle_channel_state.get("today_signals", 0) or 0)
+
+
+def _three_candle_increment_today_signal_count():
+    try:
+        ref = _three_candle_daily_ref()
+        data = ref.get() or {}
+        if not isinstance(data, dict):
+            data = {}
+        ref.update({
+            "signals": int(data.get("signals", 0) or 0) + 1,
+            "day": get_utc3_day_key(),
+            "updated_at": now_iso(),
+        })
+    except Exception as e:
+        logger.debug("Could not increment three-candle daily count: %s", e)
+    try:
+        _three_candle_channel_state["today_signals"] = int(_three_candle_channel_state.get("today_signals", 0) or 0) + 1
+    except Exception:
+        pass
+
+
+def _three_candle_daily_limit_reached() -> bool:
+    try:
+        settings = _three_candle_get_settings()
+        limit = int(settings.get("daily_limit", 0) or 0)
+        if limit <= 0:
+            return False
+        return _three_candle_today_signal_count() >= limit
+    except Exception:
+        return False
+
+
 def _three_candle_is_enabled() -> bool:
-    return bool(THREE_CANDLE_CHANNEL_ENABLED and _three_candle_channel_id())
+    settings = _three_candle_get_settings()
+    return bool(settings.get("enabled") and _three_candle_channel_id())
 
 
 def _three_candle_direction_icon(direction: str) -> str:
@@ -8903,6 +9003,91 @@ def _three_candle_register_final_result(pair: str, result: str):
             streaks[pair] = 0
     except Exception:
         pass
+
+
+def _three_candle_record_result(trade: dict, result_type: str, result_text: str):
+    try:
+        record = {
+            "created_at": now_iso(),
+            "day": get_utc3_day_key(),
+            "pair": str((trade or {}).get("pair", "")),
+            "symbol": str((trade or {}).get("symbol", "")),
+            "direction": str((trade or {}).get("direction", "")),
+            "result_type": str(result_type),
+            "result_text": str(result_text),
+            "payout": safe_int((trade or {}).get("payout", 0), 0),
+        }
+        key = f"{int(time_module.time() * 1000)}_{safe_key(record.get('pair'))}"
+        _three_candle_results_ref().child(key).set(record)
+    except Exception as e:
+        logger.debug("Could not record three-candle result: %s", e)
+
+
+def _three_candle_fetch_result_records() -> list[dict]:
+    try:
+        data = _three_candle_results_ref().get() or {}
+        if not isinstance(data, dict):
+            return []
+        items = []
+        for k, v in data.items():
+            if isinstance(v, dict):
+                item = dict(v)
+                item["_key"] = k
+                items.append(item)
+        items.sort(key=lambda x: str(x.get("created_at", "")))
+        return items
+    except Exception as e:
+        logger.exception("Could not fetch three-candle result records: %s", e)
+        return []
+
+
+def build_three_candle_channel_summary(limit: int | None = None) -> str:
+    records = _three_candle_fetch_result_records()
+    if limit and int(limit) > 0:
+        records = records[-int(limit):]
+        title = f"📊 ملخص قناة 3 شموع - آخر {int(limit)} نتيجة"
+    else:
+        title = "📊 ملخص قناة 3 شموع - من بداية القناة"
+
+    direct_win = sum(1 for r in records if r.get("result_type") == "direct_win")
+    mg_win = sum(1 for r in records if r.get("result_type") == "mg_win")
+    loss = sum(1 for r in records if r.get("result_type") == "loss")
+    draw = sum(1 for r in records if r.get("result_type") == "draw")
+    cancelled = sum(1 for r in records if r.get("result_type") == "cancelled")
+    total_closed = direct_win + mg_win + loss + draw
+    wins = direct_win + mg_win
+    win_rate = round((wins / total_closed) * 100, 1) if total_closed else 0
+
+    return (
+        f"{title}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📌 النتائج المحسوبة: {total_closed}\n"
+        f"Win✅ مباشر: {direct_win}\n"
+        f"Win✅. مضاعفة: {mg_win}\n"
+        f"Lose💔: {loss}\n"
+        f"🟰doji: {draw}\n"
+        f"🚫 إلغاء: {cancelled}\n"
+        f"📈 نسبة الربح: {win_rate}%"
+    )[:3900]
+
+
+def build_three_candle_channel_status() -> str:
+    settings = _three_candle_get_settings()
+    channel_id = _three_candle_channel_id()
+    limit = int(settings.get("daily_limit", 0) or 0)
+    today_count = _three_candle_today_signal_count()
+    pending = _three_candle_channel_state.get("pending_trade")
+    return (
+        "📋 حالة قناة 3 شموع\n"
+        "━━━━━━━━━━━━━━\n"
+        f"النشر: {'شغال ✅' if _three_candle_is_enabled() else 'متوقف ⛔'}\n"
+        f"القناة: {channel_id or 'غير مضبوطة'}\n"
+        f"حد الصفقات اليومي: {'مفتوح ♾' if limit <= 0 else limit}\n"
+        f"منشور اليوم: {today_count}\n"
+        f"آخر فحص: {_three_candle_channel_state.get('last_scan_at') or 'لا يوجد'}\n"
+        f"صفقة قيد المتابعة: {'نعم' if isinstance(pending, dict) else 'لا'}\n"
+        f"آخر خطأ: {_three_candle_channel_state.get('last_error') or 'لا يوجد'}"
+    )[:3900]
 
 
 def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
@@ -9040,7 +9225,28 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
             return True
 
         symbol = trade.get("symbol")
-        direction = trade.get("direction")
+        direction = str(trade.get("direction") or "").upper()
+
+        # أولًا: نتأكد أن الشمعة الثالثة أغلقت بنفس اللون المتوقع.
+        # إذا عكست آخر الثواني، نلغي الصفقة قبل حساب الدخول.
+        if not bool(trade.get("third_candle_confirmed", False)):
+            current_bucket = int(trade.get("current_bucket", 0) or 0)
+            if now_ts < current_bucket + 60 + int(THREE_CANDLE_RESULT_DELAY_SECONDS):
+                return True
+            confirmation_candle = _three_candle_get_candle(symbol, current_bucket)
+            if not confirmation_candle:
+                return True
+            parts = _otc_edge_candle_parts(confirmation_candle)
+            expected_dir = 1 if direction == "CALL" else -1
+            if int(parts.get("dir", 0) or 0) != expected_dir:
+                await safe_send_message(context.bot, chat_id=channel_id, text="تم الغاء الصفقة")
+                _three_candle_channel_state["cancelled_sent"] = int(_three_candle_channel_state.get("cancelled_sent", 0) or 0) + 1
+                _three_candle_record_result(trade, "cancelled", "تم الغاء الصفقة")
+                _three_candle_channel_state["pending_trade"] = None
+                return False
+            trade["third_candle_confirmed"] = True
+            _three_candle_channel_state["pending_trade"] = trade
+
         step = int(trade.get("step", 0) or 0)
         bucket = int(trade.get("entry_bucket") if step == 0 else trade.get("martingale_bucket"))
         # لا نحكم قبل إغلاق الشمعة مع تأخير صغير حتى يكتمل الكاش.
@@ -9062,13 +9268,22 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
             return True
 
         final_result = result
-        await safe_send_message(
-            context.bot,
-            chat_id=channel_id,
-            text=_three_candle_result_message(trade, final_result, martingale=(step == 1), candle=candle),
-        )
+        martingale = (step == 1)
+        result_text = _three_candle_result_message(trade, final_result, martingale=martingale, candle=candle)
+        await safe_send_message(context.bot, chat_id=channel_id, text=result_text)
         _three_candle_channel_state["results_sent"] = int(_three_candle_channel_state.get("results_sent", 0) or 0) + 1
         _three_candle_register_final_result(str(trade.get("pair")), final_result)
+
+        if final_result == "win" and martingale:
+            result_type = "mg_win"
+        elif final_result == "win":
+            result_type = "direct_win"
+        elif final_result == "loss":
+            result_type = "loss"
+        else:
+            result_type = "draw"
+        _three_candle_record_result(trade, result_type, result_text)
+
         _three_candle_channel_state["pending_trade"] = None
         return False
     except Exception as e:
@@ -9086,6 +9301,9 @@ async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
         # إذا في صفقة قائمة، ننتظر نتيجتها ولا نرسل صفقة جديدة.
         has_pending = await _three_candle_process_pending_trade(context)
         if has_pending:
+            return
+
+        if _three_candle_daily_limit_reached():
             return
 
         candidates = _three_candle_collect_candidates()
@@ -9109,6 +9327,7 @@ async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
         sent = await safe_send_message(context.bot, chat_id=channel_id, text=_three_candle_signal_message(trade))
         if sent:
             _three_candle_channel_state["signals_sent"] = int(_three_candle_channel_state.get("signals_sent", 0) or 0) + 1
+            _three_candle_increment_today_signal_count()
         else:
             _three_candle_channel_state["pending_trade"] = None
     except Exception as e:
@@ -14281,7 +14500,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== Common buttons =====
     if text == "🔙 رجوع":
-        if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message", "otc_list_waiting_text", "otc_pair_diagnostics_waiting", "otc_candle_diagnostics_waiting", "otc_edge_waiting_pair", "otc_edge_watch_waiting_pair", "trading_room_waiting_balance"}:
+        if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message", "otc_list_waiting_text", "otc_pair_diagnostics_waiting", "otc_candle_diagnostics_waiting", "otc_edge_waiting_pair", "otc_edge_watch_waiting_pair", "three_candle_waiting_daily_limit", "three_candle_waiting_summary_count", "trading_room_waiting_balance"}:
             context.user_data["step"] = None
             await update.message.reply_text("تم الرجوع.", reply_markup=admin_main_keyboard)
             return
@@ -14469,6 +14688,86 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 build_otc_edge_single_pair_message(text),
                 reply_markup=admin_otc_edge_keyboard
             )
+            return
+
+
+        if text == "📡 قناة 3 شموع":
+            reset_signal_state(context)
+            await update.message.reply_text(
+                "📡 قناة 3 شموع - Beta\nاختر الإجراء المطلوب:",
+                reply_markup=three_candle_admin_keyboard
+            )
+            return
+
+        if text == "🟢 تشغيل نشر القناة":
+            ok = _three_candle_set_enabled(True)
+            await update.message.reply_text(
+                "✅ تم تشغيل نشر قناة 3 شموع" if ok else "❌ تعذر تشغيل النشر. راجع اللوج.",
+                reply_markup=three_candle_admin_keyboard
+            )
+            return
+
+        if text == "🔴 إيقاف نشر القناة":
+            ok = _three_candle_set_enabled(False)
+            await update.message.reply_text(
+                "⛔ تم إيقاف نشر قناة 3 شموع" if ok else "❌ تعذر إيقاف النشر. راجع اللوج.",
+                reply_markup=three_candle_admin_keyboard
+            )
+            return
+
+        if text == "🎯 حد صفقات اليوم":
+            context.user_data["step"] = "three_candle_waiting_daily_limit"
+            await update.message.reply_text(
+                "🎯 أرسل عدد الصفقات التي تريد نشرها خلال اليوم.\nمثال: 10\n\nأرسل 0 لجعل النشر مفتوح.",
+                reply_markup=three_candle_admin_keyboard
+            )
+            return
+
+        if step == "three_candle_waiting_daily_limit":
+            context.user_data["step"] = None
+            value = safe_int(text, -1)
+            if value < 0:
+                await update.message.reply_text("❌ أرسل رقم صحيح، مثال: 10 أو 0 للنشر المفتوح.", reply_markup=three_candle_admin_keyboard)
+                return
+            ok = _three_candle_set_daily_limit(value)
+            label = "مفتوح ♾" if value == 0 else str(value)
+            await update.message.reply_text(
+                f"✅ تم ضبط حد صفقات اليوم: {label}" if ok else "❌ تعذر حفظ الحد. راجع اللوج.",
+                reply_markup=three_candle_admin_keyboard
+            )
+            return
+
+        if text == "♾ نشر مفتوح":
+            ok = _three_candle_set_daily_limit(0)
+            await update.message.reply_text(
+                "✅ تم جعل النشر مفتوح بدون حد يومي" if ok else "❌ تعذر حفظ الإعداد. راجع اللوج.",
+                reply_markup=three_candle_admin_keyboard
+            )
+            return
+
+        if text == "📊 ملخص القناة":
+            context.user_data["step"] = "three_candle_waiting_summary_count"
+            await update.message.reply_text(
+                "📊 أرسل عدد النتائج التي تريد تلخيصها، مثال: 50\nأو أرسل: الكل\nلعرض الملخص من بداية القناة.",
+                reply_markup=three_candle_admin_keyboard
+            )
+            return
+
+        if step == "three_candle_waiting_summary_count":
+            context.user_data["step"] = None
+            raw = str(text or "").strip().lower()
+            if raw in {"الكل", "كل", "all", "0"}:
+                await update.message.reply_text(build_three_candle_channel_summary(None), reply_markup=three_candle_admin_keyboard)
+                return
+            count = safe_int(raw, -1)
+            if count <= 0:
+                await update.message.reply_text("❌ أرسل رقم صحيح أو كلمة: الكل", reply_markup=three_candle_admin_keyboard)
+                return
+            await update.message.reply_text(build_three_candle_channel_summary(count), reply_markup=three_candle_admin_keyboard)
+            return
+
+        if text == "📋 حالة القناة":
+            await update.message.reply_text(build_three_candle_channel_status(), reply_markup=three_candle_admin_keyboard)
             return
 
         if text == "📊 إحصائيات البوت":
