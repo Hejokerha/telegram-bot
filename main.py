@@ -119,28 +119,6 @@ def parse_id_set_from_env(name: str) -> set[int]:
 
 OTC_LIST_MANAGER_IDS = parse_id_set_from_env("OTC_LIST_MANAGER_IDS")
 
-# ===== OTC Edge Engine beta access =====
-# الميزة التجريبية تظهر فقط للأدمن وهذه الحسابات، ولا تظهر لباقي المستخدمين.
-OTC_EDGE_EXTRA_IDS = parse_id_set_from_env("OTC_EDGE_EXTRA_IDS")
-OTC_EDGE_ALLOWED_IDS = {
-    ADMIN_TELEGRAM_ID,
-    6656949901,
-    6575230269,
-    1592499902,
-} | set(OTC_EDGE_EXTRA_IDS)
-
-
-def is_otc_edge_allowed(user_id: int) -> bool:
-    try:
-        uid = int(user_id)
-        return uid in OTC_EDGE_ALLOWED_IDS or is_admin(uid)
-    except Exception:
-        try:
-            return int(user_id) in OTC_EDGE_ALLOWED_IDS
-        except Exception:
-            return False
-
-
 DATABASE_URL = "https://telegram-bot-f0229-default-rtdb.firebaseio.com"
 
 WELCOME_MESSAGE = """
@@ -450,15 +428,6 @@ admin_otc_edge_keyboard = ReplyKeyboardMarkup(
         ["🎯 مراقبة زوج محدد", "🛑 إيقاف مراقبة Edge"],
         ["📋 حالة مراقبة Edge", "📊 تقرير الأنماط"],
         ["🧪 فحص زوج محدد"],
-        ["⬅️ رجوع"],
-    ],
-    resize_keyboard=True
-)
-
-otc_edge_user_keyboard = ReplyKeyboardMarkup(
-    [
-        ["🎯 مراقبة زوج محدد"],
-        ["🛑 إيقاف مراقبة Edge", "📋 حالة مراقبة Edge"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -7786,10 +7755,6 @@ OTC_EDGE_ENTRY_LAST_ALERT_SECOND = int(os.getenv(
     "OTC_EDGE_ENTRY_LAST_ALERT_SECOND",
     str(max(1, OTC_EDGE_ENTRY_WINDOW_SECONDS - OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS))
 ))
-# أثناء اختبار الزوج قبل إرسال الصفقات للمستخدم: لا نترك المستخدم ينتظر بصمت طويلًا.
-OTC_EDGE_CALIBRATION_PROGRESS_SECONDS = int(os.getenv("OTC_EDGE_CALIBRATION_PROGRESS_SECONDS", "120"))
-OTC_EDGE_CALIBRATION_NO_TRADE_TIMEOUT_SECONDS = int(os.getenv("OTC_EDGE_CALIBRATION_NO_TRADE_TIMEOUT_SECONDS", "600"))
-
 
 _otc_edge_watcher_state = {
     "enabled": False,
@@ -7808,8 +7773,6 @@ _otc_edge_watcher_state = {
     "active_trade_until_ts": 0.0,
     "active_trade": None,
     "entry_window_skips": 0,
-    "calibration": None,
-    "reverse_direction": False,
 }
 
 
@@ -8210,28 +8173,25 @@ def scan_otc_edge_market(limit: int | None = None, include_weak: bool = False) -
         return results
 
 
-def build_otc_edge_menu_message(user_id: int | None = None) -> str:
+def build_otc_edge_menu_message() -> str:
     watcher_status = "شغالة ✅" if _otc_edge_watcher_state.get("enabled") else "متوقفة ⏸"
-    if user_id is not None and not is_admin(user_id):
-        return (
-            f"🧠 OTC Edge Engine\n"
-            f"━━━━━━━━━━━━━━\n\n"
-            f"👁 حالة المراقبة: {watcher_status}\n\n"
-            f"اختر مراقبة زوج محدد، ثم أرسل اسم الزوج المطلوب."
-        )
     return (
-        f"🧠 OTC Edge Engine\n"
-        f"━━━━━━━━━━━━━━\n\n"
+        "🧠 OTC Edge Engine - Admin Only\n"
+        "━━━━━━━━━━━━━━\n\n"
+        "هذا القسم خاص بالأدمن فقط.\n"
+        "وظيفته كشف الأنماط السلوكية المتكررة في OTC من بث Quotex Live، بدون نشر للمستخدمين وبدون تغيير نظام الإشارات.\n\n"
         f"👁 حالة المراقبة التلقائية: {watcher_status}\n\n"
-        f"الأزرار:\n"
-        f"🔎 فحص السوق الآن: يعرض أفضل الفرص الحالية فورًا.\n"
-        f"🚀 مراقبة كل السوق: البوت يراقب كل الأزواج ويرسل فرصة مباشرة عند ظهور Edge قوي.\n"
-        f"🎯 مراقبة زوج محدد: يختبر الزوج أولًا داخليًا ثم يطلب منك تأكيد الجاهزية.\n"
-        f"📋 حالة مراقبة Edge: يعرض وضع المراقبة.\n"
-        f"📊 تقرير الأنماط: يلخص نتائج الأنماط السابقة المسجلة إن وجدت.\n"
-        f"🧪 فحص زوج محدد: يعطيك قراءة تفصيلية مرة واحدة لزوج واحد."
+        "الأزرار:\n"
+        "🔎 فحص السوق الآن: يعرض أفضل الفرص الحالية فورًا.\n"
+        "🚀 مراقبة كل السوق: البوت يراقب كل الأزواج ويرسل لك فرصة مباشرة عند ظهور Edge قوي.\n"
+        "🎯 مراقبة زوج محدد: تختار زوجًا أو عدة أزواج، والبوت ينبهك فقط عليها.\n"
+        "📋 حالة مراقبة Edge: يعرض وضع المراقبة والآخر فرصة رآها البوت.\n"
+        "📊 تقرير الأنماط: يلخص نتائج الأنماط السابقة المسجلة إن وجدت.\n"
+        "🧪 فحص زوج محدد: يعطيك قراءة تفصيلية مرة واحدة لزوج واحد.\n\n"
+        "قاعدة الدخول من تنبيه المراقبة:\n"
+        f"ادخل فقط خلال صلاحية التنبيه، والصفقة تكون على إغلاق شمعة M1 الحالية حتى يطابق الدخول تحليل البوت.\n\n"
+        "⚠️ هذه قراءة احتمالية وليست ضمان ربح."
     )
-
 
 def format_otc_edge_item(item: dict, rank: int | None = None, detailed: bool = False) -> str:
     try:
@@ -8400,25 +8360,11 @@ def parse_otc_edge_watch_pairs(text: str) -> tuple[list[str], list[str]]:
     return pairs, errors
 
 
-def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pairs: list[str] | None = None, calibrate: bool = False) -> str:
+def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pairs: list[str] | None = None) -> str:
     try:
         pairs = list(dict.fromkeys(pairs or []))
         if mode == "pairs" and not pairs:
             return "❌ لم يتم تشغيل المراقبة لأن قائمة الأزواج فارغة."
-
-        calibration = None
-        if calibrate and mode == "pairs":
-            calibration = {
-                "status": "testing",  # testing | waiting_ready | live
-                "target": int(os.getenv("OTC_EDGE_CALIBRATION_TRADES", "10")),
-                "trades": [],
-                "pending_trade": None,
-                "reverse_direction": False,
-                "ready_message_sent": False,
-                "last_progress_at": time_module.time(),
-                "no_trade_since": time_module.time(),
-                "started_at": now_iso(),
-            }
 
         _otc_edge_watcher_state.update({
             "enabled": True,
@@ -8437,17 +8383,7 @@ def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pai
             "active_trade_until_ts": 0.0,
             "active_trade": None,
             "entry_window_skips": 0,
-            "calibration": calibration,
-            "reverse_direction": False,
         })
-
-        if calibration is not None:
-            return (
-                "✅ تم استلام الزوج.\n"
-                "سيقوم البوت الآن بقراءة بيانات الزوج ومراقبة الصفقات داخليًا، "
-                "وسينبهك عندما تصبح البيانات جاهزة."
-            )
-
         return build_otc_edge_watcher_status_message(prefix="✅ تم تشغيل مراقبة Edge.")
     except Exception as e:
         logger.exception("Could not start OTC Edge watcher: %s", e)
@@ -8459,195 +8395,9 @@ def stop_otc_edge_watcher() -> str:
         was_enabled = bool(_otc_edge_watcher_state.get("enabled"))
         _otc_edge_watcher_state["enabled"] = False
         _otc_edge_watcher_state["last_error"] = None
-        _otc_edge_watcher_state["calibration"] = None
-        _otc_edge_watcher_state["active_trade_until_ts"] = 0.0
-        _otc_edge_watcher_state["active_trade"] = None
         return "🛑 تم إيقاف مراقبة OTC Edge." if was_enabled else "مراقبة OTC Edge متوقفة أصلًا."
     except Exception as e:
         return f"تعذر إيقاف المراقبة: {e}"
-
-
-def _otc_edge_result_ref(user_id: int, trade_id: str):
-    return system_ref().child("otc_edge_user_results").child(str(int(user_id))).child(str(trade_id))
-
-
-def _otc_edge_reverse_direction(direction: str) -> str:
-    direction = str(direction or "").upper()
-    if direction == "CALL":
-        return "PUT"
-    if direction == "PUT":
-        return "CALL"
-    return direction
-
-
-def _otc_edge_apply_direction_mode(item: dict) -> dict:
-    result = dict(item or {})
-    try:
-        if bool(_otc_edge_watcher_state.get("reverse_direction")):
-            result["raw_direction"] = result.get("direction")
-            result["direction"] = _otc_edge_reverse_direction(result.get("direction"))
-            result["reversed"] = True
-    except Exception:
-        pass
-    return result
-
-
-def _otc_edge_make_trade_id() -> str:
-    try:
-        return f"{int(time_module.time() * 1000):x}{random.randint(100, 999)}"
-    except Exception:
-        return str(int(time_module.time()))
-
-
-def build_otc_edge_result_keyboard(trade_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("Win✅", callback_data=f"edge_result:{trade_id}:win"),
-            InlineKeyboardButton("Lose💔", callback_data=f"edge_result:{trade_id}:loss"),
-        ]
-    ])
-
-
-def build_otc_edge_ready_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("نعم", callback_data="edge_ready:yes"),
-            InlineKeyboardButton("لا", callback_data="edge_ready:no"),
-        ]
-    ])
-
-
-def _otc_edge_store_signal_record(user_id: int, trade_id: str, item: dict):
-    try:
-        _otc_edge_result_ref(user_id, trade_id).set({
-            "trade_id": trade_id,
-            "user_id": int(user_id),
-            "pair": item.get("pair"),
-            "direction": item.get("direction"),
-            "raw_direction": item.get("raw_direction", item.get("direction")),
-            "reversed": bool(item.get("reversed")),
-            "score": item.get("score"),
-            "payout": item.get("payout"),
-            "pattern": item.get("pattern"),
-            "price": item.get("price"),
-            "sent_at": now_iso(),
-            "result": "pending",
-        })
-    except Exception as e:
-        logger.debug("Could not store OTC Edge signal record: %s", e)
-
-
-def _otc_edge_update_manual_result(user_id: int, trade_id: str, result: str):
-    try:
-        result = "win" if str(result).lower().startswith("win") else "loss"
-        _otc_edge_result_ref(user_id, trade_id).update({
-            "result": result,
-            "result_updated_at": now_iso(),
-        })
-    except Exception as e:
-        logger.debug("Could not update OTC Edge manual result: %s", e)
-
-
-def _otc_edge_trade_close_price(symbol: str, close_ts: float):
-    try:
-        close_ts = float(close_ts)
-        target_bucket = int(close_ts // 60) * 60 - 60
-        with quotex_otc_feed.lock:
-            candles_map = dict((quotex_otc_feed.candles.get(symbol) or {}))
-            candle = candles_map.get(target_bucket)
-            if not candle:
-                candidates = [c for k, c in sorted(candles_map.items()) if int(k) <= target_bucket]
-                candle = candidates[-1] if candidates else None
-        if candle and candle.get("close") is not None:
-            return float(candle.get("close"))
-    except Exception:
-        pass
-    return None
-
-
-def _otc_edge_build_virtual_trade(item: dict, now_ts: float) -> dict:
-    timing = _otc_edge_current_candle_timing()
-    symbol = get_otc_symbol_for_pair(item.get("pair")) or item.get("symbol")
-    if _otc_edge_timing_mode() == "m1_candle_close":
-        close_dt = timing.get("close_dt")
-        close_ts = close_dt.timestamp() if close_dt else (now_ts + int(timing.get("remaining", 60) or 60))
-        close_text = timing.get("close_text")
-    else:
-        close_ts = now_ts + int(OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS)
-        close_text = (now_utc().astimezone(UTC_PLUS_3) + timedelta(seconds=int(OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS))).strftime("%H:%M:%S")
-    return {
-        "pair": item.get("pair"),
-        "symbol": symbol,
-        "direction": item.get("direction"),
-        "entry_price": float(item.get("price")),
-        "entry_ts": now_ts,
-        "close_ts": float(close_ts),
-        "close_text": close_text,
-        "score": item.get("score"),
-        "payout": item.get("payout"),
-        "pattern": item.get("pattern"),
-    }
-
-
-def _otc_edge_finalize_virtual_trade(trade: dict) -> dict | None:
-    try:
-        close_price = _otc_edge_trade_close_price(trade.get("symbol"), float(trade.get("close_ts")))
-        if close_price is None:
-            return None
-        entry = float(trade.get("entry_price"))
-        direction = str(trade.get("direction") or "").upper()
-        win = close_price > entry if direction == "CALL" else close_price < entry if direction == "PUT" else False
-        result = dict(trade)
-        result.update({
-            "close_price": close_price,
-            "result": "win" if win else "loss",
-            "finished_at": now_iso(),
-        })
-        return result
-    except Exception as e:
-        logger.debug("Could not finalize virtual OTC Edge trade: %s", e)
-        return None
-
-
-def _otc_edge_calibration_counts(calibration: dict) -> tuple[int, int, int]:
-    trades = list((calibration or {}).get("trades") or [])
-    wins = sum(1 for t in trades if str(t.get("result")) == "win")
-    losses = sum(1 for t in trades if str(t.get("result")) == "loss")
-    return wins, losses, len(trades)
-
-
-async def _otc_edge_send_calibration_progress_if_needed(context: ContextTypes.DEFAULT_TYPE, calibration: dict, now_ts: float):
-    """يرسل تحديثًا بسيطًا أثناء اختبار الزوج حتى لا يبقى المستخدم منتظرًا بلا أي رد."""
-    try:
-        interval = max(30, int(OTC_EDGE_CALIBRATION_PROGRESS_SECONDS))
-        last = float(calibration.get("last_progress_at") or 0)
-        if now_ts - last < interval:
-            return
-        calibration["last_progress_at"] = now_ts
-        wins, losses, total = _otc_edge_calibration_counts(calibration)
-        target = int(calibration.get("target", 10) or 10)
-        pair_text = ", ".join(_otc_edge_watcher_state.get("pairs") or []) or "الزوج المحدد"
-        await safe_send_message(
-            context.bot,
-            chat_id=int(_otc_edge_watcher_state.get("chat_id") or ADMIN_TELEGRAM_ID),
-            text=(
-                "⏳ لا يزال البوت يختبر الزوج داخليًا.\n"
-                f"الزوج: {pair_text}\n"
-                f"التقدم: {total}/{target} | win={wins} / loss={losses}\n"
-                "لن يتم إرسال صفقات دخول قبل انتهاء الاختبار."
-            ),
-        )
-    except Exception as e:
-        logger.debug("Could not send OTC Edge calibration progress: %s", e)
-
-
-def _otc_edge_calibration_waiting_too_long(calibration: dict, now_ts: float) -> bool:
-    try:
-        timeout = max(120, int(OTC_EDGE_CALIBRATION_NO_TRADE_TIMEOUT_SECONDS))
-        no_trade_since = float(calibration.get("no_trade_since") or now_ts)
-        return bool(now_ts - no_trade_since >= timeout)
-    except Exception:
-        return False
 
 
 def _otc_edge_alert_rate_limited(now_ts: float) -> bool:
@@ -8837,29 +8587,51 @@ def _otc_edge_collect_watcher_candidates() -> list[dict]:
 def build_otc_edge_entry_alert_message(item: dict) -> str:
     try:
         timing = _otc_edge_current_candle_timing()
+        now_text = timing.get("now", now_utc().astimezone(UTC_PLUS_3)).strftime("%H:%M:%S")
+        mode_text = _otc_edge_watch_mode_text()
         score = int(item.get("score", 0) or 0)
+        tick_age = item.get("tick_age")
+        metrics = item.get("metrics") or {}
         timing_mode = _otc_edge_timing_mode()
 
         if timing_mode == "m1_candle_close":
             remaining = int(float(timing.get("remaining", 0) or 0))
             sec = float(timing.get("second", 0) or 0)
-            return (
-                f"📌 الاتجاه: {_otc_edge_direction_icon(item.get('direction'))}\n"
+            timing_lines = (
+                "🕯 نظام الصفقة: M1 Candle Close\n"
                 f"🟢 الدخول: الآن خلال {OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS} ثواني فقط\n"
                 f"🏁 انتهاء الصفقة: {timing.get('close_text')} UTC+3\n"
                 f"⏱ المتبقي لإغلاق الشمعة: {remaining} ثانية | الثانية الحالية: {sec:.1f}\n"
                 f"🚫 لا تدخل إذا وصلت بعد الثانية {OTC_EDGE_ENTRY_WINDOW_SECONDS} من الشمعة.\n"
-                f"📊 Edge Score: {score}% | payout: {item.get('payout', 0)}%"
-            )[:3900]
+            )
+        else:
+            timing_lines = (
+                "🕐 نظام الصفقة: Fixed 60s\n"
+                f"🟢 الدخول: الآن خلال {OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS} ثواني فقط\n"
+                f"🏁 انتهاء الصفقة: بعد {OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS} ثانية من لحظة دخولك\n"
+            )
 
         return (
+            "🚨 OTC Edge Alert - فرصة مباشرة\n"
+            "━━━━━━━━━━━━━━\n"
+            f"⏰ وقت التنبيه: {now_text} UTC+3\n"
+            f"👁 المراقبة: {mode_text}\n\n"
+            "✅ قرار الدخول: ادخل الآن فقط إذا كنت جاهزًا\n"
+            f"⏳ صلاحية التنبيه: {OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS} ثواني\n"
+            f"{timing_lines}"
+            f"🔒 لن يتم إرسال فرصة جديدة قبل انتهاء هذه الصفقة.\n\n"
+            f"💱 الزوج: {item.get('pair')}\n"
             f"📌 الاتجاه: {_otc_edge_direction_icon(item.get('direction'))}\n"
-            f"🟢 الدخول: الآن خلال {OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS} ثواني فقط\n"
-            f"🏁 انتهاء الصفقة: بعد {OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS} ثانية من لحظة دخولك\n"
-            f"📊 Edge Score: {score}% | payout: {item.get('payout', 0)}%"
+            f"📊 Edge Score: {score}% | payout: {item.get('payout', 0)}%\n"
+            f"🧩 النمط: {item.get('reason')}\n"
+            f"💵 السعر الآن: {_otc_edge_price_text(item.get('pair', ''), item.get('price'))}\n"
+            f"⏱ عمر آخر tick: {tick_age} ثانية\n\n"
+            f"🔍 القراءة: {item.get('detail')}\n"
+            f"⚠️ إلغاء الدخول إذا تأخرت، أو السعر عكس بقوة، أو ظهرت شمعة رفض ضد الاتجاه.\n"
+            f"📐 p35={metrics.get('pressure_35')} | m35={metrics.get('momentum_35')} | p12={metrics.get('pressure_12')}"
         )[:3900]
     except Exception as e:
-        return f"تعذر تنسيق التنبيه: {e}"
+        return f"🚨 OTC Edge Alert\nتعذر تنسيق التنبيه: {e}"
 
 
 def build_otc_edge_watcher_status_message(prefix: str | None = None) -> str:
@@ -8917,16 +8689,6 @@ def build_otc_edge_watcher_status_message(prefix: str | None = None) -> str:
                 "آخر فرصة رآها البوت:",
                 f"• {last_candidate.get('pair')} {_otc_edge_direction_icon(last_candidate.get('direction'))} | {last_candidate.get('score')}% | payout {last_candidate.get('payout')}%",
             ])
-        cal = _otc_edge_watcher_state.get("calibration") or {}
-        if cal:
-            wins, losses, total = _otc_edge_calibration_counts(cal)
-            status = str(cal.get("status") or "")
-            if status == "testing":
-                lines.extend(["", f"🧪 اختبار الزوج: {total}/{int(cal.get('target', 10) or 10)} | win={wins} / loss={losses}"])
-            elif status == "waiting_ready":
-                lines.extend(["", "✅ انتهى اختبار الزوج وينتظر تأكيد الجاهزية."])
-            elif status == "live":
-                lines.extend(["", "✅ المراقبة الحية مفعّلة."])
         if _otc_edge_watcher_state.get("last_error"):
             lines.append(f"⚠️ آخر خطأ: {_otc_edge_watcher_state.get('last_error')}")
         return "\n".join(lines)[:3900]
@@ -8939,64 +8701,6 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
         if not bool(_otc_edge_watcher_state.get("enabled")):
             return
         _otc_edge_watcher_state["last_scan_at"] = now_iso()
-        now_ts = time_module.time()
-
-        calibration = _otc_edge_watcher_state.get("calibration") or None
-        if calibration and calibration.get("status") == "testing":
-            if not calibration.get("no_trade_since"):
-                calibration["no_trade_since"] = now_ts
-            await _otc_edge_send_calibration_progress_if_needed(context, calibration, now_ts)
-            pending = calibration.get("pending_trade")
-            if pending and now_ts >= float(pending.get("close_ts", 0) or 0) + int(OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS):
-                finished = _otc_edge_finalize_virtual_trade(pending)
-                if finished:
-                    trades = list(calibration.get("trades") or [])
-                    trades.append(finished)
-                    calibration["trades"] = trades
-                    calibration["pending_trade"] = None
-                    calibration["no_trade_since"] = now_ts
-                    _otc_edge_watcher_state["active_trade_until_ts"] = 0.0
-                    _otc_edge_watcher_state["active_trade"] = None
-
-                    wins, losses, total = _otc_edge_calibration_counts(calibration)
-                    target = int(calibration.get("target", 10) or 10)
-                    if total >= target and wins != losses:
-                        reverse = losses > wins
-                        calibration["reverse_direction"] = bool(reverse)
-                        calibration["status"] = "waiting_ready"
-                        _otc_edge_watcher_state["reverse_direction"] = bool(reverse)
-                        if not calibration.get("ready_message_sent"):
-                            calibration["ready_message_sent"] = True
-                            await safe_send_message(
-                                context.bot,
-                                chat_id=int(_otc_edge_watcher_state.get("chat_id") or ADMIN_TELEGRAM_ID),
-                                text="لقد انتهيت، هل أنت جاهز؟",
-                                reply_markup=build_otc_edge_ready_keyboard(),
-                            )
-                        return
-
-            if calibration.get("pending_trade"):
-                return
-
-            if _otc_edge_calibration_waiting_too_long(calibration, now_ts):
-                pair_text = ", ".join(_otc_edge_watcher_state.get("pairs") or []) or "الزوج المحدد"
-                await safe_send_message(
-                    context.bot,
-                    chat_id=int(_otc_edge_watcher_state.get("chat_id") or ADMIN_TELEGRAM_ID),
-                    text=(
-                        "⚠️ هذا الزوج لا يعطي فرص اختبار كافية الآن.\n"
-                        f"الزوج: {pair_text}\n"
-                        "أوقفته مؤقتًا حتى لا يبقى البوت منتظرًا بصمت. جرّب زوجًا آخر أو أعد تشغيل المراقبة لاحقًا."
-                    ),
-                )
-                _otc_edge_watcher_state["enabled"] = False
-                _otc_edge_watcher_state["calibration"] = None
-                _otc_edge_watcher_state["active_trade_until_ts"] = 0.0
-                _otc_edge_watcher_state["active_trade"] = None
-                return
-
-        if calibration and calibration.get("status") == "waiting_ready":
-            return
 
         candidates = _otc_edge_collect_watcher_candidates()
         if candidates:
@@ -9008,32 +8712,18 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                 "pattern": candidates[0].get("pattern"),
             }
 
+        now_ts = time_module.time()
         for item in candidates:
             if not _otc_edge_can_alert(item, now_ts):
                 continue
-
-            if calibration and calibration.get("status") == "testing":
-                try:
-                    virtual_trade = _otc_edge_build_virtual_trade(item, now_ts)
-                    calibration["pending_trade"] = virtual_trade
-                    _otc_edge_set_active_trade_lock(item, now_ts)
-                except Exception as e:
-                    _otc_edge_watcher_state["last_error"] = str(e)
-                    logger.exception("Could not start OTC Edge calibration trade: %s", e)
-                break
-
             chat_id = int(_otc_edge_watcher_state.get("chat_id") or ADMIN_TELEGRAM_ID)
-            final_item = _otc_edge_apply_direction_mode(item)
-            trade_id = _otc_edge_make_trade_id()
             sent = await safe_send_message(
                 context.bot,
                 chat_id=chat_id,
-                text=build_otc_edge_entry_alert_message(final_item),
-                reply_markup=build_otc_edge_result_keyboard(trade_id),
+                text=build_otc_edge_entry_alert_message(item),
             )
             if sent:
-                _otc_edge_store_signal_record(chat_id, trade_id, final_item)
-                _otc_edge_set_active_trade_lock(final_item, now_ts)
+                _otc_edge_set_active_trade_lock(item, now_ts)
                 _otc_edge_watcher_state["last_alert_at"] = now_iso()
                 _otc_edge_watcher_state["alerts_sent"] = int(_otc_edge_watcher_state.get("alerts_sent", 0) or 0) + 1
                 times = list(_otc_edge_watcher_state.get("alert_times") or [])
@@ -9101,6 +8791,329 @@ def build_otc_edge_patterns_report() -> str:
     except Exception as e:
         logger.exception("Could not build OTC Edge patterns report: %s", e)
         return "تعذر إنشاء تقرير الأنماط. راجع اللوج."
+
+
+
+# ===== Beta channel: 3 same-color candles continuation strategy =====
+# إضافة اختبارية مستقلة عن OTC Edge Engine وOTC SNIPER.
+# تنشر على قناة Telegram فقط إذا تم ضبط THREE_CANDLE_CHANNEL_ID وتفعيل THREE_CANDLE_CHANNEL_ENABLED.
+THREE_CANDLE_CHANNEL_ID_RAW = os.getenv("THREE_CANDLE_CHANNEL_ID", "").strip()
+THREE_CANDLE_CHANNEL_ENABLED = os.getenv("THREE_CANDLE_CHANNEL_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+THREE_CANDLE_MIN_PAYOUT = int(os.getenv("THREE_CANDLE_MIN_PAYOUT", "80"))
+THREE_CANDLE_SCAN_SECONDS = int(os.getenv("THREE_CANDLE_SCAN_SECONDS", "2"))
+THREE_CANDLE_ALERT_REMAINING_SECONDS = float(os.getenv("THREE_CANDLE_ALERT_REMAINING_SECONDS", "10"))
+THREE_CANDLE_MIN_REMAINING_SECONDS = float(os.getenv("THREE_CANDLE_MIN_REMAINING_SECONDS", "2"))
+THREE_CANDLE_RESULT_DELAY_SECONDS = int(os.getenv("THREE_CANDLE_RESULT_DELAY_SECONDS", "5"))
+THREE_CANDLE_PAIR_LOSS_LIMIT = int(os.getenv("THREE_CANDLE_PAIR_LOSS_LIMIT", "2"))
+THREE_CANDLE_PAIR_COOLDOWN_SECONDS = int(os.getenv("THREE_CANDLE_PAIR_COOLDOWN_SECONDS", "1800"))
+THREE_CANDLE_TIE_EPSILON = float(os.getenv("THREE_CANDLE_TIE_EPSILON", str(OTC_LIVE_TIE_EPSILON)))
+
+_three_candle_channel_state = {
+    "pending_trade": None,
+    "last_signal_buckets": {},
+    "pair_loss_streaks": {},
+    "pair_cooldowns": {},
+    "signals_sent": 0,
+    "results_sent": 0,
+    "last_scan_at": None,
+    "last_error": None,
+}
+
+
+def _three_candle_channel_id():
+    raw = str(THREE_CANDLE_CHANNEL_ID_RAW or "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.lstrip("-").isdigit():
+            return int(raw)
+    except Exception:
+        pass
+    return raw
+
+
+def _three_candle_is_enabled() -> bool:
+    return bool(THREE_CANDLE_CHANNEL_ENABLED and _three_candle_channel_id())
+
+
+def _three_candle_direction_icon(direction: str) -> str:
+    direction = str(direction or "").upper()
+    if direction == "CALL":
+        return "🟢 CALL"
+    if direction == "PUT":
+        return "🔴 PUT"
+    return "⚪"
+
+
+def _three_candle_result_for_direction(direction: str, open_price, close_price) -> str:
+    try:
+        o = float(open_price)
+        c = float(close_price)
+        if abs(c - o) <= float(THREE_CANDLE_TIE_EPSILON):
+            return "draw"
+        direction = str(direction or "").upper()
+        if direction == "CALL":
+            return "win" if c > o else "loss"
+        if direction == "PUT":
+            return "win" if c < o else "loss"
+        return "unknown"
+    except Exception:
+        return "unknown"
+
+
+def _three_candle_bucket_now() -> tuple[int, float]:
+    now_ts = time_module.time()
+    bucket_ts = int(now_ts // 60) * 60
+    remaining = float(bucket_ts + 60 - now_ts)
+    return bucket_ts, remaining
+
+
+def _three_candle_get_sorted_candles(symbol: str) -> list[dict]:
+    try:
+        with quotex_otc_feed.lock:
+            candles_map = dict((quotex_otc_feed.candles.get(symbol) or {}))
+        return [dict(c) for _, c in sorted(candles_map.items())]
+    except Exception:
+        return []
+
+
+def _three_candle_pair_on_cooldown(pair: str) -> tuple[bool, int]:
+    try:
+        now_ts = time_module.time()
+        until_ts = float((_three_candle_channel_state.get("pair_cooldowns") or {}).get(pair, 0) or 0)
+        if until_ts > now_ts:
+            return True, int(round(until_ts - now_ts))
+        if until_ts:
+            (_three_candle_channel_state.get("pair_cooldowns") or {}).pop(pair, None)
+        return False, 0
+    except Exception:
+        return False, 0
+
+
+def _three_candle_register_final_result(pair: str, result: str):
+    try:
+        streaks = _three_candle_channel_state.setdefault("pair_loss_streaks", {})
+        cooldowns = _three_candle_channel_state.setdefault("pair_cooldowns", {})
+        if result == "loss":
+            streaks[pair] = int(streaks.get(pair, 0) or 0) + 1
+            if int(streaks[pair]) >= int(THREE_CANDLE_PAIR_LOSS_LIMIT):
+                cooldowns[pair] = time_module.time() + int(THREE_CANDLE_PAIR_COOLDOWN_SECONDS)
+                streaks[pair] = 0
+        elif result in {"win", "draw"}:
+            streaks[pair] = 0
+    except Exception:
+        pass
+
+
+def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
+    try:
+        on_cd, _remain = _three_candle_pair_on_cooldown(pair)
+        if on_cd:
+            return None
+
+        instrument = quotex_otc_feed.instrument(symbol) if "quotex_otc_feed" in globals() else {}
+        payout = int(float((instrument or {}).get("payout", 0) or 0))
+        is_otc = bool((instrument or {}).get("is_otc", True))
+        if instrument and (not is_otc or payout < int(THREE_CANDLE_MIN_PAYOUT)):
+            return None
+        if payout and payout < int(THREE_CANDLE_MIN_PAYOUT):
+            return None
+
+        current_bucket, remaining = _three_candle_bucket_now()
+        if remaining > float(THREE_CANDLE_ALERT_REMAINING_SECONDS):
+            return None
+        if remaining < float(THREE_CANDLE_MIN_REMAINING_SECONDS):
+            return None
+
+        candles = _three_candle_get_sorted_candles(symbol)
+        if len(candles) < 3:
+            return None
+        by_bucket = {int(float(c.get("bucket_ts", 0) or 0)): c for c in candles}
+        current = by_bucket.get(current_bucket)
+        prev1 = by_bucket.get(current_bucket - 60)
+        prev2 = by_bucket.get(current_bucket - 120)
+        if not current or not prev1 or not prev2:
+            return None
+
+        p1 = _otc_edge_candle_parts(prev2)
+        p2 = _otc_edge_candle_parts(prev1)
+        pc = _otc_edge_candle_parts(current)
+        if p1["dir"] == 0 or p2["dir"] == 0 or pc["dir"] == 0:
+            return None
+        if not (p1["dir"] == p2["dir"] == pc["dir"]):
+            return None
+
+        direction = "CALL" if pc["dir"] > 0 else "PUT"
+        last_signals = _three_candle_channel_state.setdefault("last_signal_buckets", {})
+        if int(last_signals.get(symbol, 0) or 0) == int(current_bucket):
+            return None
+
+        # نعطي أولوية للشمعات الواضحة والباي أوت الأعلى.
+        body_score = round((p1.get("body_ratio", 0) + p2.get("body_ratio", 0) + pc.get("body_ratio", 0)) / 3, 4)
+        return {
+            "pair": pair,
+            "symbol": symbol,
+            "direction": direction,
+            "payout": payout,
+            "current_bucket": int(current_bucket),
+            "entry_bucket": int(current_bucket + 60),
+            "entry_close_bucket": int(current_bucket + 120),
+            "remaining": round(float(remaining), 1),
+            "body_score": body_score,
+            "third_color": "خضراء" if direction == "CALL" else "حمراء",
+        }
+    except Exception as e:
+        logger.debug("three candle candidate failed for %s/%s: %s", pair, symbol, e)
+        return None
+
+
+def _three_candle_collect_candidates() -> list[dict]:
+    results = []
+    try:
+        pair_map = get_otc_analysis_pair_map()
+        for pair, symbol in pair_map.items():
+            candidate = _three_candle_candidate_for_pair(pair, symbol)
+            if candidate:
+                results.append(candidate)
+        results.sort(key=lambda x: (int(x.get("payout", 0) or 0), float(x.get("body_score", 0) or 0)), reverse=True)
+    except Exception as e:
+        _three_candle_channel_state["last_error"] = str(e)
+        logger.exception("Three-candle channel candidate scan failed: %s", e)
+    return results
+
+
+def _three_candle_signal_message(trade: dict) -> str:
+    try:
+        entry_dt = datetime.fromtimestamp(int(trade.get("entry_bucket")), tz=UTC).astimezone(UTC_PLUS_3)
+        close_dt = datetime.fromtimestamp(int(trade.get("entry_close_bucket")), tz=UTC).astimezone(UTC_PLUS_3)
+        direction_icon = _three_candle_direction_icon(trade.get('direction'))
+        pair = trade.get('pair')
+        payout = trade.get('payout', 0)
+        warning_color = trade.get('third_color')
+        return (
+            "⚡ OTC SIGNAL\n"
+            "━━━━━━━━━━━━━━\n"
+            f"💱 {pair}\n"
+            f"📌 {direction_icon}\n"
+            f"⏳ الدخول: {entry_dt.strftime('%H:%M:%S')} UTC+3\n"
+            f"🏁 الانتهاء: {close_dt.strftime('%H:%M:%S')} UTC+3\n"
+            f"💰 payout: {payout}%\n"
+            f"⚠️ ادخل فقط إذا أغلقت الشمعة الحالية {warning_color}."
+        )[:3900]
+    except Exception as e:
+        return f"⚡ OTC SIGNAL\nتعذر تنسيق الرسالة: {e}"
+
+
+def _three_candle_result_message(trade: dict, result: str, *, martingale: bool = False, candle: dict | None = None) -> str:
+    try:
+        if result == "win":
+            # Win✅. تعني أن الربح جاء بعد المضاعفة MG1.
+            return "Win✅." if martingale else "Win✅"
+        if result == "loss":
+            return "Lose💔"
+        if result == "draw":
+            return "🟰doji"
+        return "🟰doji"
+    except Exception:
+        return "🟰doji"
+
+
+def _three_candle_get_candle(symbol: str, bucket_ts: int) -> dict:
+    try:
+        with quotex_otc_feed.lock:
+            candle = (quotex_otc_feed.candles.get(symbol) or {}).get(int(bucket_ts))
+        return dict(candle) if candle else {}
+    except Exception:
+        return {}
+
+
+async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """يعالج الصفقة الحالية إن وجدت. يرجع True إذا توجد صفقة قيد المتابعة."""
+    trade = _three_candle_channel_state.get("pending_trade")
+    if not isinstance(trade, dict):
+        return False
+
+    try:
+        now_ts = time_module.time()
+        channel_id = _three_candle_channel_id()
+        if not channel_id:
+            return True
+
+        symbol = trade.get("symbol")
+        direction = trade.get("direction")
+        step = int(trade.get("step", 0) or 0)
+        bucket = int(trade.get("entry_bucket") if step == 0 else trade.get("martingale_bucket"))
+        # لا نحكم قبل إغلاق الشمعة مع تأخير صغير حتى يكتمل الكاش.
+        if now_ts < bucket + 60 + int(THREE_CANDLE_RESULT_DELAY_SECONDS):
+            return True
+
+        candle = _three_candle_get_candle(symbol, bucket)
+        if not candle:
+            # إذا لم تصل الشمعة بعد ننتظر، ولا ننشر نتيجة خاطئة.
+            return True
+
+        result = _three_candle_result_for_direction(direction, candle.get("open"), candle.get("close"))
+        if step == 0 and result == "loss":
+            # مضاعفة: لا ننشر الخسارة المباشرة، ننتظر الشمعة التالية بنفس الاتجاه.
+            trade["step"] = 1
+            trade["first_result"] = "loss"
+            trade["martingale_bucket"] = int(bucket + 60)
+            _three_candle_channel_state["pending_trade"] = trade
+            return True
+
+        final_result = result
+        await safe_send_message(
+            context.bot,
+            chat_id=channel_id,
+            text=_three_candle_result_message(trade, final_result, martingale=(step == 1), candle=candle),
+        )
+        _three_candle_channel_state["results_sent"] = int(_three_candle_channel_state.get("results_sent", 0) or 0) + 1
+        _three_candle_register_final_result(str(trade.get("pair")), final_result)
+        _three_candle_channel_state["pending_trade"] = None
+        return False
+    except Exception as e:
+        _three_candle_channel_state["last_error"] = str(e)
+        logger.exception("Three-candle pending trade processing failed: %s", e)
+        return True
+
+
+async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not _three_candle_is_enabled():
+            return
+        _three_candle_channel_state["last_scan_at"] = now_iso()
+
+        # إذا في صفقة قائمة، ننتظر نتيجتها ولا نرسل صفقة جديدة.
+        has_pending = await _three_candle_process_pending_trade(context)
+        if has_pending:
+            return
+
+        candidates = _three_candle_collect_candidates()
+        if not candidates:
+            return
+
+        item = candidates[0]
+        channel_id = _three_candle_channel_id()
+        if not channel_id:
+            return
+
+        # نحجز الصفقة قبل الإرسال حتى لا تتكرر بنفس الدورة.
+        trade = dict(item)
+        trade.update({
+            "created_at": now_iso(),
+            "step": 0,
+        })
+        _three_candle_channel_state.setdefault("last_signal_buckets", {})[trade.get("symbol")] = int(trade.get("current_bucket"))
+        _three_candle_channel_state["pending_trade"] = trade
+
+        sent = await safe_send_message(context.bot, chat_id=channel_id, text=_three_candle_signal_message(trade))
+        if sent:
+            _three_candle_channel_state["signals_sent"] = int(_three_candle_channel_state.get("signals_sent", 0) or 0) + 1
+        else:
+            _three_candle_channel_state["pending_trade"] = None
+    except Exception as e:
+        _three_candle_channel_state["last_error"] = str(e)
+        logger.exception("Three-candle channel job error: %s", e)
 
 
 
@@ -11541,43 +11554,14 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
     if lang is None:
         lang = get_user_language(user_id)
 
-    edge_allowed = is_otc_edge_allowed(user_id)
-
     if is_otc_list_manager(user_id) and not is_admin(user_id):
-        if lang == "en":
-            rows = [
-                ["📊 Generate Signals"],
-                ["🧠 Trading Session Room"],
-            ]
-            if edge_allowed:
-                rows.append(["🧠 OTC Edge Engine"])
-            rows.extend([
-                ["👤 My Account", "🎥 Watch Bot Tutorial"],
-                ["📞 Contact Support", "🌐 Change Language"],
-                ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
-            ])
-            return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
-        rows = [
-            ["📊 توليد إشارات"],
-            ["🧠 غرفة جلسة تداول"],
-        ]
-        if edge_allowed:
-            rows.append(["🧠 OTC Edge Engine"])
-        rows.extend([
-            ["👤 حالة حسابي", "🎥 مشاهدة فيديو شرح البوت"],
-            ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
-            ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
-        ])
-        return ReplyKeyboardMarkup(rows, resize_keyboard=True)
-
+        return otc_list_manager_keyboard if lang != "en" else main_keyboard_en
     if is_admin(user_id):
         if lang == "en":
             return ReplyKeyboardMarkup(
                 [
                     ["📊 Generate Signals"],
                     ["🧠 Trading Session Room"],
-                    ["🧠 OTC Edge Engine"],
                     ["👤 My Account", "📞 Contact Support"],
                     ["🌐 Change Language", "🛠 Admin Panel"],
                 ],
@@ -11587,36 +11571,11 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
             [
                 ["📊 توليد إشارات"],
                 ["🧠 غرفة جلسة تداول"],
-                ["🧠 OTC Edge Engine"],
                 ["👤 حالة حسابي", "📞 تواصل مع المسؤول"],
                 ["🌐 تغيير اللغة", "🛠 لوحة الأدمن"],
             ],
             resize_keyboard=True
         )
-
-    if edge_allowed:
-        if lang == "en":
-            return ReplyKeyboardMarkup(
-                [
-                    ["📊 Generate Signals"],
-                    ["🧠 Trading Session Room"],
-                    ["🧠 OTC Edge Engine"],
-                    ["👤 My Account", "🎥 Watch Bot Tutorial"],
-                    ["📞 Contact Support", "🌐 Change Language"],
-                ],
-                resize_keyboard=True
-            )
-        return ReplyKeyboardMarkup(
-            [
-                ["📊 توليد إشارات"],
-                ["🧠 غرفة جلسة تداول"],
-                ["🧠 OTC Edge Engine"],
-                ["👤 حالة حسابي", "🎥 مشاهدة فيديو شرح البوت"],
-                ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
-            ],
-            resize_keyboard=True
-        )
-
     return main_keyboard_en if lang == "en" else main_keyboard
 
 
@@ -12226,56 +12185,6 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         if handled:
             return
 
-    if data == "edge_done":
-        await query.answer("تم تسجيل النتيجة")
-        return
-
-    if data.startswith("edge_result:"):
-        if not is_otc_edge_allowed(user.id):
-            await query.answer("غير مسموح", show_alert=True)
-            return
-        try:
-            _, trade_id, result = data.split(":", 2)
-            result = "win" if result == "win" else "loss"
-            _otc_edge_update_manual_result(user.id, trade_id, result)
-            await query.answer("تم تسجيل النتيجة")
-            label = "Win✅" if result == "win" else "Lose💔"
-            try:
-                await query.edit_message_reply_markup(
-                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(f"تم تسجيل {label}", callback_data="edge_done")]])
-                )
-            except Exception:
-                pass
-        except Exception:
-            await query.answer("تعذر تسجيل النتيجة", show_alert=True)
-        return
-
-    if data.startswith("edge_ready:"):
-        if not is_otc_edge_allowed(user.id):
-            await query.answer("غير مسموح", show_alert=True)
-            return
-        choice = data.split(":", 1)[1]
-        cal = _otc_edge_watcher_state.get("calibration") or {}
-        if choice == "yes":
-            cal["status"] = "live"
-            _otc_edge_watcher_state["calibration"] = cal
-            _otc_edge_watcher_state["enabled"] = True
-            await query.answer("تم التشغيل")
-            try:
-                await query.edit_message_reply_markup(reply_markup=None)
-            except Exception:
-                pass
-            await safe_send_message(context.bot, chat_id=user.id, text="✅ تم تشغيل المراقبة.", reply_markup=otc_edge_user_keyboard if not is_admin(user.id) else admin_otc_edge_keyboard)
-        else:
-            stop_otc_edge_watcher()
-            await query.answer("تم الإيقاف")
-            try:
-                await query.edit_message_reply_markup(reply_markup=None)
-            except Exception:
-                pass
-            await safe_send_message(context.bot, chat_id=user.id, text="تم إيقاف المراقبة.", reply_markup=otc_edge_user_keyboard if not is_admin(user.id) else admin_otc_edge_keyboard)
-        return
-
     if not is_admin(user.id):
         await query.answer("هذا الزر للأدمن فقط", show_alert=True)
         return
@@ -12418,13 +12327,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if not get_bot_enabled():
         await send_maintenance_message(update, context, lang)
-        return
-
-    if is_otc_edge_allowed(user.id) and not is_approved(user.id):
-        await update.message.reply_text(
-            f"✅ أهلًا {user.first_name}\nمرحبًا بك في بوت TRADING TIME.",
-            reply_markup=build_main_menu_for_user(user.id, lang)
-        )
         return
 
     # مشرف الليستات: إذا كان مفعّلًا يظهر له كيبورد الليستات+الإشارات، وإذا غير مفعّل يرجع لمسار البداية.
@@ -13597,53 +13499,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Trading Session Room is shared between Arabic and English users; handle it before English fallback.
     if await handle_trading_room_message(update, context):
         return
-
-    # ===== OTC Edge Engine beta access =====
-    if is_otc_edge_allowed(user.id):
-        edge_markup = admin_otc_edge_keyboard if is_admin(user.id) else otc_edge_user_keyboard
-
-        if text == "🧠 OTC Edge Engine":
-            reset_signal_state(context)
-            await update.message.reply_text(
-                build_otc_edge_menu_message(user.id),
-                reply_markup=edge_markup
-            )
-            return
-
-        if text == "🎯 مراقبة زوج محدد":
-            context.user_data["step"] = "otc_edge_watch_waiting_pair"
-            await update.message.reply_text(
-                "🎯 أرسل الزوج الذي تريد مراقبته.\n\nمثال:\nUSD/INR (OTC)",
-                reply_markup=edge_markup
-            )
-            return
-
-        if step == "otc_edge_watch_waiting_pair":
-            pairs, errors = parse_otc_edge_watch_pairs(text)
-            context.user_data["step"] = None
-            if not pairs:
-                await update.message.reply_text(
-                    "❌ لم أستطع قراءة الزوج.\nأرسل مثالًا بهذا الشكل:\nUSD/INR (OTC)",
-                    reply_markup=edge_markup
-                )
-                return
-            msg = start_otc_edge_watcher(user.id, user.id, mode="pairs", pairs=pairs[:1], calibrate=True)
-            await update.message.reply_text(msg, reply_markup=edge_markup)
-            return
-
-        if text == "🛑 إيقاف مراقبة Edge":
-            await update.message.reply_text(
-                stop_otc_edge_watcher(),
-                reply_markup=edge_markup
-            )
-            return
-
-        if text == "📋 حالة مراقبة Edge":
-            await update.message.reply_text(
-                build_otc_edge_watcher_status_message(),
-                reply_markup=edge_markup
-            )
-            return
 
     if lang == "en":
         await handle_message_en(update, context)
@@ -15202,6 +15057,14 @@ def main():
         interval=OTC_EDGE_WATCHER_SCAN_SECONDS,
         first=OTC_EDGE_WATCHER_SCAN_SECONDS,
         name="admin_otc_edge_watcher",
+    )
+
+    # قناة اختبار استراتيجية 3 شموع متتالية. تعمل فقط عند ضبط THREE_CANDLE_CHANNEL_ID وتفعيلها من env.
+    job_queue.run_repeating(
+        three_candle_channel_job,
+        interval=THREE_CANDLE_SCAN_SECONDS,
+        first=10,
+        name="three_candle_channel_strategy",
     )
 
     if FIREBASE_24H_MONITOR_ENABLED:
