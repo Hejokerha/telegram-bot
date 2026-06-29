@@ -368,13 +368,67 @@ GLOBAL_MARKET_CLOSED_MESSAGE = (
 ONLINE_MINUTES_WINDOW = 15
 
 # ===== Firebase init =====
-firebase_json = os.getenv("FIREBASE_CREDENTIALS_JSON")
+def _load_firebase_credential():
+    """Load Firebase credentials safely on Render/local.
 
-if firebase_json:
-    cred_dict = json.loads(firebase_json)
-    cred = credentials.Certificate(cred_dict)
-else:
-    cred = credentials.Certificate("serviceAccountKey.json")
+    Priority:
+    1) FIREBASE_CREDENTIALS_JSON when it is valid JSON.
+    2) FIREBASE_CREDENTIALS_FILE or GOOGLE_APPLICATION_CREDENTIALS when set.
+    3) serviceAccountKey.json in the project folder.
+
+    If FIREBASE_CREDENTIALS_JSON is present but malformed, we do NOT crash
+    immediately; we fall back to the file path if available and print a clear log.
+    """
+    firebase_json_raw = os.getenv("FIREBASE_CREDENTIALS_JSON")
+
+    if firebase_json_raw:
+        firebase_json_raw = str(firebase_json_raw).strip()
+        try:
+            cred_dict = json.loads(firebase_json_raw)
+
+            # Some dashboards store the whole JSON as a quoted JSON string.
+            if isinstance(cred_dict, str):
+                cred_dict = json.loads(cred_dict)
+
+            if not isinstance(cred_dict, dict):
+                raise ValueError("FIREBASE_CREDENTIALS_JSON did not decode to a JSON object")
+
+            # Normalize private key newlines for Firebase Admin SDK.
+            private_key = cred_dict.get("private_key")
+            if isinstance(private_key, str):
+                cred_dict["private_key"] = private_key.replace("\\n", "\n")
+
+            return credentials.Certificate(cred_dict)
+        except Exception as e:
+            logger.warning(
+                "FIREBASE_CREDENTIALS_JSON is present but invalid; trying credential file fallback. Error: %s",
+                e,
+            )
+
+    credential_file = (
+        os.getenv("FIREBASE_CREDENTIALS_FILE")
+        or os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+        or "serviceAccountKey.json"
+    )
+
+    if credential_file and os.path.exists(credential_file):
+        logger.warning("Using Firebase credential file: %s", credential_file)
+        return credentials.Certificate(credential_file)
+
+    # Render secret files are often mounted under /etc/secrets.
+    render_secret_file = "/etc/secrets/serviceAccountKey.json"
+    if os.path.exists(render_secret_file):
+        logger.warning("Using Firebase Render secret file: %s", render_secret_file)
+        return credentials.Certificate(render_secret_file)
+
+    raise RuntimeError(
+        "Firebase credentials not found. Fix FIREBASE_CREDENTIALS_JSON, "
+        "or set FIREBASE_CREDENTIALS_FILE / GOOGLE_APPLICATION_CREDENTIALS, "
+        "or provide serviceAccountKey.json."
+    )
+
+
+cred = _load_firebase_credential()
 
 if not firebase_admin._apps:
     firebase_admin.initialize_app(cred, {
