@@ -938,7 +938,9 @@ COPY_SIGNAL_VALIDITY_SECONDS = int(os.getenv("COPY_SIGNAL_VALIDITY_SECONDS", "25
 COPY_REQUEST_TIMEOUT_SECONDS = int(os.getenv("COPY_REQUEST_TIMEOUT_SECONDS", "6"))
 COPY_SEND_OTC_LIVE_NOW = os.getenv("COPY_SEND_OTC_LIVE_NOW", "true").lower() in {"1", "true", "yes", "on"}
 COPY_SEND_REAL_MARKET = os.getenv("COPY_SEND_REAL_MARKET", "true").lower() in {"1", "true", "yes", "on"}
-COPY_SEND_TIMED_LISTS = os.getenv("COPY_SEND_TIMED_LISTS", "false").lower() in {"1", "true", "yes", "on"}
+COPY_SEND_TIMED_LISTS = os.getenv("COPY_SEND_TIMED_LISTS", "true").lower() in {"1", "true", "yes", "on"}
+COPY_SEND_THREE_CANDLE = os.getenv("COPY_SEND_THREE_CANDLE", "true").lower() in {"1", "true", "yes", "on"}
+COPY_SEND_TRADING_ROOM = os.getenv("COPY_SEND_TRADING_ROOM", "true").lower() in {"1", "true", "yes", "on"}
 
 # ===== Embedded TRADING TIME COPY SERVER =====
 # يشغل Copy Server داخل نفس خدمة Render الخاصة بالبوت حتى لا تحتاج Web Service ثاني.
@@ -1820,6 +1822,24 @@ def _copy_duration_seconds(signal: dict) -> int:
     return 60
 
 
+
+def normalize_copy_source(source: str | None) -> str:
+    """Normalize all bot sections to canonical extension source keys."""
+    raw = str(source or "bot").strip().lower()
+    compact = raw.replace("-", "_").replace(" ", "_")
+
+    if any(x in compact for x in ["three_candle", "3_candle", "threecandle"]) or ("3" in compact and "candle" in compact):
+        return "three_candle"
+    if any(x in compact for x in ["trading_room", "session_room", "room_session"]):
+        return "trading_room"
+    if any(x in compact for x in ["timed_list", "otc_timed", "schedule", "scheduled_list", "list"]):
+        return "timed_list"
+    if ("otc" in compact and "live" in compact) or "live_now" in compact or "direct" in compact:
+        return "otc_live"
+    if any(x in compact for x in ["real_market", "global_market", "global", "real"]):
+        return "real_market"
+    return raw or "bot"
+
 def _copy_display_pair(signal: dict) -> str:
     try:
         pair = str(signal.get("pair_display") or signal.get("pair") or signal.get("symbol") or "").strip()
@@ -1836,6 +1856,7 @@ def _copy_display_pair(signal: dict) -> str:
 
 def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
     """يبني Payload موحد لإرساله إلى TRADING TIME COPY SERVER."""
+    source = normalize_copy_source(source)
     signal = dict(signal or {})
     entry_dt = _copy_parse_iso(signal.get("entry_time")) or now_utc()
     expires_dt = _copy_parse_iso(signal.get("expires_at")) or (entry_dt + timedelta(seconds=int(COPY_SIGNAL_VALIDITY_SECONDS)))
@@ -1920,6 +1941,155 @@ async def maybe_publish_copy_signal(result: dict, source: str, enabled: bool = T
         return copy_result
     except Exception as e:
         logger.warning("Copy Trading hook error | source=%s | error=%s", source, e)
+        return {"ok": False, "error": str(e)}
+
+
+def _copy_direction_from_signal_line(line: str) -> str:
+    try:
+        raw = str(line or "").upper()
+        if "CALL" in raw or "صاعد" in raw or "BUY" in raw:
+            return "CALL"
+        if "PUT" in raw or "هابط" in raw or "SELL" in raw:
+            return "PUT"
+    except Exception:
+        pass
+    return ""
+
+
+def _copy_pair_from_signal_line(line: str, fallback_pair: str) -> str:
+    try:
+        parts = str(line or "").split(" — ")
+        if parts and str(parts[0]).strip():
+            return str(parts[0]).strip()
+    except Exception:
+        pass
+    return str(fallback_pair or "").strip()
+
+
+async def publish_copy_timed_list_signals(pair: str, signals: list[str], interval_minutes: int, start_dt: datetime, source: str = "timed_list") -> dict:
+    """Send each timed-list item to the extension with its real entry time.
+
+    مهم: الإضافة في v0.22 تدعم Queue، لذلك ترسل الليستة كاملة الآن،
+    وكل صفقة تنتظر وقتها داخل الإضافة.
+    """
+    if not COPY_SEND_TIMED_LISTS:
+        return {"ok": False, "skipped": True, "reason": "COPY_SEND_TIMED_LISTS=false"}
+    if not signals:
+        return {"ok": False, "skipped": True, "reason": "empty list"}
+
+    sent = 0
+    failed = 0
+    details = []
+    for index, line in enumerate(list(signals)):
+        try:
+            entry_dt = start_dt + timedelta(minutes=int(index) * int(interval_minutes or 1))
+            direction = _copy_direction_from_signal_line(line) or get_stable_direction(pair, entry_dt)
+            pair_name = _copy_pair_from_signal_line(line, pair)
+            if not pair_name or not direction:
+                failed += 1
+                continue
+            payload = {
+                "ok": True,
+                "id": f"timed_{safe_key(pair_name)}_{int(entry_dt.timestamp())}_{direction}_{index}",
+                "pair": pair_name,
+                "pair_display": pair_name,
+                "direction": direction,
+                "timeframe": "M1",
+                "duration_seconds": 60,
+                "duration_minutes": 1,
+                "entry_time": entry_dt.isoformat(),
+                "expires_at": (entry_dt + timedelta(seconds=max(30, int(COPY_SIGNAL_VALIDITY_SECONDS)))).isoformat(),
+                "note": f"timed_list {index + 1}/{len(signals)} | interval={interval_minutes}m",
+            }
+            result = await publish_copy_trading_signal(payload, source=source)
+            details.append(result)
+            if result.get("ok"):
+                sent += 1
+            else:
+                failed += 1
+            await asyncio.sleep(0.05)
+        except Exception as e:
+            failed += 1
+            logger.warning("Timed-list Copy signal failed | pair=%s | index=%s | error=%s", pair, index, e)
+    logger.info("Copy Trading timed list sent | pair=%s | sent=%s | failed=%s", pair, sent, failed)
+    return {"ok": sent > 0, "sent": sent, "failed": failed, "details": details[-3:]}
+
+
+async def publish_copy_three_candle_signal(trade: dict) -> dict:
+    """Send the 3-candle channel signal to the extension as source=three_candle."""
+    if not COPY_SEND_THREE_CANDLE:
+        return {"ok": False, "skipped": True, "reason": "COPY_SEND_THREE_CANDLE=false"}
+    try:
+        entry_bucket = int(float((trade or {}).get("entry_bucket") or 0))
+        if entry_bucket <= 0:
+            return {"ok": False, "skipped": True, "reason": "missing entry_bucket"}
+        entry_dt = datetime.fromtimestamp(entry_bucket, tz=UTC)
+        pair = str((trade or {}).get("pair") or "").strip()
+        direction = str((trade or {}).get("direction") or "").strip().upper()
+        if not pair or direction not in {"CALL", "PUT"}:
+            return {"ok": False, "skipped": True, "reason": "missing pair/direction"}
+        payload = {
+            "ok": True,
+            "id": f"three_{safe_key(pair)}_{entry_bucket}_{direction}",
+            "pair": pair,
+            "pair_display": pair,
+            "symbol": (trade or {}).get("symbol"),
+            "platform_symbol": (trade or {}).get("symbol"),
+            "direction": direction,
+            "timeframe": "M1",
+            "duration_seconds": 60,
+            "duration_minutes": 1,
+            "entry_time": entry_dt.isoformat(),
+            "expires_at": (entry_dt + timedelta(seconds=max(30, int(COPY_SIGNAL_VALIDITY_SECONDS)))).isoformat(),
+            "quality": int(round(float((trade or {}).get("body_score", 0) or 0) * 100)) if (trade or {}).get("body_score") is not None else None,
+            "payout": (trade or {}).get("payout"),
+            "note": "three_candle_channel",
+        }
+        result = await publish_copy_trading_signal(payload, source="three_candle")
+        logger.info("Copy Trading three-candle sent | pair=%s | result=%s", pair, result)
+        return result
+    except Exception as e:
+        logger.warning("Three-candle Copy signal failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+async def publish_copy_trading_room_signal(trade: dict, state: dict | None = None) -> dict:
+    """Send Trading Room entries to the extension as source=trading_room."""
+    if not COPY_SEND_TRADING_ROOM:
+        return {"ok": False, "skipped": True, "reason": "COPY_SEND_TRADING_ROOM=false"}
+    try:
+        entry_ts = float((trade or {}).get("entry_ts") or 0)
+        if entry_ts <= 0:
+            return {"ok": False, "skipped": True, "reason": "missing entry_ts"}
+        entry_dt = datetime.fromtimestamp(entry_ts, tz=UTC)
+        pair = str((trade or {}).get("pair") or (state or {}).get("pair") or "").strip()
+        direction = str((trade or {}).get("direction") or "").strip().upper()
+        if not pair or direction not in {"CALL", "PUT"}:
+            return {"ok": False, "skipped": True, "reason": "missing pair/direction"}
+        payload = {
+            "ok": True,
+            "id": f"room_{safe_key(pair)}_{int(entry_ts)}_{direction}_{safe_key((trade or {}).get('setup_kind'))}",
+            "pair": pair,
+            "pair_display": pair,
+            "symbol": (trade or {}).get("symbol") or (state or {}).get("symbol"),
+            "platform_symbol": (trade or {}).get("symbol") or (state or {}).get("symbol"),
+            "direction": direction,
+            "timeframe": "M1",
+            "duration_seconds": 60,
+            "duration_minutes": 1,
+            "entry_time": entry_dt.isoformat(),
+            "expires_at": (entry_dt + timedelta(seconds=max(30, int(COPY_SIGNAL_VALIDITY_SECONDS)))).isoformat(),
+            "quality": (trade or {}).get("score"),
+            "confidence": (trade or {}).get("score"),
+            "entry_price": (trade or {}).get("price"),
+            "payout": (trade or {}).get("payout"),
+            "note": str((trade or {}).get("setup") or (trade or {}).get("setup_kind") or "trading_room")[:500],
+        }
+        result = await publish_copy_trading_signal(payload, source="trading_room")
+        logger.info("Copy Trading trading-room sent | pair=%s | result=%s", pair, result)
+        return result
+    except Exception as e:
+        logger.warning("Trading Room Copy signal failed: %s", e)
         return {"ok": False, "error": str(e)}
 
 
@@ -5645,6 +5815,8 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
         text=trade_message,
         reply_markup=get_trading_room_active_keyboard(admin_id)
     )
+
+    await publish_copy_trading_room_signal(analysis, state)
 
     try:
         result_when = max(
@@ -9552,6 +9724,7 @@ async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
         if sent:
             _three_candle_channel_state["signals_sent"] = int(_three_candle_channel_state.get("signals_sent", 0) or 0) + 1
             _three_candle_increment_today_signal_count()
+            await publish_copy_three_candle_signal(trade)
         else:
             _three_candle_channel_state["pending_trade"] = None
     except Exception as e:
@@ -13397,6 +13570,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         record_signal_usage(user.id, count, "otc_timed")
+        await publish_copy_timed_list_signals(pair, signals, interval_minutes, start_dt, source="timed_list")
         reset_signal_state(context)
         return
 
@@ -13421,7 +13595,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result.get("ok"):
             record_signal_usage(user.id, 1, "otc_live_now")
-            await maybe_publish_copy_signal(result, source="bot_otc_live_now_en", enabled=COPY_SEND_OTC_LIVE_NOW)
+            await maybe_publish_copy_signal(result, source="otc_live", enabled=COPY_SEND_OTC_LIVE_NOW)
         reset_signal_state(context)
         return
 
@@ -13456,7 +13630,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result.get("ok"):
             record_signal_usage(user.id, 1, "real_market")
-            await maybe_publish_copy_signal(result, source="bot_real_market_en", enabled=COPY_SEND_REAL_MARKET)
+            await maybe_publish_copy_signal(result, source="real_market", enabled=COPY_SEND_REAL_MARKET)
         reset_signal_state(context)
         return
 
@@ -15425,6 +15599,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         record_signal_usage(user.id, count, "otc_timed")
+        await publish_copy_timed_list_signals(pair, signals, interval_minutes, start_dt, source="timed_list")
 
         reset_signal_state(context)
         return
@@ -15454,7 +15629,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result.get("ok"):
             record_signal_usage(user.id, 1, "otc_live_now")
-            await maybe_publish_copy_signal(result, source="bot_otc_live_now", enabled=COPY_SEND_OTC_LIVE_NOW)
+            await maybe_publish_copy_signal(result, source="otc_live", enabled=COPY_SEND_OTC_LIVE_NOW)
 
         reset_signal_state(context)
         return
@@ -15501,7 +15676,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result.get("ok"):
             record_signal_usage(user.id, 1, "real_market")
-            await maybe_publish_copy_signal(result, source="bot_real_market", enabled=COPY_SEND_REAL_MARKET)
+            await maybe_publish_copy_signal(result, source="real_market", enabled=COPY_SEND_REAL_MARKET)
 
         reset_signal_state(context)
         return
