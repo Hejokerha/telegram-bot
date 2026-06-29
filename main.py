@@ -5,6 +5,7 @@ import json
 import csv
 import io
 import hashlib
+import hmac
 import asyncio
 import random
 import re
@@ -873,6 +874,27 @@ MONTHLY_SIGNAL_DAILY_LIMIT = int(os.getenv("MONTHLY_SIGNAL_DAILY_LIMIT", "50"))
 SIGNAL_USAGE_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_USAGE_COOLDOWN_SECONDS", "3"))
 ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_SECONDS", "300"))
 
+# ===== TRADING TIME COPY =====
+# يربط البوت مع Copy Server حتى تصل الصفقات مباشرة إلى إضافة Chrome.
+# اتركه false حتى تكون جاهزًا للتجربة، ثم فعّله من .env.
+COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
+COPY_SERVER_SECRET = os.getenv("COPY_SERVER_SECRET", "change-me-now")
+COPY_SIGNAL_VALIDITY_SECONDS = int(os.getenv("COPY_SIGNAL_VALIDITY_SECONDS", "25"))
+COPY_REQUEST_TIMEOUT_SECONDS = int(os.getenv("COPY_REQUEST_TIMEOUT_SECONDS", "6"))
+COPY_SEND_OTC_LIVE_NOW = os.getenv("COPY_SEND_OTC_LIVE_NOW", "true").lower() in {"1", "true", "yes", "on"}
+COPY_SEND_REAL_MARKET = os.getenv("COPY_SEND_REAL_MARKET", "true").lower() in {"1", "true", "yes", "on"}
+COPY_SEND_TIMED_LISTS = os.getenv("COPY_SEND_TIMED_LISTS", "false").lower() in {"1", "true", "yes", "on"}
+
+# ===== Embedded TRADING TIME COPY SERVER =====
+# يشغل Copy Server داخل نفس خدمة Render الخاصة بالبوت حتى لا تحتاج Web Service ثاني.
+COPY_EMBEDDED_SERVER_ENABLED = os.getenv("COPY_EMBEDDED_SERVER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+COPY_ALLOWED_ORIGINS = [x.strip() for x in os.getenv("COPY_ALLOWED_ORIGINS", "*").split(",") if x.strip()]
+COPY_LICENSES = os.getenv("COPY_LICENSES", "DEMO-111:active")
+COPY_SIGNAL_HISTORY_LIMIT = int(os.getenv("COPY_SIGNAL_HISTORY_LIMIT", "200"))
+COPY_UVICORN_LOG_LEVEL = os.getenv("COPY_UVICORN_LOG_LEVEL", "info")
+
+
 _firebase_cache = {}
 
 
@@ -1698,6 +1720,154 @@ async def safe_send_message(bot, *, chat_id, text: str, parse_mode: str | None =
     if last_error:
         logger.warning("Telegram send_message skipped after retries | chat_id=%s | error=%s", chat_id, last_error)
     return None
+
+# ===== TRADING TIME COPY helpers =====
+def _copy_parse_iso(value: str | None):
+    try:
+        if not value:
+            return None
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+    except Exception:
+        return None
+
+
+def _copy_timeframe(signal: dict) -> str:
+    try:
+        tf = signal.get("timeframe") or signal.get("duration_minutes") or signal.get("timeframe_minutes") or 1
+        text = str(tf).strip().upper()
+        if text.isdigit():
+            return f"M{text}"
+        if text.startswith("M") and text[1:].isdigit():
+            return text
+        return text or "M1"
+    except Exception:
+        return "M1"
+
+
+def _copy_duration_seconds(signal: dict) -> int:
+    try:
+        if signal.get("duration_seconds"):
+            return max(5, int(float(signal.get("duration_seconds"))))
+        if signal.get("duration_minutes"):
+            return max(5, int(float(signal.get("duration_minutes")) * 60))
+        if signal.get("timeframe_minutes"):
+            return max(5, int(float(signal.get("timeframe_minutes")) * 60))
+        tf = _copy_timeframe(signal)
+        if tf.startswith("M") and tf[1:].isdigit():
+            return max(5, int(tf[1:]) * 60)
+    except Exception:
+        pass
+    return 60
+
+
+def _copy_display_pair(signal: dict) -> str:
+    try:
+        pair = str(signal.get("pair_display") or signal.get("pair") or signal.get("symbol") or "").strip()
+        # إذا كانت صفقة OTC وكان اسم الزوج لا يحتوي OTC، أضفها للعرض حتى تعرف الإضافة أنه OTC.
+        src = str(signal.get("source") or "").lower()
+        symbol = str(signal.get("symbol") or signal.get("platform_symbol") or "")
+        if pair and "otc" not in pair.lower() and ("otc" in src or symbol.lower().endswith("_otc")):
+            if "/" in pair:
+                return f"{pair} (OTC)"
+        return pair
+    except Exception:
+        return str(signal.get("pair") or "")
+
+
+def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
+    """يبني Payload موحد لإرساله إلى TRADING TIME COPY SERVER."""
+    signal = dict(signal or {})
+    entry_dt = _copy_parse_iso(signal.get("entry_time")) or now_utc()
+    expires_dt = _copy_parse_iso(signal.get("expires_at")) or (entry_dt + timedelta(seconds=int(COPY_SIGNAL_VALIDITY_SECONDS)))
+
+    pair_display = _copy_display_pair({**signal, "source": source})
+    platform_symbol = signal.get("platform_symbol") or signal.get("symbol") or signal.get("pair") or pair_display or ""
+    direction = str(signal.get("direction") or "").strip().upper()
+
+    payload = {
+        "source": source,
+        "pair": pair_display,
+        "pair_display": pair_display,
+        "platform_symbol": platform_symbol,
+        "direction": direction,
+        "timeframe": _copy_timeframe(signal),
+        "duration_seconds": _copy_duration_seconds(signal),
+        "entry_time": entry_dt.isoformat(),
+        "expires_at": expires_dt.isoformat(),
+        "created_at": now_iso(),
+        "quality": signal.get("quality"),
+        "confidence": signal.get("confidence"),
+        "entry_price": signal.get("entry_price"),
+        "payout": signal.get("payout"),
+        "note": str(signal.get("note") or "")[:500],
+    }
+
+    base = "|".join([
+        str(payload.get("source")),
+        str(payload.get("pair")),
+        str(payload.get("platform_symbol")),
+        str(payload.get("direction")),
+        str(payload.get("entry_time")),
+    ])
+    payload["id"] = str(signal.get("id") or hashlib.sha256(base.encode("utf-8")).hexdigest()[:18])
+    return payload
+
+
+def send_copy_trading_signal_sync(signal: dict, source: str = "bot") -> dict:
+    """يرسل الإشارة إلى Copy Server بدون كسر البوت إذا فشل الاتصال."""
+    if not COPY_TRADING_ENABLED:
+        return {"ok": False, "skipped": True, "reason": "COPY_TRADING_ENABLED=false"}
+
+    try:
+        payload = build_copy_trading_payload(signal, source=source)
+        if not payload.get("pair") or not payload.get("direction"):
+            return {"ok": False, "skipped": True, "reason": "missing pair/direction", "payload": payload}
+        res = requests.post(
+            f"{COPY_SERVER_URL}/api/bot/signal",
+            json=payload,
+            headers={"X-TTCOPY-SECRET": COPY_SERVER_SECRET},
+            timeout=int(COPY_REQUEST_TIMEOUT_SECONDS),
+        )
+        if res.status_code != 200:
+            logger.warning("Copy Trading signal rejected | status=%s | text=%s", res.status_code, res.text[:300])
+            return {"ok": False, "status_code": res.status_code, "text": res.text[:300]}
+        return res.json()
+    except Exception as e:
+        logger.warning("Copy Trading send failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+async def publish_copy_trading_signal(signal: dict, source: str = "bot") -> dict:
+    try:
+        return await asyncio.to_thread(send_copy_trading_signal_sync, signal, source)
+    except Exception as e:
+        logger.warning("Copy Trading async publish failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+async def maybe_publish_copy_signal(result: dict, source: str, enabled: bool = True) -> dict:
+    """يرسل فقط الإشارات المباشرة الناجحة إلى TRADING TIME COPY."""
+    try:
+        if not enabled:
+            return {"ok": False, "skipped": True, "reason": "source disabled"}
+        if not result or not result.get("ok"):
+            return {"ok": False, "skipped": True, "reason": "result not ok"}
+        copy_result = await publish_copy_trading_signal(result, source=source)
+        if copy_result.get("ok"):
+            logger.info("Copy Trading signal sent | source=%s | delivery=%s", source, copy_result.get("delivery"))
+        else:
+            logger.info("Copy Trading signal skipped/failed | source=%s | result=%s", source, copy_result)
+        return copy_result
+    except Exception as e:
+        logger.warning("Copy Trading hook error | source=%s | error=%s", source, e)
+        return {"ok": False, "error": str(e)}
+
 
 def format_dt_ar(iso_value: str):
     dt = parse_iso(iso_value)
@@ -13197,6 +13367,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result.get("ok"):
             record_signal_usage(user.id, 1, "otc_live_now")
+            await maybe_publish_copy_signal(result, source="bot_otc_live_now_en", enabled=COPY_SEND_OTC_LIVE_NOW)
         reset_signal_state(context)
         return
 
@@ -13231,6 +13402,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result.get("ok"):
             record_signal_usage(user.id, 1, "real_market")
+            await maybe_publish_copy_signal(result, source="bot_real_market_en", enabled=COPY_SEND_REAL_MARKET)
         reset_signal_state(context)
         return
 
@@ -15228,6 +15400,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result.get("ok"):
             record_signal_usage(user.id, 1, "otc_live_now")
+            await maybe_publish_copy_signal(result, source="bot_otc_live_now", enabled=COPY_SEND_OTC_LIVE_NOW)
 
         reset_signal_state(context)
         return
@@ -15274,6 +15447,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result.get("ok"):
             record_signal_usage(user.id, 1, "real_market")
+            await maybe_publish_copy_signal(result, source="bot_real_market", enabled=COPY_SEND_REAL_MARKET)
 
         reset_signal_state(context)
         return
@@ -15282,6 +15456,334 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 اختر خيارًا من القائمة.",
         reply_markup=build_main_menu_for_user(user.id)
     )
+
+
+
+
+# ===== Embedded TRADING TIME COPY SERVER =====
+# هذا السيرفر يستقبل الصفقات من البوت ويبثها لإضافات Chrome المتصلة على نفس رابط Render.
+_copy_server_started = False
+_copy_clients = {}
+_copy_signal_history = []
+_copy_client_events = []
+
+
+def _copy_load_licenses() -> dict:
+    result = {}
+    raw = str(COPY_LICENSES or "DEMO-111:active")
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if ":" in part:
+            token, status = part.split(":", 1)
+        else:
+            token, status = part, "active"
+        token = token.strip()
+        if token:
+            result[token] = {"status": (status.strip() or "active")}
+    return result
+
+
+def _copy_server_parse_iso(value):
+    try:
+        if not value:
+            return None
+        text = str(value).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+    except Exception:
+        return None
+
+
+def _copy_server_normalize_direction(direction: str) -> str:
+    d = str(direction or "").strip().upper()
+    if d in {"CALL", "BUY", "UP", "🟢 CALL"}:
+        return "CALL"
+    if d in {"PUT", "SELL", "DOWN", "🔴 PUT"}:
+        return "PUT"
+    raise ValueError("direction must be CALL or PUT")
+
+
+def _copy_server_normalize_timeframe(value) -> str:
+    if value is None:
+        return "M1"
+    text = str(value).strip().upper()
+    if text.isdigit():
+        return f"M{text}"
+    if text.startswith("M") and text[1:].isdigit():
+        return text
+    return text or "M1"
+
+
+def _copy_server_duration_seconds(data: dict) -> int:
+    try:
+        if data.get("duration_seconds"):
+            return max(5, int(float(data.get("duration_seconds"))))
+        if data.get("duration_minutes"):
+            return max(5, int(float(data.get("duration_minutes")) * 60))
+        tf = _copy_server_normalize_timeframe(data.get("timeframe"))
+        if tf.startswith("M") and tf[1:].isdigit():
+            return max(5, int(tf[1:]) * 60)
+    except Exception:
+        pass
+    return 60
+
+
+def _copy_server_make_signal_id(payload: dict) -> str:
+    base = "|".join([
+        str(payload.get("source", "bot")),
+        str(payload.get("pair") or payload.get("pair_display") or ""),
+        str(payload.get("platform_symbol") or ""),
+        str(payload.get("direction") or ""),
+        str(payload.get("entry_time") or ""),
+        str(payload.get("created_at") or ""),
+    ])
+    return hashlib.sha256(base.encode("utf-8")).hexdigest()[:18]
+
+
+def _copy_server_sanitize_signal(data: dict) -> dict:
+    payload = dict(data or {})
+    direction = _copy_server_normalize_direction(payload.get("direction"))
+    timeframe = _copy_server_normalize_timeframe(payload.get("timeframe") or payload.get("duration_minutes") or "M1")
+    duration_seconds = _copy_server_duration_seconds(payload)
+
+    entry_dt = _copy_server_parse_iso(payload.get("entry_time") or payload.get("entry_time_iso"))
+    created_dt = _copy_server_parse_iso(payload.get("created_at")) or datetime.now(UTC)
+    if not entry_dt:
+        entry_dt = created_dt
+
+    expires_dt = _copy_server_parse_iso(payload.get("expires_at") or payload.get("valid_until"))
+    if not expires_dt:
+        expires_dt = entry_dt + timedelta(seconds=int(COPY_SIGNAL_VALIDITY_SECONDS))
+
+    pair_display = str(payload.get("pair_display") or payload.get("pair") or "").strip()
+    platform_symbol = str(payload.get("platform_symbol") or payload.get("symbol") or payload.get("pair") or "").strip()
+    if not pair_display and not platform_symbol:
+        raise ValueError("pair or platform_symbol is required")
+
+    return {
+        "type": "signal",
+        "id": str(payload.get("id") or _copy_server_make_signal_id(payload)),
+        "source": str(payload.get("source") or "bot"),
+        "mode": str(payload.get("mode") or "copy"),
+        "pair": pair_display or platform_symbol,
+        "pair_display": pair_display or platform_symbol,
+        "platform_symbol": platform_symbol or pair_display,
+        "direction": direction,
+        "timeframe": timeframe,
+        "duration_seconds": duration_seconds,
+        "entry_time": entry_dt.isoformat(),
+        "expires_at": expires_dt.isoformat(),
+        "created_at": created_dt.isoformat(),
+        "quality": payload.get("quality"),
+        "confidence": payload.get("confidence"),
+        "entry_price": payload.get("entry_price"),
+        "payout": payload.get("payout"),
+        "note": str(payload.get("note") or "")[:500],
+    }
+
+
+def _copy_server_check_secret(secret: str | None):
+    if not secret or not hmac.compare_digest(str(secret), str(COPY_SERVER_SECRET)):
+        raise ValueError("invalid server secret")
+
+
+async def _copy_send_json_safe(ws, payload: dict) -> bool:
+    try:
+        await ws.send_json(payload)
+        return True
+    except Exception:
+        return False
+
+
+async def _copy_broadcast_signal(signal: dict) -> dict:
+    dead = []
+    delivered = 0
+    for client_id, client in list(_copy_clients.items()):
+        ws = client.get("ws")
+        ok = await _copy_send_json_safe(ws, {"type": "signal", "signal": signal})
+        if ok:
+            delivered += 1
+            client["last_sent_at"] = now_iso()
+        else:
+            dead.append(client_id)
+
+    for client_id in dead:
+        _copy_clients.pop(client_id, None)
+
+    return {"online_clients": len(_copy_clients), "delivered": delivered, "dead_removed": len(dead)}
+
+
+def create_embedded_copy_api():
+    from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+    from fastapi.middleware.cors import CORSMiddleware
+
+    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.12.0")
+    copy_api.add_middleware(
+        CORSMiddleware,
+        allow_origins=COPY_ALLOWED_ORIGINS,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
+    licenses = _copy_load_licenses()
+
+    @copy_api.get("/health")
+    async def copy_health():
+        return {
+            "ok": True,
+            "app": "TRADING TIME COPY EMBEDDED SERVER",
+            "time": now_iso(),
+            "online_clients": len(_copy_clients),
+            "history_size": len(_copy_signal_history),
+            "bot": "telegram-bot",
+        }
+
+    @copy_api.get("/copy/health")
+    async def copy_health_alias():
+        return await copy_health()
+
+    @copy_api.get("/api/admin/status")
+    async def copy_admin_status(x_ttcopy_secret: str | None = Header(default=None)):
+        try:
+            _copy_server_check_secret(x_ttcopy_secret)
+        except ValueError as e:
+            raise HTTPException(status_code=401, detail=str(e))
+        return {
+            "online_clients": len(_copy_clients),
+            "clients": [
+                {
+                    "client_id": k,
+                    "license": v.get("license"),
+                    "device_id": v.get("device_id"),
+                    "connected_at": v.get("connected_at"),
+                    "last_seen_at": v.get("last_seen_at"),
+                    "last_sent_at": v.get("last_sent_at"),
+                }
+                for k, v in _copy_clients.items()
+            ],
+            "last_signals": _copy_signal_history[-20:],
+        }
+
+    @copy_api.post("/api/bot/signal")
+    async def copy_bot_signal(request: Request, x_ttcopy_secret: str | None = Header(default=None)):
+        try:
+            _copy_server_check_secret(x_ttcopy_secret)
+            body = await request.json()
+            normalized = _copy_server_sanitize_signal(body)
+        except ValueError as e:
+            msg = str(e)
+            code = 401 if "secret" in msg else 400
+            raise HTTPException(status_code=code, detail=msg)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"invalid payload: {e}")
+
+        normalized["received_at"] = now_iso()
+        normalized["origin"] = "bot"
+        _copy_signal_history.append(normalized)
+        del _copy_signal_history[:-int(COPY_SIGNAL_HISTORY_LIMIT)]
+        delivery = await _copy_broadcast_signal(normalized)
+        return {"ok": True, "signal": normalized, "delivery": delivery}
+
+    @copy_api.post("/api/admin/manual-signal")
+    async def copy_manual_signal(request: Request, x_ttcopy_secret: str | None = Header(default=None)):
+        try:
+            _copy_server_check_secret(x_ttcopy_secret)
+            body = await request.json()
+            body["source"] = body.get("source") or "admin_manual"
+            normalized = _copy_server_sanitize_signal(body)
+        except ValueError as e:
+            msg = str(e)
+            code = 401 if "secret" in msg else 400
+            raise HTTPException(status_code=code, detail=msg)
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"invalid payload: {e}")
+
+        normalized["received_at"] = now_iso()
+        normalized["origin"] = "admin_manual"
+        _copy_signal_history.append(normalized)
+        del _copy_signal_history[:-int(COPY_SIGNAL_HISTORY_LIMIT)]
+        delivery = await _copy_broadcast_signal(normalized)
+        return {"ok": True, "signal": normalized, "delivery": delivery}
+
+    @copy_api.websocket("/ws/extension")
+    async def copy_extension_ws(websocket: WebSocket, token: str = Query(...), device_id: str = Query(default="unknown")):
+        await websocket.accept()
+        license_record = licenses.get(token)
+        if not license_record or license_record.get("status") != "active":
+            await websocket.close(code=4401, reason="invalid or inactive license")
+            return
+
+        client_id = hashlib.sha256(f"{token}:{device_id}:{time_module.time()}".encode("utf-8")).hexdigest()[:16]
+        _copy_clients[client_id] = {
+            "ws": websocket,
+            "license": token,
+            "device_id": device_id,
+            "connected_at": now_iso(),
+            "last_seen_at": now_iso(),
+            "last_sent_at": None,
+        }
+        await _copy_send_json_safe(websocket, {
+            "type": "hello",
+            "ok": True,
+            "client_id": client_id,
+            "server_time": now_iso(),
+            "message": "TRADING TIME COPY connected",
+        })
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                if client_id in _copy_clients:
+                    _copy_clients[client_id]["last_seen_at"] = now_iso()
+                try:
+                    event = json.loads(raw)
+                except Exception:
+                    event = {"type": "raw", "raw": raw[:500]}
+                event["client_id"] = client_id
+                event["license"] = token
+                event["server_received_at"] = now_iso()
+                _copy_client_events.append(event)
+                del _copy_client_events[:-int(COPY_SIGNAL_HISTORY_LIMIT)]
+
+                if event.get("type") == "ping":
+                    await _copy_send_json_safe(websocket, {"type": "pong", "server_time": now_iso()})
+                elif event.get("type") == "ack":
+                    await _copy_send_json_safe(websocket, {"type": "ack_saved", "signal_id": event.get("signal_id")})
+                else:
+                    await _copy_send_json_safe(websocket, {"type": "event_saved", "server_time": now_iso()})
+        except WebSocketDisconnect:
+            pass
+        finally:
+            _copy_clients.pop(client_id, None)
+
+    return copy_api
+
+
+def start_embedded_copy_server():
+    """يشغل TRADING TIME COPY Server داخل نفس عملية البوت على Render."""
+    global _copy_server_started
+    if _copy_server_started or not COPY_EMBEDDED_SERVER_ENABLED:
+        return
+    try:
+        import uvicorn
+        port = int(os.getenv("PORT", "8080"))
+        copy_api = create_embedded_copy_api()
+
+        def _run():
+            uvicorn.run(copy_api, host="0.0.0.0", port=port, log_level=str(COPY_UVICORN_LOG_LEVEL or "info"))
+
+        thread = threading.Thread(target=_run, name="trading-time-copy-server", daemon=True)
+        thread.start()
+        _copy_server_started = True
+        logger.warning("Embedded TRADING TIME COPY Server started on 0.0.0.0:%s", port)
+    except Exception as e:
+        logger.exception("Could not start embedded TRADING TIME COPY Server: %s", e)
 
 
 # ===== App Runner =====
@@ -15339,6 +15841,9 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
 def main():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN غير موجود داخل ملف .env")
+
+    # شغّل Copy Server داخل نفس خدمة Render الخاصة بالبوت.
+    start_embedded_copy_server()
 
     app = Application.builder().token(BOT_TOKEN).build()
 
