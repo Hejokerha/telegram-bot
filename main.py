@@ -15962,7 +15962,7 @@ def run_telegram_bot_only():
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
 
-    app.run_polling(drop_pending_updates=True, close_loop=False)
+    app.run_polling(drop_pending_updates=True, close_loop=False, stop_signals=None)
 
 
 
