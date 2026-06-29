@@ -15892,12 +15892,11 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
         except Exception:
             pass
 
-def main():
+def run_telegram_bot_only():
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN غير موجود داخل ملف .env")
 
-    # شغّل Copy Server داخل نفس خدمة Render الخاصة بالبوت.
-    start_embedded_copy_server()
+    # في نسخة Web Service، FastAPI/Uvicorn هو السيرفر الأساسي، لذلك لا نشغل سيرفر مدمج داخل thread هنا.
 
     app = Application.builder().token(BOT_TOKEN).build()
 
@@ -15966,5 +15965,42 @@ def main():
     app.run_polling(drop_pending_updates=True, close_loop=False)
 
 
+
+# ===== Render Web Service entrypoint =====
+# هذا هو التطبيق الذي يجب أن يراه Render كـ Web Service حتى يفتح بورت فورًا.
+# استخدم Start Command: python main.py
+render_app = create_embedded_copy_api()
+_telegram_bot_thread_started = False
+
+
+def _start_telegram_bot_background_once():
+    global _telegram_bot_thread_started
+    if _telegram_bot_thread_started:
+        return
+    _telegram_bot_thread_started = True
+
+    def _runner():
+        try:
+            logger.warning("Starting Telegram bot polling in background thread for Render Web Service...")
+            run_telegram_bot_only()
+        except Exception as e:
+            logger.exception("Telegram bot background thread crashed: %s", e)
+
+    thread = threading.Thread(target=_runner, name="telegram-bot-polling", daemon=True)
+    thread.start()
+
+
+@render_app.on_event("startup")
+async def _render_app_startup():
+    _start_telegram_bot_background_once()
+    logger.warning("TRADING TIME Web Service startup complete. Copy API is listening and bot thread is starting.")
+
+
 if __name__ == "__main__":
-    main()
+    # Render Web Service يحتاج أن يفتح التطبيق بورت فعلي.
+    # لذلك نشغل uvicorn كعملية أساسية، والبوت يعمل داخل background thread عبر startup event.
+    import uvicorn
+
+    port = int(os.getenv("PORT", "8080"))
+    logger.warning("Starting Render Web Service on 0.0.0.0:%s", port)
+    uvicorn.run(render_app, host="0.0.0.0", port=port, log_level=str(COPY_UVICORN_LOG_LEVEL or "info"))
