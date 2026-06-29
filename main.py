@@ -502,9 +502,11 @@ three_candle_admin_keyboard = ReplyKeyboardMarkup(
 
 copy_admin_keyboard = ReplyKeyboardMarkup(
     [
+        ["🟢 تشغيل Copy", "🔴 إيقاف Copy"],
         ["🔑 كود أسبوع", "🔑 كود شهر"],
         ["🔑 كود دائم", "📋 أكواد Copy"],
-        ["⛔ إيقاف كود", "📡 حالة Copy"],
+        ["⛔ إيقاف كود", "♻️ تصفير جهاز كود"],
+        ["📌 رسالة تحديث", "📡 حالة Copy"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -959,7 +961,8 @@ COPY_EMBEDDED_SERVER_ENABLED = os.getenv("COPY_EMBEDDED_SERVER_ENABLED", "true")
 COPY_ALLOWED_ORIGINS = [x.strip() for x in os.getenv("COPY_ALLOWED_ORIGINS", "*").split(",") if x.strip()]
 COPY_LICENSES = os.getenv("COPY_LICENSES", "DEMO-111:active")
 COPY_LICENSE_DEFAULT_MAX_DEVICES = int(os.getenv("COPY_LICENSE_DEFAULT_MAX_DEVICES", "1"))
-COPY_LICENSE_DEVICE_TOUCH_SECONDS = int(os.getenv("COPY_LICENSE_DEVICE_TOUCH_SECONDS", "60"))
+COPY_LICENSE_DEVICE_TOUCH_SECONDS = int(os.getenv("COPY_LICENSE_DEVICE_TOUCH_SECONDS", "600"))
+COPY_SETTINGS_CACHE_TTL_SECONDS = int(os.getenv("COPY_SETTINGS_CACHE_TTL_SECONDS", "60"))
 COPY_SIGNAL_HISTORY_LIMIT = int(os.getenv("COPY_SIGNAL_HISTORY_LIMIT", "200"))
 COPY_UVICORN_LOG_LEVEL = os.getenv("COPY_UVICORN_LOG_LEVEL", "info")
 
@@ -1715,6 +1718,82 @@ def parse_iso(value: str):
 
 
 
+# ===== TRADING TIME COPY LIGHT ADMIN CONTROL =====
+def copy_settings_ref():
+    return system_ref().child("copy_trading").child("settings")
+
+
+def get_copy_settings() -> dict:
+    cached = _cache_get("copy_trading:settings", COPY_SETTINGS_CACHE_TTL_SECONDS)
+    if cached is not None:
+        return cached
+
+    default = {
+        "global_enabled": True,
+        "latest_version": "v0.24",
+        "update_notice": "",
+        "updated_at": None,
+    }
+    try:
+        data = copy_settings_ref().get() or {}
+        if not isinstance(data, dict):
+            data = {}
+        result = {**default, **data}
+        result["global_enabled"] = bool(result.get("global_enabled", True))
+        return _cache_set("copy_trading:settings", result)
+    except Exception as e:
+        logger.warning("Could not read copy settings: %s", e)
+        return _cache_set("copy_trading:settings", default)
+
+
+def clear_copy_settings_cache():
+    _cache_delete_prefix("copy_trading:settings")
+
+
+def is_copy_global_enabled() -> bool:
+    return bool(get_copy_settings().get("global_enabled", True))
+
+
+def set_copy_global_enabled(enabled: bool, admin_id: int | None = None) -> bool:
+    try:
+        copy_settings_ref().update({
+            "global_enabled": bool(enabled),
+            "updated_at": now_iso(),
+            "updated_by": int(admin_id) if admin_id else None,
+        })
+        clear_copy_settings_cache()
+        return True
+    except Exception as e:
+        logger.warning("Could not update copy global enabled: %s", e)
+        return False
+
+
+def set_copy_update_notice(message: str, admin_id: int | None = None) -> bool:
+    try:
+        text = str(message or "").strip()[:600]
+        copy_settings_ref().update({
+            "update_notice": text,
+            "latest_version": "v0.24",
+            "updated_at": now_iso(),
+            "updated_by": int(admin_id) if admin_id else None,
+        })
+        clear_copy_settings_cache()
+        return True
+    except Exception as e:
+        logger.warning("Could not update copy notice: %s", e)
+        return False
+
+
+def copy_public_settings_payload() -> dict:
+    settings = get_copy_settings()
+    return {
+        "global_enabled": bool(settings.get("global_enabled", True)),
+        "latest_version": settings.get("latest_version") or "v0.24",
+        "update_notice": settings.get("update_notice") or "",
+        "updated_at": settings.get("updated_at"),
+    }
+
+
 # ===== TRADING TIME COPY LICENSE MANAGER =====
 _copy_license_touch_cache = {}
 
@@ -1852,6 +1931,29 @@ def disable_copy_license(token: str) -> bool:
     return True
 
 
+
+def reset_copy_license_devices(token: str) -> bool:
+    token = normalize_copy_license_token(token)
+    if not token:
+        return False
+    record = get_copy_license_record(token)
+    if not record or record.get("source") == "env":
+        return False
+    copy_licenses_ref().child(copy_license_key(token)).update({
+        "devices": {},
+        "last_seen_at": None,
+        "devices_reset_at": now_iso(),
+    })
+    try:
+        prefix = f"{token}:"
+        for key in list(_copy_license_touch_cache.keys()):
+            if str(key).startswith(prefix):
+                _copy_license_touch_cache.pop(key, None)
+    except Exception:
+        pass
+    return True
+
+
 def list_copy_licenses(limit: int = 20) -> list[dict]:
     items = []
     try:
@@ -1952,22 +2054,23 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tou
         return False, "device limit reached", record
 
     try:
-        updates = {"last_seen_at": now_iso()}
+        updates = {}
         now_ts = time_module.time()
+        now_value = now_iso()
         touch_key = f"{token}:{device_key}"
         last_touch = float(_copy_license_touch_cache.get(touch_key, 0) or 0)
         if device_key not in devices:
+            updates["last_seen_at"] = now_value
             updates[f"devices/{device_key}"] = {
                 "device_id": device_id,
-                "bound_at": now_iso(),
-                "last_seen_at": now_iso(),
+                "bound_at": now_value,
+                "last_seen_at": now_value,
             }
             _copy_license_touch_cache[touch_key] = now_ts
         elif touch and now_ts - last_touch >= int(COPY_LICENSE_DEVICE_TOUCH_SECONDS):
-            updates[f"devices/{device_key}/last_seen_at"] = now_iso()
+            updates["last_seen_at"] = now_value
+            updates[f"devices/{device_key}/last_seen_at"] = now_value
             _copy_license_touch_cache[touch_key] = now_ts
-        elif not touch:
-            updates = {}
         if updates:
             copy_licenses_ref().child(copy_license_key(token)).update(updates)
     except Exception as e:
@@ -1981,29 +2084,39 @@ def build_copy_status_message() -> str:
     active = 0
     expired = 0
     disabled = 0
+    total_devices = 0
     for rec in licenses:
         status = str(rec.get("status") or "").lower()
+        devices = rec.get("devices") if isinstance(rec.get("devices"), dict) else {}
+        total_devices += len(devices)
         if status == "disabled":
             disabled += 1
         elif copy_license_is_expired(rec.get("expires_at")) or status == "expired":
             expired += 1
         elif status == "active":
             active += 1
-    return (
-        "📡 حالة Copy Trading\n"
-        "━━━━━━━━━━━━━━\n"
-        f"🟢 المتصلين الآن: {len(_copy_clients) if '_copy_clients' in globals() else 0}\n"
-        f"🔑 الأكواد النشطة: {active}\n"
-        f"⏳ الأكواد المنتهية: {expired}\n"
-        f"⛔ الأكواد المعطلة: {disabled}\n"
-        f"📨 آخر الصفقات بالسجل: {len(_copy_signal_history) if '_copy_signal_history' in globals() else 0}\n"
-        f"🧾 أحداث الإضافة: {len(_copy_client_events) if '_copy_client_events' in globals() else 0}\n\n"
-        "آخر المتصلين:\n" + ("\n".join(
-            f"• {html.escape(str(v.get('license', '-')))} | {html.escape(str(v.get('device_id', '-')))[:24]} | {format_dt_ar(v.get('last_seen_at', ''))}"
-            for _k, v in list((_copy_clients if '_copy_clients' in globals() else {}).items())[-8:]
-        ) or "لا يوجد متصلين الآن")
-    )[:3900]
 
+    settings = get_copy_settings()
+    enabled = bool(settings.get("global_enabled", True))
+    update_notice = str(settings.get("update_notice") or "").strip()
+    latest_version = settings.get("latest_version") or "v0.24"
+
+    lines = [
+        "📡 حالة Copy Trading",
+        "━━━━━━━━━━━━━━",
+        f"الحالة العامة: {'🟢 شغال' if enabled else '🔴 موقوف للجميع'}",
+        f"آخر نسخة: {html.escape(str(latest_version))}",
+        "",
+        f"🔑 الأكواد النشطة: {active}",
+        f"⏳ الأكواد المنتهية: {expired}",
+        f"⛔ الأكواد المعطلة: {disabled}",
+        f"📱 الأجهزة المربوطة: {total_devices}",
+        "",
+        "ملاحظة: تم حذف سجل التنفيذ التفصيلي لتخفيف استهلاك الداتا. الحمايات وسجل آخر تنفيذ تبقى محلية داخل الإضافة.",
+    ]
+    if update_notice:
+        lines.extend(["", "📌 رسالة التحديث:", html.escape(update_notice)])
+    return "\n".join(lines)[:3900]
 
 def safe_int(value, default: int = 0) -> int:
     try:
@@ -15308,9 +15421,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text in {"🔐 Copy Trading", "Copy Trading"}:
             reset_signal_state(context)
             await update.message.reply_text(
-                "🔐 لوحة Copy Trading\n\nاختر إنشاء كود تفعيل أو عرض حالة المتصلين.",
+                "🔐 لوحة Copy Trading\n\nتحكم خفيف بدون سجلات تفصيلية حتى ما يزيد استهلاك Firebase.",
                 reply_markup=copy_admin_keyboard
             )
+            return
+
+        if text == "🟢 تشغيل Copy":
+            if set_copy_global_enabled(True, user.id):
+                await update.message.reply_text("✅ تم تشغيل Copy Trading للجميع.", reply_markup=copy_admin_keyboard)
+            else:
+                await update.message.reply_text("❌ تعذر تشغيل Copy Trading. راجع لوج Render.", reply_markup=copy_admin_keyboard)
+            return
+
+        if text == "🔴 إيقاف Copy":
+            if set_copy_global_enabled(False, user.id):
+                await update.message.reply_text("🔴 تم إيقاف Copy Trading للجميع. الإضافات تبقى متصلة لكن لن تستقبل صفقات جديدة.", reply_markup=copy_admin_keyboard)
+            else:
+                await update.message.reply_text("❌ تعذر إيقاف Copy Trading. راجع لوج Render.", reply_markup=copy_admin_keyboard)
             return
 
         if text == "📡 حالة Copy":
@@ -15343,6 +15470,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if text == "♻️ تصفير جهاز كود":
+            context.user_data["step"] = "copy_reset_device_waiting_token"
+            await update.message.reply_text(
+                "♻️ أرسل كود Copy الذي تريد تصفير الأجهزة المرتبطة به.\n\nبعد التصفير، أول جهاز يفتح الإضافة بهذا الكود سيرتبط من جديد.",
+                reply_markup=copy_admin_keyboard
+            )
+            return
+
+        if text == "📌 رسالة تحديث":
+            context.user_data["step"] = "copy_update_notice_waiting_text"
+            await update.message.reply_text(
+                "📌 أرسل رسالة التحديث التي تريد أن تظهر داخل الإضافة.\n\nأرسل كلمة: مسح\nلحذف رسالة التحديث الحالية.",
+                reply_markup=copy_admin_keyboard
+            )
+            return
+
         if text == "⛔ إيقاف كود":
             context.user_data["step"] = "copy_disable_waiting_token"
             await update.message.reply_text(
@@ -15359,6 +15502,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             else:
                 await update.message.reply_text("❌ لم أستطع إيقاف الكود. تأكد أنه كود منشأ من البوت وليس من Render Env.", reply_markup=copy_admin_keyboard)
             return
+
+        if step == "copy_reset_device_waiting_token":
+            context.user_data["step"] = None
+            token = normalize_copy_license_token(text)
+            if reset_copy_license_devices(token):
+                await update.message.reply_text(f"✅ تم تصفير الأجهزة للكود:\n<code>{html.escape(token)}</code>", parse_mode="HTML", reply_markup=copy_admin_keyboard)
+            else:
+                await update.message.reply_text("❌ لم أستطع تصفير الأجهزة. تأكد أن الكود منشأ من البوت وليس من Render Env.", reply_markup=copy_admin_keyboard)
+            return
+
+        if step == "copy_update_notice_waiting_text":
+            context.user_data["step"] = None
+            notice = "" if str(text).strip() == "مسح" else str(text).strip()
+            if set_copy_update_notice(notice, user.id):
+                msg = "✅ تم مسح رسالة التحديث." if not notice else "✅ تم حفظ رسالة التحديث للإضافة."
+                await update.message.reply_text(msg, reply_markup=copy_admin_keyboard)
+            else:
+                await update.message.reply_text("❌ تعذر حفظ رسالة التحديث. راجع لوج Render.", reply_markup=copy_admin_keyboard)
+            return
+
 
         if text == "🧠 OTC Edge Engine":
             reset_signal_state(context)
@@ -16179,8 +16342,17 @@ async def _copy_send_json_safe(ws, payload: dict) -> bool:
 
 
 async def _copy_broadcast_signal(signal: dict) -> dict:
-    dead = []
+    if not is_copy_global_enabled():
+        return {
+            "online_clients": len(_copy_clients),
+            "delivered": 0,
+            "dead_removed": 0,
+            "global_enabled": False,
+            "reason": "copy trading stopped by admin",
+        }
+
     delivered = 0
+    dead = []
     for client_id, client in list(_copy_clients.items()):
         ws = client.get("ws")
         ok = await _copy_send_json_safe(ws, {"type": "signal", "signal": signal})
@@ -16189,18 +16361,20 @@ async def _copy_broadcast_signal(signal: dict) -> dict:
             client["last_sent_at"] = now_iso()
         else:
             dead.append(client_id)
-
     for client_id in dead:
         _copy_clients.pop(client_id, None)
-
-    return {"online_clients": len(_copy_clients), "delivered": delivered, "dead_removed": len(dead)}
-
+    return {
+        "online_clients": len(_copy_clients),
+        "delivered": delivered,
+        "dead_removed": len(dead),
+        "global_enabled": True,
+    }
 
 def create_embedded_copy_api():
     from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
 
-    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.23.0")
+    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.24.0")
     copy_api.add_middleware(
         CORSMiddleware,
         allow_origins=COPY_ALLOWED_ORIGINS,
@@ -16215,9 +16389,10 @@ def create_embedded_copy_api():
         return {
             "ok": True,
             "app": "TRADING TIME COPY EMBEDDED SERVER",
+            "version": "0.24.0",
             "time": now_iso(),
+            "copy_settings": copy_public_settings_payload(),
             "online_clients": len(_copy_clients),
-            "history_size": len(_copy_signal_history),
             "bot": "telegram-bot",
         }
 
@@ -16237,6 +16412,7 @@ def create_embedded_copy_api():
             "plan": (record or {}).get("plan"),
             "expires_at": (record or {}).get("expires_at"),
             "max_devices": (record or {}).get("max_devices"),
+            "copy_settings": copy_public_settings_payload(),
         }
 
     @copy_api.get("/api/admin/status")
@@ -16326,6 +16502,7 @@ def create_embedded_copy_api():
             "client_id": client_id,
             "server_time": now_iso(),
             "message": "TRADING TIME COPY connected",
+            "copy_settings": copy_public_settings_payload(),
             "license": {
                 "token": token,
                 "status": "active",
@@ -16354,7 +16531,11 @@ def create_embedded_copy_api():
                 del _copy_client_events[:-int(COPY_SIGNAL_HISTORY_LIMIT)]
 
                 if event.get("type") == "ping":
-                    await _copy_send_json_safe(websocket, {"type": "pong", "server_time": now_iso()})
+                    await _copy_send_json_safe(websocket, {
+                        "type": "pong",
+                        "server_time": now_iso(),
+                        "copy_settings": copy_public_settings_payload(),
+                    })
                 elif event.get("type") == "ack":
                     await _copy_send_json_safe(websocket, {"type": "ack_saved", "signal_id": event.get("signal_id")})
                 else:
