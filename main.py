@@ -451,6 +451,7 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["📥 الطلبات المعلقة", "📋 كافة المستخدمين"],
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
+        ["🔐 Copy Trading", "📡 حالة Copy"],
         ["🧠 غرفة جلسة تداول", "🧠 OTC Edge Engine"],
         ["📡 قناة 3 شموع", "🧾 فحص ليستة OTC"],
         ["📋 عرض نتائج الليستة"],
@@ -494,6 +495,16 @@ three_candle_admin_keyboard = ReplyKeyboardMarkup(
         ["🟢 تشغيل نشر القناة", "🔴 إيقاف نشر القناة"],
         ["🎯 حد صفقات اليوم", "♾ نشر مفتوح"],
         ["📊 ملخص القناة", "📋 حالة القناة"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+copy_admin_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🔑 كود أسبوع", "🔑 كود شهر"],
+        ["🔑 كود دائم", "📋 أكواد Copy"],
+        ["⛔ إيقاف كود", "📡 حالة Copy"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -947,6 +958,8 @@ COPY_SEND_TRADING_ROOM = os.getenv("COPY_SEND_TRADING_ROOM", "true").lower() in 
 COPY_EMBEDDED_SERVER_ENABLED = os.getenv("COPY_EMBEDDED_SERVER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 COPY_ALLOWED_ORIGINS = [x.strip() for x in os.getenv("COPY_ALLOWED_ORIGINS", "*").split(",") if x.strip()]
 COPY_LICENSES = os.getenv("COPY_LICENSES", "DEMO-111:active")
+COPY_LICENSE_DEFAULT_MAX_DEVICES = int(os.getenv("COPY_LICENSE_DEFAULT_MAX_DEVICES", "1"))
+COPY_LICENSE_DEVICE_TOUCH_SECONDS = int(os.getenv("COPY_LICENSE_DEVICE_TOUCH_SECONDS", "60"))
 COPY_SIGNAL_HISTORY_LIMIT = int(os.getenv("COPY_SIGNAL_HISTORY_LIMIT", "200"))
 COPY_UVICORN_LOG_LEVEL = os.getenv("COPY_UVICORN_LOG_LEVEL", "info")
 
@@ -1700,6 +1713,296 @@ def parse_iso(value: str):
     except Exception:
         return None
 
+
+
+# ===== TRADING TIME COPY LICENSE MANAGER =====
+_copy_license_touch_cache = {}
+
+
+def copy_licenses_ref():
+    return system_ref().child("copy_trading").child("licenses")
+
+
+def copy_license_key(token: str) -> str:
+    return safe_key(str(token or "").strip())
+
+
+def normalize_copy_license_token(token: str) -> str:
+    return str(token or "").strip().upper().replace(" ", "")
+
+
+def generate_copy_license_token(plan: str = "month") -> str:
+    alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    chunks = []
+    for _ in range(3):
+        chunks.append("".join(random.choice(alphabet) for _ in range(4)))
+    prefix = {"week": "TTW", "month": "TTM", "forever": "TTV"}.get(str(plan), "TTC")
+    return f"{prefix}-" + "-".join(chunks)
+
+
+def copy_license_expiry_for_plan(plan: str):
+    plan = str(plan or "month").lower()
+    if plan in {"forever", "vip", "lifetime", "permanent"}:
+        return "forever"
+    if plan in {"week", "weekly", "7d"}:
+        return (now_utc() + timedelta(days=7)).isoformat()
+    if plan in {"month", "monthly", "30d"}:
+        return (now_utc() + timedelta(days=30)).isoformat()
+    return (now_utc() + timedelta(days=30)).isoformat()
+
+
+def copy_license_is_expired(expires_at) -> bool:
+    try:
+        if not expires_at or str(expires_at).lower() == "forever":
+            return False
+        dt = parse_iso(str(expires_at))
+        if dt is None:
+            # Accept ISO strings with Z suffix.
+            raw = str(expires_at).strip()
+            if raw.endswith("Z"):
+                dt = datetime.fromisoformat(raw[:-1] + "+00:00")
+        if dt is None:
+            return False
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return now_utc() > dt.astimezone(UTC)
+    except Exception:
+        return False
+
+
+def copy_license_env_records() -> dict:
+    # Backward-compatible static licenses from Render env.
+    result = {}
+    raw = str(COPY_LICENSES or "DEMO-111:active")
+    for part in raw.replace(";", ",").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        bits = part.split(":")
+        token = normalize_copy_license_token(bits[0] if bits else "")
+        status = (bits[1].strip().lower() if len(bits) > 1 and bits[1].strip() else "active")
+        if token:
+            result[token] = {
+                "token": token,
+                "status": status,
+                "plan": "env",
+                "source": "env",
+                "expires_at": "forever",
+                "max_devices": 999,
+                "devices": {},
+                "created_at": None,
+            }
+    return result
+
+
+def get_copy_license_record(token: str):
+    token = normalize_copy_license_token(token)
+    if not token:
+        return None
+    try:
+        data = copy_licenses_ref().child(copy_license_key(token)).get()
+        if isinstance(data, dict):
+            data["token"] = normalize_copy_license_token(data.get("token") or token)
+            data["source"] = data.get("source") or "firebase"
+            return data
+    except Exception as e:
+        logger.warning("Could not read copy license from Firebase: %s", e)
+    return copy_license_env_records().get(token)
+
+
+def create_copy_license(plan: str, created_by: int | None = None, max_devices: int | None = None) -> dict:
+    plan = str(plan or "month").lower()
+    max_devices = max(1, int(max_devices or COPY_LICENSE_DEFAULT_MAX_DEVICES or 1))
+
+    # Avoid collisions, even though they are very unlikely.
+    token = generate_copy_license_token(plan)
+    for _ in range(10):
+        if not get_copy_license_record(token):
+            break
+        token = generate_copy_license_token(plan)
+
+    record = {
+        "token": token,
+        "status": "active",
+        "plan": plan,
+        "source": "firebase",
+        "created_by": int(created_by) if created_by else None,
+        "created_at": now_iso(),
+        "expires_at": copy_license_expiry_for_plan(plan),
+        "max_devices": max_devices,
+        "devices": {},
+        "disabled_at": None,
+        "last_seen_at": None,
+    }
+    copy_licenses_ref().child(copy_license_key(token)).set(record)
+    return record
+
+
+def disable_copy_license(token: str) -> bool:
+    token = normalize_copy_license_token(token)
+    if not token:
+        return False
+    record = get_copy_license_record(token)
+    if not record or record.get("source") == "env":
+        return False
+    copy_licenses_ref().child(copy_license_key(token)).update({
+        "status": "disabled",
+        "disabled_at": now_iso(),
+    })
+    return True
+
+
+def list_copy_licenses(limit: int = 20) -> list[dict]:
+    items = []
+    try:
+        data = copy_licenses_ref().get() or {}
+        if isinstance(data, dict):
+            for _key, rec in data.items():
+                if isinstance(rec, dict):
+                    rec = dict(rec)
+                    rec["token"] = normalize_copy_license_token(rec.get("token") or _key)
+                    rec["source"] = rec.get("source") or "firebase"
+                    items.append(rec)
+    except Exception as e:
+        logger.warning("Could not list copy licenses from Firebase: %s", e)
+
+    for token, rec in copy_license_env_records().items():
+        items.append(dict(rec))
+
+    def sort_key(rec):
+        return str(rec.get("created_at") or rec.get("token") or "")
+
+    items.sort(key=sort_key, reverse=True)
+    return items[: int(limit or 20)]
+
+
+def format_copy_license_expiry(expires_at) -> str:
+    if not expires_at or str(expires_at).lower() == "forever":
+        return "دائم"
+    try:
+        return format_dt_ar(str(expires_at))
+    except Exception:
+        return str(expires_at)
+
+
+def build_copy_license_message(record: dict) -> str:
+    token = record.get("token") or "-"
+    plan = record.get("plan") or "-"
+    expires = format_copy_license_expiry(record.get("expires_at"))
+    max_devices = record.get("max_devices", 1)
+    return (
+        "🔑 كود تفعيل Copy Trading جاهز\n\n"
+        f"<code>{html.escape(str(token))}</code>\n\n"
+        f"📦 النوع: {html.escape(str(plan))}\n"
+        f"⏳ الصلاحية: {html.escape(str(expires))}\n"
+        f"📱 عدد الأجهزة: {html.escape(str(max_devices))}\n\n"
+        "انسخ الكود وضعه داخل إضافة TRADING TIME COPY ثم اضغط حفظ وربط."
+    )
+
+
+def build_copy_licenses_list_message(limit: int = 20) -> str:
+    items = list_copy_licenses(limit)
+    if not items:
+        return "📭 لا يوجد أكواد Copy محفوظة."
+    lines = [f"📋 آخر {len(items)} كود Copy", "━━━━━━━━━━━━━━"]
+    for rec in items:
+        token = rec.get("token") or "-"
+        status = rec.get("status") or "unknown"
+        plan = rec.get("plan") or "-"
+        expires = format_copy_license_expiry(rec.get("expires_at"))
+        devices = rec.get("devices") if isinstance(rec.get("devices"), dict) else {}
+        max_devices = rec.get("max_devices", 1)
+        source = rec.get("source") or "firebase"
+        expired = " | منتهي" if copy_license_is_expired(rec.get("expires_at")) else ""
+        lines.append(
+            f"🔑 <code>{html.escape(str(token))}</code>\n"
+            f"الحالة: {html.escape(str(status))}{expired}\n"
+            f"النوع: {html.escape(str(plan))} | الصلاحية: {html.escape(str(expires))}\n"
+            f"الأجهزة: {len(devices)}/{max_devices} | المصدر: {html.escape(str(source))}\n"
+            "──────────────"
+        )
+    return "\n".join(lines)[:3900]
+
+
+def copy_validate_license_for_device(token: str, device_id: str = "unknown", touch: bool = True) -> tuple[bool, str, dict | None]:
+    token = normalize_copy_license_token(token)
+    device_id = str(device_id or "unknown").strip()[:120] or "unknown"
+    record = get_copy_license_record(token)
+    if not record:
+        return False, "invalid license", None
+    if str(record.get("status") or "").lower() != "active":
+        return False, "inactive license", record
+    if copy_license_is_expired(record.get("expires_at")):
+        # Mark Firebase records as expired for easier admin visibility.
+        try:
+            if record.get("source") != "env":
+                copy_licenses_ref().child(copy_license_key(token)).update({"status": "expired", "expired_at": now_iso()})
+        except Exception:
+            pass
+        return False, "expired license", record
+
+    if record.get("source") == "env":
+        return True, "ok", record
+
+    devices = record.get("devices") if isinstance(record.get("devices"), dict) else {}
+    max_devices = max(1, int(record.get("max_devices") or COPY_LICENSE_DEFAULT_MAX_DEVICES or 1))
+    device_key = safe_key(device_id)
+
+    if device_key not in devices and len(devices) >= max_devices:
+        return False, "device limit reached", record
+
+    try:
+        updates = {"last_seen_at": now_iso()}
+        now_ts = time_module.time()
+        touch_key = f"{token}:{device_key}"
+        last_touch = float(_copy_license_touch_cache.get(touch_key, 0) or 0)
+        if device_key not in devices:
+            updates[f"devices/{device_key}"] = {
+                "device_id": device_id,
+                "bound_at": now_iso(),
+                "last_seen_at": now_iso(),
+            }
+            _copy_license_touch_cache[touch_key] = now_ts
+        elif touch and now_ts - last_touch >= int(COPY_LICENSE_DEVICE_TOUCH_SECONDS):
+            updates[f"devices/{device_key}/last_seen_at"] = now_iso()
+            _copy_license_touch_cache[touch_key] = now_ts
+        elif not touch:
+            updates = {}
+        if updates:
+            copy_licenses_ref().child(copy_license_key(token)).update(updates)
+    except Exception as e:
+        logger.warning("Could not update copy license device binding: %s", e)
+
+    return True, "ok", record
+
+
+def build_copy_status_message() -> str:
+    licenses = list_copy_licenses(1000)
+    active = 0
+    expired = 0
+    disabled = 0
+    for rec in licenses:
+        status = str(rec.get("status") or "").lower()
+        if status == "disabled":
+            disabled += 1
+        elif copy_license_is_expired(rec.get("expires_at")) or status == "expired":
+            expired += 1
+        elif status == "active":
+            active += 1
+    return (
+        "📡 حالة Copy Trading\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🟢 المتصلين الآن: {len(_copy_clients) if '_copy_clients' in globals() else 0}\n"
+        f"🔑 الأكواد النشطة: {active}\n"
+        f"⏳ الأكواد المنتهية: {expired}\n"
+        f"⛔ الأكواد المعطلة: {disabled}\n"
+        f"📨 آخر الصفقات بالسجل: {len(_copy_signal_history) if '_copy_signal_history' in globals() else 0}\n"
+        f"🧾 أحداث الإضافة: {len(_copy_client_events) if '_copy_client_events' in globals() else 0}\n\n"
+        "آخر المتصلين:\n" + ("\n".join(
+            f"• {html.escape(str(v.get('license', '-')))} | {html.escape(str(v.get('device_id', '-')))[:24]} | {format_dt_ar(v.get('last_seen_at', ''))}"
+            for _k, v in list((_copy_clients if '_copy_clients' in globals() else {}).items())[-8:]
+        ) or "لا يوجد متصلين الآن")
+    )[:3900]
 
 
 def safe_int(value, default: int = 0) -> int:
@@ -14304,6 +14607,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "otc_list_waiting_text",
             "otc_pair_diagnostics_waiting",
             "otc_candle_diagnostics_waiting",
+            "copy_disable_waiting_token",
         }:
             context.user_data["step"] = None
             context.user_data.pop("target_user_id", None)
@@ -14999,6 +15303,61 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "🔴 إيقاف البوت":
             set_bot_enabled(False)
             await update.message.reply_text("🛠 تم إيقاف البوت للعامة", reply_markup=admin_main_keyboard)
+            return
+
+        if text in {"🔐 Copy Trading", "Copy Trading"}:
+            reset_signal_state(context)
+            await update.message.reply_text(
+                "🔐 لوحة Copy Trading\n\nاختر إنشاء كود تفعيل أو عرض حالة المتصلين.",
+                reply_markup=copy_admin_keyboard
+            )
+            return
+
+        if text == "📡 حالة Copy":
+            await update.message.reply_text(
+                build_copy_status_message(),
+                parse_mode="HTML",
+                reply_markup=copy_admin_keyboard
+            )
+            return
+
+        if text in {"🔑 كود أسبوع", "🔑 كود شهر", "🔑 كود دائم"}:
+            plan = "week" if "أسبوع" in text else ("forever" if "دائم" in text else "month")
+            try:
+                record = create_copy_license(plan=plan, created_by=user.id, max_devices=COPY_LICENSE_DEFAULT_MAX_DEVICES)
+                await update.message.reply_text(
+                    build_copy_license_message(record),
+                    parse_mode="HTML",
+                    reply_markup=copy_admin_keyboard
+                )
+            except Exception as e:
+                logger.exception("Could not create copy license: %s", e)
+                await update.message.reply_text("❌ تعذر إنشاء كود التفعيل. راجع لوج Render.", reply_markup=copy_admin_keyboard)
+            return
+
+        if text == "📋 أكواد Copy":
+            await update.message.reply_text(
+                build_copy_licenses_list_message(20),
+                parse_mode="HTML",
+                reply_markup=copy_admin_keyboard
+            )
+            return
+
+        if text == "⛔ إيقاف كود":
+            context.user_data["step"] = "copy_disable_waiting_token"
+            await update.message.reply_text(
+                "⛔ أرسل كود Copy الذي تريد إيقافه.\n\nملاحظة: الأكواد الموجودة فقط في Render Env لا يمكن إيقافها من البوت، احذفها من COPY_LICENSES.",
+                reply_markup=copy_admin_keyboard
+            )
+            return
+
+        if step == "copy_disable_waiting_token":
+            context.user_data["step"] = None
+            token = normalize_copy_license_token(text)
+            if disable_copy_license(token):
+                await update.message.reply_text(f"✅ تم إيقاف الكود:\n<code>{html.escape(token)}</code>", parse_mode="HTML", reply_markup=copy_admin_keyboard)
+            else:
+                await update.message.reply_text("❌ لم أستطع إيقاف الكود. تأكد أنه كود منشأ من البوت وليس من Render Env.", reply_markup=copy_admin_keyboard)
             return
 
         if text == "🧠 OTC Edge Engine":
@@ -15698,20 +16057,9 @@ _copy_client_events = []
 
 
 def _copy_load_licenses() -> dict:
-    result = {}
-    raw = str(COPY_LICENSES or "DEMO-111:active")
-    for part in raw.replace(";", ",").split(","):
-        part = part.strip()
-        if not part:
-            continue
-        if ":" in part:
-            token, status = part.split(":", 1)
-        else:
-            token, status = part, "active"
-        token = token.strip()
-        if token:
-            result[token] = {"status": (status.strip() or "active")}
-    return result
+    # Backward compatibility for older server code. v0.23 uses Firebase-backed
+    # validation through copy_validate_license_for_device().
+    return copy_license_env_records()
 
 
 def _copy_server_parse_iso(value):
@@ -15852,7 +16200,7 @@ def create_embedded_copy_api():
     from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
 
-    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.12.0")
+    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.23.0")
     copy_api.add_middleware(
         CORSMiddleware,
         allow_origins=COPY_ALLOWED_ORIGINS,
@@ -15861,7 +16209,6 @@ def create_embedded_copy_api():
         allow_headers=["*"],
     )
 
-    licenses = _copy_load_licenses()
 
     @copy_api.get("/health")
     async def copy_health():
@@ -15877,6 +16224,20 @@ def create_embedded_copy_api():
     @copy_api.get("/copy/health")
     async def copy_health_alias():
         return await copy_health()
+
+    @copy_api.get("/api/license/check")
+    async def copy_license_check(token: str = Query(...), device_id: str = Query(default="unknown")):
+        ok, reason, record = copy_validate_license_for_device(token, device_id, touch=True)
+        if not ok:
+            raise HTTPException(status_code=401, detail=reason)
+        return {
+            "ok": True,
+            "status": "active",
+            "token": normalize_copy_license_token(token),
+            "plan": (record or {}).get("plan"),
+            "expires_at": (record or {}).get("expires_at"),
+            "max_devices": (record or {}).get("max_devices"),
+        }
 
     @copy_api.get("/api/admin/status")
     async def copy_admin_status(x_ttcopy_secret: str | None = Header(default=None)):
@@ -15944,9 +16305,10 @@ def create_embedded_copy_api():
     @copy_api.websocket("/ws/extension")
     async def copy_extension_ws(websocket: WebSocket, token: str = Query(...), device_id: str = Query(default="unknown")):
         await websocket.accept()
-        license_record = licenses.get(token)
-        if not license_record or license_record.get("status") != "active":
-            await websocket.close(code=4401, reason="invalid or inactive license")
+        token = normalize_copy_license_token(token)
+        ok, reason, license_record = copy_validate_license_for_device(token, device_id, touch=True)
+        if not ok:
+            await websocket.close(code=4401, reason=reason)
             return
 
         client_id = hashlib.sha256(f"{token}:{device_id}:{time_module.time()}".encode("utf-8")).hexdigest()[:16]
@@ -15964,12 +16326,23 @@ def create_embedded_copy_api():
             "client_id": client_id,
             "server_time": now_iso(),
             "message": "TRADING TIME COPY connected",
+            "license": {
+                "token": token,
+                "status": "active",
+                "plan": (license_record or {}).get("plan"),
+                "expires_at": (license_record or {}).get("expires_at"),
+                "max_devices": (license_record or {}).get("max_devices"),
+            },
         })
         try:
             while True:
                 raw = await websocket.receive_text()
                 if client_id in _copy_clients:
                     _copy_clients[client_id]["last_seen_at"] = now_iso()
+                ok, reason, _record = copy_validate_license_for_device(token, device_id, touch=True)
+                if not ok:
+                    await websocket.close(code=4401, reason=reason)
+                    break
                 try:
                     event = json.loads(raw)
                 except Exception:
