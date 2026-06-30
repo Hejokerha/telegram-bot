@@ -955,6 +955,17 @@ COPY_SEND_TIMED_LISTS = os.getenv("COPY_SEND_TIMED_LISTS", "true").lower() in {"
 COPY_SEND_THREE_CANDLE = os.getenv("COPY_SEND_THREE_CANDLE", "true").lower() in {"1", "true", "yes", "on"}
 COPY_SEND_TRADING_ROOM = os.getenv("COPY_SEND_TRADING_ROOM", "true").lower() in {"1", "true", "yes", "on"}
 
+# يمنع صفقات المستخدمين العاديين داخل البوت من الوصول إلى إضافة النسخ.
+# الافتراضي: فقط الأدمن أو الأرقام الموجودة في COPY_SIGNAL_ALLOWED_TELEGRAM_IDS يستطيعون بث الصفقة إلى Copy Trading.
+# v0.26: user signal routing makes every user signal private to that user's own extension.
+# When this is enabled, user-generated signals are allowed into Copy Server, but delivered only
+# to extensions linked with the same Telegram user id. Broadcast/system signals without target_user_id
+# still go to all connected extensions that enabled their source.
+COPY_USER_SIGNAL_ROUTING_ENABLED = os.getenv("COPY_USER_SIGNAL_ROUTING_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+COPY_USER_SIGNALS_ADMIN_ONLY = os.getenv("COPY_USER_SIGNALS_ADMIN_ONLY", "false").lower() in {"1", "true", "yes", "on"}
+COPY_SIGNAL_ALLOWED_TELEGRAM_IDS = parse_id_set_from_env("COPY_SIGNAL_ALLOWED_TELEGRAM_IDS")
+COPY_SIGNAL_ALLOWED_TELEGRAM_IDS.add(int(ADMIN_TELEGRAM_ID))
+
 # ===== Embedded TRADING TIME COPY SERVER =====
 # يشغل Copy Server داخل نفس خدمة Render الخاصة بالبوت حتى لا تحتاج Web Service ثاني.
 COPY_EMBEDDED_SERVER_ENABLED = os.getenv("COPY_EMBEDDED_SERVER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -1730,7 +1741,7 @@ def get_copy_settings() -> dict:
 
     default = {
         "global_enabled": True,
-        "latest_version": "v0.24",
+        "latest_version": "v0.26",
         "update_notice": "",
         "updated_at": None,
     }
@@ -1773,7 +1784,7 @@ def set_copy_update_notice(message: str, admin_id: int | None = None) -> bool:
         text = str(message or "").strip()[:600]
         copy_settings_ref().update({
             "update_notice": text,
-            "latest_version": "v0.24",
+            "latest_version": "v0.26",
             "updated_at": now_iso(),
             "updated_by": int(admin_id) if admin_id else None,
         })
@@ -1788,7 +1799,7 @@ def copy_public_settings_payload() -> dict:
     settings = get_copy_settings()
     return {
         "global_enabled": bool(settings.get("global_enabled", True)),
-        "latest_version": settings.get("latest_version") or "v0.24",
+        "latest_version": settings.get("latest_version") or "v0.26",
         "update_notice": settings.get("update_notice") or "",
         "updated_at": settings.get("updated_at"),
     }
@@ -1910,6 +1921,8 @@ def create_copy_license(plan: str, created_by: int | None = None, max_devices: i
         "expires_at": copy_license_expiry_for_plan(plan),
         "max_devices": max_devices,
         "devices": {},
+        "telegram_user_id": None,
+        "telegram_linked_at": None,
         "disabled_at": None,
         "last_seen_at": None,
     }
@@ -1941,8 +1954,11 @@ def reset_copy_license_devices(token: str) -> bool:
         return False
     copy_licenses_ref().child(copy_license_key(token)).update({
         "devices": {},
+        "telegram_user_id": None,
+        "telegram_linked_at": None,
         "last_seen_at": None,
         "devices_reset_at": now_iso(),
+        "telegram_unlinked_at": now_iso(),
     })
     try:
         prefix = f"{token}:"
@@ -1997,8 +2013,9 @@ def build_copy_license_message(record: dict) -> str:
         f"<code>{html.escape(str(token))}</code>\n\n"
         f"📦 النوع: {html.escape(str(plan))}\n"
         f"⏳ الصلاحية: {html.escape(str(expires))}\n"
-        f"📱 عدد الأجهزة: {html.escape(str(max_devices))}\n\n"
-        "انسخ الكود وضعه داخل إضافة TRADING TIME COPY ثم اضغط حفظ وربط."
+        f"📱 عدد الأجهزة: {html.escape(str(max_devices))}\n"
+        "👤 الربط: أول Telegram ID يوضع داخل الإضافة سيثبت على هذا الكود\n\n"
+        "انسخ الكود وضعه داخل إضافة TRADING TIME COPY مع Telegram ID الخاص بالمستخدم ثم اضغط حفظ وربط."
     )
 
 
@@ -2020,15 +2037,29 @@ def build_copy_licenses_list_message(limit: int = 20) -> str:
             f"🔑 <code>{html.escape(str(token))}</code>\n"
             f"الحالة: {html.escape(str(status))}{expired}\n"
             f"النوع: {html.escape(str(plan))} | الصلاحية: {html.escape(str(expires))}\n"
-            f"الأجهزة: {len(devices)}/{max_devices} | المصدر: {html.escape(str(source))}\n"
+            f"الأجهزة: {len(devices)}/{max_devices} | Telegram ID: {html.escape(str(rec.get('telegram_user_id') or '-'))}\n"
+            f"المصدر: {html.escape(str(source))}\n"
             "──────────────"
         )
     return "\n".join(lines)[:3900]
 
 
-def copy_validate_license_for_device(token: str, device_id: str = "unknown", touch: bool = True) -> tuple[bool, str, dict | None]:
+def normalize_copy_telegram_user_id(value) -> str:
+    try:
+        text = str(value or "").strip()
+        if text.startswith("@"):  # usernames are not stable enough for routing; numeric ID is required.
+            return ""
+        if text.lstrip("-").isdigit():
+            return str(int(text))
+        return ""
+    except Exception:
+        return ""
+
+
+def copy_validate_license_for_device(token: str, device_id: str = "unknown", telegram_user_id=None, touch: bool = True) -> tuple[bool, str, dict | None]:
     token = normalize_copy_license_token(token)
     device_id = str(device_id or "unknown").strip()[:120] or "unknown"
+    telegram_user_id = normalize_copy_telegram_user_id(telegram_user_id)
     record = get_copy_license_record(token)
     if not record:
         return False, "invalid license", None
@@ -2044,7 +2075,16 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tou
         return False, "expired license", record
 
     if record.get("source") == "env":
+        if telegram_user_id:
+            try:
+                record["telegram_user_id"] = telegram_user_id
+            except Exception:
+                pass
         return True, "ok", record
+
+    existing_telegram_id = normalize_copy_telegram_user_id(record.get("telegram_user_id") or record.get("owner_telegram_id"))
+    if existing_telegram_id and telegram_user_id and existing_telegram_id != telegram_user_id:
+        return False, "license linked to another Telegram ID", record
 
     devices = record.get("devices") if isinstance(record.get("devices"), dict) else {}
     max_devices = max(1, int(record.get("max_devices") or COPY_LICENSE_DEFAULT_MAX_DEVICES or 1))
@@ -2059,6 +2099,9 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tou
         now_value = now_iso()
         touch_key = f"{token}:{device_key}"
         last_touch = float(_copy_license_touch_cache.get(touch_key, 0) or 0)
+        if telegram_user_id and not existing_telegram_id:
+            updates["telegram_user_id"] = telegram_user_id
+            updates["telegram_linked_at"] = now_value
         if device_key not in devices:
             updates["last_seen_at"] = now_value
             updates[f"devices/{device_key}"] = {
@@ -2085,10 +2128,13 @@ def build_copy_status_message() -> str:
     expired = 0
     disabled = 0
     total_devices = 0
+    linked_telegram = 0
     for rec in licenses:
         status = str(rec.get("status") or "").lower()
         devices = rec.get("devices") if isinstance(rec.get("devices"), dict) else {}
         total_devices += len(devices)
+        if normalize_copy_telegram_user_id(rec.get("telegram_user_id")):
+            linked_telegram += 1
         if status == "disabled":
             disabled += 1
         elif copy_license_is_expired(rec.get("expires_at")) or status == "expired":
@@ -2099,7 +2145,7 @@ def build_copy_status_message() -> str:
     settings = get_copy_settings()
     enabled = bool(settings.get("global_enabled", True))
     update_notice = str(settings.get("update_notice") or "").strip()
-    latest_version = settings.get("latest_version") or "v0.24"
+    latest_version = settings.get("latest_version") or "v0.26"
 
     lines = [
         "📡 حالة Copy Trading",
@@ -2111,8 +2157,9 @@ def build_copy_status_message() -> str:
         f"⏳ الأكواد المنتهية: {expired}",
         f"⛔ الأكواد المعطلة: {disabled}",
         f"📱 الأجهزة المربوطة: {total_devices}",
+        f"👤 الأكواد المربوطة بـ Telegram ID: {linked_telegram}",
         "",
-        "ملاحظة: تم حذف سجل التنفيذ التفصيلي لتخفيف استهلاك الداتا. الحمايات وسجل آخر تنفيذ تبقى محلية داخل الإضافة.",
+        "ملاحظة: في v0.26 صفقات كل مستخدم تصل فقط للإضافة المربوطة بنفس Telegram ID. الإشارات العامة بدون هدف تبقى Broadcast.",
     ]
     if update_notice:
         lines.extend(["", "📌 رسالة التحديث:", html.escape(update_notice)])
@@ -2270,6 +2317,31 @@ def _copy_display_pair(signal: dict) -> str:
         return str(signal.get("pair") or "")
 
 
+def is_copy_signal_creator_allowed(creator_user_id=None) -> bool:
+    """يسمح ببث Copy Trading فقط من الأدمن/الأرقام المسموحة عند وجود مستخدم مولّد للصفقة."""
+    try:
+        if COPY_USER_SIGNAL_ROUTING_ENABLED:
+            return True
+        if not COPY_USER_SIGNALS_ADMIN_ONLY:
+            return True
+        if creator_user_id is None:
+            # مصادر النظام/القنوات لا تحمل user_id، وتبقى مسموحة.
+            return True
+        uid = int(creator_user_id)
+        return uid in set(COPY_SIGNAL_ALLOWED_TELEGRAM_IDS or {int(ADMIN_TELEGRAM_ID)})
+    except Exception:
+        return False
+
+
+def copy_signal_guard_skip_payload(creator_user_id=None) -> dict:
+    return {
+        "ok": False,
+        "skipped": True,
+        "reason": "creator_user_not_allowed_for_copy",
+        "creator_user_id": creator_user_id,
+    }
+
+
 def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
     """يبني Payload موحد لإرساله إلى TRADING TIME COPY SERVER."""
     source = normalize_copy_source(source)
@@ -2297,6 +2369,8 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
         "entry_price": signal.get("entry_price"),
         "payout": signal.get("payout"),
         "note": str(signal.get("note") or "")[:500],
+        "creator_user_id": normalize_copy_telegram_user_id(signal.get("creator_user_id") or signal.get("user_id")),
+        "target_user_id": normalize_copy_telegram_user_id(signal.get("target_user_id") or signal.get("telegram_user_id")),
     }
 
     base = "|".join([
@@ -2342,13 +2416,20 @@ async def publish_copy_trading_signal(signal: dict, source: str = "bot") -> dict
         return {"ok": False, "error": str(e)}
 
 
-async def maybe_publish_copy_signal(result: dict, source: str, enabled: bool = True) -> dict:
+async def maybe_publish_copy_signal(result: dict, source: str, enabled: bool = True, creator_user_id=None) -> dict:
     """يرسل فقط الإشارات المباشرة الناجحة إلى TRADING TIME COPY."""
     try:
         if not enabled:
             return {"ok": False, "skipped": True, "reason": "source disabled"}
+        if not is_copy_signal_creator_allowed(creator_user_id):
+            logger.info("Copy Trading blocked user-generated signal | user_id=%s | source=%s", creator_user_id, source)
+            return copy_signal_guard_skip_payload(creator_user_id)
         if not result or not result.get("ok"):
             return {"ok": False, "skipped": True, "reason": "result not ok"}
+        if COPY_USER_SIGNAL_ROUTING_ENABLED and creator_user_id is not None:
+            result = dict(result)
+            result["creator_user_id"] = int(creator_user_id)
+            result["target_user_id"] = int(creator_user_id)
         copy_result = await publish_copy_trading_signal(result, source=source)
         if copy_result.get("ok"):
             logger.info("Copy Trading signal sent | source=%s | delivery=%s", source, copy_result.get("delivery"))
@@ -2382,7 +2463,7 @@ def _copy_pair_from_signal_line(line: str, fallback_pair: str) -> str:
     return str(fallback_pair or "").strip()
 
 
-async def publish_copy_timed_list_signals(pair: str, signals: list[str], interval_minutes: int, start_dt: datetime, source: str = "timed_list") -> dict:
+async def publish_copy_timed_list_signals(pair: str, signals: list[str], interval_minutes: int, start_dt: datetime, source: str = "timed_list", creator_user_id=None) -> dict:
     """Send each timed-list item to the extension with its real entry time.
 
     مهم: الإضافة في v0.22 تدعم Queue، لذلك ترسل الليستة كاملة الآن،
@@ -2390,6 +2471,9 @@ async def publish_copy_timed_list_signals(pair: str, signals: list[str], interva
     """
     if not COPY_SEND_TIMED_LISTS:
         return {"ok": False, "skipped": True, "reason": "COPY_SEND_TIMED_LISTS=false"}
+    if not is_copy_signal_creator_allowed(creator_user_id):
+        logger.info("Copy Trading blocked timed-list user signal | user_id=%s | pair=%s", creator_user_id, pair)
+        return copy_signal_guard_skip_payload(creator_user_id)
     if not signals:
         return {"ok": False, "skipped": True, "reason": "empty list"}
 
@@ -2416,6 +2500,8 @@ async def publish_copy_timed_list_signals(pair: str, signals: list[str], interva
                 "entry_time": entry_dt.isoformat(),
                 "expires_at": (entry_dt + timedelta(seconds=max(30, int(COPY_SIGNAL_VALIDITY_SECONDS)))).isoformat(),
                 "note": f"timed_list {index + 1}/{len(signals)} | interval={interval_minutes}m",
+                "creator_user_id": int(creator_user_id) if creator_user_id is not None else None,
+                "target_user_id": int(creator_user_id) if (COPY_USER_SIGNAL_ROUTING_ENABLED and creator_user_id is not None) else None,
             }
             result = await publish_copy_trading_signal(payload, source=source)
             details.append(result)
@@ -2469,10 +2555,13 @@ async def publish_copy_three_candle_signal(trade: dict) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-async def publish_copy_trading_room_signal(trade: dict, state: dict | None = None) -> dict:
+async def publish_copy_trading_room_signal(trade: dict, state: dict | None = None, creator_user_id=None) -> dict:
     """Send Trading Room entries to the extension as source=trading_room."""
     if not COPY_SEND_TRADING_ROOM:
         return {"ok": False, "skipped": True, "reason": "COPY_SEND_TRADING_ROOM=false"}
+    if not is_copy_signal_creator_allowed(creator_user_id):
+        logger.info("Copy Trading blocked trading-room user signal | user_id=%s", creator_user_id)
+        return copy_signal_guard_skip_payload(creator_user_id)
     try:
         entry_ts = float((trade or {}).get("entry_ts") or 0)
         if entry_ts <= 0:
@@ -2500,6 +2589,8 @@ async def publish_copy_trading_room_signal(trade: dict, state: dict | None = Non
             "entry_price": (trade or {}).get("price"),
             "payout": (trade or {}).get("payout"),
             "note": str((trade or {}).get("setup") or (trade or {}).get("setup_kind") or "trading_room")[:500],
+            "creator_user_id": int(creator_user_id) if creator_user_id is not None else None,
+            "target_user_id": int(creator_user_id) if (COPY_USER_SIGNAL_ROUTING_ENABLED and creator_user_id is not None) else None,
         }
         result = await publish_copy_trading_signal(payload, source="trading_room")
         logger.info("Copy Trading trading-room sent | pair=%s | result=%s", pair, result)
@@ -6232,7 +6323,7 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
         reply_markup=get_trading_room_active_keyboard(admin_id)
     )
 
-    await publish_copy_trading_room_signal(analysis, state)
+    await publish_copy_trading_room_signal(analysis, state, creator_user_id=admin_id)
 
     try:
         result_when = max(
@@ -13986,7 +14077,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         record_signal_usage(user.id, count, "otc_timed")
-        await publish_copy_timed_list_signals(pair, signals, interval_minutes, start_dt, source="timed_list")
+        await publish_copy_timed_list_signals(pair, signals, interval_minutes, start_dt, source="timed_list", creator_user_id=user.id)
         reset_signal_state(context)
         return
 
@@ -14011,7 +14102,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result.get("ok"):
             record_signal_usage(user.id, 1, "otc_live_now")
-            await maybe_publish_copy_signal(result, source="otc_live", enabled=COPY_SEND_OTC_LIVE_NOW)
+            await maybe_publish_copy_signal(result, source="otc_live", enabled=COPY_SEND_OTC_LIVE_NOW, creator_user_id=user.id)
         reset_signal_state(context)
         return
 
@@ -14046,7 +14137,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result.get("ok"):
             record_signal_usage(user.id, 1, "real_market")
-            await maybe_publish_copy_signal(result, source="real_market", enabled=COPY_SEND_REAL_MARKET)
+            await maybe_publish_copy_signal(result, source="real_market", enabled=COPY_SEND_REAL_MARKET, creator_user_id=user.id)
         reset_signal_state(context)
         return
 
@@ -15421,7 +15512,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text in {"🔐 Copy Trading", "Copy Trading"}:
             reset_signal_state(context)
             await update.message.reply_text(
-                "🔐 لوحة Copy Trading\n\nتحكم خفيف بدون سجلات تفصيلية حتى ما يزيد استهلاك Firebase.",
+                "🔐 لوحة Copy Trading\n\nتحكم خفيف + توجيه شخصي: صفقات كل مستخدم تصل فقط لإضافته حسب Telegram ID.",
                 reply_markup=copy_admin_keyboard
             )
             return
@@ -15473,7 +15564,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "♻️ تصفير جهاز كود":
             context.user_data["step"] = "copy_reset_device_waiting_token"
             await update.message.reply_text(
-                "♻️ أرسل كود Copy الذي تريد تصفير الأجهزة المرتبطة به.\n\nبعد التصفير، أول جهاز يفتح الإضافة بهذا الكود سيرتبط من جديد.",
+                "♻️ أرسل كود Copy الذي تريد تصفير الأجهزة المرتبطة به.\n\nبعد التصفير، أول جهاز و Telegram ID يفتح الإضافة بهذا الكود سيرتبط من جديد.",
                 reply_markup=copy_admin_keyboard
             )
             return
@@ -15507,7 +15598,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["step"] = None
             token = normalize_copy_license_token(text)
             if reset_copy_license_devices(token):
-                await update.message.reply_text(f"✅ تم تصفير الأجهزة للكود:\n<code>{html.escape(token)}</code>", parse_mode="HTML", reply_markup=copy_admin_keyboard)
+                await update.message.reply_text(f"✅ تم تصفير الأجهزة وربط Telegram للكود:\n<code>{html.escape(token)}</code>", parse_mode="HTML", reply_markup=copy_admin_keyboard)
             else:
                 await update.message.reply_text("❌ لم أستطع تصفير الأجهزة. تأكد أن الكود منشأ من البوت وليس من Render Env.", reply_markup=copy_admin_keyboard)
             return
@@ -16121,7 +16212,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         record_signal_usage(user.id, count, "otc_timed")
-        await publish_copy_timed_list_signals(pair, signals, interval_minutes, start_dt, source="timed_list")
+        await publish_copy_timed_list_signals(pair, signals, interval_minutes, start_dt, source="timed_list", creator_user_id=user.id)
 
         reset_signal_state(context)
         return
@@ -16151,7 +16242,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result.get("ok"):
             record_signal_usage(user.id, 1, "otc_live_now")
-            await maybe_publish_copy_signal(result, source="otc_live", enabled=COPY_SEND_OTC_LIVE_NOW)
+            await maybe_publish_copy_signal(result, source="otc_live", enabled=COPY_SEND_OTC_LIVE_NOW, creator_user_id=user.id)
 
         reset_signal_state(context)
         return
@@ -16198,7 +16289,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         if result.get("ok"):
             record_signal_usage(user.id, 1, "real_market")
-            await maybe_publish_copy_signal(result, source="real_market", enabled=COPY_SEND_REAL_MARKET)
+            await maybe_publish_copy_signal(result, source="real_market", enabled=COPY_SEND_REAL_MARKET, creator_user_id=user.id)
 
         reset_signal_state(context)
         return
@@ -16325,6 +16416,9 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         "entry_price": payload.get("entry_price"),
         "payout": payload.get("payout"),
         "note": str(payload.get("note") or "")[:500],
+        "creator_user_id": normalize_copy_telegram_user_id(payload.get("creator_user_id") or payload.get("user_id")),
+        "target_user_id": normalize_copy_telegram_user_id(payload.get("target_user_id") or payload.get("telegram_user_id")),
+        "scope": "user" if normalize_copy_telegram_user_id(payload.get("target_user_id") or payload.get("telegram_user_id")) else "broadcast",
     }
 
 
@@ -16351,9 +16445,15 @@ async def _copy_broadcast_signal(signal: dict) -> dict:
             "reason": "copy trading stopped by admin",
         }
 
+    target_user_id = normalize_copy_telegram_user_id((signal or {}).get("target_user_id"))
     delivered = 0
+    skipped_scope = 0
     dead = []
     for client_id, client in list(_copy_clients.items()):
+        client_user_id = normalize_copy_telegram_user_id(client.get("telegram_user_id"))
+        if target_user_id and client_user_id != target_user_id:
+            skipped_scope += 1
+            continue
         ws = client.get("ws")
         ok = await _copy_send_json_safe(ws, {"type": "signal", "signal": signal})
         if ok:
@@ -16367,14 +16467,17 @@ async def _copy_broadcast_signal(signal: dict) -> dict:
         "online_clients": len(_copy_clients),
         "delivered": delivered,
         "dead_removed": len(dead),
+        "skipped_scope": skipped_scope,
         "global_enabled": True,
+        "target_user_id": target_user_id or None,
+        "scope": "user" if target_user_id else "broadcast",
     }
 
 def create_embedded_copy_api():
     from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
 
-    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.24.0")
+    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.26.0")
     copy_api.add_middleware(
         CORSMiddleware,
         allow_origins=COPY_ALLOWED_ORIGINS,
@@ -16389,7 +16492,7 @@ def create_embedded_copy_api():
         return {
             "ok": True,
             "app": "TRADING TIME COPY EMBEDDED SERVER",
-            "version": "0.24.0",
+            "version": "0.26.0",
             "time": now_iso(),
             "copy_settings": copy_public_settings_payload(),
             "online_clients": len(_copy_clients),
@@ -16401,8 +16504,8 @@ def create_embedded_copy_api():
         return await copy_health()
 
     @copy_api.get("/api/license/check")
-    async def copy_license_check(token: str = Query(...), device_id: str = Query(default="unknown")):
-        ok, reason, record = copy_validate_license_for_device(token, device_id, touch=True)
+    async def copy_license_check(token: str = Query(...), device_id: str = Query(default="unknown"), telegram_user_id: str = Query(default="")):
+        ok, reason, record = copy_validate_license_for_device(token, device_id, telegram_user_id=telegram_user_id, touch=True)
         if not ok:
             raise HTTPException(status_code=401, detail=reason)
         return {
@@ -16412,6 +16515,7 @@ def create_embedded_copy_api():
             "plan": (record or {}).get("plan"),
             "expires_at": (record or {}).get("expires_at"),
             "max_devices": (record or {}).get("max_devices"),
+            "telegram_user_id": normalize_copy_telegram_user_id((record or {}).get("telegram_user_id") or telegram_user_id),
             "copy_settings": copy_public_settings_payload(),
         }
 
@@ -16428,6 +16532,7 @@ def create_embedded_copy_api():
                     "client_id": k,
                     "license": v.get("license"),
                     "device_id": v.get("device_id"),
+                    "telegram_user_id": v.get("telegram_user_id"),
                     "connected_at": v.get("connected_at"),
                     "last_seen_at": v.get("last_seen_at"),
                     "last_sent_at": v.get("last_sent_at"),
@@ -16479,19 +16584,21 @@ def create_embedded_copy_api():
         return {"ok": True, "signal": normalized, "delivery": delivery}
 
     @copy_api.websocket("/ws/extension")
-    async def copy_extension_ws(websocket: WebSocket, token: str = Query(...), device_id: str = Query(default="unknown")):
+    async def copy_extension_ws(websocket: WebSocket, token: str = Query(...), device_id: str = Query(default="unknown"), telegram_user_id: str = Query(default="")):
         await websocket.accept()
         token = normalize_copy_license_token(token)
-        ok, reason, license_record = copy_validate_license_for_device(token, device_id, touch=True)
+        telegram_user_id = normalize_copy_telegram_user_id(telegram_user_id)
+        ok, reason, license_record = copy_validate_license_for_device(token, device_id, telegram_user_id=telegram_user_id, touch=True)
         if not ok:
             await websocket.close(code=4401, reason=reason)
             return
 
-        client_id = hashlib.sha256(f"{token}:{device_id}:{time_module.time()}".encode("utf-8")).hexdigest()[:16]
+        client_id = hashlib.sha256(f"{token}:{device_id}:{telegram_user_id}:{time_module.time()}".encode("utf-8")).hexdigest()[:16]
         _copy_clients[client_id] = {
             "ws": websocket,
             "license": token,
             "device_id": device_id,
+            "telegram_user_id": telegram_user_id,
             "connected_at": now_iso(),
             "last_seen_at": now_iso(),
             "last_sent_at": None,
@@ -16509,6 +16616,8 @@ def create_embedded_copy_api():
                 "plan": (license_record or {}).get("plan"),
                 "expires_at": (license_record or {}).get("expires_at"),
                 "max_devices": (license_record or {}).get("max_devices"),
+                "telegram_user_id": normalize_copy_telegram_user_id((license_record or {}).get("telegram_user_id") or telegram_user_id),
+                "route_mode": "personal" if telegram_user_id else "broadcast_only_until_telegram_id_is_set",
             },
         })
         try:
@@ -16516,7 +16625,7 @@ def create_embedded_copy_api():
                 raw = await websocket.receive_text()
                 if client_id in _copy_clients:
                     _copy_clients[client_id]["last_seen_at"] = now_iso()
-                ok, reason, _record = copy_validate_license_for_device(token, device_id, touch=True)
+                ok, reason, _record = copy_validate_license_for_device(token, device_id, telegram_user_id=telegram_user_id, touch=True)
                 if not ok:
                     await websocket.close(code=4401, reason=reason)
                     break
