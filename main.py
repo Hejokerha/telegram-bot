@@ -2371,6 +2371,10 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
         "note": str(signal.get("note") or "")[:500],
         "creator_user_id": normalize_copy_telegram_user_id(signal.get("creator_user_id") or signal.get("user_id")),
         "target_user_id": normalize_copy_telegram_user_id(signal.get("target_user_id") or signal.get("telegram_user_id")),
+        "batch_id": signal.get("batch_id") or signal.get("list_batch_id") or signal.get("timed_list_batch_id"),
+        "timed_list_batch_id": signal.get("timed_list_batch_id") or signal.get("list_batch_id") or signal.get("batch_id"),
+        "list_index": signal.get("list_index"),
+        "list_total": signal.get("list_total"),
     }
 
     base = "|".join([
@@ -2477,6 +2481,7 @@ async def publish_copy_timed_list_signals(pair: str, signals: list[str], interva
     if not signals:
         return {"ok": False, "skipped": True, "reason": "empty list"}
 
+    list_batch_id = f"timed_batch_{safe_key(pair)}_{int(now_utc().timestamp())}_{safe_key(str(creator_user_id or 'broadcast'))}_{random.randint(1000, 9999)}"
     sent = 0
     failed = 0
     details = []
@@ -2500,6 +2505,10 @@ async def publish_copy_timed_list_signals(pair: str, signals: list[str], interva
                 "entry_time": entry_dt.isoformat(),
                 "expires_at": (entry_dt + timedelta(seconds=max(30, int(COPY_SIGNAL_VALIDITY_SECONDS)))).isoformat(),
                 "note": f"timed_list {index + 1}/{len(signals)} | interval={interval_minutes}m",
+                "batch_id": list_batch_id,
+                "timed_list_batch_id": list_batch_id,
+                "list_index": index + 1,
+                "list_total": len(signals),
                 "creator_user_id": int(creator_user_id) if creator_user_id is not None else None,
                 "target_user_id": int(creator_user_id) if (COPY_USER_SIGNAL_ROUTING_ENABLED and creator_user_id is not None) else None,
             }
@@ -16419,6 +16428,10 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         "creator_user_id": normalize_copy_telegram_user_id(payload.get("creator_user_id") or payload.get("user_id")),
         "target_user_id": normalize_copy_telegram_user_id(payload.get("target_user_id") or payload.get("telegram_user_id")),
         "scope": "user" if normalize_copy_telegram_user_id(payload.get("target_user_id") or payload.get("telegram_user_id")) else "broadcast",
+        "batch_id": payload.get("batch_id") or payload.get("list_batch_id") or payload.get("timed_list_batch_id"),
+        "timed_list_batch_id": payload.get("timed_list_batch_id") or payload.get("list_batch_id") or payload.get("batch_id"),
+        "list_index": payload.get("list_index"),
+        "list_total": payload.get("list_total"),
     }
 
 
@@ -16477,7 +16490,7 @@ def create_embedded_copy_api():
     from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
 
-    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.26.0")
+    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.28.0")
     copy_api.add_middleware(
         CORSMiddleware,
         allow_origins=COPY_ALLOWED_ORIGINS,
