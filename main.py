@@ -506,8 +506,9 @@ copy_admin_keyboard = ReplyKeyboardMarkup(
         ["🔑 كود أسبوع", "🔑 كود شهر"],
         ["🔑 كود دائم", "📋 أكواد Copy"],
         ["⛔ إيقاف كود", "♻️ تصفير جهاز كود"],
-        ["📌 رسالة تحديث", "📡 حالة Copy"],
-        ["⬅️ رجوع"],
+        ["♻️ تصفير كل الأجهزة", "🗑 حذف كود"],
+        ["🧹 تنظيف الأكواد", "📌 رسالة تحديث"],
+        ["📡 حالة Copy", "⬅️ رجوع"],
     ],
     resize_keyboard=True
 )
@@ -1741,7 +1742,7 @@ def get_copy_settings() -> dict:
 
     default = {
         "global_enabled": True,
-        "latest_version": "v0.26",
+        "latest_version": "v0.42",
         "update_notice": "",
         "updated_at": None,
     }
@@ -1784,7 +1785,7 @@ def set_copy_update_notice(message: str, admin_id: int | None = None) -> bool:
         text = str(message or "").strip()[:600]
         copy_settings_ref().update({
             "update_notice": text,
-            "latest_version": "v0.26",
+            "latest_version": "v0.42",
             "updated_at": now_iso(),
             "updated_by": int(admin_id) if admin_id else None,
         })
@@ -1799,7 +1800,7 @@ def copy_public_settings_payload() -> dict:
     settings = get_copy_settings()
     return {
         "global_enabled": bool(settings.get("global_enabled", True)),
-        "latest_version": settings.get("latest_version") or "v0.26",
+        "latest_version": settings.get("latest_version") or "v0.42",
         "update_notice": settings.get("update_notice") or "",
         "updated_at": settings.get("updated_at"),
     }
@@ -1969,6 +1970,121 @@ def reset_copy_license_devices(token: str) -> bool:
         pass
     return True
 
+
+
+
+def delete_copy_license(token: str) -> bool:
+    token = normalize_copy_license_token(token)
+    if not token:
+        return False
+    record = get_copy_license_record(token)
+    if not record or record.get("source") == "env":
+        return False
+    try:
+        copy_licenses_ref().child(copy_license_key(token)).delete()
+        try:
+            prefix = f"{token}:"
+            for key in list(_copy_license_touch_cache.keys()):
+                if str(key).startswith(prefix):
+                    _copy_license_touch_cache.pop(key, None)
+        except Exception:
+            pass
+        return True
+    except Exception as e:
+        logger.warning("Could not delete copy license %s: %s", token, e)
+        return False
+
+
+def reset_all_copy_license_devices() -> dict:
+    """Reset device and Telegram bindings for every Firebase Copy license. Env licenses are not affected."""
+    result = {"reset": 0, "skipped": 0, "errors": 0}
+    try:
+        data = copy_licenses_ref().get() or {}
+        if not isinstance(data, dict):
+            return result
+        now_value = now_iso()
+        for key, rec in data.items():
+            if not isinstance(rec, dict):
+                result["skipped"] += 1
+                continue
+            try:
+                token = normalize_copy_license_token(rec.get("token") or key)
+                copy_licenses_ref().child(str(key)).update({
+                    "devices": {},
+                    "telegram_user_id": None,
+                    "telegram_linked_at": None,
+                    "last_seen_at": None,
+                    "devices_reset_at": now_value,
+                    "telegram_unlinked_at": now_value,
+                })
+                if token:
+                    prefix = f"{token}:"
+                    for cache_key in list(_copy_license_touch_cache.keys()):
+                        if str(cache_key).startswith(prefix):
+                            _copy_license_touch_cache.pop(cache_key, None)
+                result["reset"] += 1
+            except Exception:
+                result["errors"] += 1
+    except Exception as e:
+        logger.warning("Could not reset all copy license devices: %s", e)
+        result["errors"] += 1
+    return result
+
+
+def cleanup_copy_licenses(delete_disabled: bool = True, delete_expired: bool = True) -> dict:
+    """Delete useless Firebase licenses: disabled and/or expired. Active valid licenses are kept."""
+    result = {"deleted": 0, "disabled": 0, "expired": 0, "kept": 0, "errors": 0}
+    try:
+        data = copy_licenses_ref().get() or {}
+        if not isinstance(data, dict):
+            return result
+        for key, rec in data.items():
+            if not isinstance(rec, dict):
+                result["kept"] += 1
+                continue
+            status = str(rec.get("status") or "").lower()
+            is_disabled = status == "disabled"
+            is_expired = status == "expired" or copy_license_is_expired(rec.get("expires_at"))
+            should_delete = (delete_disabled and is_disabled) or (delete_expired and is_expired)
+            if not should_delete:
+                result["kept"] += 1
+                continue
+            try:
+                copy_licenses_ref().child(str(key)).delete()
+                result["deleted"] += 1
+                if is_disabled:
+                    result["disabled"] += 1
+                if is_expired:
+                    result["expired"] += 1
+            except Exception:
+                result["errors"] += 1
+    except Exception as e:
+        logger.warning("Could not cleanup copy licenses: %s", e)
+        result["errors"] += 1
+    return result
+
+
+def build_copy_cleanup_result_message(result: dict) -> str:
+    return (
+        "🧹 نتيجة تنظيف أكواد Copy\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🗑 المحذوفة: {int(result.get('deleted', 0) or 0)}\n"
+        f"⛔ منها معطلة: {int(result.get('disabled', 0) or 0)}\n"
+        f"⏳ منها منتهية: {int(result.get('expired', 0) or 0)}\n"
+        f"✅ بقيت كما هي: {int(result.get('kept', 0) or 0)}\n"
+        f"⚠️ أخطاء: {int(result.get('errors', 0) or 0)}"
+    )
+
+
+def build_copy_reset_all_result_message(result: dict) -> str:
+    return (
+        "♻️ نتيجة تصفير أجهزة أكواد Copy\n"
+        "━━━━━━━━━━━━━━\n"
+        f"✅ تم تصفير: {int(result.get('reset', 0) or 0)} كود\n"
+        f"⏭ تم تخطي: {int(result.get('skipped', 0) or 0)}\n"
+        f"⚠️ أخطاء: {int(result.get('errors', 0) or 0)}\n\n"
+        "بعدها أول جهاز و Telegram ID يستخدم الكود سيرتبط من جديد."
+    )
 
 def list_copy_licenses(limit: int = 20) -> list[dict]:
     items = []
@@ -2145,7 +2261,7 @@ def build_copy_status_message() -> str:
     settings = get_copy_settings()
     enabled = bool(settings.get("global_enabled", True))
     update_notice = str(settings.get("update_notice") or "").strip()
-    latest_version = settings.get("latest_version") or "v0.26"
+    latest_version = settings.get("latest_version") or "v0.42"
 
     lines = [
         "📡 حالة Copy Trading",
@@ -2159,7 +2275,7 @@ def build_copy_status_message() -> str:
         f"📱 الأجهزة المربوطة: {total_devices}",
         f"👤 الأكواد المربوطة بـ Telegram ID: {linked_telegram}",
         "",
-        "ملاحظة: في v0.26 صفقات كل مستخدم تصل فقط للإضافة المربوطة بنفس Telegram ID. الإشارات العامة بدون هدف تبقى Broadcast.",
+        "ملاحظة: صفقات كل مستخدم تصل فقط للإضافة المربوطة بنفس Telegram ID. يمكنك تصفير الأجهزة بعد تحديث الإضافة إذا تغيّر جهاز المستخدم.",
     ]
     if update_notice:
         lines.extend(["", "📌 رسالة التحديث:", html.escape(update_notice)])
@@ -15521,7 +15637,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text in {"🔐 Copy Trading", "Copy Trading"}:
             reset_signal_state(context)
             await update.message.reply_text(
-                "🔐 لوحة Copy Trading\n\nتحكم خفيف + توجيه شخصي: صفقات كل مستخدم تصل فقط لإضافته حسب Telegram ID.",
+                "🔐 لوحة Copy Trading\n\nإدارة الأكواد + توجيه شخصي: صفقات كل مستخدم تصل فقط لإضافته حسب Telegram ID.",
                 reply_markup=copy_admin_keyboard
             )
             return
@@ -15578,6 +15694,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if text == "♻️ تصفير كل الأجهزة":
+            context.user_data["step"] = "copy_reset_all_devices_confirm"
+            await update.message.reply_text(
+                "⚠️ هذا الخيار سيصفر الأجهزة و Telegram ID لكل الأكواد المنشأة من البوت.\n\n"
+                "استخدمه بعد تحديثات الإضافة أو عندما تريد إعادة ربط الأكواد من جديد.\n\n"
+                "أرسل: نعم\nللتأكيد، أو أي كلمة أخرى للإلغاء.",
+                reply_markup=copy_admin_keyboard
+            )
+            return
+
+        if text == "🧹 تنظيف الأكواد":
+            context.user_data["step"] = "copy_cleanup_codes_confirm"
+            await update.message.reply_text(
+                "🧹 هذا الخيار سيحذف فقط الأكواد المعطلة أو المنتهية من Firebase.\n"
+                "الأكواد النشطة لن تُحذف.\n\n"
+                "أرسل: نعم\nللتأكيد، أو أي كلمة أخرى للإلغاء.",
+                reply_markup=copy_admin_keyboard
+            )
+            return
+
+        if text == "🗑 حذف كود":
+            context.user_data["step"] = "copy_delete_waiting_token"
+            await update.message.reply_text(
+                "🗑 أرسل كود Copy الذي تريد حذفه نهائيًا من Firebase.\n\n"
+                "ملاحظة: كود DEMO-111 أو أي كود موجود في Render Env لا يمكن حذفه من هنا؛ احذفه من COPY_LICENSES إذا أردت.",
+                reply_markup=copy_admin_keyboard
+            )
+            return
+
         if text == "📌 رسالة تحديث":
             context.user_data["step"] = "copy_update_notice_waiting_text"
             await update.message.reply_text(
@@ -15592,6 +15737,33 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⛔ أرسل كود Copy الذي تريد إيقافه.\n\nملاحظة: الأكواد الموجودة فقط في Render Env لا يمكن إيقافها من البوت، احذفها من COPY_LICENSES.",
                 reply_markup=copy_admin_keyboard
             )
+            return
+
+        if step == "copy_reset_all_devices_confirm":
+            context.user_data["step"] = None
+            if str(text).strip().lower() in {"نعم", "yes", "y", "confirm", "تأكيد"}:
+                result = reset_all_copy_license_devices()
+                await update.message.reply_text(build_copy_reset_all_result_message(result), reply_markup=copy_admin_keyboard)
+            else:
+                await update.message.reply_text("تم إلغاء تصفير كل الأجهزة.", reply_markup=copy_admin_keyboard)
+            return
+
+        if step == "copy_cleanup_codes_confirm":
+            context.user_data["step"] = None
+            if str(text).strip().lower() in {"نعم", "yes", "y", "confirm", "تأكيد"}:
+                result = cleanup_copy_licenses(delete_disabled=True, delete_expired=True)
+                await update.message.reply_text(build_copy_cleanup_result_message(result), reply_markup=copy_admin_keyboard)
+            else:
+                await update.message.reply_text("تم إلغاء تنظيف الأكواد.", reply_markup=copy_admin_keyboard)
+            return
+
+        if step == "copy_delete_waiting_token":
+            context.user_data["step"] = None
+            token = normalize_copy_license_token(text)
+            if delete_copy_license(token):
+                await update.message.reply_text(f"🗑 تم حذف الكود نهائيًا:\n<code>{html.escape(token)}</code>", parse_mode="HTML", reply_markup=copy_admin_keyboard)
+            else:
+                await update.message.reply_text("❌ لم أستطع حذف الكود. تأكد أنه كود منشأ من البوت وليس من Render Env.", reply_markup=copy_admin_keyboard)
             return
 
         if step == "copy_disable_waiting_token":
@@ -16490,7 +16662,7 @@ def create_embedded_copy_api():
     from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
 
-    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.28.0")
+    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.42.0")
     copy_api.add_middleware(
         CORSMiddleware,
         allow_origins=COPY_ALLOWED_ORIGINS,
