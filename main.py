@@ -16658,11 +16658,81 @@ async def _copy_broadcast_signal(signal: dict) -> dict:
         "scope": "user" if target_user_id else "broadcast",
     }
 
+
+def _copy_event_alert_title(kind: str) -> str:
+    kind = str(kind or '').strip()
+    if kind == 'target_profit_reached':
+        return '✅ تم تحقيق تارجت الربح'
+    if kind == 'target_loss_reached':
+        return '🛑 تم تحقيق تارجت الخسارة'
+    if kind == 'sequence_result_uncertain_stop':
+        return '⚠️ توقفت الإضافة للحماية'
+    return '🔔 تنبيه من TRADING TIME COPY'
+
+
+def _copy_event_alert_text(event: dict, client: dict | None = None) -> str:
+    event = event or {}
+    client = client or {}
+    kind = str(event.get('kind') or '')
+    title = _copy_event_alert_title(kind)
+    amount = event.get('amount')
+    pnl_text = event.get('pnl_text') or ''
+    reason = str(event.get('reason') or '').strip()
+    pair = str(event.get('pair') or '').strip()
+    direction = str(event.get('direction') or '').strip()
+    account_mode = str(event.get('account_mode') or '').upper()
+    lines = [f"<b>{html.escape(title)}</b>"]
+    if amount not in (None, ''):
+        try:
+            lines.append(f"المبلغ: <b>${float(amount):g}</b>")
+        except Exception:
+            lines.append(f"المبلغ: <b>{html.escape(str(amount))}</b>")
+    if pnl_text:
+        lines.append(f"نتيجة اليوم: <b>{html.escape(str(pnl_text))}</b>")
+    if pair:
+        lines.append(f"الزوج: <b>{html.escape(pair)}</b>")
+    if direction:
+        lines.append(f"الاتجاه: <b>{html.escape(direction)}</b>")
+    if account_mode:
+        lines.append(f"الحساب: <b>{html.escape(account_mode)}</b>")
+    if reason:
+        lines.append(f"السبب: {html.escape(reason)[:600]}")
+    lines.append("\nTRADING TIME COPY")
+    return "\n".join(lines)[:3900]
+
+
+async def _copy_send_extension_alert_to_user(event: dict, client: dict | None = None) -> bool:
+    try:
+        event = event or {}
+        client = client or {}
+        chat_id = normalize_copy_telegram_user_id(
+            event.get('telegram_user_id') or client.get('telegram_user_id') or event.get('target_user_id')
+        )
+        if not chat_id:
+            return False
+        if not BOT_TOKEN:
+            logger.warning("COPY alert skipped: BOT_TOKEN is missing")
+            return False
+        text = _copy_event_alert_text(event, client)
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        def _post():
+            return requests.post(url, json=payload, timeout=8)
+        res = await asyncio.to_thread(_post)
+        if not (200 <= int(res.status_code) < 300):
+            logger.warning("COPY alert send failed | chat_id=%s | status=%s | body=%s", chat_id, res.status_code, res.text[:300])
+            return False
+        return True
+    except Exception as e:
+        logger.warning("COPY alert send error: %s", e)
+        return False
+
+
 def create_embedded_copy_api():
     from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
 
-    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.42.0")
+    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.55.0")
     copy_api.add_middleware(
         CORSMiddleware,
         allow_origins=COPY_ALLOWED_ORIGINS,
@@ -16677,7 +16747,7 @@ def create_embedded_copy_api():
         return {
             "ok": True,
             "app": "TRADING TIME COPY EMBEDDED SERVER",
-            "version": "0.26.0",
+            "version": "0.55.0",
             "time": now_iso(),
             "copy_settings": copy_public_settings_payload(),
             "online_clients": len(_copy_clients),
@@ -16832,6 +16902,13 @@ def create_embedded_copy_api():
                     })
                 elif event.get("type") == "ack":
                     await _copy_send_json_safe(websocket, {"type": "ack_saved", "signal_id": event.get("signal_id")})
+                elif event.get("type") == "extension_event":
+                    payload_event = event.get("event") if isinstance(event.get("event"), dict) else {}
+                    payload_event["telegram_user_id"] = payload_event.get("telegram_user_id") or telegram_user_id
+                    sent = False
+                    if payload_event.get("type") == "extension_alert":
+                        sent = await _copy_send_extension_alert_to_user(payload_event, _copy_clients.get(client_id) or {})
+                    await _copy_send_json_safe(websocket, {"type": "extension_event_saved", "sent": bool(sent), "server_time": now_iso()})
                 else:
                     await _copy_send_json_safe(websocket, {"type": "event_saved", "server_time": now_iso()})
         except WebSocketDisconnect:
