@@ -9847,12 +9847,19 @@ THREE_CANDLE_PAIR_LOSS_LIMIT = int(os.getenv("THREE_CANDLE_PAIR_LOSS_LIMIT", "2"
 THREE_CANDLE_PAIR_COOLDOWN_SECONDS = int(os.getenv("THREE_CANDLE_PAIR_COOLDOWN_SECONDS", "1800"))
 THREE_CANDLE_TIE_EPSILON = float(os.getenv("THREE_CANDLE_TIE_EPSILON", str(OTC_LIVE_TIE_EPSILON)))
 THREE_CANDLE_DAILY_LIMIT_DEFAULT = int(os.getenv("THREE_CANDLE_DAILY_LIMIT", "0"))  # 0 = مفتوح
+# v0.56: strategy test mode - momentum must be 4+ candles, with optional 1-2 candle correction.
+THREE_CANDLE_MOMENTUM_MIN = int(os.getenv("THREE_CANDLE_MOMENTUM_MIN", "4"))
+THREE_CANDLE_MAX_CORRECTION_CANDLES = int(os.getenv("THREE_CANDLE_MAX_CORRECTION_CANDLES", "2"))
+# After a pair gets a signal, block it for the next N published signals, regardless of result.
+THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT = int(os.getenv("THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT", "2"))
+THREE_CANDLE_TEST_LABEL = os.getenv("THREE_CANDLE_TEST_LABEL", "🧪 اختبار").strip() or "🧪 اختبار"
 
 _three_candle_channel_state = {
     "pending_trade": None,
     "last_signal_buckets": {},
     "pair_loss_streaks": {},
     "pair_cooldowns": {},
+    "pair_signal_blocks": {},
     "signals_sent": 0,
     "results_sent": 0,
     "cancelled_sent": 0,
@@ -10018,6 +10025,80 @@ def _three_candle_pair_on_cooldown(pair: str) -> tuple[bool, int]:
         return False, 0
 
 
+def _three_candle_pair_signal_block_remaining(pair: str) -> int:
+    """Return how many upcoming published signals must pass before this pair may be used again."""
+    try:
+        blocks = _three_candle_channel_state.setdefault("pair_signal_blocks", {})
+        remaining = int(blocks.get(pair, 0) or 0)
+        if remaining <= 0:
+            blocks.pop(pair, None)
+            return 0
+        return remaining
+    except Exception:
+        return 0
+
+
+def _three_candle_note_published_pair(pair: str):
+    """Block the just-used pair for the next N published three-candle signals.
+
+    Example with N=2: after EUR/CHF gets a signal, the next two published signals
+    must be on other pairs before EUR/CHF becomes eligible again.
+    """
+    try:
+        pair = str(pair or "").strip()
+        if not pair:
+            return
+        blocks = _three_candle_channel_state.setdefault("pair_signal_blocks", {})
+        for p in list(blocks.keys()):
+            if p == pair:
+                continue
+            try:
+                blocks[p] = int(blocks.get(p, 0) or 0) - 1
+            except Exception:
+                blocks[p] = 0
+            if int(blocks.get(p, 0) or 0) <= 0:
+                blocks.pop(p, None)
+        block_count = max(0, int(THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT))
+        if block_count > 0:
+            blocks[pair] = block_count
+        else:
+            blocks.pop(pair, None)
+    except Exception:
+        pass
+
+
+def _three_candle_run_count_by_dir(by_bucket: dict, end_bucket: int, direction_value: int) -> tuple[int, list[dict]]:
+    """Count consecutive candles ending at end_bucket with the requested direction."""
+    count = 0
+    parts_list = []
+    try:
+        bucket = int(end_bucket)
+        direction_value = 1 if int(direction_value) > 0 else -1
+        while True:
+            candle = by_bucket.get(int(bucket))
+            if not candle:
+                break
+            parts = _otc_edge_candle_parts(candle)
+            if int(parts.get("dir", 0) or 0) != direction_value:
+                break
+            count += 1
+            parts_list.append(parts)
+            bucket -= 60
+        return count, parts_list
+    except Exception:
+        return count, parts_list
+
+
+def _three_candle_avg_body_score(parts_list: list[dict]) -> float:
+    try:
+        vals = [float((p or {}).get("body_ratio", 0) or 0) for p in parts_list if isinstance(p, dict)]
+        if not vals:
+            return 0.0
+        return round(sum(vals) / len(vals), 4)
+    except Exception:
+        return 0.0
+
+
 def _three_candle_register_final_result(pair: str, result: str):
     try:
         streaks = _three_candle_channel_state.setdefault("pair_loss_streaks", {})
@@ -10112,6 +10193,8 @@ def build_three_candle_channel_status() -> str:
         f"القناة: {channel_id or 'غير مضبوطة'}\n"
         f"حد الصفقات اليومي: {'مفتوح ♾' if limit <= 0 else limit}\n"
         f"منشور اليوم: {today_count}\n"
+        f"نمط الاختبار: مومنتم {THREE_CANDLE_MOMENTUM_MIN}+ شموع + تصحيح حتى {THREE_CANDLE_MAX_CORRECTION_CANDLES} شمعة\n"
+        f"منع تكرار الزوج: بعد كل صفقة يمنع {THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT} صفقتين منشورتين\n"
         f"آخر فحص: {_three_candle_channel_state.get('last_scan_at') or 'لا يوجد'}\n"
         f"صفقة قيد المتابعة: {'نعم' if isinstance(pending, dict) else 'لا'}\n"
         f"آخر خطأ: {_three_candle_channel_state.get('last_error') or 'لا يوجد'}"
@@ -10122,6 +10205,10 @@ def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
     try:
         on_cd, _remain = _three_candle_pair_on_cooldown(pair)
         if on_cd:
+            return None
+
+        # v0.56: after a pair gets a signal, it is blocked for the next N published signals.
+        if _three_candle_pair_signal_block_remaining(pair) > 0:
             return None
 
         instrument = quotex_otc_feed.instrument(symbol) if "quotex_otc_feed" in globals() else {}
@@ -10139,30 +10226,71 @@ def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
             return None
 
         candles = _three_candle_get_sorted_candles(symbol)
-        if len(candles) < 3:
+        # Need enough history for 4+ momentum candles plus up to 2 correction candles and current candle.
+        if len(candles) < int(THREE_CANDLE_MOMENTUM_MIN) + 1:
             return None
+
         by_bucket = {int(float(c.get("bucket_ts", 0) or 0)): c for c in candles}
         current = by_bucket.get(current_bucket)
-        prev1 = by_bucket.get(current_bucket - 60)
-        prev2 = by_bucket.get(current_bucket - 120)
-        if not current or not prev1 or not prev2:
+        if not current:
             return None
 
-        p1 = _otc_edge_candle_parts(prev2)
-        p2 = _otc_edge_candle_parts(prev1)
-        pc = _otc_edge_candle_parts(current)
-        if p1["dir"] == 0 or p2["dir"] == 0 or pc["dir"] == 0:
-            return None
-        if not (p1["dir"] == p2["dir"] == pc["dir"]):
+        current_parts = _otc_edge_candle_parts(current)
+        current_dir = int(current_parts.get("dir", 0) or 0)
+        if current_dir == 0:
             return None
 
-        direction = "CALL" if pc["dir"] > 0 else "PUT"
+        min_momentum = max(4, int(THREE_CANDLE_MOMENTUM_MIN))
+        max_correction = max(0, int(THREE_CANDLE_MAX_CORRECTION_CANDLES))
+
+        setup = None
+
+        # Pattern A: pure continuation. Current candle completes the 4+ same-color momentum run.
+        previous_run_count, previous_run_parts = _three_candle_run_count_by_dir(by_bucket, current_bucket - 60, current_dir)
+        total_momentum = previous_run_count + 1
+        if total_momentum >= min_momentum:
+            direction_value = current_dir
+            setup = {
+                "pattern": "momentum_continuation",
+                "pattern_ar": f"مومنتم مباشر {total_momentum} شموع",
+                "momentum_count": int(total_momentum),
+                "correction_count": 0,
+                "direction_value": int(direction_value),
+                "confirm_current_dir": int(current_dir),
+                "parts_for_score": ([current_parts] + previous_run_parts[:max(min_momentum - 1, 1)]),
+            }
+
+        # Pattern B: 4+ momentum candles, then 1-2 corrective candles against the momentum.
+        # Example: 4/5/6 green candles + 1 or 2 red correction candles => next candle CALL.
+        if setup is None and max_correction > 0:
+            correction_dir = current_dir
+            correction_count, correction_parts = _three_candle_run_count_by_dir(by_bucket, current_bucket, correction_dir)
+            if 1 <= correction_count <= max_correction:
+                momentum_dir = -correction_dir
+                momentum_end_bucket = current_bucket - (correction_count * 60)
+                momentum_count, momentum_parts = _three_candle_run_count_by_dir(by_bucket, momentum_end_bucket, momentum_dir)
+                if momentum_count >= min_momentum:
+                    setup = {
+                        "pattern": "momentum_correction",
+                        "pattern_ar": f"مومنتم {momentum_count} شموع + تصحيح {correction_count} شمعة",
+                        "momentum_count": int(momentum_count),
+                        "correction_count": int(correction_count),
+                        "direction_value": int(momentum_dir),
+                        "confirm_current_dir": int(correction_dir),
+                        "parts_for_score": (momentum_parts[:min_momentum] + correction_parts[:correction_count]),
+                    }
+
+        if not setup:
+            return None
+
+        direction = "CALL" if int(setup.get("direction_value", 0) or 0) > 0 else "PUT"
         last_signals = _three_candle_channel_state.setdefault("last_signal_buckets", {})
         if int(last_signals.get(symbol, 0) or 0) == int(current_bucket):
             return None
 
-        # نعطي أولوية للشمعات الواضحة والباي أوت الأعلى.
-        body_score = round((p1.get("body_ratio", 0) + p2.get("body_ratio", 0) + pc.get("body_ratio", 0)) / 3, 4)
+        body_score = _three_candle_avg_body_score(setup.get("parts_for_score") or [])
+        confirm_dir = int(setup.get("confirm_current_dir", setup.get("direction_value", 0)) or 0)
+        confirm_color = "خضراء" if confirm_dir > 0 else "حمراء"
         return {
             "pair": pair,
             "symbol": symbol,
@@ -10173,12 +10301,17 @@ def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
             "entry_close_bucket": int(current_bucket + 120),
             "remaining": round(float(remaining), 1),
             "body_score": body_score,
-            "third_color": "خضراء" if direction == "CALL" else "حمراء",
+            "third_color": confirm_color,
+            "confirm_current_dir": int(confirm_dir),
+            "pattern": str(setup.get("pattern") or "momentum"),
+            "pattern_ar": str(setup.get("pattern_ar") or "مومنتم"),
+            "momentum_count": int(setup.get("momentum_count", 0) or 0),
+            "correction_count": int(setup.get("correction_count", 0) or 0),
+            "test_mode": True,
         }
     except Exception as e:
         logger.debug("three candle candidate failed for %s/%s: %s", pair, symbol, e)
         return None
-
 
 def _three_candle_collect_candidates() -> list[dict]:
     results = []
@@ -10203,15 +10336,19 @@ def _three_candle_signal_message(trade: dict) -> str:
         pair = trade.get('pair')
         payout = trade.get('payout', 0)
         warning_color = trade.get('third_color')
+        pattern_text = trade.get('pattern_ar') or 'مومنتم اختبار'
         return (
+            f"{THREE_CANDLE_TEST_LABEL} - صفقة اختبار\n"
             "⚡ OTC SIGNAL\n"
             "━━━━━━━━━━━━━━\n"
             f"💱 {pair}\n"
             f"📌 {direction_icon}\n"
+            f"📊 النمط: {pattern_text}\n"
             f"⏳ الدخول: {entry_dt.strftime('%H:%M:%S')} UTC+3\n"
             f"🏁 الانتهاء: {close_dt.strftime('%H:%M:%S')} UTC+3\n"
             f"💰 payout: {payout}%\n"
-            f"⚠️ ادخل فقط إذا أغلقت الشمعة الحالية {warning_color}."
+            f"⚠️ اختبار فقط - لا تدخلوا الصفقات حالياً.\n"
+            f"⚠️ يعتمد الشرط على إغلاق الشمعة الحالية {warning_color}."
         )[:3900]
     except Exception as e:
         return f"⚡ OTC SIGNAL\nتعذر تنسيق الرسالة: {e}"
@@ -10265,7 +10402,9 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
             if not confirmation_candle:
                 return True
             parts = _otc_edge_candle_parts(confirmation_candle)
-            expected_dir = 1 if direction == "CALL" else -1
+            expected_dir = int(trade.get("confirm_current_dir", 1 if direction == "CALL" else -1) or 0)
+            if expected_dir == 0:
+                expected_dir = 1 if direction == "CALL" else -1
             if int(parts.get("dir", 0) or 0) != expected_dir:
                 await safe_send_message(context.bot, chat_id=channel_id, text="تم الغاء الصفقة")
                 _three_candle_channel_state["cancelled_sent"] = int(_three_candle_channel_state.get("cancelled_sent", 0) or 0) + 1
@@ -10356,6 +10495,7 @@ async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
         if sent:
             _three_candle_channel_state["signals_sent"] = int(_three_candle_channel_state.get("signals_sent", 0) or 0) + 1
             _three_candle_increment_today_signal_count()
+            _three_candle_note_published_pair(str(trade.get("pair") or ""))
             await publish_copy_three_candle_signal(trade)
         else:
             _three_candle_channel_state["pending_trade"] = None
