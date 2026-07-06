@@ -9847,7 +9847,7 @@ THREE_CANDLE_PAIR_LOSS_LIMIT = int(os.getenv("THREE_CANDLE_PAIR_LOSS_LIMIT", "2"
 THREE_CANDLE_PAIR_COOLDOWN_SECONDS = int(os.getenv("THREE_CANDLE_PAIR_COOLDOWN_SECONDS", "1800"))
 THREE_CANDLE_TIE_EPSILON = float(os.getenv("THREE_CANDLE_TIE_EPSILON", str(OTC_LIVE_TIE_EPSILON)))
 THREE_CANDLE_DAILY_LIMIT_DEFAULT = int(os.getenv("THREE_CANDLE_DAILY_LIMIT", "0"))  # 0 = مفتوح
-# v0.56: strategy test mode - momentum must be 4+ candles, with optional 1-2 candle correction.
+# v0.57: private public message - strategy internals hidden from channel posts.
 THREE_CANDLE_MOMENTUM_MIN = int(os.getenv("THREE_CANDLE_MOMENTUM_MIN", "4"))
 THREE_CANDLE_MAX_CORRECTION_CANDLES = int(os.getenv("THREE_CANDLE_MAX_CORRECTION_CANDLES", "2"))
 # After a pair gets a signal, block it for the next N published signals, regardless of result.
@@ -10207,7 +10207,7 @@ def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
         if on_cd:
             return None
 
-        # v0.56: after a pair gets a signal, it is blocked for the next N published signals.
+        # v0.57: after a pair gets a signal, it is blocked for the next N published signals.
         if _three_candle_pair_signal_block_remaining(pair) > 0:
             return None
 
@@ -10335,20 +10335,16 @@ def _three_candle_signal_message(trade: dict) -> str:
         direction_icon = _three_candle_direction_icon(trade.get('direction'))
         pair = trade.get('pair')
         payout = trade.get('payout', 0)
-        warning_color = trade.get('third_color')
-        pattern_text = trade.get('pattern_ar') or 'مومنتم اختبار'
         return (
             f"{THREE_CANDLE_TEST_LABEL} - صفقة اختبار\n"
             "⚡ OTC SIGNAL\n"
             "━━━━━━━━━━━━━━\n"
             f"💱 {pair}\n"
             f"📌 {direction_icon}\n"
-            f"📊 النمط: {pattern_text}\n"
             f"⏳ الدخول: {entry_dt.strftime('%H:%M:%S')} UTC+3\n"
             f"🏁 الانتهاء: {close_dt.strftime('%H:%M:%S')} UTC+3\n"
             f"💰 payout: {payout}%\n"
-            f"⚠️ اختبار فقط - لا تدخلوا الصفقات حالياً.\n"
-            f"⚠️ يعتمد الشرط على إغلاق الشمعة الحالية {warning_color}."
+            f"⚠️ اختبار فقط - لا تدخلوا الصفقات حالياً."
         )[:3900]
     except Exception as e:
         return f"⚡ OTC SIGNAL\nتعذر تنسيق الرسالة: {e}"
