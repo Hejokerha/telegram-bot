@@ -10175,7 +10175,6 @@ def build_three_candle_channel_summary(limit: int | None = None) -> str:
         f"Win✅. مضاعفة: {mg_win}\n"
         f"Lose💔: {loss}\n"
         f"🟰doji: {draw}\n"
-        f"🚫 إلغاء: {cancelled}\n"
         f"📈 نسبة الربح: {win_rate}%"
     )[:3900]
 
@@ -10388,8 +10387,8 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
         symbol = trade.get("symbol")
         direction = str(trade.get("direction") or "").upper()
 
-        # أولًا: نتأكد أن الشمعة الثالثة أغلقت بنفس اللون المتوقع.
-        # إذا عكست آخر الثواني، نلغي الصفقة قبل حساب الدخول.
+        # v0.58: إلغاء رسائل/منطق "تم الغاء الصفقة" لقناة الاختبار.
+        # الصفقة بعد نشرها تُتابَع حتى نتيجتها بدل إلغائها بسبب انعكاس آخر لحظة.
         if not bool(trade.get("third_candle_confirmed", False)):
             current_bucket = int(trade.get("current_bucket", 0) or 0)
             if now_ts < current_bucket + 60 + int(THREE_CANDLE_RESULT_DELAY_SECONDS):
@@ -10397,16 +10396,6 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
             confirmation_candle = _three_candle_get_candle(symbol, current_bucket)
             if not confirmation_candle:
                 return True
-            parts = _otc_edge_candle_parts(confirmation_candle)
-            expected_dir = int(trade.get("confirm_current_dir", 1 if direction == "CALL" else -1) or 0)
-            if expected_dir == 0:
-                expected_dir = 1 if direction == "CALL" else -1
-            if int(parts.get("dir", 0) or 0) != expected_dir:
-                await safe_send_message(context.bot, chat_id=channel_id, text="تم الغاء الصفقة")
-                _three_candle_channel_state["cancelled_sent"] = int(_three_candle_channel_state.get("cancelled_sent", 0) or 0) + 1
-                _three_candle_record_result(trade, "cancelled", "تم الغاء الصفقة")
-                _three_candle_channel_state["pending_trade"] = None
-                return False
             trade["third_candle_confirmed"] = True
             _three_candle_channel_state["pending_trade"] = trade
 
