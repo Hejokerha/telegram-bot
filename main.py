@@ -2727,7 +2727,14 @@ async def publish_copy_otc_edge_signal(item: dict) -> dict:
             "confidence": int(item.get("score", 0) or 0),
             "entry_price": item.get("price"),
             "payout": item.get("payout"),
-            "note": f"otc_edge_engine | pattern={item.get('pattern') or item.get('reason') or '-'}",
+            "entry_mode": "instant",
+            "copy_entry_mode": "instant",
+            "execution_mode": "direct",
+            "immediate_entry": True,
+            "direct_entry": True,
+            "allow_background_entry": True,
+            "max_entry_delay_seconds": int(OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS),
+            "note": f"otc_edge_engine | direct_entry | pattern={item.get('pattern') or item.get('reason') or '-'}",
         }
         result = await publish_copy_trading_signal(payload, source="otc_edge")
         logger.info("Copy Trading OTC Edge sent | pair=%s | result=%s", pair, result)
