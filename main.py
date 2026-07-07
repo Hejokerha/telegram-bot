@@ -494,7 +494,8 @@ three_candle_admin_keyboard = ReplyKeyboardMarkup(
     [
         ["🟢 تشغيل نشر القناة", "🔴 إيقاف نشر القناة"],
         ["🎯 حد صفقات اليوم", "♾ نشر مفتوح"],
-        ["📊 ملخص القناة", "📋 حالة القناة"],
+        ["📊 ملخص القناة", "🧠 تقرير الذاكرة"],
+        ["📋 حالة القناة"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -9854,6 +9855,12 @@ THREE_CANDLE_MAX_CORRECTION_CANDLES = int(os.getenv("THREE_CANDLE_MAX_CORRECTION
 THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT = int(os.getenv("THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT", "2"))
 THREE_CANDLE_TEST_LABEL = os.getenv("THREE_CANDLE_TEST_LABEL", "🧪 اختبار").strip() or "🧪 اختبار"
 
+# v0.59: Strategy Memory is analysis-only. It records why each 3-candle trade
+# won/lost so we can later build a smart filter from real statistics.
+THREE_CANDLE_MEMORY_ENABLED = os.getenv("THREE_CANDLE_MEMORY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+THREE_CANDLE_MEMORY_REPORT_LIMIT = int(os.getenv("THREE_CANDLE_MEMORY_REPORT_LIMIT", "200"))
+THREE_CANDLE_MEMORY_MIN_GROUP_SAMPLE = int(os.getenv("THREE_CANDLE_MEMORY_MIN_GROUP_SAMPLE", "3"))
+
 _three_candle_channel_state = {
     "pending_trade": None,
     "last_signal_buckets": {},
@@ -9866,6 +9873,7 @@ _three_candle_channel_state = {
     "today_signals": 0,
     "last_scan_at": None,
     "last_error": None,
+    "memory_records_written": 0,
 }
 
 
@@ -10114,20 +10122,235 @@ def _three_candle_register_final_result(pair: str, result: str):
         pass
 
 
-def _three_candle_record_result(trade: dict, result_type: str, result_text: str):
+
+def _three_candle_result_outcome(result_type: str) -> str:
+    result_type = str(result_type or "").strip().lower()
+    if result_type in {"direct_win", "mg_win", "win"}:
+        return "win"
+    if result_type in {"loss", "lose"}:
+        return "loss"
+    if result_type in {"draw", "doji", "tie"}:
+        return "draw"
+    return "unknown"
+
+
+def _three_candle_initial_outcome(result_type: str) -> str:
+    """Quality of the original entry before any MG1 rescue."""
+    result_type = str(result_type or "").strip().lower()
+    if result_type == "direct_win":
+        return "win"
+    if result_type in {"mg_win", "loss"}:
+        return "loss"
+    if result_type == "draw":
+        return "draw"
+    return "unknown"
+
+
+def _three_candle_payout_band(payout) -> str:
     try:
-        record = {
-            "created_at": now_iso(),
-            "day": get_utc3_day_key(),
-            "pair": str((trade or {}).get("pair", "")),
-            "symbol": str((trade or {}).get("symbol", "")),
-            "direction": str((trade or {}).get("direction", "")),
-            "result_type": str(result_type),
-            "result_text": str(result_text),
-            "payout": safe_int((trade or {}).get("payout", 0), 0),
-        }
+        p = int(float(payout or 0))
+    except Exception:
+        p = 0
+    if p <= 0:
+        return "غير معروف"
+    if p < 80:
+        return "<80"
+    if p < 85:
+        return "80-84"
+    if p < 90:
+        return "85-89"
+    if p < 95:
+        return "90-94"
+    return "95+"
+
+
+def _three_candle_hour_label(bucket_ts) -> str:
+    try:
+        dt = datetime.fromtimestamp(int(bucket_ts), tz=UTC).astimezone(UTC_PLUS_3)
+        return f"{dt.strftime('%H')}:00"
+    except Exception:
+        return "غير معروف"
+
+
+def _three_candle_float(v, default=0.0, digits=4):
+    try:
+        return round(float(v), int(digits))
+    except Exception:
+        return default
+
+
+def _three_candle_build_memory_record(trade: dict, result_type: str, result_text: str, candle: dict | None = None) -> dict:
+    trade = trade or {}
+    candle = candle or {}
+    outcome = _three_candle_result_outcome(result_type)
+    initial_outcome = _three_candle_initial_outcome(result_type)
+    entry_bucket = int(trade.get("entry_bucket") or 0)
+    try:
+        entry_dt = datetime.fromtimestamp(entry_bucket, tz=UTC).astimezone(UTC_PLUS_3) if entry_bucket else now_utc().astimezone(UTC_PLUS_3)
+    except Exception:
+        entry_dt = now_utc().astimezone(UTC_PLUS_3)
+    record = {
+        "created_at": now_iso(),
+        "day": get_utc3_day_key(),
+        "entry_hour": int(entry_dt.strftime("%H")),
+        "entry_hour_label": _three_candle_hour_label(entry_bucket),
+        "pair": str(trade.get("pair", "")),
+        "symbol": str(trade.get("symbol", "")),
+        "direction": str(trade.get("direction", "")).upper(),
+        "result_type": str(result_type),
+        "outcome": outcome,
+        "initial_outcome": initial_outcome,
+        "result_text": str(result_text),
+        "payout": safe_int(trade.get("payout", 0), 0),
+        "payout_band": _three_candle_payout_band(trade.get("payout", 0)),
+        "pattern": str(trade.get("pattern") or "unknown"),
+        "pattern_ar": str(trade.get("pattern_ar") or ""),
+        "momentum_count": safe_int(trade.get("momentum_count", 0), 0),
+        "correction_count": safe_int(trade.get("correction_count", 0), 0),
+        "body_score": _three_candle_float(trade.get("body_score", 0), 0.0, 4),
+        "momentum_body_score": _three_candle_float(trade.get("momentum_body_score", 0), 0.0, 4),
+        "correction_body_score": _three_candle_float(trade.get("correction_body_score", 0), 0.0, 4),
+        "confirm_body_ratio": _three_candle_float(trade.get("confirm_body_ratio", 0), 0.0, 4),
+        "confirm_upper_wick": _three_candle_float(trade.get("confirm_upper_wick", 0), 0.0, 4),
+        "confirm_lower_wick": _three_candle_float(trade.get("confirm_lower_wick", 0), 0.0, 4),
+        "entry_bucket": entry_bucket,
+        "step": safe_int(trade.get("step", 0), 0),
+        "martingale": str(result_type) == "mg_win",
+        "test_mode": bool(trade.get("test_mode", True)),
+        "source_version": "v0.59_strategy_memory",
+    }
+    if candle:
+        record.update({
+            "result_open": _three_candle_float(candle.get("open", 0), 0.0, 6),
+            "result_close": _three_candle_float(candle.get("close", 0), 0.0, 6),
+            "result_high": _three_candle_float(candle.get("high", 0), 0.0, 6),
+            "result_low": _three_candle_float(candle.get("low", 0), 0.0, 6),
+        })
+    return record
+
+
+def _three_candle_group_stats(records: list[dict], key_name: str) -> dict:
+    groups = {}
+    for r in records:
+        key = str(r.get(key_name) or "غير معروف")
+        g = groups.setdefault(key, {"key": key, "total": 0, "direct": 0, "mg": 0, "loss": 0, "draw": 0, "initial_win": 0, "initial_loss": 0})
+        g["total"] += 1
+        result_type = str(r.get("result_type") or "")
+        outcome = str(r.get("outcome") or "")
+        initial = str(r.get("initial_outcome") or "")
+        if result_type == "direct_win":
+            g["direct"] += 1
+        elif result_type == "mg_win":
+            g["mg"] += 1
+        elif outcome == "loss":
+            g["loss"] += 1
+        elif outcome == "draw":
+            g["draw"] += 1
+        if initial == "win":
+            g["initial_win"] += 1
+        elif initial == "loss":
+            g["initial_loss"] += 1
+    for g in groups.values():
+        total = max(1, int(g.get("total", 0)))
+        decided_initial = max(1, int(g.get("initial_win", 0)) + int(g.get("initial_loss", 0)))
+        final_wins = int(g.get("direct", 0)) + int(g.get("mg", 0))
+        g["final_wr"] = round((final_wins / total) * 100, 1)
+        g["initial_wr"] = round((int(g.get("initial_win", 0)) / decided_initial) * 100, 1)
+        g["loss_rate"] = round((int(g.get("loss", 0)) / total) * 100, 1)
+        # Score favors clean direct wins and penalizes final losses. MG wins are weak because the first entry failed.
+        g["quality_score"] = round((int(g.get("direct", 0)) * 1.0 + int(g.get("mg", 0)) * 0.25 - int(g.get("loss", 0)) * 1.0) / total, 3)
+    return groups
+
+
+def _three_candle_format_group_lines(groups: dict, *, reverse: bool, limit: int = 5) -> str:
+    try:
+        min_sample = max(1, int(THREE_CANDLE_MEMORY_MIN_GROUP_SAMPLE))
+        rows = [g for g in groups.values() if int(g.get("total", 0)) >= min_sample]
+        rows.sort(key=lambda g: (float(g.get("quality_score", 0)), float(g.get("initial_wr", 0)), int(g.get("total", 0))), reverse=reverse)
+        lines = []
+        for g in rows[:int(limit)]:
+            lines.append(
+                f"• {g.get('key')}: {g.get('total')} صفقات | دخول أول {g.get('initial_wr')}% | نهائي {g.get('final_wr')}% | خسارة {g.get('loss_rate')}%"
+            )
+        return "\n".join(lines) if lines else "لا يوجد عيّنة كافية بعد."
+    except Exception:
+        return "تعذر تنسيق التقرير."
+
+
+def build_three_candle_strategy_memory_report(limit: int | None = None) -> str:
+    records = _three_candle_fetch_result_records()
+    if limit is None:
+        limit = int(THREE_CANDLE_MEMORY_REPORT_LIMIT)
+    if limit and int(limit) > 0:
+        records = records[-int(limit):]
+    records = [r for r in records if str(r.get("result_type") or "") in {"direct_win", "mg_win", "loss", "draw"}]
+    total = len(records)
+    if not total:
+        return "🧠 ذاكرة استراتيجية 3 شموع\n━━━━━━━━━━━━━━\nلا يوجد نتائج كافية بعد. خلّي القناة تجمع صفقات اختبار أولاً."
+
+    direct_win = sum(1 for r in records if r.get("result_type") == "direct_win")
+    mg_win = sum(1 for r in records if r.get("result_type") == "mg_win")
+    loss = sum(1 for r in records if r.get("result_type") == "loss")
+    draw = sum(1 for r in records if r.get("result_type") == "draw")
+    initial_wins = sum(1 for r in records if r.get("initial_outcome") == "win")
+    initial_losses = sum(1 for r in records if r.get("initial_outcome") == "loss")
+    initial_total = max(1, initial_wins + initial_losses)
+    final_wins = direct_win + mg_win
+    initial_wr = round((initial_wins / initial_total) * 100, 1)
+    final_wr = round((final_wins / max(1, total)) * 100, 1)
+
+    pair_groups = _three_candle_group_stats(records, "pair")
+    pattern_groups = _three_candle_group_stats(records, "pattern")
+    correction_groups = _three_candle_group_stats(records, "correction_count")
+    momentum_groups = _three_candle_group_stats(records, "momentum_count")
+    hour_groups = _three_candle_group_stats(records, "entry_hour_label")
+    payout_groups = _three_candle_group_stats(records, "payout_band")
+
+    return (
+        "🧠 ذاكرة استراتيجية 3 شموع\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📌 العينة: آخر {total} نتيجة\n"
+        f"✅ Win مباشر: {direct_win}\n"
+        f"✅ Win MG1: {mg_win}\n"
+        f"💔 Loss: {loss}\n"
+        f"🟰 Draw: {draw}\n"
+        f"🎯 جودة الدخول الأول: {initial_wr}%\n"
+        f"📈 النتيجة النهائية بعد MG1: {final_wr}%\n\n"
+        "✅ أفضل الأزواج مبدئياً:\n"
+        f"{_three_candle_format_group_lines(pair_groups, reverse=True, limit=4)}\n\n"
+        "⚠️ أسوأ الأزواج مبدئياً:\n"
+        f"{_three_candle_format_group_lines(pair_groups, reverse=False, limit=4)}\n\n"
+        "📊 حسب النمط:\n"
+        f"{_three_candle_format_group_lines(pattern_groups, reverse=True, limit=4)}\n\n"
+        "🔁 حسب عدد التصحيح:\n"
+        f"{_three_candle_format_group_lines(correction_groups, reverse=True, limit=4)}\n\n"
+        "🔥 حسب قوة المومنتم:\n"
+        f"{_three_candle_format_group_lines(momentum_groups, reverse=True, limit=4)}\n\n"
+        "⏰ حسب الساعة:\n"
+        f"{_three_candle_format_group_lines(hour_groups, reverse=True, limit=4)}\n\n"
+        "💰 حسب payout:\n"
+        f"{_three_candle_format_group_lines(payout_groups, reverse=True, limit=4)}\n\n"
+        "ملاحظة: v0.59 تحليل فقط، لا يمنع الصفقات تلقائياً."
+    )[:3900]
+
+def _three_candle_record_result(trade: dict, result_type: str, result_text: str, candle: dict | None = None):
+    try:
+        if bool(THREE_CANDLE_MEMORY_ENABLED):
+            record = _three_candle_build_memory_record(trade, result_type, result_text, candle=candle)
+        else:
+            record = {
+                "created_at": now_iso(),
+                "day": get_utc3_day_key(),
+                "pair": str((trade or {}).get("pair", "")),
+                "symbol": str((trade or {}).get("symbol", "")),
+                "direction": str((trade or {}).get("direction", "")),
+                "result_type": str(result_type),
+                "result_text": str(result_text),
+                "payout": safe_int((trade or {}).get("payout", 0), 0),
+            }
         key = f"{int(time_module.time() * 1000)}_{safe_key(record.get('pair'))}"
         _three_candle_results_ref().child(key).set(record)
+        _three_candle_channel_state["memory_records_written"] = int(_three_candle_channel_state.get("memory_records_written", 0) or 0) + 1
     except Exception as e:
         logger.debug("Could not record three-candle result: %s", e)
 
@@ -10194,6 +10417,8 @@ def build_three_candle_channel_status() -> str:
         f"منشور اليوم: {today_count}\n"
         f"نمط الاختبار: مومنتم {THREE_CANDLE_MOMENTUM_MIN}+ شموع + تصحيح حتى {THREE_CANDLE_MAX_CORRECTION_CANDLES} شمعة\n"
         f"منع تكرار الزوج: بعد كل صفقة يمنع {THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT} صفقتين منشورتين\n"
+        f"ذاكرة الاستراتيجية: {'شغالة 🧠' if THREE_CANDLE_MEMORY_ENABLED else 'متوقفة'}\n"
+        f"سجلات الذاكرة بهذه الجلسة: {_three_candle_channel_state.get('memory_records_written', 0)}\n"
         f"آخر فحص: {_three_candle_channel_state.get('last_scan_at') or 'لا يوجد'}\n"
         f"صفقة قيد المتابعة: {'نعم' if isinstance(pending, dict) else 'لا'}\n"
         f"آخر خطأ: {_three_candle_channel_state.get('last_error') or 'لا يوجد'}"
@@ -10257,6 +10482,8 @@ def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
                 "direction_value": int(direction_value),
                 "confirm_current_dir": int(current_dir),
                 "parts_for_score": ([current_parts] + previous_run_parts[:max(min_momentum - 1, 1)]),
+                "momentum_parts": ([current_parts] + previous_run_parts),
+                "correction_parts": [],
             }
 
         # Pattern B: 4+ momentum candles, then 1-2 corrective candles against the momentum.
@@ -10277,6 +10504,8 @@ def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
                         "direction_value": int(momentum_dir),
                         "confirm_current_dir": int(correction_dir),
                         "parts_for_score": (momentum_parts[:min_momentum] + correction_parts[:correction_count]),
+                        "momentum_parts": momentum_parts,
+                        "correction_parts": correction_parts,
                     }
 
         if not setup:
@@ -10288,6 +10517,8 @@ def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
             return None
 
         body_score = _three_candle_avg_body_score(setup.get("parts_for_score") or [])
+        momentum_body_score = _three_candle_avg_body_score(setup.get("momentum_parts") or [])
+        correction_body_score = _three_candle_avg_body_score(setup.get("correction_parts") or [])
         confirm_dir = int(setup.get("confirm_current_dir", setup.get("direction_value", 0)) or 0)
         confirm_color = "خضراء" if confirm_dir > 0 else "حمراء"
         return {
@@ -10300,6 +10531,11 @@ def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
             "entry_close_bucket": int(current_bucket + 120),
             "remaining": round(float(remaining), 1),
             "body_score": body_score,
+            "momentum_body_score": momentum_body_score,
+            "correction_body_score": correction_body_score,
+            "confirm_body_ratio": _three_candle_float(current_parts.get("body_ratio", 0), 0.0, 4),
+            "confirm_upper_wick": _three_candle_float(current_parts.get("upper_wick", 0), 0.0, 4),
+            "confirm_lower_wick": _three_candle_float(current_parts.get("lower_wick", 0), 0.0, 4),
             "third_color": confirm_color,
             "confirm_current_dir": int(confirm_dir),
             "pattern": str(setup.get("pattern") or "momentum"),
@@ -10434,7 +10670,7 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
             result_type = "loss"
         else:
             result_type = "draw"
-        _three_candle_record_result(trade, result_type, result_text)
+        _three_candle_record_result(trade, result_type, result_text, candle=candle)
 
         _three_candle_channel_state["pending_trade"] = None
         return False
@@ -16085,6 +16321,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(build_three_candle_channel_summary(count), reply_markup=three_candle_admin_keyboard)
             return
 
+        if text == "🧠 تقرير الذاكرة":
+            await update.message.reply_text(build_three_candle_strategy_memory_report(), reply_markup=three_candle_admin_keyboard)
+            return
+
         if text == "📋 حالة القناة":
             await update.message.reply_text(build_three_candle_channel_status(), reply_markup=three_candle_admin_keyboard)
             return
@@ -17141,7 +17381,7 @@ def run_telegram_bot_only():
         name="admin_otc_edge_watcher",
     )
 
-    # قناة اختبار استراتيجية 3 شموع متتالية. تعمل فقط عند ضبط THREE_CANDLE_CHANNEL_ID وتفعيلها من env.
+    # قناة اختبار استراتيجية 3 شموع + ذاكرة تحليل v0.59. تعمل فقط عند ضبط THREE_CANDLE_CHANNEL_ID وتفعيلها من env.
     job_queue.run_repeating(
         three_candle_channel_job,
         interval=THREE_CANDLE_SCAN_SECONDS,
