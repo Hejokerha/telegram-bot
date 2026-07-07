@@ -956,6 +956,7 @@ COPY_SEND_REAL_MARKET = os.getenv("COPY_SEND_REAL_MARKET", "true").lower() in {"
 COPY_SEND_TIMED_LISTS = os.getenv("COPY_SEND_TIMED_LISTS", "true").lower() in {"1", "true", "yes", "on"}
 COPY_SEND_THREE_CANDLE = os.getenv("COPY_SEND_THREE_CANDLE", "true").lower() in {"1", "true", "yes", "on"}
 COPY_SEND_TRADING_ROOM = os.getenv("COPY_SEND_TRADING_ROOM", "true").lower() in {"1", "true", "yes", "on"}
+COPY_SEND_OTC_EDGE = os.getenv("COPY_SEND_OTC_EDGE", "true").lower() in {"1", "true", "yes", "on"}
 
 # يمنع صفقات المستخدمين العاديين داخل البوت من الوصول إلى إضافة النسخ.
 # الافتراضي: فقط الأدمن أو الأرقام الموجودة في COPY_SIGNAL_ALLOWED_TELEGRAM_IDS يستطيعون بث الصفقة إلى Copy Trading.
@@ -2412,6 +2413,8 @@ def normalize_copy_source(source: str | None) -> str:
         return "three_candle"
     if any(x in compact for x in ["trading_room", "session_room", "room_session"]):
         return "trading_room"
+    if any(x in compact for x in ["otc_edge", "edge_engine", "edge"]):
+        return "otc_edge"
     if any(x in compact for x in ["timed_list", "otc_timed", "schedule", "scheduled_list", "list"]):
         return "timed_list"
     if ("otc" in compact and "live" in compact) or "live_now" in compact or "direct" in compact:
@@ -2671,13 +2674,66 @@ async def publish_copy_three_candle_signal(trade: dict) -> dict:
             "expires_at": (entry_dt + timedelta(seconds=max(30, int(COPY_SIGNAL_VALIDITY_SECONDS)))).isoformat(),
             "quality": int(round(float((trade or {}).get("body_score", 0) or 0) * 100)) if (trade or {}).get("body_score") is not None else None,
             "payout": (trade or {}).get("payout"),
-            "note": "three_candle_channel",
+            "note": f"three_candle_channel | smart={bool((trade or {}).get('smart_filter'))} | pattern={(trade or {}).get('pattern')} | m={(trade or {}).get('momentum_count')} | c={(trade or {}).get('correction_count')}",
         }
         result = await publish_copy_trading_signal(payload, source="three_candle")
         logger.info("Copy Trading three-candle sent | pair=%s | result=%s", pair, result)
         return result
     except Exception as e:
         logger.warning("Three-candle Copy signal failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
+async def publish_copy_otc_edge_signal(item: dict) -> dict:
+    """Send OTC Edge watcher alerts to the extension as source=otc_edge."""
+    if not COPY_SEND_OTC_EDGE:
+        return {"ok": False, "skipped": True, "reason": "COPY_SEND_OTC_EDGE=false"}
+    try:
+        item = dict(item or {})
+        pair = str(item.get("pair") or "").strip()
+        direction = str(item.get("direction") or "").strip().upper()
+        symbol = item.get("symbol") or get_otc_symbol_for_pair(pair)
+        if not pair or direction not in {"CALL", "PUT"}:
+            return {"ok": False, "skipped": True, "reason": "missing pair/direction"}
+
+        timing = _otc_edge_current_candle_timing() if "_otc_edge_current_candle_timing" in globals() else {}
+        now_dt = now_utc()
+        if _otc_edge_timing_mode() == "m1_candle_close" and timing.get("close_dt"):
+            # Edge alert is intended for immediate entry on the current M1 candle.
+            entry_dt = now_dt
+            try:
+                close_dt_local = timing.get("close_dt")
+                duration_seconds = max(5, int((close_dt_local.astimezone(UTC) - now_dt).total_seconds()))
+            except Exception:
+                duration_seconds = 60
+        else:
+            entry_dt = now_dt
+            duration_seconds = int(OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS)
+
+        payload = {
+            "ok": True,
+            "id": f"edge_{safe_key(pair)}_{int(entry_dt.timestamp())}_{direction}_{safe_key(item.get('pattern'))}",
+            "pair": pair,
+            "pair_display": pair,
+            "symbol": symbol,
+            "platform_symbol": symbol,
+            "direction": direction,
+            "timeframe": "M1",
+            "duration_seconds": max(5, int(duration_seconds)),
+            "duration_minutes": 1,
+            "entry_time": entry_dt.isoformat(),
+            "expires_at": (entry_dt + timedelta(seconds=max(5, int(OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS)))).isoformat(),
+            "quality": int(item.get("score", 0) or 0),
+            "confidence": int(item.get("score", 0) or 0),
+            "entry_price": item.get("price"),
+            "payout": item.get("payout"),
+            "note": f"otc_edge_engine | pattern={item.get('pattern') or item.get('reason') or '-'}",
+        }
+        result = await publish_copy_trading_signal(payload, source="otc_edge")
+        logger.info("Copy Trading OTC Edge sent | pair=%s | result=%s", pair, result)
+        return result
+    except Exception as e:
+        logger.warning("OTC Edge Copy signal failed: %s", e)
         return {"ok": False, "error": str(e)}
 
 
@@ -9769,6 +9825,7 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                 times = list(_otc_edge_watcher_state.get("alert_times") or [])
                 times.append(now_ts)
                 _otc_edge_watcher_state["alert_times"] = [float(t) for t in times if now_ts - float(t) < 3600]
+                await publish_copy_otc_edge_signal(item)
             break
     except Exception as e:
         _otc_edge_watcher_state["last_error"] = str(e)
@@ -9861,6 +9918,20 @@ THREE_CANDLE_MEMORY_ENABLED = os.getenv("THREE_CANDLE_MEMORY_ENABLED", "true").l
 THREE_CANDLE_MEMORY_REPORT_LIMIT = int(os.getenv("THREE_CANDLE_MEMORY_REPORT_LIMIT", "200"))
 THREE_CANDLE_MEMORY_MIN_GROUP_SAMPLE = int(os.getenv("THREE_CANDLE_MEMORY_MIN_GROUP_SAMPLE", "3"))
 
+# v0.60: Smart Filter Test. Dynamic filters based on strategy memory; no permanent pair bans.
+THREE_CANDLE_SMART_FILTER_ENABLED = os.getenv("THREE_CANDLE_SMART_FILTER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+THREE_CANDLE_SMART_MIN_PAYOUT = int(os.getenv("THREE_CANDLE_SMART_MIN_PAYOUT", "90"))
+# Empty means allow all. Default test: correction setups only.
+THREE_CANDLE_SMART_ALLOWED_PATTERNS = [x.strip() for x in os.getenv("THREE_CANDLE_SMART_ALLOWED_PATTERNS", "momentum_correction").split(",") if x.strip()]
+# Empty means allow all. Default test from current report: momentum_count 5 only.
+THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS = [int(x) for x in re.findall(r"\d+", os.getenv("THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS", "5"))]
+THREE_CANDLE_SMART_PAIR_FILTER_ENABLED = os.getenv("THREE_CANDLE_SMART_PAIR_FILTER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+THREE_CANDLE_SMART_PAIR_LOOKBACK = int(os.getenv("THREE_CANDLE_SMART_PAIR_LOOKBACK", "200"))
+THREE_CANDLE_SMART_PAIR_MIN_SAMPLE = int(os.getenv("THREE_CANDLE_SMART_PAIR_MIN_SAMPLE", "3"))
+THREE_CANDLE_SMART_PAIR_MIN_FINAL_WR = float(os.getenv("THREE_CANDLE_SMART_PAIR_MIN_FINAL_WR", "70"))
+THREE_CANDLE_SMART_PAIR_MAX_LOSS_RATE = float(os.getenv("THREE_CANDLE_SMART_PAIR_MAX_LOSS_RATE", "24.9"))
+THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS = int(os.getenv("THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS", "60"))
+
 _three_candle_channel_state = {
     "pending_trade": None,
     "last_signal_buckets": {},
@@ -9874,6 +9945,10 @@ _three_candle_channel_state = {
     "last_scan_at": None,
     "last_error": None,
     "memory_records_written": 0,
+    "smart_filter_skips": 0,
+    "last_smart_skip": None,
+    "smart_records_cache": [],
+    "smart_records_cache_at": 0.0,
 }
 
 
@@ -10217,7 +10292,7 @@ def _three_candle_build_memory_record(trade: dict, result_type: str, result_text
         "step": safe_int(trade.get("step", 0), 0),
         "martingale": str(result_type) == "mg_win",
         "test_mode": bool(trade.get("test_mode", True)),
-        "source_version": "v0.59_strategy_memory",
+        "source_version": "v0.60_smart_filter_test",
     }
     if candle:
         record.update({
@@ -10330,7 +10405,7 @@ def build_three_candle_strategy_memory_report(limit: int | None = None) -> str:
         f"{_three_candle_format_group_lines(hour_groups, reverse=True, limit=4)}\n\n"
         "💰 حسب payout:\n"
         f"{_three_candle_format_group_lines(payout_groups, reverse=True, limit=4)}\n\n"
-        "ملاحظة: v0.59 تحليل فقط، لا يمنع الصفقات تلقائياً."
+        "ملاحظة: v0.60 يشغل فلتر اختبار ذكي فوق ذاكرة الاستراتيجية."
     )[:3900]
 
 def _three_candle_record_result(trade: dict, result_type: str, result_text: str, candle: dict | None = None):
@@ -10372,6 +10447,117 @@ def _three_candle_fetch_result_records() -> list[dict]:
         logger.exception("Could not fetch three-candle result records: %s", e)
         return []
 
+
+
+def _three_candle_smart_record_decided(r: dict) -> bool:
+    try:
+        return str((r or {}).get("result_type") or "") in {"direct_win", "mg_win", "loss", "draw"}
+    except Exception:
+        return False
+
+
+
+def _three_candle_get_smart_records_cached() -> list[dict]:
+    """Cached memory fetch for smart filtering to avoid heavy Firebase reads every scan/pair."""
+    try:
+        now_ts = time_module.time()
+        cache_at = float(_three_candle_channel_state.get("smart_records_cache_at", 0) or 0)
+        cache = _three_candle_channel_state.get("smart_records_cache") or []
+        if cache and (now_ts - cache_at) < int(THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS):
+            return list(cache)
+        records = [r for r in _three_candle_fetch_result_records() if _three_candle_smart_record_decided(r)]
+        limit = int(THREE_CANDLE_SMART_PAIR_LOOKBACK)
+        if limit > 0:
+            records = records[-limit:]
+        _three_candle_channel_state["smart_records_cache"] = list(records)
+        _three_candle_channel_state["smart_records_cache_at"] = now_ts
+        return records
+    except Exception as e:
+        logger.debug("Could not read smart records cache: %s", e)
+        return []
+
+
+def _three_candle_pair_recent_stats(pair: str, limit: int | None = None) -> dict:
+    """Recent rolling stats for one pair. Recomputed every scan, so pair blocks are never permanent."""
+    try:
+        pair = str(pair or "").strip()
+        if not pair:
+            return {"total": 0}
+        records = _three_candle_get_smart_records_cached()
+        if limit is None:
+            limit = int(THREE_CANDLE_SMART_PAIR_LOOKBACK)
+        if limit and int(limit) > 0:
+            records = records[-int(limit):]
+        rows = [r for r in records if str(r.get("pair") or "").strip() == pair]
+        total = len(rows)
+        wins = sum(1 for r in rows if str(r.get("result_type") or "") in {"direct_win", "mg_win"})
+        losses = sum(1 for r in rows if str(r.get("outcome") or "") == "loss" or str(r.get("result_type") or "") == "loss")
+        draws = sum(1 for r in rows if str(r.get("outcome") or "") == "draw" or str(r.get("result_type") or "") == "draw")
+        final_wr = round((wins / max(1, total)) * 100, 1) if total else 0.0
+        loss_rate = round((losses / max(1, total)) * 100, 1) if total else 0.0
+        return {"total": total, "wins": wins, "losses": losses, "draws": draws, "final_wr": final_wr, "loss_rate": loss_rate}
+    except Exception as e:
+        logger.debug("Could not build three-candle pair stats for %s: %s", pair, e)
+        return {"total": 0, "error": str(e)}
+
+
+def _three_candle_smart_pair_allowed(pair: str) -> tuple[bool, str]:
+    try:
+        if not bool(THREE_CANDLE_SMART_PAIR_FILTER_ENABLED):
+            return True, "pair_filter_off"
+        stats = _three_candle_pair_recent_stats(pair)
+        sample = int(stats.get("total", 0) or 0)
+        if sample < int(THREE_CANDLE_SMART_PAIR_MIN_SAMPLE):
+            return True, f"pair_sample_low:{sample}"
+        final_wr = float(stats.get("final_wr", 0) or 0)
+        loss_rate = float(stats.get("loss_rate", 0) or 0)
+        if final_wr < float(THREE_CANDLE_SMART_PAIR_MIN_FINAL_WR):
+            return False, f"pair_recent_wr_low:{final_wr}%/{sample}"
+        if loss_rate > float(THREE_CANDLE_SMART_PAIR_MAX_LOSS_RATE):
+            return False, f"pair_recent_loss_high:{loss_rate}%/{sample}"
+        return True, f"pair_ok:{final_wr}%/{sample}"
+    except Exception as e:
+        return True, f"pair_filter_error:{e}"
+
+
+def _three_candle_apply_smart_filter(candidate: dict) -> dict | None:
+    """v0.60 test filter. It reduces weak setups but never permanently bans a pair."""
+    try:
+        if not bool(THREE_CANDLE_SMART_FILTER_ENABLED):
+            return candidate
+        candidate = dict(candidate or {})
+        reasons = []
+
+        payout = int(float(candidate.get("payout", 0) or 0))
+        if payout < int(THREE_CANDLE_SMART_MIN_PAYOUT):
+            reasons.append(f"payout<{THREE_CANDLE_SMART_MIN_PAYOUT}:{payout}")
+
+        allowed_patterns = list(THREE_CANDLE_SMART_ALLOWED_PATTERNS or [])
+        pattern = str(candidate.get("pattern") or "")
+        if allowed_patterns and pattern not in allowed_patterns:
+            reasons.append(f"pattern_blocked:{pattern}")
+
+        allowed_counts = list(THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS or [])
+        momentum_count = int(candidate.get("momentum_count", 0) or 0)
+        if allowed_counts and momentum_count not in allowed_counts:
+            reasons.append(f"momentum_blocked:{momentum_count}")
+
+        pair_allowed, pair_reason = _three_candle_smart_pair_allowed(str(candidate.get("pair") or ""))
+        candidate["smart_pair_reason"] = pair_reason
+        if not pair_allowed:
+            reasons.append(pair_reason)
+
+        if reasons:
+            _three_candle_channel_state["smart_filter_skips"] = int(_three_candle_channel_state.get("smart_filter_skips", 0) or 0) + 1
+            _three_candle_channel_state["last_smart_skip"] = " | ".join(reasons)[:300]
+            return None
+
+        candidate["smart_filter"] = True
+        candidate["smart_pair_reason"] = pair_reason
+        return candidate
+    except Exception as e:
+        logger.debug("Smart filter failed open: %s", e)
+        return candidate
 
 def build_three_candle_channel_summary(limit: int | None = None) -> str:
     records = _three_candle_fetch_result_records()
@@ -10418,6 +10604,9 @@ def build_three_candle_channel_status() -> str:
         f"نمط الاختبار: مومنتم {THREE_CANDLE_MOMENTUM_MIN}+ شموع + تصحيح حتى {THREE_CANDLE_MAX_CORRECTION_CANDLES} شمعة\n"
         f"منع تكرار الزوج: بعد كل صفقة يمنع {THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT} صفقتين منشورتين\n"
         f"ذاكرة الاستراتيجية: {'شغالة 🧠' if THREE_CANDLE_MEMORY_ENABLED else 'متوقفة'}\n"
+        f"فلتر v0.60: {'شغال ✅' if THREE_CANDLE_SMART_FILTER_ENABLED else 'متوقف'} | pattern={','.join(THREE_CANDLE_SMART_ALLOWED_PATTERNS or ['الكل'])} | momentum={','.join(map(str, THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS or ['الكل']))} | payout>={THREE_CANDLE_SMART_MIN_PAYOUT}\n"
+        f"فلتر الأزواج: {'ديناميكي ✅' if THREE_CANDLE_SMART_PAIR_FILTER_ENABLED else 'متوقف'} | عينة {THREE_CANDLE_SMART_PAIR_LOOKBACK} | لا يوجد حظر دائم\n"
+        f"تجاهلات الفلتر بهذه الجلسة: {_three_candle_channel_state.get('smart_filter_skips', 0)} | آخر سبب: {_three_candle_channel_state.get('last_smart_skip') or 'لا يوجد'}\n"
         f"سجلات الذاكرة بهذه الجلسة: {_three_candle_channel_state.get('memory_records_written', 0)}\n"
         f"آخر فحص: {_three_candle_channel_state.get('last_scan_at') or 'لا يوجد'}\n"
         f"صفقة قيد المتابعة: {'نعم' if isinstance(pending, dict) else 'لا'}\n"
@@ -10521,7 +10710,7 @@ def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
         correction_body_score = _three_candle_avg_body_score(setup.get("correction_parts") or [])
         confirm_dir = int(setup.get("confirm_current_dir", setup.get("direction_value", 0)) or 0)
         confirm_color = "خضراء" if confirm_dir > 0 else "حمراء"
-        return {
+        candidate = {
             "pair": pair,
             "symbol": symbol,
             "direction": direction,
@@ -10544,6 +10733,7 @@ def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
             "correction_count": int(setup.get("correction_count", 0) or 0),
             "test_mode": True,
         }
+        return _three_candle_apply_smart_filter(candidate)
     except Exception as e:
         logger.debug("three candle candidate failed for %s/%s: %s", pair, symbol, e)
         return None
