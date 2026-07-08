@@ -957,6 +957,7 @@ COPY_SEND_TIMED_LISTS = os.getenv("COPY_SEND_TIMED_LISTS", "true").lower() in {"
 COPY_SEND_THREE_CANDLE = os.getenv("COPY_SEND_THREE_CANDLE", "true").lower() in {"1", "true", "yes", "on"}
 COPY_SEND_TRADING_ROOM = os.getenv("COPY_SEND_TRADING_ROOM", "true").lower() in {"1", "true", "yes", "on"}
 COPY_SEND_OTC_EDGE = os.getenv("COPY_SEND_OTC_EDGE", "true").lower() in {"1", "true", "yes", "on"}
+COPY_OTC_EDGE_SIGNAL_VALID_SECONDS = int(os.getenv("COPY_OTC_EDGE_SIGNAL_VALID_SECONDS", str(max(10, int(os.getenv("OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS", "5")) * 2))))
 
 # يمنع صفقات المستخدمين العاديين داخل البوت من الوصول إلى إضافة النسخ.
 # الافتراضي: فقط الأدمن أو الأرقام الموجودة في COPY_SIGNAL_ALLOWED_TELEGRAM_IDS يستطيعون بث الصفقة إلى Copy Trading.
@@ -2495,6 +2496,15 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
         "timed_list_batch_id": signal.get("timed_list_batch_id") or signal.get("list_batch_id") or signal.get("batch_id"),
         "list_index": signal.get("list_index"),
         "list_total": signal.get("list_total"),
+        # v0.62: preserve execution-mode flags for fast/direct copy sources such as OTC Edge.
+        "entry_mode": signal.get("entry_mode"),
+        "copy_entry_mode": signal.get("copy_entry_mode"),
+        "execution_mode": signal.get("execution_mode"),
+        "immediate_entry": bool(signal.get("immediate_entry") or signal.get("instant_entry") or False),
+        "direct_entry": bool(signal.get("direct_entry") or False),
+        "instant_entry": bool(signal.get("instant_entry") or signal.get("immediate_entry") or False),
+        "allow_background_entry": bool(signal.get("allow_background_entry") or False),
+        "max_entry_delay_seconds": signal.get("max_entry_delay_seconds"),
     }
 
     base = "|".join([
@@ -2722,7 +2732,7 @@ async def publish_copy_otc_edge_signal(item: dict) -> dict:
             "duration_seconds": max(5, int(duration_seconds)),
             "duration_minutes": 1,
             "entry_time": entry_dt.isoformat(),
-            "expires_at": (entry_dt + timedelta(seconds=max(5, int(OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS)))).isoformat(),
+            "expires_at": (entry_dt + timedelta(seconds=max(10, int(COPY_OTC_EDGE_SIGNAL_VALID_SECONDS)))).isoformat(),
             "quality": int(item.get("score", 0) or 0),
             "confidence": int(item.get("score", 0) or 0),
             "entry_price": item.get("price"),
@@ -2733,7 +2743,7 @@ async def publish_copy_otc_edge_signal(item: dict) -> dict:
             "immediate_entry": True,
             "direct_entry": True,
             "allow_background_entry": True,
-            "max_entry_delay_seconds": int(OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS),
+            "max_entry_delay_seconds": max(10, int(COPY_OTC_EDGE_SIGNAL_VALID_SECONDS)),
             "note": f"otc_edge_engine | direct_entry | pattern={item.get('pattern') or item.get('reason') or '-'}",
         }
         result = await publish_copy_trading_signal(payload, source="otc_edge")
@@ -9763,7 +9773,16 @@ def build_otc_edge_watcher_status_message(prefix: str | None = None) -> str:
             f"🪟 نافذة التنبيه: من الثانية {OTC_EDGE_ENTRY_MIN_SECOND} إلى {min(OTC_EDGE_ENTRY_LAST_ALERT_SECOND, OTC_EDGE_ENTRY_WINDOW_SECONDS - OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS)} | الدخول مسموح حتى الثانية {OTC_EDGE_ENTRY_WINDOW_SECONDS}",
             f"🔒 القفل بعد التنبيه: حتى نهاية الصفقة الحالية",
             f"📨 تنبيهات مرسلة منذ التشغيل: {_otc_edge_watcher_state.get('alerts_sent', 0)}",
+            f"📤 Copy OTC Edge: {'مفعل ✅' if COPY_SEND_OTC_EDGE else 'متوقف ⛔'} | صلاحية النسخ {max(10, int(COPY_OTC_EDGE_SIGNAL_VALID_SECONDS))}ث",
         ])
+        if _otc_edge_watcher_state.get("last_copy_result"):
+            cr = _otc_edge_watcher_state.get("last_copy_result") or {}
+            delivery = cr.get("delivery") if isinstance(cr, dict) else None
+            delivered = (delivery or {}).get("delivered") if isinstance(delivery, dict) else None
+            online = (delivery or {}).get("online_clients") if isinstance(delivery, dict) else None
+            lines.append(f"آخر إرسال للنسخ: ok={bool(cr.get('ok'))} | delivered={delivered} | online={online}")
+        if _otc_edge_watcher_state.get("last_copy_at"):
+            lines.append(f"آخر Copy: {format_dt_ar(_otc_edge_watcher_state.get('last_copy_at'))}")
         remain = _otc_edge_active_trade_remaining(time_module.time())
         if remain > 0:
             active_trade = _otc_edge_watcher_state.get("active_trade") or {}
@@ -9820,19 +9839,23 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
             if not _otc_edge_can_alert(item, now_ts):
                 continue
             chat_id = int(_otc_edge_watcher_state.get("chat_id") or ADMIN_TELEGRAM_ID)
+            copy_result = await publish_copy_otc_edge_signal(item)
+            _otc_edge_watcher_state["last_copy_result"] = copy_result
+            _otc_edge_watcher_state["last_copy_at"] = now_iso()
             sent = await safe_send_message(
                 context.bot,
                 chat_id=chat_id,
                 text=build_otc_edge_entry_alert_message(item),
             )
-            if sent:
+            # v0.62: Copy delivery must not depend on Telegram alert success.
+            # If either Telegram alert OR Copy Server publish succeeded, lock this candidate to prevent duplicates.
+            if sent or bool((copy_result or {}).get("ok")):
                 _otc_edge_set_active_trade_lock(item, now_ts)
                 _otc_edge_watcher_state["last_alert_at"] = now_iso()
                 _otc_edge_watcher_state["alerts_sent"] = int(_otc_edge_watcher_state.get("alerts_sent", 0) or 0) + 1
                 times = list(_otc_edge_watcher_state.get("alert_times") or [])
                 times.append(now_ts)
                 _otc_edge_watcher_state["alert_times"] = [float(t) for t in times if now_ts - float(t) < 3600]
-                await publish_copy_otc_edge_signal(item)
             break
     except Exception as e:
         _otc_edge_watcher_state["last_error"] = str(e)
@@ -9925,18 +9948,19 @@ THREE_CANDLE_MEMORY_ENABLED = os.getenv("THREE_CANDLE_MEMORY_ENABLED", "true").l
 THREE_CANDLE_MEMORY_REPORT_LIMIT = int(os.getenv("THREE_CANDLE_MEMORY_REPORT_LIMIT", "200"))
 THREE_CANDLE_MEMORY_MIN_GROUP_SAMPLE = int(os.getenv("THREE_CANDLE_MEMORY_MIN_GROUP_SAMPLE", "3"))
 
-# v0.60: Smart Filter Test. Dynamic filters based on strategy memory; no permanent pair bans.
+# v0.63: Balanced Smart Filter Test. Dynamic filters based on strategy memory; no permanent pair bans.
+# Loosened from v0.60 because the strict test generated too few signals.
 THREE_CANDLE_SMART_FILTER_ENABLED = os.getenv("THREE_CANDLE_SMART_FILTER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-THREE_CANDLE_SMART_MIN_PAYOUT = int(os.getenv("THREE_CANDLE_SMART_MIN_PAYOUT", "90"))
+THREE_CANDLE_SMART_MIN_PAYOUT = int(os.getenv("THREE_CANDLE_SMART_MIN_PAYOUT", "85"))
 # Empty means allow all. Default test: correction setups only.
 THREE_CANDLE_SMART_ALLOWED_PATTERNS = [x.strip() for x in os.getenv("THREE_CANDLE_SMART_ALLOWED_PATTERNS", "momentum_correction").split(",") if x.strip()]
-# Empty means allow all. Default test from current report: momentum_count 5 only.
-THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS = [int(x) for x in re.findall(r"\d+", os.getenv("THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS", "5"))]
+# Empty means allow all. Balanced test: momentum_count 4 or 5 to avoid over-filtering.
+THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS = [int(x) for x in re.findall(r"\d+", os.getenv("THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS", "4,5"))]
 THREE_CANDLE_SMART_PAIR_FILTER_ENABLED = os.getenv("THREE_CANDLE_SMART_PAIR_FILTER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 THREE_CANDLE_SMART_PAIR_LOOKBACK = int(os.getenv("THREE_CANDLE_SMART_PAIR_LOOKBACK", "200"))
-THREE_CANDLE_SMART_PAIR_MIN_SAMPLE = int(os.getenv("THREE_CANDLE_SMART_PAIR_MIN_SAMPLE", "3"))
-THREE_CANDLE_SMART_PAIR_MIN_FINAL_WR = float(os.getenv("THREE_CANDLE_SMART_PAIR_MIN_FINAL_WR", "70"))
-THREE_CANDLE_SMART_PAIR_MAX_LOSS_RATE = float(os.getenv("THREE_CANDLE_SMART_PAIR_MAX_LOSS_RATE", "24.9"))
+THREE_CANDLE_SMART_PAIR_MIN_SAMPLE = int(os.getenv("THREE_CANDLE_SMART_PAIR_MIN_SAMPLE", "5"))
+THREE_CANDLE_SMART_PAIR_MIN_FINAL_WR = float(os.getenv("THREE_CANDLE_SMART_PAIR_MIN_FINAL_WR", "65"))
+THREE_CANDLE_SMART_PAIR_MAX_LOSS_RATE = float(os.getenv("THREE_CANDLE_SMART_PAIR_MAX_LOSS_RATE", "35"))
 THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS = int(os.getenv("THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS", "60"))
 
 _three_candle_channel_state = {
@@ -10299,7 +10323,7 @@ def _three_candle_build_memory_record(trade: dict, result_type: str, result_text
         "step": safe_int(trade.get("step", 0), 0),
         "martingale": str(result_type) == "mg_win",
         "test_mode": bool(trade.get("test_mode", True)),
-        "source_version": "v0.60_smart_filter_test",
+        "source_version": "v0.63_balanced_filter_test",
     }
     if candle:
         record.update({
@@ -10412,7 +10436,7 @@ def build_three_candle_strategy_memory_report(limit: int | None = None) -> str:
         f"{_three_candle_format_group_lines(hour_groups, reverse=True, limit=4)}\n\n"
         "💰 حسب payout:\n"
         f"{_three_candle_format_group_lines(payout_groups, reverse=True, limit=4)}\n\n"
-        "ملاحظة: v0.60 يشغل فلتر اختبار ذكي فوق ذاكرة الاستراتيجية."
+        "ملاحظة: v0.63 يشغل فلتر اختبار متوازن فوق ذاكرة الاستراتيجية."
     )[:3900]
 
 def _three_candle_record_result(trade: dict, result_type: str, result_text: str, candle: dict | None = None):
@@ -10528,7 +10552,7 @@ def _three_candle_smart_pair_allowed(pair: str) -> tuple[bool, str]:
 
 
 def _three_candle_apply_smart_filter(candidate: dict) -> dict | None:
-    """v0.60 test filter. It reduces weak setups but never permanently bans a pair."""
+    """v0.63 balanced test filter. It reduces weak setups without choking signal volume."""
     try:
         if not bool(THREE_CANDLE_SMART_FILTER_ENABLED):
             return candidate
@@ -10611,7 +10635,7 @@ def build_three_candle_channel_status() -> str:
         f"نمط الاختبار: مومنتم {THREE_CANDLE_MOMENTUM_MIN}+ شموع + تصحيح حتى {THREE_CANDLE_MAX_CORRECTION_CANDLES} شمعة\n"
         f"منع تكرار الزوج: بعد كل صفقة يمنع {THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT} صفقتين منشورتين\n"
         f"ذاكرة الاستراتيجية: {'شغالة 🧠' if THREE_CANDLE_MEMORY_ENABLED else 'متوقفة'}\n"
-        f"فلتر v0.60: {'شغال ✅' if THREE_CANDLE_SMART_FILTER_ENABLED else 'متوقف'} | pattern={','.join(THREE_CANDLE_SMART_ALLOWED_PATTERNS or ['الكل'])} | momentum={','.join(map(str, THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS or ['الكل']))} | payout>={THREE_CANDLE_SMART_MIN_PAYOUT}\n"
+        f"فلتر v0.63: {'شغال ✅' if THREE_CANDLE_SMART_FILTER_ENABLED else 'متوقف'} | pattern={','.join(THREE_CANDLE_SMART_ALLOWED_PATTERNS or ['الكل'])} | momentum={','.join(map(str, THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS or ['الكل']))} | payout>={THREE_CANDLE_SMART_MIN_PAYOUT}\n"
         f"فلتر الأزواج: {'ديناميكي ✅' if THREE_CANDLE_SMART_PAIR_FILTER_ENABLED else 'متوقف'} | عينة {THREE_CANDLE_SMART_PAIR_LOOKBACK} | لا يوجد حظر دائم\n"
         f"تجاهلات الفلتر بهذه الجلسة: {_three_candle_channel_state.get('smart_filter_skips', 0)} | آخر سبب: {_three_candle_channel_state.get('last_smart_skip') or 'لا يوجد'}\n"
         f"سجلات الذاكرة بهذه الجلسة: {_three_candle_channel_state.get('memory_records_written', 0)}\n"
@@ -17166,6 +17190,15 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         "timed_list_batch_id": payload.get("timed_list_batch_id") or payload.get("list_batch_id") or payload.get("batch_id"),
         "list_index": payload.get("list_index"),
         "list_total": payload.get("list_total"),
+        # v0.62: do not strip direct-entry fields at the embedded Copy Server boundary.
+        "entry_mode": payload.get("entry_mode"),
+        "copy_entry_mode": payload.get("copy_entry_mode"),
+        "execution_mode": payload.get("execution_mode"),
+        "immediate_entry": bool(payload.get("immediate_entry") or payload.get("instant_entry") or False),
+        "direct_entry": bool(payload.get("direct_entry") or False),
+        "instant_entry": bool(payload.get("instant_entry") or payload.get("immediate_entry") or False),
+        "allow_background_entry": bool(payload.get("allow_background_entry") or False),
+        "max_entry_delay_seconds": payload.get("max_entry_delay_seconds"),
     }
 
 
@@ -17294,7 +17327,7 @@ def create_embedded_copy_api():
     from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
 
-    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.55.0")
+    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.62.0")
     copy_api.add_middleware(
         CORSMiddleware,
         allow_origins=COPY_ALLOWED_ORIGINS,
@@ -17309,7 +17342,7 @@ def create_embedded_copy_api():
         return {
             "ok": True,
             "app": "TRADING TIME COPY EMBEDDED SERVER",
-            "version": "0.55.0",
+            "version": "0.62.0",
             "time": now_iso(),
             "copy_settings": copy_public_settings_payload(),
             "online_clients": len(_copy_clients),
