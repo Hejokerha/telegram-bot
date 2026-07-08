@@ -495,6 +495,7 @@ three_candle_admin_keyboard = ReplyKeyboardMarkup(
         ["🟢 تشغيل نشر القناة", "🔴 إيقاف نشر القناة"],
         ["🎯 حد صفقات اليوم", "♾ نشر مفتوح"],
         ["📊 ملخص القناة", "🧠 تقرير الذاكرة"],
+        ["🧹 تصفير الذاكرة"],
         ["📋 حالة القناة"],
         ["⬅️ رجوع"],
     ],
@@ -9940,7 +9941,7 @@ THREE_CANDLE_MOMENTUM_MIN = int(os.getenv("THREE_CANDLE_MOMENTUM_MIN", "4"))
 THREE_CANDLE_MAX_CORRECTION_CANDLES = int(os.getenv("THREE_CANDLE_MAX_CORRECTION_CANDLES", "2"))
 # After a pair gets a signal, block it for the next N published signals, regardless of result.
 THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT = int(os.getenv("THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT", "2"))
-THREE_CANDLE_TEST_LABEL = os.getenv("THREE_CANDLE_TEST_LABEL", "🧪 اختبار").strip() or "🧪 اختبار"
+THREE_CANDLE_TEST_LABEL = os.getenv("THREE_CANDLE_TEST_LABEL", "").strip()
 
 # v0.59: Strategy Memory is analysis-only. It records why each 3-candle trade
 # won/lost so we can later build a smart filter from real statistics.
@@ -9948,12 +9949,12 @@ THREE_CANDLE_MEMORY_ENABLED = os.getenv("THREE_CANDLE_MEMORY_ENABLED", "true").l
 THREE_CANDLE_MEMORY_REPORT_LIMIT = int(os.getenv("THREE_CANDLE_MEMORY_REPORT_LIMIT", "200"))
 THREE_CANDLE_MEMORY_MIN_GROUP_SAMPLE = int(os.getenv("THREE_CANDLE_MEMORY_MIN_GROUP_SAMPLE", "3"))
 
-# v0.63: Balanced Smart Filter Test. Dynamic filters based on strategy memory; no permanent pair bans.
-# Loosened from v0.60 because the strict test generated too few signals.
+# v0.65: Add exact 5-candle momentum continuation to the balanced filter.
+# Correction setups remain as v0.63; continuation without correction is allowed only when momentum_count == 5.
 THREE_CANDLE_SMART_FILTER_ENABLED = os.getenv("THREE_CANDLE_SMART_FILTER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 THREE_CANDLE_SMART_MIN_PAYOUT = int(os.getenv("THREE_CANDLE_SMART_MIN_PAYOUT", "85"))
 # Empty means allow all. Default test: correction setups only.
-THREE_CANDLE_SMART_ALLOWED_PATTERNS = [x.strip() for x in os.getenv("THREE_CANDLE_SMART_ALLOWED_PATTERNS", "momentum_correction").split(",") if x.strip()]
+THREE_CANDLE_SMART_ALLOWED_PATTERNS = [x.strip() for x in os.getenv("THREE_CANDLE_SMART_ALLOWED_PATTERNS", "momentum_correction,momentum_continuation").split(",") if x.strip()]
 # Empty means allow all. Balanced test: momentum_count 4 or 5 to avoid over-filtering.
 THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS = [int(x) for x in re.findall(r"\d+", os.getenv("THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS", "4,5"))]
 THREE_CANDLE_SMART_PAIR_FILTER_ENABLED = os.getenv("THREE_CANDLE_SMART_PAIR_FILTER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -9962,6 +9963,8 @@ THREE_CANDLE_SMART_PAIR_MIN_SAMPLE = int(os.getenv("THREE_CANDLE_SMART_PAIR_MIN_
 THREE_CANDLE_SMART_PAIR_MIN_FINAL_WR = float(os.getenv("THREE_CANDLE_SMART_PAIR_MIN_FINAL_WR", "65"))
 THREE_CANDLE_SMART_PAIR_MAX_LOSS_RATE = float(os.getenv("THREE_CANDLE_SMART_PAIR_MAX_LOSS_RATE", "35"))
 THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS = int(os.getenv("THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS", "60"))
+# Exact momentum count allowed for pure continuation signals. 0 disables pure continuation.
+THREE_CANDLE_CONTINUATION_EXACT_MOMENTUM = int(os.getenv("THREE_CANDLE_CONTINUATION_EXACT_MOMENTUM", "5"))
 
 _three_candle_channel_state = {
     "pending_trade": None,
@@ -10323,7 +10326,7 @@ def _three_candle_build_memory_record(trade: dict, result_type: str, result_text
         "step": safe_int(trade.get("step", 0), 0),
         "martingale": str(result_type) == "mg_win",
         "test_mode": bool(trade.get("test_mode", True)),
-        "source_version": "v0.63_balanced_filter_test",
+        "source_version": "v0.64_live_message_memory_reset",
     }
     if candle:
         record.update({
@@ -10392,7 +10395,7 @@ def build_three_candle_strategy_memory_report(limit: int | None = None) -> str:
     records = [r for r in records if str(r.get("result_type") or "") in {"direct_win", "mg_win", "loss", "draw"}]
     total = len(records)
     if not total:
-        return "🧠 ذاكرة استراتيجية 3 شموع\n━━━━━━━━━━━━━━\nلا يوجد نتائج كافية بعد. خلّي القناة تجمع صفقات اختبار أولاً."
+        return "🧠 ذاكرة استراتيجية 3 شموع\n━━━━━━━━━━━━━━\nلا يوجد نتائج كافية بعد. خلّي القناة تجمع صفقات جديدة أولاً."
 
     direct_win = sum(1 for r in records if r.get("result_type") == "direct_win")
     mg_win = sum(1 for r in records if r.get("result_type") == "mg_win")
@@ -10436,7 +10439,7 @@ def build_three_candle_strategy_memory_report(limit: int | None = None) -> str:
         f"{_three_candle_format_group_lines(hour_groups, reverse=True, limit=4)}\n\n"
         "💰 حسب payout:\n"
         f"{_three_candle_format_group_lines(payout_groups, reverse=True, limit=4)}\n\n"
-        "ملاحظة: v0.63 يشغل فلتر اختبار متوازن فوق ذاكرة الاستراتيجية."
+        "ملاحظة: v0.64 يشغل فلتر متوازن فوق ذاكرة الاستراتيجية."
     )[:3900]
 
 def _three_candle_record_result(trade: dict, result_type: str, result_text: str, candle: dict | None = None):
@@ -10478,6 +10481,24 @@ def _three_candle_fetch_result_records() -> list[dict]:
         logger.exception("Could not fetch three-candle result records: %s", e)
         return []
 
+
+def _three_candle_reset_strategy_memory() -> tuple[bool, str]:
+    """Clear 3-candle result/memory records so reports and dynamic filters start fresh."""
+    try:
+        try:
+            _three_candle_results_ref().delete()
+        except Exception:
+            _three_candle_results_ref().set({})
+        _three_candle_channel_state["memory_records_written"] = 0
+        _three_candle_channel_state["smart_records_cache"] = []
+        _three_candle_channel_state["smart_records_cache_at"] = 0.0
+        _three_candle_channel_state["smart_filter_skips"] = 0
+        _three_candle_channel_state["last_smart_skip"] = None
+        _three_candle_channel_state["last_error"] = None
+        return True, "✅ تم تصفير ذاكرة استراتيجية 3 شموع. من الآن التقرير والفلتر الديناميكي سيحسبان من النتائج الجديدة فقط."
+    except Exception as e:
+        logger.exception("Could not reset three-candle strategy memory: %s", e)
+        return False, "❌ تعذر تصفير الذاكرة. راجع اللوج."
 
 
 def _three_candle_smart_record_decided(r: dict) -> bool:
@@ -10570,7 +10591,11 @@ def _three_candle_apply_smart_filter(candidate: dict) -> dict | None:
 
         allowed_counts = list(THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS or [])
         momentum_count = int(candidate.get("momentum_count", 0) or 0)
-        if allowed_counts and momentum_count not in allowed_counts:
+        if pattern == "momentum_continuation":
+            continuation_exact = int(THREE_CANDLE_CONTINUATION_EXACT_MOMENTUM or 0)
+            if continuation_exact <= 0 or momentum_count != continuation_exact:
+                reasons.append(f"continuation_exact_blocked:{momentum_count}!= {continuation_exact}")
+        elif allowed_counts and momentum_count not in allowed_counts:
             reasons.append(f"momentum_blocked:{momentum_count}")
 
         pair_allowed, pair_reason = _three_candle_smart_pair_allowed(str(candidate.get("pair") or ""))
@@ -10632,10 +10657,10 @@ def build_three_candle_channel_status() -> str:
         f"القناة: {channel_id or 'غير مضبوطة'}\n"
         f"حد الصفقات اليومي: {'مفتوح ♾' if limit <= 0 else limit}\n"
         f"منشور اليوم: {today_count}\n"
-        f"نمط الاختبار: مومنتم {THREE_CANDLE_MOMENTUM_MIN}+ شموع + تصحيح حتى {THREE_CANDLE_MAX_CORRECTION_CANDLES} شمعة\n"
+        f"النمط الحالي: مومنتم {THREE_CANDLE_MOMENTUM_MIN}+ شموع + تصحيح حتى {THREE_CANDLE_MAX_CORRECTION_CANDLES} شمعة\n"
         f"منع تكرار الزوج: بعد كل صفقة يمنع {THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT} صفقتين منشورتين\n"
         f"ذاكرة الاستراتيجية: {'شغالة 🧠' if THREE_CANDLE_MEMORY_ENABLED else 'متوقفة'}\n"
-        f"فلتر v0.63: {'شغال ✅' if THREE_CANDLE_SMART_FILTER_ENABLED else 'متوقف'} | pattern={','.join(THREE_CANDLE_SMART_ALLOWED_PATTERNS or ['الكل'])} | momentum={','.join(map(str, THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS or ['الكل']))} | payout>={THREE_CANDLE_SMART_MIN_PAYOUT}\n"
+        f"فلتر v0.65: {'شغال ✅' if THREE_CANDLE_SMART_FILTER_ENABLED else 'متوقف'} | pattern={','.join(THREE_CANDLE_SMART_ALLOWED_PATTERNS or ['الكل'])} | correction_momentum={','.join(map(str, THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS or ['الكل']))} | continuation_exact={THREE_CANDLE_CONTINUATION_EXACT_MOMENTUM} | payout>={THREE_CANDLE_SMART_MIN_PAYOUT}\n"
         f"فلتر الأزواج: {'ديناميكي ✅' if THREE_CANDLE_SMART_PAIR_FILTER_ENABLED else 'متوقف'} | عينة {THREE_CANDLE_SMART_PAIR_LOOKBACK} | لا يوجد حظر دائم\n"
         f"تجاهلات الفلتر بهذه الجلسة: {_three_candle_channel_state.get('smart_filter_skips', 0)} | آخر سبب: {_three_candle_channel_state.get('last_smart_skip') or 'لا يوجد'}\n"
         f"سجلات الذاكرة بهذه الجلسة: {_three_candle_channel_state.get('memory_records_written', 0)}\n"
@@ -10689,10 +10714,12 @@ def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
 
         setup = None
 
-        # Pattern A: pure continuation. Current candle completes the 4+ same-color momentum run.
+        # Pattern A: pure continuation. In v0.65 this is intentionally narrow:
+        # allow only exactly 5 same-color momentum candles without correction.
         previous_run_count, previous_run_parts = _three_candle_run_count_by_dir(by_bucket, current_bucket - 60, current_dir)
         total_momentum = previous_run_count + 1
-        if total_momentum >= min_momentum:
+        continuation_exact = int(THREE_CANDLE_CONTINUATION_EXACT_MOMENTUM or 0)
+        if continuation_exact > 0 and total_momentum == continuation_exact:
             direction_value = current_dir
             setup = {
                 "pattern": "momentum_continuation",
@@ -10792,15 +10819,13 @@ def _three_candle_signal_message(trade: dict) -> str:
         pair = trade.get('pair')
         payout = trade.get('payout', 0)
         return (
-            f"{THREE_CANDLE_TEST_LABEL} - صفقة اختبار\n"
             "⚡ OTC SIGNAL\n"
             "━━━━━━━━━━━━━━\n"
             f"💱 {pair}\n"
             f"📌 {direction_icon}\n"
             f"⏳ الدخول: {entry_dt.strftime('%H:%M:%S')} UTC+3\n"
             f"🏁 الانتهاء: {close_dt.strftime('%H:%M:%S')} UTC+3\n"
-            f"💰 payout: {payout}%\n"
-            f"⚠️ اختبار فقط - لا تدخلوا الصفقات حالياً."
+            f"💰 payout: {payout}%"
         )[:3900]
     except Exception as e:
         return f"⚡ OTC SIGNAL\nتعذر تنسيق الرسالة: {e}"
@@ -16544,6 +16569,23 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == "🧠 تقرير الذاكرة":
             await update.message.reply_text(build_three_candle_strategy_memory_report(), reply_markup=three_candle_admin_keyboard)
+            return
+
+        if text == "🧹 تصفير الذاكرة":
+            context.user_data["step"] = "three_candle_confirm_reset_memory"
+            await update.message.reply_text(
+                "⚠️ تصفير ذاكرة استراتيجية 3 شموع سيحذف نتائج الذاكرة القديمة ويجعل التقرير والفلتر الديناميكي يبدآن من جديد.\n\nأرسل: تأكيد\nللإلغاء أرسل أي شيء آخر.",
+                reply_markup=three_candle_admin_keyboard
+            )
+            return
+
+        if step == "three_candle_confirm_reset_memory":
+            context.user_data["step"] = None
+            if str(text or "").strip().lower() in {"تأكيد", "تاكيد", "نعم", "yes", "confirm"}:
+                ok, msg = _three_candle_reset_strategy_memory()
+                await update.message.reply_text(msg, reply_markup=three_candle_admin_keyboard)
+            else:
+                await update.message.reply_text("تم إلغاء تصفير الذاكرة.", reply_markup=three_candle_admin_keyboard)
             return
 
         if text == "📋 حالة القناة":
