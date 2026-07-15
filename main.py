@@ -1471,6 +1471,9 @@ def get_otc_feed_diagnostics_for_pair(pair_text: str) -> str:
 FIREBASE_24H_MONITOR_ENABLED = os.getenv("FIREBASE_24H_MONITOR_ENABLED", "true").lower() == "true"
 FIREBASE_24H_REPORT_SECONDS = int(os.getenv("FIREBASE_24H_REPORT_SECONDS", "86400"))
 FIREBASE_24H_TOP_N = int(os.getenv("FIREBASE_24H_TOP_N", "25"))
+# v0.66: configurable daily download guard for the approximate in-bot monitor.
+FIREBASE_DAILY_DOWNLOAD_LIMIT_MB = float(os.getenv("FIREBASE_DAILY_DOWNLOAD_LIMIT_MB", "360"))
+FIREBASE_DAILY_DOWNLOAD_WARNING_PERCENT = float(os.getenv("FIREBASE_DAILY_DOWNLOAD_WARNING_PERCENT", "80"))
 
 _firebase_24h_read_stats = {}
 _firebase_24h_write_stats = {}
@@ -1548,6 +1551,23 @@ def install_firebase_24h_monitor():
         ref_cls.delete = patched_delete
         ref_cls._trading_time_fb24_wrapped = True
 
+        # Limited Firebase queries use Query.get(), not Reference.get(). Track them too
+        # so the 24h report reflects the optimized reads instead of silently omitting them.
+        try:
+            query_cls = getattr(db, "Query", None)
+            if query_cls is not None and not getattr(query_cls, "_trading_time_fb24_wrapped", False):
+                original_query_get = query_cls.get
+
+                def patched_query_get(self, *args, **kwargs):
+                    result = original_query_get(self, *args, **kwargs)
+                    _fb24_add(_firebase_24h_read_stats, "GET_QUERY", _fb24_ref_path(self), _fb24_size(result))
+                    return result
+
+                query_cls.get = patched_query_get
+                query_cls._trading_time_fb24_wrapped = True
+        except Exception as query_wrap_error:
+            logger.debug("Could not wrap Firebase Query.get for 24h monitor: %s", query_wrap_error)
+
         _firebase_24h_started_at = now_iso()
         _firebase_24h_monitor_installed = True
         logger.warning("Firebase 24h monitor installed successfully")
@@ -1580,8 +1600,14 @@ def build_firebase_24h_report_text() -> str:
     lines.append(f"بدأت المراقبة: {_firebase_24h_started_at or 'unknown'}")
     lines.append(f"مدة التقرير: {int(FIREBASE_24H_REPORT_SECONDS / 3600)} ساعة")
     lines.append("")
+    approx_read_mb = total_read_bytes / 1024 / 1024
     lines.append(f"📥 READS: {total_read_count} calls")
-    lines.append(f"📦 Approx read size: {total_read_bytes / 1024 / 1024:.2f} MB")
+    lines.append(f"📦 Approx read size: {approx_read_mb:.2f} MB")
+    if FIREBASE_DAILY_DOWNLOAD_LIMIT_MB > 0:
+        usage_percent = (approx_read_mb / FIREBASE_DAILY_DOWNLOAD_LIMIT_MB) * 100
+        lines.append(f"🛡️ Daily download guard: {usage_percent:.1f}% من {FIREBASE_DAILY_DOWNLOAD_LIMIT_MB:.0f} MB")
+        if usage_percent >= FIREBASE_DAILY_DOWNLOAD_WARNING_PERCENT:
+            lines.append("⚠️ تحذير: استهلاك التنزيل اقترب من الحد اليومي أو تجاوزه.")
     lines.append("")
     lines.append(f"📤 WRITES: {total_write_count} calls")
     lines.append(f"📦 Approx write payload: {total_write_bytes / 1024 / 1024:.2f} MB")
@@ -9943,13 +9969,23 @@ THREE_CANDLE_MAX_CORRECTION_CANDLES = int(os.getenv("THREE_CANDLE_MAX_CORRECTION
 THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT = int(os.getenv("THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT", "2"))
 THREE_CANDLE_TEST_LABEL = os.getenv("THREE_CANDLE_TEST_LABEL", "").strip()
 
-# v0.59: Strategy Memory is analysis-only. It records why each 3-candle trade
-# won/lost so we can later build a smart filter from real statistics.
+# v0.66: Firebase-efficient Strategy Memory.
+# - memory_v2: compact records used by reports and the dynamic pair filter.
+# - memory_details_v2: detailed features kept for future deep analysis, never auto-read.
+# - legacy /results is queried only once (last N only) for an optional migration.
 THREE_CANDLE_MEMORY_ENABLED = os.getenv("THREE_CANDLE_MEMORY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 THREE_CANDLE_MEMORY_REPORT_LIMIT = int(os.getenv("THREE_CANDLE_MEMORY_REPORT_LIMIT", "200"))
 THREE_CANDLE_MEMORY_MIN_GROUP_SAMPLE = int(os.getenv("THREE_CANDLE_MEMORY_MIN_GROUP_SAMPLE", "3"))
+THREE_CANDLE_MEMORY_COMPACT_PATH = os.getenv("THREE_CANDLE_MEMORY_COMPACT_PATH", "memory_v2").strip() or "memory_v2"
+THREE_CANDLE_MEMORY_DETAILS_PATH = os.getenv("THREE_CANDLE_MEMORY_DETAILS_PATH", "memory_details_v2").strip() or "memory_details_v2"
+THREE_CANDLE_MEMORY_META_PATH = os.getenv("THREE_CANDLE_MEMORY_META_PATH", "memory_meta_v2").strip() or "memory_meta_v2"
+THREE_CANDLE_MEMORY_STORE_DETAILS = os.getenv("THREE_CANDLE_MEMORY_STORE_DETAILS", "true").lower() in {"1", "true", "yes", "on"}
+THREE_CANDLE_MEMORY_MIGRATE_LEGACY = os.getenv("THREE_CANDLE_MEMORY_MIGRATE_LEGACY", "true").lower() in {"1", "true", "yes", "on"}
+THREE_CANDLE_MEMORY_QUERY_LIMIT = int(os.getenv("THREE_CANDLE_MEMORY_QUERY_LIMIT", "250"))
+THREE_CANDLE_SETTINGS_CACHE_SECONDS = int(os.getenv("THREE_CANDLE_SETTINGS_CACHE_SECONDS", "60"))
 
 # v0.65: Add exact 5-candle momentum continuation to the balanced filter.
+# v0.66: Optimize Firebase memory/download usage without changing the trading strategy.
 # Correction setups remain as v0.63; continuation without correction is allowed only when momentum_count == 5.
 THREE_CANDLE_SMART_FILTER_ENABLED = os.getenv("THREE_CANDLE_SMART_FILTER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 THREE_CANDLE_SMART_MIN_PAYOUT = int(os.getenv("THREE_CANDLE_SMART_MIN_PAYOUT", "85"))
@@ -9962,7 +9998,7 @@ THREE_CANDLE_SMART_PAIR_LOOKBACK = int(os.getenv("THREE_CANDLE_SMART_PAIR_LOOKBA
 THREE_CANDLE_SMART_PAIR_MIN_SAMPLE = int(os.getenv("THREE_CANDLE_SMART_PAIR_MIN_SAMPLE", "5"))
 THREE_CANDLE_SMART_PAIR_MIN_FINAL_WR = float(os.getenv("THREE_CANDLE_SMART_PAIR_MIN_FINAL_WR", "65"))
 THREE_CANDLE_SMART_PAIR_MAX_LOSS_RATE = float(os.getenv("THREE_CANDLE_SMART_PAIR_MAX_LOSS_RATE", "35"))
-THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS = int(os.getenv("THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS", "60"))
+THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS = int(os.getenv("THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS", "300"))
 # Exact momentum count allowed for pure continuation signals. 0 disables pure continuation.
 THREE_CANDLE_CONTINUATION_EXACT_MOMENTUM = int(os.getenv("THREE_CANDLE_CONTINUATION_EXACT_MOMENTUM", "5"))
 
@@ -9983,6 +10019,11 @@ _three_candle_channel_state = {
     "last_smart_skip": None,
     "smart_records_cache": [],
     "smart_records_cache_at": 0.0,
+    "smart_records_cache_limit": 0,
+    "settings_cache": None,
+    "settings_cache_at": 0.0,
+    "memory_migration_checked": False,
+    "memory_legacy_migrated": 0,
 }
 
 
@@ -10003,34 +10044,67 @@ def _three_candle_settings_ref():
 
 
 def _three_candle_results_ref():
+    """Legacy results path kept only for one-time migration/reset compatibility."""
     return system_ref().child("three_candle_channel").child("results")
+
+
+def _three_candle_memory_ref():
+    return system_ref().child("three_candle_channel").child(THREE_CANDLE_MEMORY_COMPACT_PATH)
+
+
+def _three_candle_memory_details_ref():
+    return system_ref().child("three_candle_channel").child(THREE_CANDLE_MEMORY_DETAILS_PATH)
+
+
+def _three_candle_memory_meta_ref():
+    return system_ref().child("three_candle_channel").child(THREE_CANDLE_MEMORY_META_PATH)
 
 
 def _three_candle_daily_ref(day_key: str | None = None):
     return system_ref().child("three_candle_channel").child("daily").child(day_key or get_utc3_day_key())
 
 
-def _three_candle_get_settings() -> dict:
+def _three_candle_get_settings(force_refresh: bool = False) -> dict:
     default = {
         "enabled": bool(THREE_CANDLE_CHANNEL_ENABLED),
         "daily_limit": int(THREE_CANDLE_DAILY_LIMIT_DEFAULT),
     }
     try:
+        now_ts = time_module.time()
+        cached = _three_candle_channel_state.get("settings_cache")
+        cached_at = float(_three_candle_channel_state.get("settings_cache_at", 0) or 0)
+        if (
+            not force_refresh
+            and isinstance(cached, dict)
+            and (now_ts - cached_at) < max(1, int(THREE_CANDLE_SETTINGS_CACHE_SECONDS))
+        ):
+            return dict(cached)
+
         data = _three_candle_settings_ref().get() or {}
         if not isinstance(data, dict):
             data = {}
-        return {
+        settings = {
             "enabled": bool(data.get("enabled", default["enabled"])),
             "daily_limit": int(data.get("daily_limit", default["daily_limit"]) or 0),
         }
+        _three_candle_channel_state["settings_cache"] = dict(settings)
+        _three_candle_channel_state["settings_cache_at"] = now_ts
+        return settings
     except Exception as e:
         logger.exception("Could not read three-candle channel settings: %s", e)
-        return default
+        cached = _three_candle_channel_state.get("settings_cache")
+        return dict(cached) if isinstance(cached, dict) else default
 
 
 def _three_candle_set_enabled(enabled: bool) -> bool:
     try:
         _three_candle_settings_ref().update({"enabled": bool(enabled), "updated_at": now_iso()})
+        cached = _three_candle_channel_state.get("settings_cache") or {}
+        cached = dict(cached) if isinstance(cached, dict) else {}
+        cached["enabled"] = bool(enabled)
+        cached.setdefault("daily_limit", int(THREE_CANDLE_DAILY_LIMIT_DEFAULT))
+        _three_candle_channel_state["settings_cache"] = cached
+        _three_candle_channel_state["settings_cache_at"] = time_module.time()
         return True
     except Exception as e:
         logger.exception("Could not update three-candle enabled: %s", e)
@@ -10039,7 +10113,14 @@ def _three_candle_set_enabled(enabled: bool) -> bool:
 
 def _three_candle_set_daily_limit(limit: int) -> bool:
     try:
-        _three_candle_settings_ref().update({"daily_limit": max(0, int(limit)), "updated_at": now_iso()})
+        normalized_limit = max(0, int(limit))
+        _three_candle_settings_ref().update({"daily_limit": normalized_limit, "updated_at": now_iso()})
+        cached = _three_candle_channel_state.get("settings_cache") or {}
+        cached = dict(cached) if isinstance(cached, dict) else {}
+        cached["daily_limit"] = normalized_limit
+        cached.setdefault("enabled", bool(THREE_CANDLE_CHANNEL_ENABLED))
+        _three_candle_channel_state["settings_cache"] = cached
+        _three_candle_channel_state["settings_cache_at"] = time_module.time()
         return True
     except Exception as e:
         logger.exception("Could not update three-candle daily limit: %s", e)
@@ -10326,7 +10407,7 @@ def _three_candle_build_memory_record(trade: dict, result_type: str, result_text
         "step": safe_int(trade.get("step", 0), 0),
         "martingale": str(result_type) == "mg_win",
         "test_mode": bool(trade.get("test_mode", True)),
-        "source_version": "v0.64_live_message_memory_reset",
+        "source_version": "v0.66_memory_optimized",
     }
     if candle:
         record.update({
@@ -10387,11 +10468,10 @@ def _three_candle_format_group_lines(groups: dict, *, reverse: bool, limit: int 
 
 
 def build_three_candle_strategy_memory_report(limit: int | None = None) -> str:
-    records = _three_candle_fetch_result_records()
     if limit is None:
         limit = int(THREE_CANDLE_MEMORY_REPORT_LIMIT)
-    if limit and int(limit) > 0:
-        records = records[-int(limit):]
+    limit = max(1, int(limit))
+    records = _three_candle_fetch_result_records(limit=limit)
     records = [r for r in records if str(r.get("result_type") or "") in {"direct_win", "mg_win", "loss", "draw"}]
     total = len(records)
     if not total:
@@ -10439,15 +10519,117 @@ def build_three_candle_strategy_memory_report(limit: int | None = None) -> str:
         f"{_three_candle_format_group_lines(hour_groups, reverse=True, limit=4)}\n\n"
         "💰 حسب payout:\n"
         f"{_three_candle_format_group_lines(payout_groups, reverse=True, limit=4)}\n\n"
-        "ملاحظة: v0.64 يشغل فلتر متوازن فوق ذاكرة الاستراتيجية."
+        "ملاحظة: v0.66 يستخدم ذاكرة مضغوطة وقراءات محدودة مع فلتر متوازن."
     )[:3900]
+
+def _three_candle_compact_memory_record(record: dict) -> dict:
+    """Keep only fields required by reports/current filters plus compact quality features."""
+    record = record or {}
+    allowed = (
+        "created_at", "day", "entry_hour", "entry_hour_label", "pair", "symbol", "direction",
+        "result_type", "outcome", "initial_outcome", "payout", "payout_band", "pattern",
+        "momentum_count", "correction_count", "body_score", "momentum_body_score",
+        "correction_body_score", "confirm_body_ratio", "confirm_upper_wick", "confirm_lower_wick",
+        "martingale", "source_version",
+    )
+    compact = {key: record.get(key) for key in allowed if key in record}
+    compact["source_version"] = "v0.66_memory_optimized"
+    return compact
+
+
+def _three_candle_query_last_dict(ref, limit: int) -> dict:
+    """Server-side bounded query. Never falls back to a full-path .get()."""
+    try:
+        limit = max(1, int(limit))
+        data = ref.order_by_key().limit_to_last(limit).get() or {}
+        return data if isinstance(data, dict) else {}
+    except Exception as e:
+        logger.exception("Could not run limited Firebase query for three-candle memory: %s", e)
+        return {}
+
+
+def _three_candle_records_from_dict(data: dict) -> list[dict]:
+    items = []
+    for key, value in (data or {}).items():
+        if isinstance(value, dict):
+            item = dict(value)
+            item["_key"] = str(key)
+            items.append(item)
+    # Keys begin with millisecond timestamps, making key order the most reliable order.
+    items.sort(key=lambda row: str(row.get("_key", "")))
+    return items
+
+
+def _three_candle_try_migrate_legacy_memory(limit: int) -> list[dict]:
+    """One-time bounded migration of the newest legacy records into compact memory_v2."""
+    try:
+        if _three_candle_channel_state.get("memory_migration_checked"):
+            return []
+        _three_candle_channel_state["memory_migration_checked"] = True
+        if not bool(THREE_CANDLE_MEMORY_MIGRATE_LEGACY):
+            return []
+
+        migrated_flag = bool((_three_candle_memory_meta_ref().child("legacy_migrated").get() or False))
+        if migrated_flag:
+            return []
+
+        legacy_data = _three_candle_query_last_dict(_three_candle_results_ref(), limit)
+        legacy_rows = _three_candle_records_from_dict(legacy_data)
+        updates = {}
+        migrated_rows = []
+        for row in legacy_rows:
+            key = str(row.get("_key") or "").strip()
+            if not key:
+                continue
+            compact = _three_candle_compact_memory_record(row)
+            compact["migrated_from_legacy"] = True
+            updates[key] = compact
+            item = dict(compact)
+            item["_key"] = key
+            migrated_rows.append(item)
+        if updates:
+            _three_candle_memory_ref().update(updates)
+        _three_candle_memory_meta_ref().update({
+            "legacy_migrated": True,
+            "legacy_migrated_count": len(updates),
+            "legacy_migrated_at": now_iso(),
+            "version": "v0.66",
+        })
+        _three_candle_channel_state["memory_legacy_migrated"] = len(updates)
+        return migrated_rows
+    except Exception as e:
+        logger.exception("Could not migrate legacy three-candle memory: %s", e)
+        return []
+
+
+def _three_candle_cache_append(record: dict, key: str):
+    try:
+        cache = list(_three_candle_channel_state.get("smart_records_cache") or [])
+        item = dict(record or {})
+        item["_key"] = str(key)
+        cache = [row for row in cache if str(row.get("_key") or "") != str(key)]
+        cache.append(item)
+        cache.sort(key=lambda row: str(row.get("_key", "")))
+        keep = max(
+            1,
+            int(THREE_CANDLE_MEMORY_QUERY_LIMIT),
+            int(THREE_CANDLE_MEMORY_REPORT_LIMIT),
+            int(THREE_CANDLE_SMART_PAIR_LOOKBACK),
+        )
+        cache = cache[-keep:]
+        _three_candle_channel_state["smart_records_cache"] = cache
+        _three_candle_channel_state["smart_records_cache_at"] = time_module.time()
+        _three_candle_channel_state["smart_records_cache_limit"] = keep
+    except Exception as e:
+        logger.debug("Could not append three-candle memory cache: %s", e)
+
 
 def _three_candle_record_result(trade: dict, result_type: str, result_text: str, candle: dict | None = None):
     try:
         if bool(THREE_CANDLE_MEMORY_ENABLED):
-            record = _three_candle_build_memory_record(trade, result_type, result_text, candle=candle)
+            detailed_record = _three_candle_build_memory_record(trade, result_type, result_text, candle=candle)
         else:
-            record = {
+            detailed_record = {
                 "created_at": now_iso(),
                 "day": get_utc3_day_key(),
                 "pair": str((trade or {}).get("pair", "")),
@@ -10456,46 +10638,79 @@ def _three_candle_record_result(trade: dict, result_type: str, result_text: str,
                 "result_type": str(result_type),
                 "result_text": str(result_text),
                 "payout": safe_int((trade or {}).get("payout", 0), 0),
+                "outcome": _three_candle_result_outcome(result_type),
+                "initial_outcome": _three_candle_initial_outcome(result_type),
+                "source_version": "v0.66_memory_optimized",
             }
-        key = f"{int(time_module.time() * 1000)}_{safe_key(record.get('pair'))}"
-        _three_candle_results_ref().child(key).set(record)
+        compact_record = _three_candle_compact_memory_record(detailed_record)
+        key = f"{int(time_module.time() * 1000)}_{safe_key(compact_record.get('pair'))}"
+
+        # One multi-location write: compact hot memory + optional cold detailed memory.
+        update_payload = {f"{THREE_CANDLE_MEMORY_COMPACT_PATH}/{key}": compact_record}
+        if bool(THREE_CANDLE_MEMORY_STORE_DETAILS):
+            update_payload[f"{THREE_CANDLE_MEMORY_DETAILS_PATH}/{key}"] = detailed_record
+        system_ref().child("three_candle_channel").update(update_payload)
+
+        _three_candle_cache_append(compact_record, key)
         _three_candle_channel_state["memory_records_written"] = int(_three_candle_channel_state.get("memory_records_written", 0) or 0) + 1
     except Exception as e:
         logger.debug("Could not record three-candle result: %s", e)
 
 
-def _three_candle_fetch_result_records() -> list[dict]:
+def _three_candle_fetch_result_records(limit: int | None = None, force_refresh: bool = False) -> list[dict]:
+    """Read only a bounded compact window, with a process cache refreshed locally after every result."""
     try:
-        data = _three_candle_results_ref().get() or {}
-        if not isinstance(data, dict):
-            return []
-        items = []
-        for k, v in data.items():
-            if isinstance(v, dict):
-                item = dict(v)
-                item["_key"] = k
-                items.append(item)
-        items.sort(key=lambda x: str(x.get("created_at", "")))
-        return items
+        if limit is None:
+            limit = max(int(THREE_CANDLE_MEMORY_REPORT_LIMIT), int(THREE_CANDLE_SMART_PAIR_LOOKBACK))
+        limit = max(1, min(int(limit), max(1, int(THREE_CANDLE_MEMORY_QUERY_LIMIT))))
+
+        now_ts = time_module.time()
+        cache = list(_three_candle_channel_state.get("smart_records_cache") or [])
+        cache_at = float(_three_candle_channel_state.get("smart_records_cache_at", 0) or 0)
+        cache_limit = int(_three_candle_channel_state.get("smart_records_cache_limit", 0) or 0)
+        if (
+            not force_refresh
+            and cache
+            and cache_limit >= limit
+            and (now_ts - cache_at) < max(1, int(THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS))
+        ):
+            return cache[-limit:]
+
+        data = _three_candle_query_last_dict(_three_candle_memory_ref(), limit)
+        rows = _three_candle_records_from_dict(data)
+        if not rows:
+            rows = _three_candle_try_migrate_legacy_memory(limit)
+            rows.sort(key=lambda row: str(row.get("_key", "")))
+
+        _three_candle_channel_state["smart_records_cache"] = list(rows)
+        _three_candle_channel_state["smart_records_cache_at"] = now_ts
+        _three_candle_channel_state["smart_records_cache_limit"] = limit
+        return rows[-limit:]
     except Exception as e:
-        logger.exception("Could not fetch three-candle result records: %s", e)
+        logger.exception("Could not fetch optimized three-candle memory records: %s", e)
         return []
 
 
 def _three_candle_reset_strategy_memory() -> tuple[bool, str]:
-    """Clear 3-candle result/memory records so reports and dynamic filters start fresh."""
+    """Clear legacy, compact, detailed and metadata paths so reports/filters start truly fresh."""
     try:
-        try:
-            _three_candle_results_ref().delete()
-        except Exception:
-            _three_candle_results_ref().set({})
+        base_ref = system_ref().child("three_candle_channel")
+        base_ref.update({
+            "results": None,
+            THREE_CANDLE_MEMORY_COMPACT_PATH: None,
+            THREE_CANDLE_MEMORY_DETAILS_PATH: None,
+            THREE_CANDLE_MEMORY_META_PATH: None,
+        })
         _three_candle_channel_state["memory_records_written"] = 0
         _three_candle_channel_state["smart_records_cache"] = []
         _three_candle_channel_state["smart_records_cache_at"] = 0.0
+        _three_candle_channel_state["smart_records_cache_limit"] = 0
+        _three_candle_channel_state["memory_migration_checked"] = False
+        _three_candle_channel_state["memory_legacy_migrated"] = 0
         _three_candle_channel_state["smart_filter_skips"] = 0
         _three_candle_channel_state["last_smart_skip"] = None
         _three_candle_channel_state["last_error"] = None
-        return True, "✅ تم تصفير ذاكرة استراتيجية 3 شموع. من الآن التقرير والفلتر الديناميكي سيحسبان من النتائج الجديدة فقط."
+        return True, "✅ تم تصفير ذاكرة استراتيجية 3 شموع بالكامل. التقرير والفلتر سيحسبان من النتائج الجديدة فقط."
     except Exception as e:
         logger.exception("Could not reset three-candle strategy memory: %s", e)
         return False, "❌ تعذر تصفير الذاكرة. راجع اللوج."
@@ -10508,22 +10723,14 @@ def _three_candle_smart_record_decided(r: dict) -> bool:
         return False
 
 
-
 def _three_candle_get_smart_records_cached() -> list[dict]:
-    """Cached memory fetch for smart filtering to avoid heavy Firebase reads every scan/pair."""
+    """Shared bounded compact cache for the dynamic pair filter."""
     try:
-        now_ts = time_module.time()
-        cache_at = float(_three_candle_channel_state.get("smart_records_cache_at", 0) or 0)
-        cache = _three_candle_channel_state.get("smart_records_cache") or []
-        if cache and (now_ts - cache_at) < int(THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS):
-            return list(cache)
-        records = [r for r in _three_candle_fetch_result_records() if _three_candle_smart_record_decided(r)]
-        limit = int(THREE_CANDLE_SMART_PAIR_LOOKBACK)
-        if limit > 0:
-            records = records[-limit:]
-        _three_candle_channel_state["smart_records_cache"] = list(records)
-        _three_candle_channel_state["smart_records_cache_at"] = now_ts
-        return records
+        limit = max(1, int(THREE_CANDLE_SMART_PAIR_LOOKBACK))
+        return [
+            row for row in _three_candle_fetch_result_records(limit=limit)
+            if _three_candle_smart_record_decided(row)
+        ][-limit:]
     except Exception as e:
         logger.debug("Could not read smart records cache: %s", e)
         return []
@@ -10616,12 +10823,10 @@ def _three_candle_apply_smart_filter(candidate: dict) -> dict | None:
         return candidate
 
 def build_three_candle_channel_summary(limit: int | None = None) -> str:
-    records = _three_candle_fetch_result_records()
-    if limit and int(limit) > 0:
-        records = records[-int(limit):]
-        title = f"📊 ملخص قناة 3 شموع - آخر {int(limit)} نتيجة"
-    else:
-        title = "📊 ملخص قناة 3 شموع - من بداية القناة"
+    effective_limit = int(limit) if limit and int(limit) > 0 else int(THREE_CANDLE_MEMORY_REPORT_LIMIT)
+    effective_limit = max(1, effective_limit)
+    records = _three_candle_fetch_result_records(limit=effective_limit)
+    title = f"📊 ملخص قناة 3 شموع - آخر {effective_limit} نتيجة"
 
     direct_win = sum(1 for r in records if r.get("result_type") == "direct_win")
     mg_win = sum(1 for r in records if r.get("result_type") == "mg_win")
@@ -10660,10 +10865,13 @@ def build_three_candle_channel_status() -> str:
         f"النمط الحالي: مومنتم {THREE_CANDLE_MOMENTUM_MIN}+ شموع + تصحيح حتى {THREE_CANDLE_MAX_CORRECTION_CANDLES} شمعة\n"
         f"منع تكرار الزوج: بعد كل صفقة يمنع {THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT} صفقتين منشورتين\n"
         f"ذاكرة الاستراتيجية: {'شغالة 🧠' if THREE_CANDLE_MEMORY_ENABLED else 'متوقفة'}\n"
-        f"فلتر v0.65: {'شغال ✅' if THREE_CANDLE_SMART_FILTER_ENABLED else 'متوقف'} | pattern={','.join(THREE_CANDLE_SMART_ALLOWED_PATTERNS or ['الكل'])} | correction_momentum={','.join(map(str, THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS or ['الكل']))} | continuation_exact={THREE_CANDLE_CONTINUATION_EXACT_MOMENTUM} | payout>={THREE_CANDLE_SMART_MIN_PAYOUT}\n"
+        f"ذاكرة Firebase المضغوطة: {THREE_CANDLE_MEMORY_COMPACT_PATH} | آخر {THREE_CANDLE_MEMORY_QUERY_LIMIT} كحد أقصى\n"
+        f"كاش الذاكرة: {THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS} ثانية | كاش الإعدادات: {THREE_CANDLE_SETTINGS_CACHE_SECONDS} ثانية\n"
+        f"فلتر v0.66: {'شغال ✅' if THREE_CANDLE_SMART_FILTER_ENABLED else 'متوقف'} | pattern={','.join(THREE_CANDLE_SMART_ALLOWED_PATTERNS or ['الكل'])} | correction_momentum={','.join(map(str, THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS or ['الكل']))} | continuation_exact={THREE_CANDLE_CONTINUATION_EXACT_MOMENTUM} | payout>={THREE_CANDLE_SMART_MIN_PAYOUT}\n"
         f"فلتر الأزواج: {'ديناميكي ✅' if THREE_CANDLE_SMART_PAIR_FILTER_ENABLED else 'متوقف'} | عينة {THREE_CANDLE_SMART_PAIR_LOOKBACK} | لا يوجد حظر دائم\n"
         f"تجاهلات الفلتر بهذه الجلسة: {_three_candle_channel_state.get('smart_filter_skips', 0)} | آخر سبب: {_three_candle_channel_state.get('last_smart_skip') or 'لا يوجد'}\n"
         f"سجلات الذاكرة بهذه الجلسة: {_three_candle_channel_state.get('memory_records_written', 0)}\n"
+        f"ترحيل الذاكرة القديمة: {_three_candle_channel_state.get('memory_legacy_migrated', 0)} سجل\n"
         f"آخر فحص: {_three_candle_channel_state.get('last_scan_at') or 'لا يوجد'}\n"
         f"صفقة قيد المتابعة: {'نعم' if isinstance(pending, dict) else 'لا'}\n"
         f"آخر خطأ: {_three_candle_channel_state.get('last_error') or 'لا يوجد'}"
