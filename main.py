@@ -959,6 +959,9 @@ COPY_SEND_THREE_CANDLE = os.getenv("COPY_SEND_THREE_CANDLE", "true").lower() in 
 COPY_SEND_TRADING_ROOM = os.getenv("COPY_SEND_TRADING_ROOM", "true").lower() in {"1", "true", "yes", "on"}
 COPY_SEND_OTC_EDGE = os.getenv("COPY_SEND_OTC_EDGE", "true").lower() in {"1", "true", "yes", "on"}
 COPY_OTC_EDGE_SIGNAL_VALID_SECONDS = int(os.getenv("COPY_OTC_EDGE_SIGNAL_VALID_SECONDS", str(max(10, int(os.getenv("OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS", "5")) * 2))))
+# v0.67: عند مراقبة زوج واحد نرسل أمر تجهيز مسبق للإضافة قبل السماح بأي إشارة Edge.
+COPY_OTC_EDGE_PREPARE_ENABLED = os.getenv("COPY_OTC_EDGE_PREPARE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+COPY_OTC_EDGE_PREPARE_REFRESH_SECONDS = int(os.getenv("COPY_OTC_EDGE_PREPARE_REFRESH_SECONDS", "60"))
 
 # يمنع صفقات المستخدمين العاديين داخل البوت من الوصول إلى إضافة النسخ.
 # الافتراضي: فقط الأدمن أو الأرقام الموجودة في COPY_SIGNAL_ALLOWED_TELEGRAM_IDS يستطيعون بث الصفقة إلى Copy Trading.
@@ -2532,6 +2535,15 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
         "instant_entry": bool(signal.get("instant_entry") or signal.get("immediate_entry") or False),
         "allow_background_entry": bool(signal.get("allow_background_entry") or False),
         "max_entry_delay_seconds": signal.get("max_entry_delay_seconds"),
+        # v0.67: preserve exact platform expiry and OTC Edge pre-arm control fields.
+        "expiry_time": signal.get("expiry_time") or signal.get("trade_expiry_time"),
+        "expiry_timestamp": signal.get("expiry_timestamp") or signal.get("trade_expiry_timestamp"),
+        "trade_expiry_mode": signal.get("trade_expiry_mode"),
+        "signal_kind": signal.get("signal_kind"),
+        "prepare_only": bool(signal.get("prepare_only") or False),
+        "preselected_pair_mode": bool(signal.get("preselected_pair_mode") or False),
+        "watch_pair": signal.get("watch_pair"),
+        "skip_asset_switch": bool(signal.get("skip_asset_switch") or False),
     }
 
     base = "|".join([
@@ -2721,6 +2733,61 @@ async def publish_copy_three_candle_signal(trade: dict) -> dict:
         return {"ok": False, "error": str(e)}
 
 
+async def publish_copy_otc_edge_prepare_signal(pair: str) -> dict:
+    """Pre-select a single watched OTC Edge pair inside connected extensions without opening a trade."""
+    if not COPY_SEND_OTC_EDGE or not COPY_OTC_EDGE_PREPARE_ENABLED:
+        return {"ok": False, "skipped": True, "reason": "OTC Edge prepare disabled"}
+    try:
+        resolved_pair, symbol = _otc_edge_resolve_pair_text(pair) if "_otc_edge_resolve_pair_text" in globals() else (pair, get_otc_symbol_for_pair(pair))
+        resolved_pair = str(resolved_pair or pair or "").strip()
+        symbol = symbol or get_otc_symbol_for_pair(resolved_pair)
+        if not resolved_pair or not symbol:
+            return {"ok": False, "skipped": True, "reason": "pair could not be resolved"}
+
+        now_dt = now_utc()
+        timing = _otc_edge_current_candle_timing() if "_otc_edge_current_candle_timing" in globals() else {}
+        close_dt = timing.get("close_dt")
+        if close_dt:
+            expiry_dt = close_dt.astimezone(UTC)
+        else:
+            expiry_dt = datetime.fromtimestamp(((int(now_dt.timestamp()) // 60) + 1) * 60, tz=UTC)
+
+        payload = {
+            "ok": True,
+            "id": f"edge_prepare_{safe_key(resolved_pair)}_{int(now_dt.timestamp()) // max(30, int(COPY_OTC_EDGE_PREPARE_REFRESH_SECONDS))}",
+            "pair": resolved_pair,
+            "pair_display": resolved_pair,
+            "symbol": symbol,
+            "platform_symbol": symbol,
+            # Copy Server currently validates a direction on every signal. prepare_only prevents any order.
+            "direction": "CALL",
+            "timeframe": "M1",
+            "duration_seconds": 60,
+            "duration_minutes": 1,
+            "entry_time": now_dt.isoformat(),
+            "expires_at": (now_dt + timedelta(seconds=60)).isoformat(),
+            "expiry_time": expiry_dt.isoformat(),
+            "expiry_timestamp": int(expiry_dt.timestamp()),
+            "trade_expiry_mode": "m1_candle_close",
+            "entry_mode": "prepare",
+            "copy_entry_mode": "prepare",
+            "execution_mode": "prepare_pair",
+            "signal_kind": "otc_edge_prepare",
+            "prepare_only": True,
+            "preselected_pair_mode": True,
+            "watch_pair": resolved_pair,
+            "skip_asset_switch": False,
+            "allow_background_entry": True,
+            "note": "otc_edge_engine | prepare_selected_pair",
+        }
+        result = await publish_copy_trading_signal(payload, source="otc_edge")
+        logger.info("Copy Trading OTC Edge prepare sent | pair=%s | result=%s", resolved_pair, result)
+        return result
+    except Exception as e:
+        logger.warning("OTC Edge prepare signal failed: %s", e)
+        return {"ok": False, "error": str(e)}
+
+
 async def publish_copy_otc_edge_signal(item: dict) -> dict:
     """Send OTC Edge watcher alerts to the extension as source=otc_edge."""
     if not COPY_SEND_OTC_EDGE:
@@ -2736,16 +2803,25 @@ async def publish_copy_otc_edge_signal(item: dict) -> dict:
         timing = _otc_edge_current_candle_timing() if "_otc_edge_current_candle_timing" in globals() else {}
         now_dt = now_utc()
         if _otc_edge_timing_mode() == "m1_candle_close" and timing.get("close_dt"):
-            # Edge alert is intended for immediate entry on the current M1 candle.
+            # Critical v0.67 fix: send the exact full-minute close timestamp.
+            # Do not rebuild it as floor(entry)+floor(remaining), which can become xx:xx:59 and Quotex rejects it as Incorrect time.
+            expiry_dt = timing.get("close_dt").astimezone(UTC)
+            expiry_timestamp = int(expiry_dt.timestamp())
             entry_dt = now_dt
-            try:
-                close_dt_local = timing.get("close_dt")
-                duration_seconds = max(5, int((close_dt_local.astimezone(UTC) - now_dt).total_seconds()))
-            except Exception:
-                duration_seconds = 60
+            duration_seconds = max(5, expiry_timestamp - int(now_dt.timestamp()))
+            trade_expiry_mode = "m1_candle_close"
         else:
             entry_dt = now_dt
+            expiry_timestamp = int(now_dt.timestamp()) + int(OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS)
+            expiry_dt = datetime.fromtimestamp(expiry_timestamp, tz=UTC)
             duration_seconds = int(OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS)
+            trade_expiry_mode = "fixed_60s"
+
+        single_pair_mode = bool(
+            str((_otc_edge_watcher_state or {}).get("mode") or "") == "pairs"
+            and len(list((_otc_edge_watcher_state or {}).get("pairs") or [])) == 1
+            and str(list((_otc_edge_watcher_state or {}).get("pairs") or [""])[0]) == pair
+        )
 
         payload = {
             "ok": True,
@@ -2760,6 +2836,9 @@ async def publish_copy_otc_edge_signal(item: dict) -> dict:
             "duration_minutes": 1,
             "entry_time": entry_dt.isoformat(),
             "expires_at": (entry_dt + timedelta(seconds=max(10, int(COPY_OTC_EDGE_SIGNAL_VALID_SECONDS)))).isoformat(),
+            "expiry_time": expiry_dt.isoformat(),
+            "expiry_timestamp": expiry_timestamp,
+            "trade_expiry_mode": trade_expiry_mode,
             "quality": int(item.get("score", 0) or 0),
             "confidence": int(item.get("score", 0) or 0),
             "entry_price": item.get("price"),
@@ -2771,10 +2850,13 @@ async def publish_copy_otc_edge_signal(item: dict) -> dict:
             "direct_entry": True,
             "allow_background_entry": True,
             "max_entry_delay_seconds": max(10, int(COPY_OTC_EDGE_SIGNAL_VALID_SECONDS)),
-            "note": f"otc_edge_engine | direct_entry | pattern={item.get('pattern') or item.get('reason') or '-'}",
+            "preselected_pair_mode": single_pair_mode,
+            "watch_pair": pair if single_pair_mode else None,
+            "skip_asset_switch": single_pair_mode,
+            "note": f"otc_edge_engine | direct_entry | exact_expiry | preselected={single_pair_mode} | pattern={item.get('pattern') or item.get('reason') or '-'}",
         }
         result = await publish_copy_trading_signal(payload, source="otc_edge")
-        logger.info("Copy Trading OTC Edge sent | pair=%s | result=%s", pair, result)
+        logger.info("Copy Trading OTC Edge sent | pair=%s | expiry=%s | preselected=%s | result=%s", pair, expiry_timestamp, single_pair_mode, result)
         return result
     except Exception as e:
         logger.warning("OTC Edge Copy signal failed: %s", e)
@@ -8913,6 +8995,12 @@ _otc_edge_watcher_state = {
     "active_trade_until_ts": 0.0,
     "active_trade": None,
     "entry_window_skips": 0,
+    # v0.67 selected-pair pre-arm state.
+    "prepare_pending": False,
+    "prepared_pair": None,
+    "last_prepare_ts": 0.0,
+    "last_prepare_at": None,
+    "last_prepare_result": None,
 }
 
 
@@ -9523,6 +9611,11 @@ def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pai
             "active_trade_until_ts": 0.0,
             "active_trade": None,
             "entry_window_skips": 0,
+            "prepare_pending": bool(mode == "pairs" and len(pairs) == 1 and COPY_OTC_EDGE_PREPARE_ENABLED),
+            "prepared_pair": pairs[0] if mode == "pairs" and len(pairs) == 1 else None,
+            "last_prepare_ts": 0.0,
+            "last_prepare_at": None,
+            "last_prepare_result": None,
         })
         return build_otc_edge_watcher_status_message(prefix="✅ تم تشغيل مراقبة Edge.")
     except Exception as e:
@@ -9535,6 +9628,8 @@ def stop_otc_edge_watcher() -> str:
         was_enabled = bool(_otc_edge_watcher_state.get("enabled"))
         _otc_edge_watcher_state["enabled"] = False
         _otc_edge_watcher_state["last_error"] = None
+        _otc_edge_watcher_state["prepare_pending"] = False
+        _otc_edge_watcher_state["prepared_pair"] = None
         return "🛑 تم إيقاف مراقبة OTC Edge." if was_enabled else "مراقبة OTC Edge متوقفة أصلًا."
     except Exception as e:
         return f"تعذر إيقاف المراقبة: {e}"
@@ -9630,8 +9725,11 @@ def _otc_edge_active_trade_remaining(now_ts: float | None = None) -> int:
         until_ts = float(_otc_edge_watcher_state.get("active_trade_until_ts") or 0)
         remain = int(round(until_ts - now_ts))
         if remain <= 0:
+            had_active_trade = bool(_otc_edge_watcher_state.get("active_trade"))
             _otc_edge_watcher_state["active_trade_until_ts"] = 0.0
             _otc_edge_watcher_state["active_trade"] = None
+            if had_active_trade and COPY_OTC_EDGE_PREPARE_ENABLED and str(_otc_edge_watcher_state.get("mode") or "") == "pairs" and len(list(_otc_edge_watcher_state.get("pairs") or [])) == 1:
+                _otc_edge_watcher_state["prepare_pending"] = True
             return 0
         return remain
     except Exception:
@@ -9724,6 +9822,42 @@ def _otc_edge_collect_watcher_candidates() -> list[dict]:
         return []
 
 
+async def _otc_edge_maybe_publish_selected_pair_prepare() -> bool:
+    """Publish a pre-arm command and reserve one scan cycle so the extension is ready before a direct signal."""
+    try:
+        if not COPY_OTC_EDGE_PREPARE_ENABLED or not COPY_SEND_OTC_EDGE:
+            return False
+        if str(_otc_edge_watcher_state.get("mode") or "") != "pairs":
+            return False
+        pairs = list(_otc_edge_watcher_state.get("pairs") or [])
+        if len(pairs) != 1:
+            return False
+        if _otc_edge_active_trade_remaining(time_module.time()) > 0:
+            return False
+
+        now_ts = time_module.time()
+        last_ts = float(_otc_edge_watcher_state.get("last_prepare_ts") or 0)
+        stale = now_ts - last_ts >= max(60, int(COPY_OTC_EDGE_PREPARE_REFRESH_SECONDS))
+        if not bool(_otc_edge_watcher_state.get("prepare_pending")) and not stale:
+            return False
+
+        pair = pairs[0]
+        result = await publish_copy_otc_edge_prepare_signal(pair)
+        _otc_edge_watcher_state["last_prepare_result"] = result
+        _otc_edge_watcher_state["last_prepare_at"] = now_iso()
+        if bool((result or {}).get("ok")):
+            _otc_edge_watcher_state["last_prepare_ts"] = now_ts
+            _otc_edge_watcher_state["prepare_pending"] = False
+            _otc_edge_watcher_state["prepared_pair"] = pair
+            return True
+        _otc_edge_watcher_state["last_error"] = f"تعذر تجهيز الزوج مسبقًا: {(result or {}).get('error') or (result or {}).get('reason') or result}"
+        return False
+    except Exception as e:
+        _otc_edge_watcher_state["last_error"] = f"OTC Edge prepare error: {e}"
+        logger.exception("OTC Edge selected-pair prepare failed: %s", e)
+        return False
+
+
 def build_otc_edge_entry_alert_message(item: dict) -> str:
     try:
         timing = _otc_edge_current_candle_timing()
@@ -9801,7 +9935,14 @@ def build_otc_edge_watcher_status_message(prefix: str | None = None) -> str:
             f"🔒 القفل بعد التنبيه: حتى نهاية الصفقة الحالية",
             f"📨 تنبيهات مرسلة منذ التشغيل: {_otc_edge_watcher_state.get('alerts_sent', 0)}",
             f"📤 Copy OTC Edge: {'مفعل ✅' if COPY_SEND_OTC_EDGE else 'متوقف ⛔'} | صلاحية النسخ {max(10, int(COPY_OTC_EDGE_SIGNAL_VALID_SECONDS))}ث",
+            f"⚙️ تجهيز الزوج المحدد مسبقًا: {'مفعل ✅' if COPY_OTC_EDGE_PREPARE_ENABLED else 'متوقف ⛔'}",
         ])
+        if _otc_edge_watcher_state.get("prepared_pair"):
+            lines.append(f"🎯 الزوج المجهز: {_otc_edge_watcher_state.get('prepared_pair')}")
+        if _otc_edge_watcher_state.get("last_prepare_at"):
+            pr = _otc_edge_watcher_state.get("last_prepare_result") or {}
+            delivery = pr.get("delivery") if isinstance(pr, dict) else None
+            lines.append(f"آخر تجهيز مسبق: {format_dt_ar(_otc_edge_watcher_state.get('last_prepare_at'))} | delivered={(delivery or {}).get('delivered') if isinstance(delivery, dict) else None}")
         if _otc_edge_watcher_state.get("last_copy_result"):
             cr = _otc_edge_watcher_state.get("last_copy_result") or {}
             delivery = cr.get("delivery") if isinstance(cr, dict) else None
@@ -9850,6 +9991,10 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
         if not bool(_otc_edge_watcher_state.get("enabled")):
             return
         _otc_edge_watcher_state["last_scan_at"] = now_iso()
+
+        # v0.67: in one-pair mode, prepare the asset first and do not generate an entry in the same scan cycle.
+        if await _otc_edge_maybe_publish_selected_pair_prepare():
+            return
 
         candidates = _otc_edge_collect_watcher_candidates()
         if candidates:
@@ -17449,6 +17594,15 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         "instant_entry": bool(payload.get("instant_entry") or payload.get("immediate_entry") or False),
         "allow_background_entry": bool(payload.get("allow_background_entry") or False),
         "max_entry_delay_seconds": payload.get("max_entry_delay_seconds"),
+        # v0.67: exact Quotex expiry + selected-pair preparation controls.
+        "expiry_time": payload.get("expiry_time") or payload.get("trade_expiry_time"),
+        "expiry_timestamp": payload.get("expiry_timestamp") or payload.get("trade_expiry_timestamp"),
+        "trade_expiry_mode": payload.get("trade_expiry_mode"),
+        "signal_kind": payload.get("signal_kind"),
+        "prepare_only": bool(payload.get("prepare_only") or False),
+        "preselected_pair_mode": bool(payload.get("preselected_pair_mode") or False),
+        "watch_pair": payload.get("watch_pair"),
+        "skip_asset_switch": bool(payload.get("skip_asset_switch") or False),
     }
 
 
