@@ -962,8 +962,8 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 # اتركه false حتى تكون جاهزًا للتجربة، ثم فعّله من .env.
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
-BOT_RELEASE_VERSION = "v0.73"
-COPY_SERVER_VERSION = "0.73.0"
+BOT_RELEASE_VERSION = "v0.74"
+COPY_SERVER_VERSION = "0.74.0"
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.72").strip() or "v0.72"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
@@ -1000,13 +1000,38 @@ COPY_SIGNAL_ALLOWED_TELEGRAM_IDS = parse_id_set_from_env("COPY_SIGNAL_ALLOWED_TE
 COPY_SIGNAL_ALLOWED_TELEGRAM_IDS.add(int(ADMIN_TELEGRAM_ID))
 
 
-def is_copy_origin_allowed(origin: str | None) -> bool:
+def is_copy_origin_allowed(origin: str | None, *, authenticated: bool = False) -> bool:
+    """Validate browser origins without breaking Chrome extension WebSockets.
+
+    Chrome uses the installed extension id in the Origin header. An unpacked build
+    receives a different id from the Chrome Web Store build, so matching one fixed
+    id disconnects legitimate development/update packages. Authentication remains
+    the license token/device binding; Origin is an additional browser boundary.
+    """
     value = str(origin or "").strip().rstrip("/")
-    if not value:
-        return False
-    allowed = {str(x).strip().rstrip("/") for x in COPY_ALLOWED_ORIGINS if str(x).strip() and str(x).strip() != "*"}
+
+    # Some Chromium extension/service-worker versions send no Origin or ``null``.
+    # Accept that compatibility case only after the license has already passed.
+    if not value or value.lower() == "null":
+        return bool(authenticated and COPY_ALLOW_NULL_WEBSOCKET_ORIGIN)
+
+    allowed = {
+        str(x).strip().rstrip("/")
+        for x in COPY_ALLOWED_ORIGINS
+        if str(x).strip() and str(x).strip() != "*"
+    }
     if value in allowed:
         return True
+
+    # Store and unpacked Chrome extensions both use a 32-character a-p id.
+    match = re.fullmatch(r"chrome-extension://([a-p]{32})", value, flags=re.IGNORECASE)
+    if match:
+        extension_id = match.group(1).lower()
+        if extension_id in COPY_ALLOWED_EXTENSION_IDS:
+            return True
+        if authenticated and COPY_ALLOW_UNPACKED_EXTENSION_ORIGINS:
+            return True
+
     if COPY_ALLOWED_ORIGIN_REGEX:
         try:
             return bool(re.fullmatch(COPY_ALLOWED_ORIGIN_REGEX, value, flags=re.IGNORECASE))
@@ -1018,18 +1043,45 @@ def is_copy_origin_allowed(origin: str | None) -> bool:
 # ===== Embedded TRADING TIME COPY SERVER =====
 # يشغل Copy Server داخل نفس خدمة Render الخاصة بالبوت حتى لا تحتاج Web Service ثاني.
 COPY_EMBEDDED_SERVER_ENABLED = os.getenv("COPY_EMBEDDED_SERVER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-# Restrict browser HTTP access to the published extension and Quotex domains by default.
-# Extra development origins can still be supplied explicitly through Render env.
-COPY_ALLOWED_ORIGINS = [
-    x.strip() for x in os.getenv(
-        "COPY_ALLOWED_ORIGINS",
-        "chrome-extension://akmgmickemnpecjoooponaijmihmlcmm,https://qxbroker.com,https://www.qxbroker.com,https://quotex.com,https://www.quotex.com",
-    ).split(",") if x.strip()
+# Restrict normal web origins while keeping Chrome Web Store and unpacked builds
+# compatible. A legacy Render value COPY_ALLOWED_ORIGINS=* is intentionally not
+# treated as "open to every site"; safe defaults are retained instead.
+_COPY_DEFAULT_ALLOWED_ORIGINS = [
+    "chrome-extension://akmgmickemnpecjoooponaijmihmlcmm",
+    "https://qxbroker.com",
+    "https://www.qxbroker.com",
+    "https://quotex.com",
+    "https://www.quotex.com",
 ]
-COPY_ALLOWED_ORIGIN_REGEX = os.getenv(
-    "COPY_ALLOWED_ORIGIN_REGEX",
-    r"^https://([a-z0-9-]+\.)?(qxbroker\.com|quotex\.com)$",
-).strip() or None
+_COPY_ALLOWED_ORIGINS_ENV = [
+    x.strip().rstrip("/")
+    for x in os.getenv("COPY_ALLOWED_ORIGINS", "").split(",")
+    if x.strip() and x.strip() != "*"
+]
+COPY_ALLOWED_ORIGINS = list(dict.fromkeys(_COPY_DEFAULT_ALLOWED_ORIGINS + _COPY_ALLOWED_ORIGINS_ENV))
+COPY_ALLOWED_EXTENSION_IDS = {
+    x.strip().lower()
+    for x in os.getenv("COPY_ALLOWED_EXTENSION_IDS", "akmgmickemnpecjoooponaijmihmlcmm").split(",")
+    if re.fullmatch(r"[a-p]{32}", x.strip(), flags=re.IGNORECASE)
+}
+# Keep this enabled so a locally loaded v0.72 package can connect even though
+# Chrome assigns it an id different from the Web Store id. A valid license is
+# still required before such an origin is accepted.
+COPY_ALLOW_UNPACKED_EXTENSION_ORIGINS = os.getenv(
+    "COPY_ALLOW_UNPACKED_EXTENSION_ORIGINS", "true"
+).lower() in {"1", "true", "yes", "on"}
+COPY_ALLOW_NULL_WEBSOCKET_ORIGIN = os.getenv(
+    "COPY_ALLOW_NULL_WEBSOCKET_ORIGIN", "true"
+).lower() in {"1", "true", "yes", "on"}
+_COPY_CUSTOM_ALLOWED_ORIGIN_REGEX = os.getenv("COPY_ALLOWED_ORIGIN_REGEX", "").strip()
+_COPY_SAFE_ALLOWED_ORIGIN_REGEX = (
+    r"(?:chrome-extension://[a-p]{32}|https://(?:[a-z0-9-]+\.)?(?:qxbroker\.com|quotex\.com))"
+)
+COPY_ALLOWED_ORIGIN_REGEX = (
+    rf"^(?:{_COPY_SAFE_ALLOWED_ORIGIN_REGEX}|(?:{_COPY_CUSTOM_ALLOWED_ORIGIN_REGEX}))$"
+    if _COPY_CUSTOM_ALLOWED_ORIGIN_REGEX
+    else rf"^{_COPY_SAFE_ALLOWED_ORIGIN_REGEX}$"
+)
 # Legacy environment licenses are opt-in only; there is no built-in demo code.
 COPY_LICENSES = os.getenv("COPY_LICENSES", "").strip()
 COPY_LICENSE_DEFAULT_MAX_DEVICES = int(os.getenv("COPY_LICENSE_DEFAULT_MAX_DEVICES", "1"))
@@ -18151,16 +18203,25 @@ def create_embedded_copy_api():
     @copy_api.websocket("/ws/extension")
     async def copy_extension_ws(websocket: WebSocket, token: str = Query(...), device_id: str = Query(default="unknown"), telegram_user_id: str = Query(default="")):
         await websocket.accept()
-        origin = websocket.headers.get("origin")
-        if not is_copy_origin_allowed(origin):
-            logger.warning("Rejected COPY WebSocket origin: %r", origin)
-            await websocket.close(code=4403, reason="origin not allowed")
-            return
         token = normalize_copy_license_token(token)
         telegram_user_id = normalize_copy_telegram_user_id(telegram_user_id)
-        ok, reason, license_record = copy_validate_license_for_device(token, device_id, telegram_user_id=telegram_user_id, touch=True)
+        ok, reason, license_record = copy_validate_license_for_device(
+            token, device_id, telegram_user_id=telegram_user_id, touch=True
+        )
         if not ok:
             await websocket.close(code=4401, reason=reason)
+            return
+
+        # Check Origin only after authentication. This keeps the boundary useful
+        # against arbitrary websites while allowing the Web Store build, locally
+        # loaded packages and Chromium's occasional null Origin behaviour.
+        origin = websocket.headers.get("origin")
+        if not is_copy_origin_allowed(origin, authenticated=True):
+            logger.warning(
+                "Rejected authenticated COPY WebSocket origin | origin=%r | device=%s | telegram_user_id=%s",
+                origin, device_id, telegram_user_id or "-"
+            )
+            await websocket.close(code=4403, reason="origin not allowed")
             return
 
         client_id = hashlib.sha256(f"{token}:{device_id}:{telegram_user_id}:{time_module.time()}".encode("utf-8")).hexdigest()[:16]
