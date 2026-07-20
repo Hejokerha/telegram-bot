@@ -178,11 +178,8 @@ CHANNEL_OTC_PAIRS = [
 CHANNEL_DAILY_SIGNAL_COUNT = 35
 CHANNEL_SIGNAL_INTERVAL_MINUTES = 3
 
-# ===== Auto publishing hard switch =====
-# بناءً على طلب الأدمن: لا يوجد أي نشر تلقائي على أي قناة.
-# التوليد اليدوي داخل البوت يبقى كما هو.
-AUTO_PUBLISHING_DISABLED = True
-
+# Auto-publishing is controlled only by each feature's own explicit setting.
+# The removed OTC Live/global channels remain disabled by their dedicated flags.
 
 # ===== Quotex OTC live websocket settings =====
 # ضع ملف cookies.txt بجانب main.py. الملف يجب أن يحتوي cookies جلسة Quotex بسطر واحد.
@@ -439,7 +436,7 @@ if not firebase_admin._apps:
 main_keyboard = ReplyKeyboardMarkup(
     [
         ["📊 توليد إشارات"],
-        ["🧠 غرفة جلسة تداول"],
+        ["🧠 غرفة جلسة تداول", "⚡ OTC Edge"],
         ["👤 حالة حسابي", "🎥 مشاهدة فيديو شرح البوت"],
         ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
     ],
@@ -490,6 +487,26 @@ admin_otc_edge_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# v0.71: public users can choose all-market monitoring or one pre-armed pair.
+# Administrative scans/reports/diagnostics remain hidden.
+otc_edge_user_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🚀 مراقبة كل السوق", "🎯 مراقبة زوج محدد"],
+        ["📋 حالة OTC Edge", "🛑 إيقاف OTC Edge"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+otc_edge_user_keyboard_en = ReplyKeyboardMarkup(
+    [
+        ["🚀 Monitor All OTC", "🎯 Monitor Specific Pair"],
+        ["📋 OTC Edge Status", "🛑 Stop OTC Edge"],
+        ["🔙 Back"],
+    ],
+    resize_keyboard=True
+)
+
 three_candle_admin_keyboard = ReplyKeyboardMarkup(
     [
         ["🟢 تشغيل نشر القناة", "🔴 إيقاف نشر القناة"],
@@ -518,6 +535,7 @@ copy_admin_keyboard = ReplyKeyboardMarkup(
 otc_list_manager_keyboard = ReplyKeyboardMarkup(
     [
         ["📊 توليد إشارات"],
+        ["🧠 غرفة جلسة تداول", "⚡ OTC Edge"],
         ["👤 حالة حسابي", "🎥 مشاهدة فيديو شرح البوت"],
         ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
@@ -684,7 +702,7 @@ language_keyboard = ReplyKeyboardMarkup(
 main_keyboard_en = ReplyKeyboardMarkup(
     [
         ["📊 Generate Signals"],
-        ["🧠 Trading Session Room"],
+        ["🧠 Trading Session Room", "⚡ OTC Edge"],
         ["👤 My Account", "🎥 Watch Bot Tutorial"],
         ["📞 Contact Support", "🌐 Change Language"],
     ],
@@ -936,12 +954,7 @@ FIREBASE_FULL_LIST_CACHE_TTL_SECONDS = int(os.getenv("FIREBASE_FULL_LIST_CACHE_T
 FIREBASE_BOT_SETTINGS_TTL_SECONDS = int(os.getenv("FIREBASE_BOT_SETTINGS_TTL_SECONDS", "60"))
 SAVE_USER_LAST_SEEN_THROTTLE_SECONDS = int(os.getenv("SAVE_USER_LAST_SEEN_THROTTLE_SECONDS", "300"))
 
-# ===== Signal usage limits =====
-# هذه الحدود تطبق على توليد الإشارات اليدوي فقط، ولا علاقة لها بأي نشر تلقائي.
-FREE_TRIAL_SIGNAL_TOTAL_LIMIT = int(os.getenv("FREE_TRIAL_SIGNAL_TOTAL_LIMIT", "10"))
-WEEKLY_SIGNAL_DAILY_LIMIT = int(os.getenv("WEEKLY_SIGNAL_DAILY_LIMIT", "30"))
-MONTHLY_SIGNAL_DAILY_LIMIT = int(os.getenv("MONTHLY_SIGNAL_DAILY_LIMIT", "50"))
-SIGNAL_USAGE_COOLDOWN_SECONDS = int(os.getenv("SIGNAL_USAGE_COOLDOWN_SECONDS", "3"))
+# Signal generation limits were permanently removed by the owner.
 ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_SECONDS", "300"))
 
 # ===== TRADING TIME COPY =====
@@ -949,7 +962,19 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 # اتركه false حتى تكون جاهزًا للتجربة، ثم فعّله من .env.
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
-COPY_SERVER_SECRET = os.getenv("COPY_SERVER_SECRET", "change-me-now")
+BOT_RELEASE_VERSION = "v0.73"
+COPY_SERVER_VERSION = "0.73.0"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.72").strip() or "v0.72"
+# No public/default secret is kept in source. If Render does not provide one,
+# derive a stable private internal secret from the already-secret Telegram token.
+_COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
+_COPY_SERVER_SECRET_SEED = BOT_TOKEN or os.urandom(32).hex()
+COPY_SERVER_SECRET = _COPY_SERVER_SECRET_ENV or hashlib.sha256(
+    f"TRADING_TIME_COPY|{_COPY_SERVER_SECRET_SEED}|{DATABASE_URL}".encode("utf-8")
+).hexdigest()
+COPY_SERVER_SECRET_SOURCE = (
+    "env" if _COPY_SERVER_SECRET_ENV else ("derived_from_bot_token" if BOT_TOKEN else "ephemeral_random")
+)
 COPY_SIGNAL_VALIDITY_SECONDS = int(os.getenv("COPY_SIGNAL_VALIDITY_SECONDS", "25"))
 COPY_REQUEST_TIMEOUT_SECONDS = int(os.getenv("COPY_REQUEST_TIMEOUT_SECONDS", "6"))
 COPY_SEND_OTC_LIVE_NOW = os.getenv("COPY_SEND_OTC_LIVE_NOW", "true").lower() in {"1", "true", "yes", "on"}
@@ -974,11 +999,39 @@ COPY_USER_SIGNALS_ADMIN_ONLY = os.getenv("COPY_USER_SIGNALS_ADMIN_ONLY", "false"
 COPY_SIGNAL_ALLOWED_TELEGRAM_IDS = parse_id_set_from_env("COPY_SIGNAL_ALLOWED_TELEGRAM_IDS")
 COPY_SIGNAL_ALLOWED_TELEGRAM_IDS.add(int(ADMIN_TELEGRAM_ID))
 
+
+def is_copy_origin_allowed(origin: str | None) -> bool:
+    value = str(origin or "").strip().rstrip("/")
+    if not value:
+        return False
+    allowed = {str(x).strip().rstrip("/") for x in COPY_ALLOWED_ORIGINS if str(x).strip() and str(x).strip() != "*"}
+    if value in allowed:
+        return True
+    if COPY_ALLOWED_ORIGIN_REGEX:
+        try:
+            return bool(re.fullmatch(COPY_ALLOWED_ORIGIN_REGEX, value, flags=re.IGNORECASE))
+        except re.error as exc:
+            logger.error("Invalid COPY_ALLOWED_ORIGIN_REGEX: %s", exc)
+    return False
+
+
 # ===== Embedded TRADING TIME COPY SERVER =====
 # يشغل Copy Server داخل نفس خدمة Render الخاصة بالبوت حتى لا تحتاج Web Service ثاني.
 COPY_EMBEDDED_SERVER_ENABLED = os.getenv("COPY_EMBEDDED_SERVER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
-COPY_ALLOWED_ORIGINS = [x.strip() for x in os.getenv("COPY_ALLOWED_ORIGINS", "*").split(",") if x.strip()]
-COPY_LICENSES = os.getenv("COPY_LICENSES", "DEMO-111:active")
+# Restrict browser HTTP access to the published extension and Quotex domains by default.
+# Extra development origins can still be supplied explicitly through Render env.
+COPY_ALLOWED_ORIGINS = [
+    x.strip() for x in os.getenv(
+        "COPY_ALLOWED_ORIGINS",
+        "chrome-extension://akmgmickemnpecjoooponaijmihmlcmm,https://qxbroker.com,https://www.qxbroker.com,https://quotex.com,https://www.quotex.com",
+    ).split(",") if x.strip()
+]
+COPY_ALLOWED_ORIGIN_REGEX = os.getenv(
+    "COPY_ALLOWED_ORIGIN_REGEX",
+    r"^https://([a-z0-9-]+\.)?(qxbroker\.com|quotex\.com)$",
+).strip() or None
+# Legacy environment licenses are opt-in only; there is no built-in demo code.
+COPY_LICENSES = os.getenv("COPY_LICENSES", "").strip()
 COPY_LICENSE_DEFAULT_MAX_DEVICES = int(os.getenv("COPY_LICENSE_DEFAULT_MAX_DEVICES", "1"))
 COPY_LICENSE_DEVICE_TOUCH_SECONDS = int(os.getenv("COPY_LICENSE_DEVICE_TOUCH_SECONDS", "600"))
 COPY_SETTINGS_CACHE_TTL_SECONDS = int(os.getenv("COPY_SETTINGS_CACHE_TTL_SECONDS", "60"))
@@ -1008,7 +1061,7 @@ def _cache_set(key: str, value):
     try:
         _firebase_cache[key] = (time_module.time(), value)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 1063", exc_info=True)
     return value
 
 
@@ -1018,7 +1071,7 @@ def _cache_delete_prefix(prefix: str):
             if str(key).startswith(prefix):
                 _firebase_cache.pop(key, None)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 1073", exc_info=True)
 
 
 def clear_user_cache(user_id: int):
@@ -1032,7 +1085,7 @@ def clear_user_cache(user_id: int):
         _cache_delete_prefix(f"video_trial:{uid}")
         _cache_delete_prefix(f"last_seen_write:{uid}")
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 1087", exc_info=True)
 
 
 def clear_users_list_cache():
@@ -1089,7 +1142,7 @@ def _diag_add(store: dict, op: str, path: str, size: int = 0):
         item["count"] += 1
         item["bytes"] += int(size or 0)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 1144", exc_info=True)
 
 
 def install_firebase_diagnostics():
@@ -1168,7 +1221,7 @@ def _http_stat_add(method: str, url: str, response_size: int = 0):
         item["count"] += 1
         item["bytes"] += int(response_size or 0)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 1223", exc_info=True)
 
 
 def install_firebase_http_diagnostics():
@@ -1191,10 +1244,10 @@ def install_firebase_http_diagnostics():
                         content = getattr(response, "content", b"") or b""
                         size = len(content)
                     except Exception:
-                        pass
+                        logger.debug("Suppressed exception at line 1246", exc_info=True)
                     _http_stat_add(method, url, size)
             except Exception:
-                pass
+                logger.debug("Suppressed exception at line 1249", exc_info=True)
 
             return response
 
@@ -1229,7 +1282,7 @@ def _urllib3_stat_add(method: str, url: str, response_size: int = 0):
         item["count"] += 1
         item["bytes"] += int(response_size or 0)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 1284", exc_info=True)
 
 
 def install_firebase_urllib3_diagnostics():
@@ -1256,7 +1309,7 @@ def install_firebase_urllib3_diagnostics():
                         if data is not None:
                             size = len(data)
                     except Exception:
-                        pass
+                        logger.debug("Suppressed exception at line 1311", exc_info=True)
 
                     if not size:
                         try:
@@ -1264,11 +1317,11 @@ def install_firebase_urllib3_diagnostics():
                             if cl:
                                 size = int(cl)
                         except Exception:
-                            pass
+                            logger.debug("Suppressed exception at line 1319", exc_info=True)
 
                     _urllib3_stat_add(method, full_url, size)
             except Exception:
-                pass
+                logger.debug("Suppressed exception at line 1323", exc_info=True)
 
             return response
 
@@ -1430,44 +1483,37 @@ def otc_list_jobs_ref(user_id: int):
 
 
 def get_otc_feed_diagnostics_for_pair(pair_text: str) -> str:
-    """Safe diagnostics message for OTC pair feed status."""
+    """Diagnostics from the current QuotexOTCLiveFeed cache."""
     try:
-        symbol = normalize_otc_pair_input(pair_text)
-        ticks = OTC_TICKS_CACHE.get(symbol, []) if "OTC_TICKS_CACHE" in globals() else []
-        candles = OTC_CANDLES_CACHE.get(symbol, []) if "OTC_CANDLES_CACHE" in globals() else []
-
-        last_tick = ticks[-1] if ticks else None
-        last_candle = candles[-1] if candles else None
-
-        lines = [
-            "فحص بيانات زوج OTC",
-            "",
-            f"الزوج: {pair_text}",
-            f"الرمز: {symbol}",
-            "",
-            f"عدد ticks بالكاش: {len(ticks)}",
-            f"عدد الشموع بالكاش: {len(candles)}",
-        ]
-
+        pair, symbol = _otc_edge_resolve_pair_text(pair_text) if "_otc_edge_resolve_pair_text" in globals() else (None, None)
+        symbol = symbol or get_otc_symbol_for_pair(pair_text) if "get_otc_symbol_for_pair" in globals() else symbol
+        symbol = symbol or normalize_otc_pair_input(pair_text)
+        rows, last_tick, candles = _get_otc_rows_and_candles(symbol) if "_get_otc_rows_and_candles" in globals() else ([], {}, [])
+        connected = bool(getattr(quotex_otc_feed, "connected", False)) if "quotex_otc_feed" in globals() else False
+        started = bool(getattr(quotex_otc_feed, "started", False)) if "quotex_otc_feed" in globals() else False
+        age = None
         if isinstance(last_tick, dict):
-            lines.append(f"آخر tick: {last_tick}")
-        elif last_tick is not None:
-            lines.append(f"آخر tick: {last_tick}")
-        else:
-            lines.append("آخر tick: لا يوجد")
-
-        if isinstance(last_candle, dict):
-            lines.append(f"آخر شمعة: {last_candle}")
-        elif last_candle is not None:
-            lines.append(f"آخر شمعة: {last_candle}")
-        else:
-            lines.append("آخر شمعة: لا يوجد")
-
-        return "\n".join(lines)
-    except Exception as e:
-        return f"تعذر فحص بيانات الزوج: {e}"
-
-
+            ts = float(last_tick.get("time") or last_tick.get("ts") or last_tick.get("timestamp") or 0)
+            if ts > 1e12:
+                ts /= 1000.0
+            if ts > 0:
+                age = max(0.0, time_module.time() - ts)
+        last_candle = candles[-1] if candles else None
+        lines = [
+            "فحص بيانات زوج OTC", "",
+            f"الزوج: {pair or pair_text}",
+            f"الرمز: {symbol}",
+            f"WebSocket: {'متصل ✅' if connected else 'غير متصل ❌'} | started={started}", "",
+            f"عدد ticks بالكاش الحي: {len(rows)}",
+            f"عدد الشموع بالكاش الحي: {len(candles)}",
+            f"عمر آخر tick: {f'{age:.1f} ثانية' if age is not None else 'لا يوجد'}",
+            f"آخر tick: {last_tick or 'لا يوجد'}",
+            f"آخر شمعة: {last_candle or 'لا يوجد'}",
+        ]
+        return "\n".join(lines)[:3900]
+    except Exception as exc:
+        logger.exception("OTC feed diagnostics failed for %s: %s", pair_text, exc)
+        return f"تعذر فحص بيانات الزوج: {exc}"
 
 
 # ===== 24h Firebase usage monitor =====
@@ -1508,7 +1554,7 @@ def _fb24_add(store: dict, op: str, path: str, size: int = 0):
         item["count"] += 1
         item["bytes"] += int(size or 0)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 1556", exc_info=True)
 
 
 def install_firebase_24h_monitor():
@@ -1647,7 +1693,7 @@ def reset_firebase_24h_stats():
         _firebase_24h_write_stats.clear()
         _firebase_24h_started_at = now_iso()
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 1695", exc_info=True)
 
 
 async def send_firebase_24h_report_job(context: ContextTypes.DEFAULT_TYPE):
@@ -1774,8 +1820,9 @@ def get_copy_settings() -> dict:
         return cached
 
     default = {
-        "global_enabled": True,
-        "latest_version": "v0.42",
+        # Fail closed: a Firebase outage must not silently enable copying.
+        "global_enabled": False,
+        "latest_version": COPY_EXTENSION_VERSION,
         "update_notice": "",
         "updated_at": None,
     }
@@ -1784,7 +1831,9 @@ def get_copy_settings() -> dict:
         if not isinstance(data, dict):
             data = {}
         result = {**default, **data}
-        result["global_enabled"] = bool(result.get("global_enabled", True))
+        result["global_enabled"] = bool(result.get("global_enabled", False))
+        # Never expose a stale version left in Firebase by an older release.
+        result["latest_version"] = COPY_EXTENSION_VERSION
         return _cache_set("copy_trading:settings", result)
     except Exception as e:
         logger.warning("Could not read copy settings: %s", e)
@@ -1796,7 +1845,7 @@ def clear_copy_settings_cache():
 
 
 def is_copy_global_enabled() -> bool:
-    return bool(get_copy_settings().get("global_enabled", True))
+    return bool(get_copy_settings().get("global_enabled", False))
 
 
 def set_copy_global_enabled(enabled: bool, admin_id: int | None = None) -> bool:
@@ -1818,7 +1867,7 @@ def set_copy_update_notice(message: str, admin_id: int | None = None) -> bool:
         text = str(message or "").strip()[:600]
         copy_settings_ref().update({
             "update_notice": text,
-            "latest_version": "v0.42",
+            "latest_version": COPY_EXTENSION_VERSION,
             "updated_at": now_iso(),
             "updated_by": int(admin_id) if admin_id else None,
         })
@@ -1832,8 +1881,8 @@ def set_copy_update_notice(message: str, admin_id: int | None = None) -> bool:
 def copy_public_settings_payload() -> dict:
     settings = get_copy_settings()
     return {
-        "global_enabled": bool(settings.get("global_enabled", True)),
-        "latest_version": settings.get("latest_version") or "v0.42",
+        "global_enabled": bool(settings.get("global_enabled", False)),
+        "latest_version": settings.get("latest_version") or COPY_EXTENSION_VERSION,
         "update_notice": settings.get("update_notice") or "",
         "updated_at": settings.get("updated_at"),
     }
@@ -1897,7 +1946,7 @@ def copy_license_is_expired(expires_at) -> bool:
 def copy_license_env_records() -> dict:
     # Backward-compatible static licenses from Render env.
     result = {}
-    raw = str(COPY_LICENSES or "DEMO-111:active")
+    raw = str(COPY_LICENSES or "")
     for part in raw.replace(";", ",").split(","):
         part = part.strip()
         if not part:
@@ -1912,7 +1961,7 @@ def copy_license_env_records() -> dict:
                 "plan": "env",
                 "source": "env",
                 "expires_at": "forever",
-                "max_devices": 999,
+                "max_devices": max(1, int(COPY_LICENSE_DEFAULT_MAX_DEVICES or 1)),
                 "devices": {},
                 "created_at": None,
             }
@@ -2000,7 +2049,7 @@ def reset_copy_license_devices(token: str) -> bool:
             if str(key).startswith(prefix):
                 _copy_license_touch_cache.pop(key, None)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 2051", exc_info=True)
     return True
 
 
@@ -2021,7 +2070,7 @@ def delete_copy_license(token: str) -> bool:
                 if str(key).startswith(prefix):
                     _copy_license_touch_cache.pop(key, None)
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 2072", exc_info=True)
         return True
     except Exception as e:
         logger.warning("Could not delete copy license %s: %s", token, e)
@@ -2206,69 +2255,100 @@ def normalize_copy_telegram_user_id(value) -> str:
 
 
 def copy_validate_license_for_device(token: str, device_id: str = "unknown", telegram_user_id=None, touch: bool = True) -> tuple[bool, str, dict | None]:
+    """Validate and atomically bind a Firebase license to Telegram/device.
+
+    New-device capacity and first Telegram binding are decided inside one Firebase
+    transaction, preventing two simultaneous connections from both passing a
+    max_devices=1 check.
+    """
     token = normalize_copy_license_token(token)
     device_id = str(device_id or "unknown").strip()[:120] or "unknown"
     telegram_user_id = normalize_copy_telegram_user_id(telegram_user_id)
-    record = get_copy_license_record(token)
-    if not record:
+    if not token:
         return False, "invalid license", None
-    if str(record.get("status") or "").lower() != "active":
-        return False, "inactive license", record
-    if copy_license_is_expired(record.get("expires_at")):
-        # Mark Firebase records as expired for easier admin visibility.
-        try:
-            if record.get("source") != "env":
-                copy_licenses_ref().child(copy_license_key(token)).update({"status": "expired", "expired_at": now_iso()})
-        except Exception:
-            pass
-        return False, "expired license", record
 
-    if record.get("source") == "env":
+    # Explicit legacy env licenses remain read-only and opt-in.
+    env_record = copy_license_env_records().get(token)
+    if env_record is not None:
+        if str(env_record.get("status") or "").lower() != "active":
+            return False, "inactive license", env_record
+        if copy_license_is_expired(env_record.get("expires_at")):
+            return False, "expired license", env_record
         if telegram_user_id:
-            try:
-                record["telegram_user_id"] = telegram_user_id
-            except Exception:
-                pass
-        return True, "ok", record
+            env_record["telegram_user_id"] = telegram_user_id
+        return True, "ok", env_record
 
-    existing_telegram_id = normalize_copy_telegram_user_id(record.get("telegram_user_id") or record.get("owner_telegram_id"))
-    if existing_telegram_id and telegram_user_id and existing_telegram_id != telegram_user_id:
-        return False, "license linked to another Telegram ID", record
-
-    devices = record.get("devices") if isinstance(record.get("devices"), dict) else {}
-    max_devices = max(1, int(record.get("max_devices") or COPY_LICENSE_DEFAULT_MAX_DEVICES or 1))
+    license_ref = copy_licenses_ref().child(copy_license_key(token))
+    decision = {"ok": False, "reason": "invalid license", "record": None}
     device_key = safe_key(device_id)
+    now_value = now_iso()
+    now_ts = time_module.time()
+    touch_key = f"{token}:{device_key}"
+    last_touch = float(_copy_license_touch_cache.get(touch_key, 0) or 0)
 
-    if device_key not in devices and len(devices) >= max_devices:
-        return False, "device limit reached", record
+    def _transaction(current):
+        if not isinstance(current, dict):
+            decision.update(ok=False, reason="invalid license", record=current)
+            return current
+        record = dict(current)
+        decision["record"] = record
+        if str(record.get("status") or "").lower() != "active":
+            decision.update(ok=False, reason="inactive license")
+            return current
+        if copy_license_is_expired(record.get("expires_at")):
+            record["status"] = "expired"
+            record["expired_at"] = now_value
+            decision.update(ok=False, reason="expired license", record=record)
+            return record
 
-    try:
-        updates = {}
-        now_ts = time_module.time()
-        now_value = now_iso()
-        touch_key = f"{token}:{device_key}"
-        last_touch = float(_copy_license_touch_cache.get(touch_key, 0) or 0)
-        if telegram_user_id and not existing_telegram_id:
-            updates["telegram_user_id"] = telegram_user_id
-            updates["telegram_linked_at"] = now_value
+        existing_tid = normalize_copy_telegram_user_id(record.get("telegram_user_id") or record.get("owner_telegram_id"))
+        if existing_tid and telegram_user_id and existing_tid != telegram_user_id:
+            decision.update(ok=False, reason="license linked to another Telegram ID")
+            return current
+
+        devices = record.get("devices") if isinstance(record.get("devices"), dict) else {}
+        devices = dict(devices)
+        max_devices = max(1, int(record.get("max_devices") or COPY_LICENSE_DEFAULT_MAX_DEVICES or 1))
+        if device_key not in devices and len(devices) >= max_devices:
+            decision.update(ok=False, reason="device limit reached")
+            return current
+
+        changed = False
+        if telegram_user_id and not existing_tid:
+            record["telegram_user_id"] = telegram_user_id
+            record["telegram_linked_at"] = now_value
+            changed = True
         if device_key not in devices:
-            updates["last_seen_at"] = now_value
-            updates[f"devices/{device_key}"] = {
+            devices[device_key] = {
                 "device_id": device_id,
                 "bound_at": now_value,
                 "last_seen_at": now_value,
             }
-            _copy_license_touch_cache[touch_key] = now_ts
+            changed = True
         elif touch and now_ts - last_touch >= int(COPY_LICENSE_DEVICE_TOUCH_SECONDS):
-            updates["last_seen_at"] = now_value
-            updates[f"devices/{device_key}/last_seen_at"] = now_value
-            _copy_license_touch_cache[touch_key] = now_ts
-        if updates:
-            copy_licenses_ref().child(copy_license_key(token)).update(updates)
-    except Exception as e:
-        logger.warning("Could not update copy license device binding: %s", e)
+            device_row = dict(devices.get(device_key) or {})
+            device_row["last_seen_at"] = now_value
+            devices[device_key] = device_row
+            changed = True
+        if changed:
+            record["devices"] = devices
+            record["last_seen_at"] = now_value
+        decision.update(ok=True, reason="ok", record=record)
+        return record
 
-    return True, "ok", record
+    try:
+        final_record = license_ref.transaction(_transaction)
+        if isinstance(final_record, dict):
+            final_record = dict(final_record)
+            final_record["token"] = normalize_copy_license_token(final_record.get("token") or token)
+            final_record["source"] = final_record.get("source") or "firebase"
+            decision["record"] = final_record
+        if decision.get("ok"):
+            _copy_license_touch_cache[touch_key] = now_ts
+        return bool(decision.get("ok")), str(decision.get("reason") or "invalid license"), decision.get("record")
+    except Exception as exc:
+        logger.exception("Atomic copy license binding failed for %s: %s", token, exc)
+        return False, "license service unavailable", decision.get("record")
 
 
 def build_copy_status_message() -> str:
@@ -2292,9 +2372,9 @@ def build_copy_status_message() -> str:
             active += 1
 
     settings = get_copy_settings()
-    enabled = bool(settings.get("global_enabled", True))
+    enabled = bool(settings.get("global_enabled", False))
     update_notice = str(settings.get("update_notice") or "").strip()
-    latest_version = settings.get("latest_version") or "v0.42"
+    latest_version = settings.get("latest_version") or COPY_EXTENSION_VERSION
 
     lines = [
         "📡 حالة Copy Trading",
@@ -2345,7 +2425,7 @@ def request_json_with_retries(url: str, *, params=None, headers=None, timeout: i
                 import time as _time
                 _time.sleep(delay)
             except Exception:
-                pass
+                logger.debug("Suppressed exception at line 2427", exc_info=True)
 
     return None, last_error or "تعذر جلب البيانات"
 
@@ -2378,7 +2458,7 @@ async def safe_send_message(bot, *, chat_id, text: str, parse_mode: str | None =
                     try:
                         await asyncio.sleep(1.5)
                     except Exception:
-                        pass
+                        logger.debug("Suppressed exception at line 2460", exc_info=True)
                     continue
                 return None
 
@@ -2430,7 +2510,7 @@ def _copy_duration_seconds(signal: dict) -> int:
         if tf.startswith("M") and tf[1:].isdigit():
             return max(5, int(tf[1:]) * 60)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 2512", exc_info=True)
     return 60
 
 
@@ -2622,7 +2702,7 @@ def _copy_direction_from_signal_line(line: str) -> str:
         if "PUT" in raw or "هابط" in raw or "SELL" in raw:
             return "PUT"
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 2704", exc_info=True)
     return ""
 
 
@@ -2632,7 +2712,7 @@ def _copy_pair_from_signal_line(line: str, fallback_pair: str) -> str:
         if parts and str(parts[0]).strip():
             return str(parts[0]).strip()
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 2714", exc_info=True)
     return str(fallback_pair or "").strip()
 
 
@@ -2733,11 +2813,19 @@ async def publish_copy_three_candle_signal(trade: dict) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-async def publish_copy_otc_edge_prepare_signal(pair: str) -> dict:
-    """Pre-select a single watched OTC Edge pair inside connected extensions without opening a trade."""
+async def publish_copy_otc_edge_prepare_signal(pair: str, target_user_id: int | None = None, state: dict | None = None) -> dict:
+    """Pre-select one watched pair only in the extension linked to the watcher owner."""
     if not COPY_SEND_OTC_EDGE or not COPY_OTC_EDGE_PREPARE_ENABLED:
         return {"ok": False, "skipped": True, "reason": "OTC Edge prepare disabled"}
     try:
+        state = state if isinstance(state, dict) else None
+        target_uid = normalize_copy_telegram_user_id(
+            target_user_id
+            or ((state or {}).get("owner_user_id"))
+            or ((state or {}).get("started_by"))
+            or ((state or {}).get("chat_id"))
+            or ADMIN_TELEGRAM_ID
+        )
         resolved_pair, symbol = _otc_edge_resolve_pair_text(pair) if "_otc_edge_resolve_pair_text" in globals() else (pair, get_otc_symbol_for_pair(pair))
         resolved_pair = str(resolved_pair or pair or "").strip()
         symbol = symbol or get_otc_symbol_for_pair(resolved_pair)
@@ -2752,14 +2840,14 @@ async def publish_copy_otc_edge_prepare_signal(pair: str) -> dict:
         else:
             expiry_dt = datetime.fromtimestamp(((int(now_dt.timestamp()) // 60) + 1) * 60, tz=UTC)
 
+        user_key = safe_key(str(target_uid or "admin"))
         payload = {
             "ok": True,
-            "id": f"edge_prepare_{safe_key(resolved_pair)}_{int(now_dt.timestamp()) // max(30, int(COPY_OTC_EDGE_PREPARE_REFRESH_SECONDS))}",
+            "id": f"edge_prepare_{user_key}_{safe_key(resolved_pair)}_{int(now_dt.timestamp()) // max(30, int(COPY_OTC_EDGE_PREPARE_REFRESH_SECONDS))}",
             "pair": resolved_pair,
             "pair_display": resolved_pair,
             "symbol": symbol,
             "platform_symbol": symbol,
-            # Copy Server currently validates a direction on every signal. prepare_only prevents any order.
             "direction": "CALL",
             "timeframe": "M1",
             "duration_seconds": 60,
@@ -2778,22 +2866,34 @@ async def publish_copy_otc_edge_prepare_signal(pair: str) -> dict:
             "watch_pair": resolved_pair,
             "skip_asset_switch": False,
             "allow_background_entry": True,
-            "note": "otc_edge_engine | prepare_selected_pair",
+            "creator_user_id": target_uid,
+            "target_user_id": target_uid,
+            "note": "otc_edge_engine | public_user_prepare | targeted",
         }
         result = await publish_copy_trading_signal(payload, source="otc_edge")
-        logger.info("Copy Trading OTC Edge prepare sent | pair=%s | result=%s", resolved_pair, result)
+        logger.info("Copy Trading OTC Edge prepare sent | user=%s | pair=%s | result=%s", target_uid, resolved_pair, result)
         return result
     except Exception as e:
         logger.warning("OTC Edge prepare signal failed: %s", e)
         return {"ok": False, "error": str(e)}
 
 
-async def publish_copy_otc_edge_signal(item: dict) -> dict:
-    """Send OTC Edge watcher alerts to the extension as source=otc_edge."""
+
+
+async def publish_copy_otc_edge_signal(item: dict, target_user_id: int | None = None, state: dict | None = None) -> dict:
+    """Send an OTC Edge signal only to the extension linked to the watcher owner."""
     if not COPY_SEND_OTC_EDGE:
         return {"ok": False, "skipped": True, "reason": "COPY_SEND_OTC_EDGE=false"}
     try:
         item = dict(item or {})
+        state = state if isinstance(state, dict) else None
+        target_uid = normalize_copy_telegram_user_id(
+            target_user_id
+            or ((state or {}).get("owner_user_id"))
+            or ((state or {}).get("started_by"))
+            or ((state or {}).get("chat_id"))
+            or ADMIN_TELEGRAM_ID
+        )
         pair = str(item.get("pair") or "").strip()
         direction = str(item.get("direction") or "").strip().upper()
         symbol = item.get("symbol") or get_otc_symbol_for_pair(pair)
@@ -2803,8 +2903,6 @@ async def publish_copy_otc_edge_signal(item: dict) -> dict:
         timing = _otc_edge_current_candle_timing() if "_otc_edge_current_candle_timing" in globals() else {}
         now_dt = now_utc()
         if _otc_edge_timing_mode() == "m1_candle_close" and timing.get("close_dt"):
-            # Critical v0.67 fix: send the exact full-minute close timestamp.
-            # Do not rebuild it as floor(entry)+floor(remaining), which can become xx:xx:59 and Quotex rejects it as Incorrect time.
             expiry_dt = timing.get("close_dt").astimezone(UTC)
             expiry_timestamp = int(expiry_dt.timestamp())
             entry_dt = now_dt
@@ -2817,15 +2915,17 @@ async def publish_copy_otc_edge_signal(item: dict) -> dict:
             duration_seconds = int(OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS)
             trade_expiry_mode = "fixed_60s"
 
+        watcher_state = state or _otc_edge_get_state(target_uid) or {}
+        pairs = list(watcher_state.get("pairs") or [])
         single_pair_mode = bool(
-            str((_otc_edge_watcher_state or {}).get("mode") or "") == "pairs"
-            and len(list((_otc_edge_watcher_state or {}).get("pairs") or [])) == 1
-            and str(list((_otc_edge_watcher_state or {}).get("pairs") or [""])[0]) == pair
+            str(watcher_state.get("mode") or "") == "pairs"
+            and len(pairs) == 1
+            and str(pairs[0]) == pair
         )
-
+        user_key = safe_key(str(target_uid or "admin"))
         payload = {
             "ok": True,
-            "id": f"edge_{safe_key(pair)}_{int(entry_dt.timestamp())}_{direction}_{safe_key(item.get('pattern'))}",
+            "id": f"edge_{user_key}_{safe_key(pair)}_{int(entry_dt.timestamp())}_{direction}_{safe_key(item.get('pattern'))}",
             "pair": pair,
             "pair_display": pair,
             "symbol": symbol,
@@ -2853,14 +2953,18 @@ async def publish_copy_otc_edge_signal(item: dict) -> dict:
             "preselected_pair_mode": single_pair_mode,
             "watch_pair": pair if single_pair_mode else None,
             "skip_asset_switch": single_pair_mode,
-            "note": f"otc_edge_engine | direct_entry | exact_expiry | preselected={single_pair_mode} | pattern={item.get('pattern') or item.get('reason') or '-'}",
+            "creator_user_id": target_uid,
+            "target_user_id": target_uid,
+            "note": f"otc_edge_engine | targeted_user={target_uid} | direct_entry | exact_expiry | preselected={single_pair_mode} | pattern={item.get('pattern') or item.get('reason') or '-'}",
         }
         result = await publish_copy_trading_signal(payload, source="otc_edge")
-        logger.info("Copy Trading OTC Edge sent | pair=%s | expiry=%s | preselected=%s | result=%s", pair, expiry_timestamp, single_pair_mode, result)
+        logger.info("Copy Trading OTC Edge sent | user=%s | pair=%s | expiry=%s | preselected=%s | result=%s", target_uid, pair, expiry_timestamp, single_pair_mode, result)
         return result
     except Exception as e:
         logger.warning("OTC Edge Copy signal failed: %s", e)
         return {"ok": False, "error": str(e)}
+
+
 
 
 async def publish_copy_trading_room_signal(trade: dict, state: dict | None = None, creator_user_id=None) -> dict:
@@ -2971,7 +3075,7 @@ def save_pending_user(user_id: int, data: dict):
     try:
         approved_ref().child(str(uid)).delete()
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 3077", exc_info=True)
 
     pending_ref().child(str(uid)).set(data)
     users_ref().child(str(uid)).update({
@@ -2998,7 +3102,7 @@ def remove_pending_user(user_id: int):
     try:
         pending_ref().child(str(uid)).delete()
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 3104", exc_info=True)
     clear_pending_list_cache()
     clear_user_cache(uid)
 
@@ -3189,7 +3293,7 @@ def force_reject_pending_user(user_id: int):
     try:
         pending_ref().child(str(uid)).delete()
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 3295", exc_info=True)
 
     try:
         users_ref().child(str(uid)).update({
@@ -3199,7 +3303,7 @@ def force_reject_pending_user(user_id: int):
             "updated_at": now_iso(),
         })
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 3305", exc_info=True)
 
     clear_user_cache(uid)
     clear_pending_list_cache()
@@ -3223,7 +3327,7 @@ def force_revoke_user_access(user_id: int, status: str = "new"):
             if isinstance(old_trial, dict) and old_trial.get("used"):
                 preserve_video_trial_used = True
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 3329", exc_info=True)
 
     if preserve_video_trial_used or has_used_video_trial_permanent(uid):
         mark_video_trial_used_permanent(uid)
@@ -3231,17 +3335,17 @@ def force_revoke_user_access(user_id: int, status: str = "new"):
     try:
         approved_ref().child(str(uid)).delete()
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 3337", exc_info=True)
 
     try:
         force_reject_pending_user(uid)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 3342", exc_info=True)
 
     try:
         users_ref().child(str(uid)).delete()
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 3347", exc_info=True)
 
     try:
         clear_user_cache(uid)
@@ -3250,7 +3354,7 @@ def force_revoke_user_access(user_id: int, status: str = "new"):
         _cache_set(f"approved_data:{uid}", None)
         _cache_set(f"video_trial:{uid}", has_used_video_trial_permanent(uid))
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 3356", exc_info=True)
 
     return True
 
@@ -3295,7 +3399,7 @@ def is_approved(user_id: int) -> bool:
                 if now_utc() > exp:
                     return _cache_set(f"approved:{uid}", False)
             except Exception:
-                pass
+                logger.debug("Suppressed exception at line 3401", exc_info=True)
 
         return _cache_set(f"approved:{uid}", True)
     except Exception as e:
@@ -3367,7 +3471,7 @@ def set_user_expiry(user_id: int, mode: str):
     try:
         clear_user_cache(user_id)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 3473", exc_info=True)
 
 
 def block_user(user_id: int):
@@ -3815,6 +3919,28 @@ class QuotexOTCLiveFeed:
         return None
 
 
+
+def normalize_pair_name_basic(pair: str) -> str:
+    raw = str(pair or "").strip().upper().replace("  ", " ")
+    raw = raw.replace(" OTC", " (OTC)")
+    if "(OTC)" not in raw and "/" in raw:
+        raw = raw + " (OTC)"
+    return raw
+
+
+def is_allowed_otc_currency_pair(pair: str) -> bool:
+    return normalize_pair_name_basic(pair) in OTC_CURRENCIES_ALLOWED_PAIRS
+
+
+def possible_symbols_for_currency_pair(pair: str) -> list[str]:
+    """Return natural and reversed Quotex OTC symbols for an approved currency pair."""
+    pair = normalize_pair_name_basic(pair).replace(" (OTC)", "")
+    if "/" not in pair:
+        return []
+    base, quote = pair.split("/", 1)
+    return list(dict.fromkeys((f"{base}{quote}_otc", f"{quote}{base}_otc")))
+
+
 OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS = []
 for _pair_key, _mapped_symbol in OTC_PAIR_TO_QUOTEX_SYMBOL.items():
     if _mapped_symbol and _mapped_symbol not in OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS:
@@ -3829,7 +3955,7 @@ for _pair_key, _mapped_symbol in OTC_PAIR_TO_QUOTEX_SYMBOL.items():
                 if _symbol_candidate not in OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS:
                     OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS.append(_symbol_candidate)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 3957", exc_info=True)
 
 
 for _allowed_pair in OTC_CURRENCIES_ALLOWED_PAIRS:
@@ -3838,7 +3964,7 @@ for _allowed_pair in OTC_CURRENCIES_ALLOWED_PAIRS:
             if _symbol_candidate not in OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS:
                 OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS.append(_symbol_candidate)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 3966", exc_info=True)
 
 quotex_otc_feed = QuotexOTCLiveFeed(OTC_ALL_POSSIBLE_QUOTEX_SYMBOLS)
 
@@ -3881,37 +4007,6 @@ FIAT_CURRENCY_CODES = {
 
 
 
-def normalize_pair_name_basic(pair: str) -> str:
-    raw = str(pair or "").strip().upper().replace("  ", " ")
-    raw = raw.replace(" OTC", " (OTC)")
-    if "(OTC)" not in raw and "/" in raw:
-        raw = raw + " (OTC)"
-    return raw
-
-
-def is_allowed_otc_currency_pair(pair: str) -> bool:
-    return normalize_pair_name_basic(pair) in OTC_CURRENCIES_ALLOWED_PAIRS
-
-
-def possible_symbols_for_currency_pair(pair: str) -> list[str]:
-    """رموز محتملة للزوج داخل Quotex، لأن بعض أزواج USD تأتي معكوسة مثل BRLUSD_otc."""
-    pair = normalize_pair_name_basic(pair).replace(" (OTC)", "")
-    if "/" not in pair:
-        return []
-
-    base, quote = pair.split("/", 1)
-    symbols = []
-
-    # الشكل الطبيعي
-    symbols.append(f"{base}{quote}_otc")
-
-    # الشكل المعكوس، مهم جدًا لأزواج مثل USD/BRL التي تظهر داخليًا BRLUSD_otc
-    symbols.append(f"{quote}{base}_otc")
-
-    # إزالة التكرار
-    return list(dict.fromkeys(symbols))
-
-
 def allowed_otc_currency_fallback_map() -> dict:
     """Fallback مؤقت عند بداية التشغيل قبل وصول instruments/list."""
     result = {}
@@ -3927,79 +4022,30 @@ def allowed_otc_currency_fallback_map() -> dict:
 
 
 def is_valid_otc_currency_pair_name(name: str) -> bool:
-    """نقبل فقط أزواج قسم Currencies التي حددناها من واجهة Quotex."""
+    """Accept only the owner-approved OTC currency pairs."""
     try:
         return is_allowed_otc_currency_pair(name)
-    except Exception:
-        return False
-
-        base = quote = None
-
-        m = re.fullmatch(r"([A-Z]{3})/([A-Z]{3})( \(OTC\))?", value)
-        if m:
-            base, quote = m.group(1), m.group(2)
-
-        if base is None:
-            m = re.fullmatch(r"([A-Z]{3})([A-Z]{3})_OTC", value)
-            if m:
-                base, quote = m.group(1), m.group(2)
-
-        if not base or not quote:
-            return False
-
-        return base in FIAT_CURRENCY_CODES and quote in FIAT_CURRENCY_CODES
-
-    except Exception:
+    except Exception as exc:
+        logger.debug("OTC pair validation failed for %r: %s", name, exc, exc_info=True)
         return False
 
 
 def normalize_otc_currency_pair_name(name: str, symbol: str | None = None) -> str | None:
-    """توحيد اسم الزوج بشرط أن يكون من Currencies المسموحة."""
+    """Normalize a platform pair/symbol only when it belongs to the approved OTC list."""
     try:
         raw = normalize_pair_name_basic(name)
         if raw in OTC_CURRENCIES_ALLOWED_PAIRS:
             return raw
-
         sym = str(symbol or "").strip().upper().replace("_OTC", "")
         if re.fullmatch(r"[A-Z]{6}", sym):
             a, b = sym[:3], sym[3:]
-
-            candidates = [
-                f"{a}/{b} (OTC)",
-                f"{b}/{a} (OTC)",
-            ]
-
-            for candidate in candidates:
+            for candidate in (f"{a}/{b} (OTC)", f"{b}/{a} (OTC)"):
                 if candidate in OTC_CURRENCIES_ALLOWED_PAIRS:
                     return candidate
-
         return None
-    except Exception:
+    except Exception as exc:
+        logger.debug("OTC pair normalization failed for %r/%r: %s", name, symbol, exc, exc_info=True)
         return None
-
-        m = re.fullmatch(r"([A-Z]{3})/([A-Z]{3})( \\(OTC\\))?", raw)
-        if m:
-            base, quote = m.group(1), m.group(2)
-            candidate = f"{base}/{quote} (OTC)"
-            return candidate if is_valid_otc_currency_pair_name(candidate) else None
-
-        sym = str(symbol or "").strip().upper().replace("_OTC", "")
-        if re.fullmatch(r"[A-Z]{6}", sym):
-            a = sym[:3]
-            b = sym[3:]
-
-            # إذا كان أحد الطرفين USD، نعرض USD أولًا لتطابق أسماء المنصة مثل USD/BRL.
-            if b == "USD":
-                candidate = f"{b}/{a} (OTC)"
-            else:
-                candidate = f"{a}/{b} (OTC)"
-
-            return candidate if is_valid_otc_currency_pair_name(candidate) else None
-
-        return None
-    except Exception:
-        return None
-
 
 
 def get_otc_analysis_pair_map() -> dict:
@@ -4055,7 +4101,7 @@ def get_otc_analysis_pair_map() -> dict:
             for symbol in fallback.values():
                 quotex_otc_feed.add_symbol(symbol)
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 4103", exc_info=True)
         return fallback
 
     return {}
@@ -4074,7 +4120,7 @@ def get_otc_symbol_for_pair(pair: str) -> str | None:
             return pair_map[pair]
 
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 4122", exc_info=True)
 
     return None
 
@@ -4176,7 +4222,7 @@ def get_stable_direction(pair_or_candles=None, dt=None, lookback: int = 5, min_m
         try:
             logger.warning("get_stable_direction failed: %s", e)
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 4224", exc_info=True)
         return None
 
 
@@ -4279,7 +4325,7 @@ def analyze_best_live_otc_now(lang: str = "ar") -> dict:
             logger.info("OTC LIVE no candidates | pair_map_count=%s | dynamic_enabled=%s | min_payout=%s",
                         len(pair_map), OTC_LIVE_DYNAMIC_PAIRS_ENABLED, OTC_LIVE_DYNAMIC_MIN_PAYOUT)
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 4327", exc_info=True)
 
         if str(lang).lower() == "en":
             no_msg = (
@@ -4432,19 +4478,127 @@ TRADING_ROOM_PAIR_TICK_MAX_AGE_SECONDS = int(os.getenv("TRADING_ROOM_PAIR_TICK_M
 
 
 
+TRADING_ROOM_SESSIONS_FIREBASE_PATH = "trading_room_sessions_v1"
+TRADING_ROOM_COOLDOWNS_FIREBASE_PATH = "trading_room_cooldowns_v1"
+
+
 def trading_room_key(admin_id: int) -> str:
     return f"trading_room:{int(admin_id)}"
 
 
+def trading_room_sessions_ref():
+    return system_ref().child(TRADING_ROOM_SESSIONS_FIREBASE_PATH)
+
+
+def trading_room_cooldowns_ref():
+    return system_ref().child(TRADING_ROOM_COOLDOWNS_FIREBASE_PATH)
+
+
 def get_trading_room_state(context: ContextTypes.DEFAULT_TYPE, admin_id: int) -> dict:
-    return context.bot_data.setdefault(trading_room_key(admin_id), {})
+    key = trading_room_key(admin_id)
+    state = context.bot_data.get(key)
+    if isinstance(state, dict):
+        return state
+    # Lazy recovery supports requests arriving before startup restoration completes.
+    try:
+        saved = trading_room_sessions_ref().child(str(int(admin_id))).get() or {}
+        if isinstance(saved, dict) and saved.get("active"):
+            context.bot_data[key] = saved
+            return saved
+    except Exception as exc:
+        logger.exception("Could not lazy-load Trading Room state for %s: %s", admin_id, exc)
+    return context.bot_data.setdefault(key, {})
+
+
+def save_trading_room_state(context: ContextTypes.DEFAULT_TYPE, admin_id: int, state: dict | None = None) -> bool:
+    try:
+        uid = int(admin_id)
+        state = state if isinstance(state, dict) else context.bot_data.get(trading_room_key(uid))
+        if not isinstance(state, dict) or not state.get("active"):
+            context.bot_data.pop(trading_room_key(uid), None)
+            trading_room_sessions_ref().child(str(uid)).delete()
+            return True
+        state["updated_at"] = now_iso()
+        clean = json.loads(json.dumps(state, ensure_ascii=False, default=str))
+        context.bot_data[trading_room_key(uid)] = state
+        trading_room_sessions_ref().child(str(uid)).set(clean)
+        return True
+    except Exception as exc:
+        logger.exception("Could not persist Trading Room state for %s: %s", admin_id, exc)
+        return False
 
 
 def clear_trading_room_state(context: ContextTypes.DEFAULT_TYPE, admin_id: int):
+    uid = int(admin_id)
+    context.bot_data.pop(trading_room_key(uid), None)
     try:
-        context.bot_data.pop(trading_room_key(admin_id), None)
-    except Exception:
-        pass
+        trading_room_sessions_ref().child(str(uid)).delete()
+    except Exception as exc:
+        logger.exception("Could not delete Trading Room state for %s: %s", uid, exc)
+
+
+def restore_trading_room_states(context: ContextTypes.DEFAULT_TYPE) -> int:
+    restored = 0
+    try:
+        rows = trading_room_sessions_ref().get() or {}
+        if not isinstance(rows, dict):
+            return 0
+        for uid_raw, state in rows.items():
+            if not isinstance(state, dict) or not state.get("active"):
+                continue
+            try:
+                uid = int(uid_raw)
+            except Exception:
+                continue
+            if not is_admin(uid) and not is_approved(uid):
+                trading_room_sessions_ref().child(str(uid)).delete()
+                continue
+            context.bot_data[trading_room_key(uid)] = state
+            restored += 1
+        logger.warning("Restored %s Trading Room session(s) from Firebase", restored)
+    except Exception as exc:
+        logger.exception("Could not restore Trading Room sessions: %s", exc)
+    return restored
+
+
+def schedule_restored_trading_room_jobs(app) -> int:
+    scheduled = 0
+    now_ts = time_module.time()
+    for key, state in list(app.bot_data.items()):
+        if not str(key).startswith("trading_room:") or not isinstance(state, dict) or not state.get("active"):
+            continue
+        try:
+            uid = int(str(key).split(":", 1)[1])
+            if state.get("waiting_result") and isinstance(state.get("current_trade"), dict):
+                trade = dict(state.get("current_trade") or {})
+                due = float(trade.get("expiry_ts") or now_ts) + TRADING_ROOM_RESULT_EXTRA_DELAY_SECONDS
+                app.job_queue.run_once(
+                    trading_room_result_job, when=max(2, due - now_ts),
+                    data={"admin_id": uid, "trade": trade},
+                    name=f"trading_room_restored_result_{uid}_{int(now_ts)}",
+                )
+            elif state.get("pending_ready") and not state.get("ready_confirmed"):
+                # User confirmation is still required; do not auto-enter.
+                pass
+            elif state.get("waiting_pair_selection"):
+                app.job_queue.run_once(
+                    trading_room_pair_select_retry_job, when=5, data={"admin_id": uid},
+                    name=f"trading_room_restored_pair_{uid}_{int(now_ts)}",
+                )
+            elif state.get("ready_confirmed") and state.get("pair") and state.get("symbol"):
+                app.job_queue.run_repeating(
+                    trading_room_scan_job, interval=TRADING_ROOM_SCAN_INTERVAL_SECONDS, first=5,
+                    data={"admin_id": uid}, name=f"trading_room_restored_scan_{uid}_{int(now_ts)}",
+                )
+            elif state.get("ready_confirmed"):
+                app.job_queue.run_once(
+                    trading_room_begin_market_job, when=5, data={"admin_id": uid},
+                    name=f"trading_room_restored_begin_{uid}_{int(now_ts)}",
+                )
+            scheduled += 1
+        except Exception as exc:
+            logger.exception("Could not schedule restored Trading Room session %s: %s", key, exc)
+    return scheduled
 
 
 def parse_balance_amount(text: str) -> float | None:
@@ -4496,25 +4650,41 @@ def trading_room_user_cooldown_key(user_id: int) -> str:
 
 
 def get_trading_room_cooldown_remaining(context: ContextTypes.DEFAULT_TYPE, user_id: int) -> int:
+    uid = int(user_id)
+    key = trading_room_user_cooldown_key(uid)
     try:
-        until_ts = float(context.bot_data.get(trading_room_user_cooldown_key(user_id), 0) or 0)
-        return max(0, int(until_ts - time_module.time()))
-    except Exception:
+        until_ts = float(context.bot_data.get(key, 0) or 0)
+        if until_ts <= 0:
+            saved = trading_room_cooldowns_ref().child(str(uid)).get()
+            until_ts = float(saved or 0)
+            if until_ts > 0:
+                context.bot_data[key] = until_ts
+        remaining = max(0, int(until_ts - time_module.time()))
+        if remaining <= 0 and until_ts > 0:
+            clear_trading_room_cooldown(context, uid)
+        return remaining
+    except Exception as exc:
+        logger.exception("Could not read Trading Room cooldown for %s: %s", uid, exc)
         return 0
 
 
 def set_trading_room_cooldown(context: ContextTypes.DEFAULT_TYPE, user_id: int, seconds: int = 1800):
+    uid = int(user_id)
+    until_ts = time_module.time() + int(seconds)
+    context.bot_data[trading_room_user_cooldown_key(uid)] = until_ts
     try:
-        context.bot_data[trading_room_user_cooldown_key(user_id)] = time_module.time() + int(seconds)
-    except Exception:
-        pass
+        trading_room_cooldowns_ref().child(str(uid)).set(until_ts)
+    except Exception as exc:
+        logger.exception("Could not persist Trading Room cooldown for %s: %s", uid, exc)
 
 
 def clear_trading_room_cooldown(context: ContextTypes.DEFAULT_TYPE, user_id: int):
+    uid = int(user_id)
+    context.bot_data.pop(trading_room_user_cooldown_key(uid), None)
     try:
-        context.bot_data.pop(trading_room_user_cooldown_key(user_id), None)
-    except Exception:
-        pass
+        trading_room_cooldowns_ref().child(str(uid)).delete()
+    except Exception as exc:
+        logger.exception("Could not delete Trading Room cooldown for %s: %s", uid, exc)
 
 
 def _cooldown_text(seconds: int) -> str:
@@ -4610,7 +4780,7 @@ def _append_trading_room_ledger(state: dict, trade: dict, win: bool, pnl: float,
         })
         state["trade_ledger"] = history[-100:]
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 4782", exc_info=True)
 
 
 def _percent_text(value) -> str:
@@ -4835,7 +5005,7 @@ def build_trading_room_admin_entry_reason(trade: dict, lang: str = "ar") -> str:
         try:
             price_line = f"\nEntry price snapshot: {float(price):.5f}" if lang == "en" else f"\nلقطة السعر وقت القرار: {float(price):.5f}"
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 5007", exc_info=True)
         if lang == "en":
             return (
                 "🧠 Admin entry analysis\n"
@@ -5018,7 +5188,7 @@ def _trading_room_loss_units_for_trade(trade: dict) -> int:
         if bool((trade or {}).get("recovery_trade")):
             return max(1, int(round(float(TRADING_ROOM_RECOVERY_MULTIPLIER))))
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 5190", exc_info=True)
     return 1
 
 
@@ -5384,6 +5554,7 @@ async def trading_room_switch_pair_if_needed(context: ContextTypes.DEFAULT_TYPE,
     state["pair_health"] = None
     state["pair_health_label"] = None
     state["market_mood"] = None
+    save_trading_room_state(context, admin_id, state)
     await safe_send_message(context.bot,
         chat_id=admin_id,
         text=("🔄 I will switch the session pair." if get_user_language(admin_id) == "en" else "🔄 سأغيّر الزوج للجلسة."),
@@ -5429,7 +5600,7 @@ def get_trading_room_market_data_status() -> dict:
                         latest_age = age
                         latest_symbol = symbol
             except Exception:
-                pass
+                logger.debug("Suppressed exception at line 5602", exc_info=True)
 
         try:
             best = select_trading_room_pair()
@@ -5496,6 +5667,7 @@ async def trading_room_pair_select_retry_job(context: ContextTypes.DEFAULT_TYPE)
         state["pair_selected_at"] = time_module.time()
         state["pair_bad_scans"] = 0
         state["last_reason"] = "Session pair selected after market data became ready" if en else "تم اختيار زوج الجلسة بعد تجهيز البيانات"
+        save_trading_room_state(context, admin_id, state)
         await safe_send_message(context.bot,
             chat_id=admin_id,
             text=(
@@ -5560,6 +5732,7 @@ async def trading_room_start_market_flow(context: ContextTypes.DEFAULT_TYPE, adm
         state["waiting_pair_selection"] = True
         state["pair_select_retries"] = 0
         state["last_reason"] = "Waiting for OTC Live market data" if en else "بانتظار تجهيز بيانات OTC Live"
+        save_trading_room_state(context, admin_id, state)
         await safe_send_message(
             context.bot,
             chat_id=admin_id,
@@ -5581,6 +5754,7 @@ async def trading_room_start_market_flow(context: ContextTypes.DEFAULT_TYPE, adm
     state["pair_selected_at"] = time_module.time()
     state["pair_bad_scans"] = 0
     state["last_reason"] = "Session pair selected" if en else "تم اختيار زوج الجلسة"
+    save_trading_room_state(context, admin_id, state)
     await safe_send_message(
         context.bot,
         chat_id=admin_id,
@@ -5673,6 +5847,7 @@ def _trading_room_market_structure_context(closed_parts: list[dict], current_par
         recent = parts[-12:]
         ranges = [float(c.get("range", 0) or 0) for c in recent if float(c.get("range", 0) or 0) > 0]
         atr = sum(ranges) / max(1, len(ranges))
+        avg_range = atr  # Order-block displacement baseline.
         ctx["atr"] = atr
         if atr <= 0:
             return ctx
@@ -5780,7 +5955,7 @@ def _trading_room_market_structure_context(closed_parts: list[dict], current_par
             ctx["round_bullish_rejection"] = bool(ctx["round_near"] and cur_low <= nearest_round + round_zone and cur_close > nearest_round and (cp.get("lower_wick", 0) >= 0.26 or m10.get("pressure", 0) > 0.08))
             ctx["round_bearish_rejection"] = bool(ctx["round_near"] and cur_high >= nearest_round - round_zone and cur_close < nearest_round and (cp.get("upper_wick", 0) >= 0.26 or m10.get("pressure", 0) < -0.08))
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 5957", exc_info=True)
 
         # BOS/CHOCH approximation from recent swing highs/lows.
         try:
@@ -5798,7 +5973,7 @@ def _trading_room_market_structure_context(closed_parts: list[dict], current_par
                 ctx["choch_bullish"] = bool(last_close > prev_swing_high and m20.get("change", 0) > 0 and m10.get("pressure", 0) > 0.05)
                 ctx["choch_bearish"] = bool(last_close < prev_swing_low and m20.get("change", 0) < 0 and m10.get("pressure", 0) < -0.05)
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 5975", exc_info=True)
 
         # Order-block approximation: last opposite candle before impulse, then retest of its body.
         try:
@@ -5822,7 +5997,7 @@ def _trading_room_market_structure_context(closed_parts: list[dict], current_par
                             ctx["order_block_bearish_retest"] = True
                             break
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 5999", exc_info=True)
 
         # Equal highs/lows liquidity sweep + micro double top/bottom.
         try:
@@ -5838,7 +6013,7 @@ def _trading_room_market_structure_context(closed_parts: list[dict], current_par
                 ctx["micro_double_bottom"] = bool(equal_lows and ctx.get("near_support") and cur_close > low_cluster and m10.get("pressure", 0) > 0.08)
                 ctx["micro_double_top"] = bool(equal_highs and ctx.get("near_resistance") and cur_close < high_cluster and m10.get("pressure", 0) < -0.08)
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 6015", exc_info=True)
 
         # Trendline / channel pullback approximation using recent closes.
         try:
@@ -5852,7 +6027,7 @@ def _trading_room_market_structure_context(closed_parts: list[dict], current_par
                 ctx["trendline_pullback_bullish"] = bool(rising_structure and (ctx.get("near_support") or ctx.get("round_bullish_rejection") or abs(price - new_mid) <= pullback_zone) and m10.get("pressure", 0) > -0.05)
                 ctx["trendline_pullback_bearish"] = bool(falling_structure and (ctx.get("near_resistance") or ctx.get("round_bearish_rejection") or abs(price - new_mid) <= pullback_zone) and m10.get("pressure", 0) < 0.05)
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 6029", exc_info=True)
 
         q = 0
         for key in (
@@ -6433,6 +6608,7 @@ async def start_trading_room_session(update: Update, context: ContextTypes.DEFAU
         "smart_exit_last_suggested_at": 0.0,
     }
     context.bot_data[trading_room_key(admin_id)] = state
+    save_trading_room_state(context, admin_id, state)
     await safe_send_message(
         context.bot,
         chat_id=admin_id,
@@ -6535,6 +6711,7 @@ async def trading_room_maybe_suggest_smart_exit(context: ContextTypes.DEFAULT_TY
     lang = get_user_language(admin_id)
     state["smart_exit_waiting"] = True
     state["smart_exit_reason"] = reason
+    save_trading_room_state(context, admin_id, state)
     state["smart_exit_last_suggested_at"] = time_module.time()
     await safe_send_message(
         context.bot,
@@ -6555,7 +6732,7 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
         try:
             context.job.schedule_removal()
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 6734", exc_info=True)
         return
 
     if state.get("waiting_result"):
@@ -6611,6 +6788,7 @@ async def trading_room_scan_job(context: ContextTypes.DEFAULT_TYPE):
         "last_trade_setup": analysis.get("setup_kind") or analysis.get("setup") or state.get("strategy_type"),
         "last_trade_direction": analysis.get("direction"),
     })
+    save_trading_room_state(context, admin_id, state)
 
     amount_line = (f"💰 Suggested trade amount: {int(trade_amount)}$" if en else f"💰 دخول الصفقة المقترح: {int(trade_amount)}$")
     if is_recovery_trade:
@@ -6702,6 +6880,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
         candle_low = float(candle.get("low", min(candle_open, candle_close)))
     except Exception:
         state["waiting_result"] = False
+        save_trading_room_state(context, admin_id, state)
         await safe_send_message(context.bot,
             chat_id=admin_id,
             text=(
@@ -6765,7 +6944,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
             })
             state["trade_ledger"] = history[-100:]
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 6946", exc_info=True)
         result_message = (
             f"{result_line}\n\n"
             f"{follow_line}\n\n"
@@ -6782,7 +6961,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
         try:
             save_trading_room_state(context, admin_id, state)
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 6963", exc_info=True)
         if state.get("active") and not state.get("waiting_result"):
             try:
                 context.job_queue.run_once(
@@ -6861,7 +7040,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
                     bs.add(trade.get("symbol"))
                 state["bad_symbols"] = list(bs)
             except Exception:
-                pass
+                logger.debug("Suppressed exception at line 7042", exc_info=True)
             _append_trading_room_ledger(state, trade, False, -loss_amount, effective_win_units=0, effective_loss_units=effective_loss_units)
             result_line = ("❌ Recovery trade lost" if en else "❌ معوضة، صفقة التعويض خسرت")
         else:
@@ -6890,6 +7069,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
         result_message += build_trading_room_admin_result_reason(trade, win, candle_open, candle_close, lang, candle_high, candle_low) + "\n\n"
     result_message += (f"📊 Session result now: {wins} win / {losses} loss\n" if en else f"📊 نتيجة الجلسة الآن: {wins} ربح / {losses} خسارة\n")
     result_message += (f"💰 Session net now: {_money_signed(net_profit)}" if en else f"💰 صافي الجلسة الآن: {_money_signed(net_profit)}")
+    save_trading_room_state(context, admin_id, state)
     await safe_send_message(context.bot,
         chat_id=admin_id,
         text=result_message,
@@ -6909,6 +7089,7 @@ async def trading_room_result_job(context: ContextTypes.DEFAULT_TYPE):
 
     if should_finish:
         state["active"] = False
+        save_trading_room_state(context, admin_id, state)
         if net_profit >= 0:
             if en:
                 end_text = (
@@ -7009,7 +7190,7 @@ def get_otc_live_feed_health() -> dict:
                         latest_tick = received
                         latest_symbol = symbol
             except Exception:
-                pass
+                logger.debug("Suppressed exception at line 7192", exc_info=True)
 
         age_seconds = None
         if latest_tick:
@@ -7310,7 +7491,7 @@ async def send_smart_martingale_advice(context: ContextTypes.DEFAULT_TYPE):
     try:
         logger.info("Smart martingale advice disabled: no advice message will be sent")
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 7493", exc_info=True)
     return
 
 
@@ -7569,7 +7750,7 @@ def stop_otc_live_runtime_state(reason: str = "disabled"):
         otc_live_channel_state["last_disabled_reason"] = reason
         otc_live_channel_state["disabled_at"] = now_iso()
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 7752", exc_info=True)
 
 
 def should_skip_otc_live_work(reason: str = "disabled") -> bool:
@@ -7954,7 +8135,7 @@ def get_otc_candle_debug_for_pair_time(pair: str, entry_ts: float) -> str:
                                 f"{dt.strftime('%H:%M')} diff={diff}s O={c.get('open')} C={c.get('close')}"
                             )
                     except Exception:
-                        pass
+                        logger.debug("Suppressed exception at line 8137", exc_info=True)
 
                 tick_in_target = 0
                 for row in prices:
@@ -7963,7 +8144,7 @@ def get_otc_candle_debug_for_pair_time(pair: str, entry_ts: float) -> str:
                         if int(ts // 60) * 60 == target_bucket:
                             tick_in_target += 1
                     except Exception:
-                        pass
+                        logger.debug("Suppressed exception at line 8146", exc_info=True)
 
                 last_tick = "none"
                 if prices:
@@ -7972,7 +8153,7 @@ def get_otc_candle_debug_for_pair_time(pair: str, entry_ts: float) -> str:
                         last_dt = datetime.fromtimestamp(last_ts, tz=UTC).astimezone(UTC_PLUS_3)
                         last_tick = f"{last_dt.strftime('%H:%M:%S')} price={prices[-1][1]}"
                     except Exception:
-                        pass
+                        logger.debug("Suppressed exception at line 8155", exc_info=True)
 
                 lines.extend([
                     f"symbol={symbol}",
@@ -8000,7 +8181,7 @@ def get_otc_possible_symbols_for_pair(pair: str) -> list[str]:
             symbols.append(f"{base}_otc")
             symbols.append(f"{base[3:]}{base[:3]}_otc")
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 8183", exc_info=True)
 
     unique = []
     for s in symbols:
@@ -8154,7 +8335,7 @@ def evaluate_otc_list_trade(trade: dict) -> dict:
                     else:
                         recent_status.append(f"{_sym}: no_ticks")
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 8337", exc_info=True)
 
         candle_debug = get_otc_candle_debug_for_pair_time(pair, entry_ts)
 
@@ -8486,7 +8667,7 @@ async def start_otc_list_watch_for_user(update: Update, context: ContextTypes.DE
     try:
         otc_list_results_ref(user.id).delete()
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 8669", exc_info=True)
 
     list_id = str(int(time_module.time()))
     parsed_trades = parse_otc_list_trades(raw_list)
@@ -8847,7 +9028,7 @@ def get_otc_live_trade_units_for_learning(trade: dict) -> float:
         if units is not None:
             return float(units)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 9030", exc_info=True)
     return float(otc_live_trade_units(
         str(trade.get("result", "unknown")),
         safe_int(trade.get("martingale_step"), 0),
@@ -8943,8 +9124,8 @@ def update_otc_live_learning_after_result(signal: dict, result: str):
 
 
 
-# ===== Admin-only OTC Edge Engine =====
-# هذا القسم لا يظهر للمستخدمين. وظيفته قراءة سلوك سوق OTC المباشر من كاش Quotex
+# ===== OTC Edge Engine: public watcher + admin diagnostics =====
+# محرك التحليل مشترك، بينما أدوات الفحص والتقارير المتقدمة تبقى للأدمن فقط.
 # واستخراج فرص إحصائية/أنماط متكررة بدون أي محاولة اختراق أو تجاوز للمنصة.
 OTC_EDGE_MIN_TICKS = int(os.getenv("OTC_EDGE_MIN_TICKS", "60"))
 OTC_EDGE_MIN_CANDLES = int(os.getenv("OTC_EDGE_MIN_CANDLES", "6"))
@@ -8954,7 +9135,7 @@ OTC_EDGE_TOP_LIMIT = int(os.getenv("OTC_EDGE_TOP_LIMIT", "6"))
 OTC_EDGE_MIN_PAYOUT = int(os.getenv("OTC_EDGE_MIN_PAYOUT", str(OTC_LIVE_MIN_PAYOUT)))
 OTC_EDGE_TICK_MAX_AGE_SECONDS = int(os.getenv("OTC_EDGE_TICK_MAX_AGE_SECONDS", "20"))
 OTC_EDGE_HISTORY_LIMIT = int(os.getenv("OTC_EDGE_HISTORY_LIMIT", "80"))
-# مراقبة خاصة للأدمن: البوت يفحص بشكل دوري ويرسل تنبيه فقط عند ظهور فرصة قوية.
+# مراقبة مستقلة لكل مستخدم: البوت يفحص دوريًا ويرسل فقط عند ظهور فرصة قوية.
 OTC_EDGE_WATCHER_SCAN_SECONDS = int(os.getenv("OTC_EDGE_WATCHER_SCAN_SECONDS", "7"))
 OTC_EDGE_WATCHER_MIN_SCORE = int(os.getenv("OTC_EDGE_WATCHER_MIN_SCORE", "78"))
 OTC_EDGE_WATCHER_MIN_PAYOUT = int(os.getenv("OTC_EDGE_WATCHER_MIN_PAYOUT", "85"))
@@ -8978,30 +9159,144 @@ OTC_EDGE_ENTRY_LAST_ALERT_SECOND = int(os.getenv(
     str(max(1, OTC_EDGE_ENTRY_WINDOW_SECONDS - OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS))
 ))
 
-_otc_edge_watcher_state = {
-    "enabled": False,
-    "mode": "all",  # all | pairs
-    "pairs": [],
-    "chat_id": ADMIN_TELEGRAM_ID,
-    "started_at": None,
-    "started_by": None,
-    "last_scan_at": None,
-    "last_alert_at": None,
-    "last_candidate": None,
-    "last_error": None,
-    "last_alerts": {},
-    "alert_times": [],
-    "alerts_sent": 0,
-    "active_trade_until_ts": 0.0,
-    "active_trade": None,
-    "entry_window_skips": 0,
-    # v0.67 selected-pair pre-arm state.
-    "prepare_pending": False,
-    "prepared_pair": None,
-    "last_prepare_ts": 0.0,
-    "last_prepare_at": None,
-    "last_prepare_result": None,
-}
+def _new_otc_edge_watcher_state(user_id: int | None = None) -> dict:
+    uid = int(user_id or ADMIN_TELEGRAM_ID)
+    return {
+        "enabled": False,
+        "mode": "all",  # all | pairs
+        "pairs": [],
+        "chat_id": uid,
+        "owner_user_id": uid,
+        "started_at": None,
+        "started_by": uid,
+        "last_scan_at": None,
+        "last_alert_at": None,
+        "last_candidate": None,
+        "last_error": None,
+        "last_alerts": {},
+        "alert_times": [],
+        "alerts_sent": 0,
+        "active_trade_until_ts": 0.0,
+        "active_trade": None,
+        "entry_window_skips": 0,
+        "prepare_pending": False,
+        "prepared_pair": None,
+        "last_prepare_ts": 0.0,
+        "last_prepare_at": None,
+        "last_prepare_result": None,
+        "last_copy_result": None,
+        "last_copy_at": None,
+        "last_timing_skip": None,
+        "last_timing_skip_at": None,
+    }
+
+
+# v0.71: every user owns an independent OTC Edge watcher with all-market or selected-pair mode.
+_otc_edge_watcher_states: dict[int, dict] = {}
+_otc_edge_watcher_state = _new_otc_edge_watcher_state(ADMIN_TELEGRAM_ID)  # admin backwards-compatible alias
+_otc_edge_watcher_states[int(ADMIN_TELEGRAM_ID)] = _otc_edge_watcher_state
+
+
+def _otc_edge_get_state(user_id: int | None = None, create: bool = True) -> dict | None:
+    try:
+        uid = int(user_id or ADMIN_TELEGRAM_ID)
+    except Exception:
+        uid = int(ADMIN_TELEGRAM_ID)
+    state = _otc_edge_watcher_states.get(uid)
+    if state is None and create:
+        state = _new_otc_edge_watcher_state(uid)
+        _otc_edge_watcher_states[uid] = state
+    return state
+
+
+def _otc_edge_enabled_states() -> list[tuple[int, dict]]:
+    return [
+        (int(uid), state)
+        for uid, state in list(_otc_edge_watcher_states.items())
+        if isinstance(state, dict) and bool(state.get("enabled"))
+    ]
+
+
+
+
+
+OTC_EDGE_WATCHERS_FIREBASE_PATH = "otc_edge_watchers_v1"
+
+
+def otc_edge_watchers_ref():
+    return system_ref().child(OTC_EDGE_WATCHERS_FIREBASE_PATH)
+
+
+def _otc_edge_durable_state(state: dict) -> dict:
+    """Keep only JSON-safe state needed to survive a Render restart."""
+    durable_keys = (
+        "enabled", "mode", "pairs", "chat_id", "owner_user_id", "started_at", "started_by",
+        "last_alert_at", "last_candidate", "last_alerts", "alert_times", "alerts_sent",
+        "active_trade_until_ts", "active_trade", "entry_window_skips", "last_copy_result",
+        "last_copy_at", "last_timing_skip", "last_timing_skip_at",
+    )
+    raw = {key: state.get(key) for key in durable_keys}
+    raw["updated_at"] = now_iso()
+    # Round-trip through JSON so Firebase never receives sets/tuples/custom values.
+    return json.loads(json.dumps(raw, ensure_ascii=False, default=str))
+
+
+def save_otc_edge_watcher_state(user_id: int, state: dict | None = None) -> bool:
+    try:
+        uid = int(user_id)
+        state = state if isinstance(state, dict) else _otc_edge_get_state(uid, create=False)
+        ref = otc_edge_watchers_ref().child(str(uid))
+        if not state or not state.get("enabled"):
+            ref.delete()
+            return True
+        ref.set(_otc_edge_durable_state(state))
+        return True
+    except Exception as exc:
+        logger.exception("Could not persist OTC Edge watcher for %s: %s", user_id, exc)
+        return False
+
+
+def restore_otc_edge_watcher_states() -> int:
+    restored = 0
+    try:
+        rows = otc_edge_watchers_ref().get() or {}
+        if not isinstance(rows, dict):
+            return 0
+        for uid_raw, saved in rows.items():
+            if not isinstance(saved, dict) or not saved.get("enabled"):
+                continue
+            try:
+                uid = int(uid_raw)
+            except Exception:
+                logger.warning("Ignoring invalid persisted OTC Edge watcher id: %r", uid_raw)
+                continue
+            if not is_admin(uid) and not is_approved(uid):
+                otc_edge_watchers_ref().child(str(uid)).delete()
+                continue
+            state = _new_otc_edge_watcher_state(uid)
+            state.update(saved)
+            state["owner_user_id"] = uid
+            state["chat_id"] = int(saved.get("chat_id") or uid)
+            state["mode"] = "pairs" if str(saved.get("mode")) == "pairs" else "all"
+            state["pairs"] = list(dict.fromkeys(saved.get("pairs") or []))
+            # Browser/page preparation is never assumed after a server restart.
+            state["prepared_pair"] = None
+            state["last_prepare_ts"] = 0.0
+            state["last_prepare_at"] = None
+            state["last_prepare_result"] = None
+            state["prepare_pending"] = bool(
+                state["mode"] == "pairs" and len(state["pairs"]) == 1 and COPY_OTC_EDGE_PREPARE_ENABLED
+            )
+            _otc_edge_watcher_states[uid] = state
+            if uid == int(ADMIN_TELEGRAM_ID):
+                _otc_edge_watcher_state.clear()
+                _otc_edge_watcher_state.update(state)
+                _otc_edge_watcher_states[uid] = _otc_edge_watcher_state
+            restored += 1
+        logger.warning("Restored %s OTC Edge watcher(s) from Firebase", restored)
+    except Exception as exc:
+        logger.exception("Could not restore OTC Edge watchers: %s", exc)
+    return restored
 
 
 def _otc_edge_direction_icon(direction: str) -> str:
@@ -9518,19 +9813,28 @@ def build_otc_edge_single_pair_message(pair_text: str) -> str:
 
 
 
-def _otc_edge_watch_mode_text() -> str:
+def _otc_edge_watch_mode_text(state: dict | None = None, lang: str = "ar") -> str:
     try:
-        mode = str(_otc_edge_watcher_state.get("mode") or "all")
+        state = state if isinstance(state, dict) else _otc_edge_watcher_state
+        mode = str(state.get("mode") or "all")
         if mode == "pairs":
-            pairs = list(_otc_edge_watcher_state.get("pairs") or [])
+            pairs = list(state.get("pairs") or [])
+            if lang == "en":
+                if not pairs:
+                    return "Selected pair: none"
+                if len(pairs) == 1:
+                    return f"Selected pair: {pairs[0]}"
+                return "Selected pairs: " + ", ".join(pairs[:8]) + (f" +{len(pairs)-8}" if len(pairs) > 8 else "")
             if not pairs:
                 return "أزواج محددة: لا يوجد"
             if len(pairs) == 1:
                 return f"زوج محدد: {pairs[0]}"
             return "أزواج محددة: " + "، ".join(pairs[:8]) + (f" +{len(pairs)-8}" if len(pairs) > 8 else "")
-        return "كل السوق"
+        return "Whole OTC market" if lang == "en" else "كل السوق"
     except Exception:
-        return "غير معروف"
+        return "Unknown" if lang == "en" else "غير معروف"
+
+
 
 
 def _otc_edge_resolve_pair_text(pair_text: str) -> tuple[str | None, str | None]:
@@ -9561,7 +9865,7 @@ def _otc_edge_resolve_pair_text(pair_text: str) -> tuple[str | None, str | None]
             if possible:
                 return normalized, possible[0]
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 9867", exc_info=True)
     return None, None
 
 
@@ -9588,18 +9892,21 @@ def parse_otc_edge_watch_pairs(text: str) -> tuple[list[str], list[str]]:
     return pairs, errors
 
 
-def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pairs: list[str] | None = None) -> str:
+def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pairs: list[str] | None = None, lang: str = "ar") -> str:
     try:
+        uid = int(started_by)
         pairs = list(dict.fromkeys(pairs or []))
         if mode == "pairs" and not pairs:
-            return "❌ لم يتم تشغيل المراقبة لأن قائمة الأزواج فارغة."
+            return "❌ No pair was selected." if lang == "en" else "❌ لم يتم تشغيل المراقبة لأن قائمة الأزواج فارغة."
 
-        _otc_edge_watcher_state.update({
+        state = _otc_edge_get_state(uid)
+        state.update({
             "enabled": True,
             "mode": "pairs" if mode == "pairs" else "all",
             "pairs": pairs,
             "chat_id": int(chat_id),
-            "started_by": int(started_by),
+            "owner_user_id": uid,
+            "started_by": uid,
             "started_at": now_iso(),
             "last_scan_at": None,
             "last_alert_at": None,
@@ -9612,36 +9919,57 @@ def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pai
             "active_trade": None,
             "entry_window_skips": 0,
             "prepare_pending": bool(mode == "pairs" and len(pairs) == 1 and COPY_OTC_EDGE_PREPARE_ENABLED),
-            "prepared_pair": pairs[0] if mode == "pairs" and len(pairs) == 1 else None,
+            "prepared_pair": None,
             "last_prepare_ts": 0.0,
             "last_prepare_at": None,
             "last_prepare_result": None,
+            "last_copy_result": None,
+            "last_copy_at": None,
+            "last_timing_skip": None,
+            "last_timing_skip_at": None,
         })
-        return build_otc_edge_watcher_status_message(prefix="✅ تم تشغيل مراقبة Edge.")
+        save_otc_edge_watcher_state(uid, state)
+        prefix = "✅ OTC Edge monitoring started." if lang == "en" else "✅ تم تشغيل مراقبة OTC Edge."
+        if is_admin(uid):
+            return build_otc_edge_watcher_status_message(prefix=prefix, state=state)
+        return build_otc_edge_user_status_message(uid, prefix=prefix, lang=lang)
     except Exception as e:
         logger.exception("Could not start OTC Edge watcher: %s", e)
-        return f"❌ تعذر تشغيل مراقبة Edge: {e}"
+        return f"❌ Could not start OTC Edge: {e}" if lang == "en" else f"❌ تعذر تشغيل مراقبة Edge: {e}"
 
 
-def stop_otc_edge_watcher() -> str:
+
+
+def stop_otc_edge_watcher(user_id: int | None = None, lang: str = "ar") -> str:
     try:
-        was_enabled = bool(_otc_edge_watcher_state.get("enabled"))
-        _otc_edge_watcher_state["enabled"] = False
-        _otc_edge_watcher_state["last_error"] = None
-        _otc_edge_watcher_state["prepare_pending"] = False
-        _otc_edge_watcher_state["prepared_pair"] = None
+        state = _otc_edge_get_state(user_id)
+        was_enabled = bool(state.get("enabled"))
+        state["enabled"] = False
+        state["last_error"] = None
+        state["prepare_pending"] = False
+        state["prepared_pair"] = None
+        state["active_trade_until_ts"] = 0.0
+        state["active_trade"] = None
+        save_otc_edge_watcher_state(int(user_id or ADMIN_TELEGRAM_ID), state)
+        if lang == "en":
+            return "🛑 OTC Edge monitoring stopped." if was_enabled else "OTC Edge monitoring is already stopped."
         return "🛑 تم إيقاف مراقبة OTC Edge." if was_enabled else "مراقبة OTC Edge متوقفة أصلًا."
     except Exception as e:
-        return f"تعذر إيقاف المراقبة: {e}"
+        return f"Could not stop monitoring: {e}" if lang == "en" else f"تعذر إيقاف المراقبة: {e}"
 
 
-def _otc_edge_alert_rate_limited(now_ts: float) -> bool:
+
+
+def _otc_edge_alert_rate_limited(now_ts: float, state: dict | None = None) -> bool:
     try:
-        times = [float(t) for t in (_otc_edge_watcher_state.get("alert_times") or []) if now_ts - float(t) < 3600]
-        _otc_edge_watcher_state["alert_times"] = times
+        state = state if isinstance(state, dict) else _otc_edge_watcher_state
+        times = [float(t) for t in (state.get("alert_times") or []) if now_ts - float(t) < 3600]
+        state["alert_times"] = times
         return len(times) >= int(OTC_EDGE_WATCHER_MAX_ALERTS_PER_HOUR)
     except Exception:
         return False
+
+
 
 
 def _otc_edge_timing_mode() -> str:
@@ -9708,48 +10036,54 @@ def _otc_edge_entry_window_status() -> tuple[bool, str, dict]:
         return True, f"تعذر فحص بوابة التوقيت: {e}", _otc_edge_current_candle_timing()
 
 
-def _otc_edge_entry_window_ok() -> bool:
+def _otc_edge_entry_window_ok(state: dict | None = None) -> bool:
     ok, reason, timing = _otc_edge_entry_window_status()
     if not ok:
         try:
-            _otc_edge_watcher_state["last_timing_skip"] = reason
-            _otc_edge_watcher_state["last_timing_skip_at"] = now_iso()
+            state = state if isinstance(state, dict) else _otc_edge_watcher_state
+            state["last_timing_skip"] = reason
+            state["last_timing_skip_at"] = now_iso()
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 10046", exc_info=True)
     return bool(ok)
 
 
-def _otc_edge_active_trade_remaining(now_ts: float | None = None) -> int:
+
+
+def _otc_edge_active_trade_remaining(now_ts: float | None = None, state: dict | None = None) -> int:
     try:
+        state = state if isinstance(state, dict) else _otc_edge_watcher_state
         now_ts = float(now_ts or time_module.time())
-        until_ts = float(_otc_edge_watcher_state.get("active_trade_until_ts") or 0)
+        until_ts = float(state.get("active_trade_until_ts") or 0)
         remain = int(round(until_ts - now_ts))
         if remain <= 0:
-            had_active_trade = bool(_otc_edge_watcher_state.get("active_trade"))
-            _otc_edge_watcher_state["active_trade_until_ts"] = 0.0
-            _otc_edge_watcher_state["active_trade"] = None
-            if had_active_trade and COPY_OTC_EDGE_PREPARE_ENABLED and str(_otc_edge_watcher_state.get("mode") or "") == "pairs" and len(list(_otc_edge_watcher_state.get("pairs") or [])) == 1:
-                _otc_edge_watcher_state["prepare_pending"] = True
+            had_active_trade = bool(state.get("active_trade"))
+            state["active_trade_until_ts"] = 0.0
+            state["active_trade"] = None
+            if had_active_trade and COPY_OTC_EDGE_PREPARE_ENABLED and str(state.get("mode") or "") == "pairs" and len(list(state.get("pairs") or [])) == 1:
+                state["prepare_pending"] = True
             return 0
         return remain
     except Exception:
         return 0
 
 
-def _otc_edge_set_active_trade_lock(item: dict, now_ts: float | None = None):
+
+
+def _otc_edge_set_active_trade_lock(item: dict, now_ts: float | None = None, state: dict | None = None):
     try:
+        state = state if isinstance(state, dict) else _otc_edge_watcher_state
         now_ts = float(now_ts or time_module.time())
         timing = _otc_edge_current_candle_timing()
         if _otc_edge_timing_mode() == "m1_candle_close":
-            # القفل يطابق الصفقة: حتى إغلاق الشمعة الحالية + هامش صغير.
             lock_seconds = max(1, int(float(timing.get("remaining", 0) or 0)) + int(OTC_EDGE_TRADE_CLOSE_BUFFER_SECONDS))
             close_at = timing.get("close_dt").isoformat() if timing.get("close_dt") else None
         else:
             lock_seconds = max(int(OTC_EDGE_WATCHER_TRADE_DURATION_SECONDS), int(OTC_EDGE_WATCHER_TRADE_LOCK_SECONDS))
             close_at = (now_utc().astimezone(UTC_PLUS_3) + timedelta(seconds=lock_seconds)).isoformat()
 
-        _otc_edge_watcher_state["active_trade_until_ts"] = now_ts + lock_seconds
-        _otc_edge_watcher_state["active_trade"] = {
+        state["active_trade_until_ts"] = now_ts + lock_seconds
+        state["active_trade"] = {
             "pair": item.get("pair"),
             "direction": item.get("direction"),
             "score": item.get("score"),
@@ -9763,17 +10097,20 @@ def _otc_edge_set_active_trade_lock(item: dict, now_ts: float | None = None):
             "lock_seconds": lock_seconds,
         }
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 10099", exc_info=True)
 
 
-def _otc_edge_can_alert(item: dict, now_ts: float) -> bool:
+
+
+def _otc_edge_can_alert(item: dict, now_ts: float, state: dict | None = None) -> bool:
     try:
+        state = state if isinstance(state, dict) else _otc_edge_watcher_state
         if not item or not item.get("ok"):
             return False
-        if _otc_edge_active_trade_remaining(now_ts) > 0:
+        if _otc_edge_active_trade_remaining(now_ts, state=state) > 0:
             return False
-        if not _otc_edge_entry_window_ok():
-            _otc_edge_watcher_state["entry_window_skips"] = int(_otc_edge_watcher_state.get("entry_window_skips", 0) or 0) + 1
+        if not _otc_edge_entry_window_ok(state=state):
+            state["entry_window_skips"] = int(state.get("entry_window_skips", 0) or 0) + 1
             return False
         if int(item.get("score", 0) or 0) < int(OTC_EDGE_WATCHER_MIN_SCORE):
             return False
@@ -9781,10 +10118,10 @@ def _otc_edge_can_alert(item: dict, now_ts: float) -> bool:
             return False
         if float(item.get("tick_age", 999) or 999) > max(3, int(OTC_EDGE_TICK_MAX_AGE_SECONDS)):
             return False
-        if _otc_edge_alert_rate_limited(now_ts):
+        if _otc_edge_alert_rate_limited(now_ts, state=state):
             return False
         key = f"{item.get('pair')}|{item.get('direction')}|{item.get('pattern')}"
-        last_alerts = _otc_edge_watcher_state.setdefault("last_alerts", {})
+        last_alerts = state.setdefault("last_alerts", {})
         last_ts = float(last_alerts.get(key, 0) or 0)
         if now_ts - last_ts < int(OTC_EDGE_WATCHER_COOLDOWN_SECONDS):
             return False
@@ -9794,12 +10131,16 @@ def _otc_edge_can_alert(item: dict, now_ts: float) -> bool:
         return False
 
 
-def _otc_edge_collect_watcher_candidates() -> list[dict]:
+
+
+def _otc_edge_collect_watcher_candidates(state: dict | None = None, pair_cache: dict | None = None, all_market_cache: dict | None = None) -> list[dict]:
     try:
-        mode = str(_otc_edge_watcher_state.get("mode") or "all")
+        state = state if isinstance(state, dict) else _otc_edge_watcher_state
+        pair_cache = pair_cache if isinstance(pair_cache, dict) else {}
+        mode = str(state.get("mode") or "all")
         candidates = []
         if mode == "pairs":
-            for pair in list(_otc_edge_watcher_state.get("pairs") or []):
+            for pair in list(state.get("pairs") or []):
                 symbol = get_otc_symbol_for_pair(pair)
                 if not symbol:
                     resolved_pair, resolved_symbol = _otc_edge_resolve_pair_text(pair)
@@ -9807,62 +10148,79 @@ def _otc_edge_collect_watcher_candidates() -> list[dict]:
                     symbol = resolved_symbol
                 if not symbol:
                     continue
-                item = analyze_otc_edge_pair(pair, symbol=symbol, include_history=True)
+                cache_key = f"{pair}|{symbol}"
+                if cache_key not in pair_cache:
+                    pair_cache[cache_key] = analyze_otc_edge_pair(pair, symbol=symbol, include_history=True)
+                item = dict(pair_cache.get(cache_key) or {})
                 if item.get("ok"):
                     candidates.append(item)
         else:
-            candidates = scan_otc_edge_market(limit=OTC_EDGE_WATCHER_TOP_ALERT_POOL, include_weak=False)
+            if isinstance(all_market_cache, dict):
+                if all_market_cache.get("items") is None:
+                    all_market_cache["items"] = scan_otc_edge_market(limit=OTC_EDGE_WATCHER_TOP_ALERT_POOL, include_weak=False)
+                candidates = [dict(x) for x in (all_market_cache.get("items") or [])]
+            else:
+                candidates = scan_otc_edge_market(limit=OTC_EDGE_WATCHER_TOP_ALERT_POOL, include_weak=False)
 
         candidates = [c for c in candidates if c.get("ok")]
         candidates.sort(key=lambda x: (int(x.get("score", 0) or 0), int(x.get("payout", 0) or 0)), reverse=True)
         return candidates
     except Exception as e:
-        _otc_edge_watcher_state["last_error"] = str(e)
+        state = state if isinstance(state, dict) else _otc_edge_watcher_state
+        state["last_error"] = str(e)
         logger.exception("OTC Edge watcher collect failed: %s", e)
         return []
 
 
-async def _otc_edge_maybe_publish_selected_pair_prepare() -> bool:
-    """Publish a pre-arm command and reserve one scan cycle so the extension is ready before a direct signal."""
+
+
+async def _otc_edge_maybe_publish_selected_pair_prepare(state: dict | None = None, owner_user_id: int | None = None) -> bool:
+    """Pre-arm the selected pair for one watcher and reserve one scan cycle."""
     try:
+        state = state if isinstance(state, dict) else _otc_edge_watcher_state
+        owner_uid = int(owner_user_id or state.get("owner_user_id") or state.get("started_by") or state.get("chat_id") or ADMIN_TELEGRAM_ID)
         if not COPY_OTC_EDGE_PREPARE_ENABLED or not COPY_SEND_OTC_EDGE:
             return False
-        if str(_otc_edge_watcher_state.get("mode") or "") != "pairs":
+        if str(state.get("mode") or "") != "pairs":
             return False
-        pairs = list(_otc_edge_watcher_state.get("pairs") or [])
+        pairs = list(state.get("pairs") or [])
         if len(pairs) != 1:
             return False
-        if _otc_edge_active_trade_remaining(time_module.time()) > 0:
+        if _otc_edge_active_trade_remaining(time_module.time(), state=state) > 0:
             return False
 
         now_ts = time_module.time()
-        last_ts = float(_otc_edge_watcher_state.get("last_prepare_ts") or 0)
+        last_ts = float(state.get("last_prepare_ts") or 0)
         stale = now_ts - last_ts >= max(60, int(COPY_OTC_EDGE_PREPARE_REFRESH_SECONDS))
-        if not bool(_otc_edge_watcher_state.get("prepare_pending")) and not stale:
+        if not bool(state.get("prepare_pending")) and not stale:
             return False
 
         pair = pairs[0]
-        result = await publish_copy_otc_edge_prepare_signal(pair)
-        _otc_edge_watcher_state["last_prepare_result"] = result
-        _otc_edge_watcher_state["last_prepare_at"] = now_iso()
+        result = await publish_copy_otc_edge_prepare_signal(pair, target_user_id=owner_uid, state=state)
+        state["last_prepare_result"] = result
+        state["last_prepare_at"] = now_iso()
         if bool((result or {}).get("ok")):
-            _otc_edge_watcher_state["last_prepare_ts"] = now_ts
-            _otc_edge_watcher_state["prepare_pending"] = False
-            _otc_edge_watcher_state["prepared_pair"] = pair
+            state["last_prepare_ts"] = now_ts
+            state["prepare_pending"] = False
+            state["prepared_pair"] = pair
             return True
-        _otc_edge_watcher_state["last_error"] = f"تعذر تجهيز الزوج مسبقًا: {(result or {}).get('error') or (result or {}).get('reason') or result}"
+        state["last_error"] = f"تعذر تجهيز الزوج مسبقًا: {(result or {}).get('error') or (result or {}).get('reason') or result}"
         return False
     except Exception as e:
-        _otc_edge_watcher_state["last_error"] = f"OTC Edge prepare error: {e}"
+        state = state if isinstance(state, dict) else _otc_edge_watcher_state
+        state["last_error"] = f"OTC Edge prepare error: {e}"
         logger.exception("OTC Edge selected-pair prepare failed: %s", e)
         return False
 
 
-def build_otc_edge_entry_alert_message(item: dict) -> str:
+
+
+def build_otc_edge_entry_alert_message(item: dict, state: dict | None = None, lang: str = "ar") -> str:
     try:
         timing = _otc_edge_current_candle_timing()
         now_text = timing.get("now", now_utc().astimezone(UTC_PLUS_3)).strftime("%H:%M:%S")
-        mode_text = _otc_edge_watch_mode_text()
+        state = state if isinstance(state, dict) else _otc_edge_watcher_state
+        mode_text = _otc_edge_watch_mode_text(state=state, lang=lang)
         score = int(item.get("score", 0) or 0)
         tick_age = item.get("tick_age")
         metrics = item.get("metrics") or {}
@@ -9908,15 +10266,16 @@ def build_otc_edge_entry_alert_message(item: dict) -> str:
         return f"🚨 OTC Edge Alert\nتعذر تنسيق التنبيه: {e}"
 
 
-def build_otc_edge_watcher_status_message(prefix: str | None = None) -> str:
+def build_otc_edge_watcher_status_message(prefix: str | None = None, state: dict | None = None) -> str:
     try:
-        enabled = bool(_otc_edge_watcher_state.get("enabled"))
+        state = state if isinstance(state, dict) else _otc_edge_watcher_state
+        enabled = bool(state.get("enabled"))
         connected = bool(getattr(quotex_otc_feed, "connected", False)) if "quotex_otc_feed" in globals() else False
         started = bool(getattr(quotex_otc_feed, "started", False)) if "quotex_otc_feed" in globals() else False
-        started_at = _otc_edge_watcher_state.get("started_at")
-        last_scan_at = _otc_edge_watcher_state.get("last_scan_at")
-        last_alert_at = _otc_edge_watcher_state.get("last_alert_at")
-        last_candidate = _otc_edge_watcher_state.get("last_candidate") or {}
+        started_at = state.get("started_at")
+        last_scan_at = state.get("last_scan_at")
+        last_alert_at = state.get("last_alert_at")
+        last_candidate = state.get("last_candidate") or {}
         lines = []
         if prefix:
             lines.append(str(prefix))
@@ -9925,35 +10284,35 @@ def build_otc_edge_watcher_status_message(prefix: str | None = None) -> str:
             "📋 حالة مراقبة OTC Edge",
             "━━━━━━━━━━━━━━",
             f"الحالة: {'شغالة ✅' if enabled else 'متوقفة ⏸'}",
-            f"الوضع: {_otc_edge_watch_mode_text()}",
+            f"الوضع: {_otc_edge_watch_mode_text(state=state)}",
             f"📡 بث Quotex: {'متصل ✅' if connected else 'غير متصل ⚠️'} | started={started}",
             f"🎯 حد التنبيه: Edge {OTC_EDGE_WATCHER_MIN_SCORE}% | payout {OTC_EDGE_WATCHER_MIN_PAYOUT}%",
             f"⏱ الفحص كل: {OTC_EDGE_WATCHER_SCAN_SECONDS} ثواني",
             f"🧊 منع تكرار نفس النمط: {OTC_EDGE_WATCHER_COOLDOWN_SECONDS} ثانية",
             f"🧭 وضع التوقيت: {'إغلاق شمعة M1 ✅' if _otc_edge_timing_mode() == 'm1_candle_close' else 'Fixed 60s'}",
             f"🪟 نافذة التنبيه: من الثانية {OTC_EDGE_ENTRY_MIN_SECOND} إلى {min(OTC_EDGE_ENTRY_LAST_ALERT_SECOND, OTC_EDGE_ENTRY_WINDOW_SECONDS - OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS)} | الدخول مسموح حتى الثانية {OTC_EDGE_ENTRY_WINDOW_SECONDS}",
-            f"🔒 القفل بعد التنبيه: حتى نهاية الصفقة الحالية",
-            f"📨 تنبيهات مرسلة منذ التشغيل: {_otc_edge_watcher_state.get('alerts_sent', 0)}",
+            "🔒 القفل بعد التنبيه: حتى نهاية الصفقة الحالية",
+            f"📨 تنبيهات مرسلة منذ التشغيل: {state.get('alerts_sent', 0)}",
             f"📤 Copy OTC Edge: {'مفعل ✅' if COPY_SEND_OTC_EDGE else 'متوقف ⛔'} | صلاحية النسخ {max(10, int(COPY_OTC_EDGE_SIGNAL_VALID_SECONDS))}ث",
             f"⚙️ تجهيز الزوج المحدد مسبقًا: {'مفعل ✅' if COPY_OTC_EDGE_PREPARE_ENABLED else 'متوقف ⛔'}",
         ])
-        if _otc_edge_watcher_state.get("prepared_pair"):
-            lines.append(f"🎯 الزوج المجهز: {_otc_edge_watcher_state.get('prepared_pair')}")
-        if _otc_edge_watcher_state.get("last_prepare_at"):
-            pr = _otc_edge_watcher_state.get("last_prepare_result") or {}
+        if state.get("prepared_pair"):
+            lines.append(f"🎯 الزوج المجهز: {state.get('prepared_pair')}")
+        if state.get("last_prepare_at"):
+            pr = state.get("last_prepare_result") or {}
             delivery = pr.get("delivery") if isinstance(pr, dict) else None
-            lines.append(f"آخر تجهيز مسبق: {format_dt_ar(_otc_edge_watcher_state.get('last_prepare_at'))} | delivered={(delivery or {}).get('delivered') if isinstance(delivery, dict) else None}")
-        if _otc_edge_watcher_state.get("last_copy_result"):
-            cr = _otc_edge_watcher_state.get("last_copy_result") or {}
+            lines.append(f"آخر تجهيز مسبق: {format_dt_ar(state.get('last_prepare_at'))} | delivered={(delivery or {}).get('delivered') if isinstance(delivery, dict) else None}")
+        if state.get("last_copy_result"):
+            cr = state.get("last_copy_result") or {}
             delivery = cr.get("delivery") if isinstance(cr, dict) else None
             delivered = (delivery or {}).get("delivered") if isinstance(delivery, dict) else None
             online = (delivery or {}).get("online_clients") if isinstance(delivery, dict) else None
             lines.append(f"آخر إرسال للنسخ: ok={bool(cr.get('ok'))} | delivered={delivered} | online={online}")
-        if _otc_edge_watcher_state.get("last_copy_at"):
-            lines.append(f"آخر Copy: {format_dt_ar(_otc_edge_watcher_state.get('last_copy_at'))}")
-        remain = _otc_edge_active_trade_remaining(time_module.time())
+        if state.get("last_copy_at"):
+            lines.append(f"آخر Copy: {format_dt_ar(state.get('last_copy_at'))}")
+        remain = _otc_edge_active_trade_remaining(time_module.time(), state=state)
         if remain > 0:
-            active_trade = _otc_edge_watcher_state.get("active_trade") or {}
+            active_trade = state.get("active_trade") or {}
             close_extra = ""
             if active_trade.get("close_text"):
                 close_extra = f" | الإغلاق: {active_trade.get('close_text')} UTC+3"
@@ -9962,10 +10321,10 @@ def build_otc_edge_watcher_status_message(prefix: str | None = None) -> str:
                 "🔒 صفقة حالية تحت المتابعة:",
                 f"• {active_trade.get('pair')} {_otc_edge_direction_icon(active_trade.get('direction'))} | باقي تقريبًا {remain} ثانية{close_extra}",
             ])
-        if _otc_edge_watcher_state.get("last_timing_skip"):
+        if state.get("last_timing_skip"):
             lines.extend([
                 "",
-                f"⏳ آخر منع بسبب التوقيت: {_otc_edge_watcher_state.get('last_timing_skip')}",
+                f"⏳ آخر منع بسبب التوقيت: {state.get('last_timing_skip')}",
             ])
         if started_at:
             lines.append(f"بدأت: {format_dt_ar(started_at)}")
@@ -9979,59 +10338,142 @@ def build_otc_edge_watcher_status_message(prefix: str | None = None) -> str:
                 "آخر فرصة رآها البوت:",
                 f"• {last_candidate.get('pair')} {_otc_edge_direction_icon(last_candidate.get('direction'))} | {last_candidate.get('score')}% | payout {last_candidate.get('payout')}%",
             ])
-        if _otc_edge_watcher_state.get("last_error"):
-            lines.append(f"⚠️ آخر خطأ: {_otc_edge_watcher_state.get('last_error')}")
+        if state.get("last_error"):
+            lines.append(f"⚠️ آخر خطأ: {state.get('last_error')}")
         return "\n".join(lines)[:3900]
     except Exception as e:
         return f"تعذر عرض حالة المراقبة: {e}"
 
 
-async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
+def build_otc_edge_user_status_message(user_id: int, prefix: str | None = None, lang: str = "ar") -> str:
     try:
-        if not bool(_otc_edge_watcher_state.get("enabled")):
-            return
-        _otc_edge_watcher_state["last_scan_at"] = now_iso()
+        state = _otc_edge_get_state(user_id)
+        enabled = bool(state.get("enabled"))
+        mode = str(state.get("mode") or "all")
+        pairs = list(state.get("pairs") or [])
+        pair = pairs[0] if pairs else None
+        remain = _otc_edge_active_trade_remaining(time_module.time(), state=state)
+        if lang == "en":
+            lines = []
+            if prefix:
+                lines.extend([str(prefix), ""])
+            lines.extend([
+                "⚡ OTC Edge",
+                "━━━━━━━━━━━━━━",
+                f"Status: {'Running ✅' if enabled else 'Stopped ⏸'}",
+                f"Monitoring mode: {('Specific pair' if mode == 'pairs' else 'Whole OTC market') if enabled else 'Not selected'}",
+            ])
+            if enabled and mode == "pairs":
+                lines.extend([
+                    f"Selected pair: {pair or 'None'}",
+                    f"Extension preparation: {'Ready ✅' if state.get('prepared_pair') else 'Waiting…'}",
+                ])
+            elif enabled:
+                lines.append("Pair switching: Automatic when a signal appears")
+            else:
+                lines.append("Extension preparation: —")
+            if remain > 0:
+                active = state.get("active_trade") or {}
+                lines.append(f"Current trade: {active.get('pair')} {_otc_edge_direction_icon(active.get('direction'))} | about {remain}s left")
+            if state.get("last_alert_at"):
+                lines.append(f"Last signal: {format_dt_ar(state.get('last_alert_at'))}")
+            if state.get("last_error"):
+                lines.append("⚠️ Preparation or delivery is not ready yet. Keep Quotex and the extension open.")
+            if not enabled:
+                lines.extend(["", "Choose all-market monitoring or one specific OTC pair."])
+            return "\n".join(lines)[:3900]
 
-        # v0.67: in one-pair mode, prepare the asset first and do not generate an entry in the same scan cycle.
-        if await _otc_edge_maybe_publish_selected_pair_prepare():
-            return
-
-        candidates = _otc_edge_collect_watcher_candidates()
-        if candidates:
-            _otc_edge_watcher_state["last_candidate"] = {
-                "pair": candidates[0].get("pair"),
-                "direction": candidates[0].get("direction"),
-                "score": candidates[0].get("score"),
-                "payout": candidates[0].get("payout"),
-                "pattern": candidates[0].get("pattern"),
-            }
-
-        now_ts = time_module.time()
-        for item in candidates:
-            if not _otc_edge_can_alert(item, now_ts):
-                continue
-            chat_id = int(_otc_edge_watcher_state.get("chat_id") or ADMIN_TELEGRAM_ID)
-            copy_result = await publish_copy_otc_edge_signal(item)
-            _otc_edge_watcher_state["last_copy_result"] = copy_result
-            _otc_edge_watcher_state["last_copy_at"] = now_iso()
-            sent = await safe_send_message(
-                context.bot,
-                chat_id=chat_id,
-                text=build_otc_edge_entry_alert_message(item),
-            )
-            # v0.62: Copy delivery must not depend on Telegram alert success.
-            # If either Telegram alert OR Copy Server publish succeeded, lock this candidate to prevent duplicates.
-            if sent or bool((copy_result or {}).get("ok")):
-                _otc_edge_set_active_trade_lock(item, now_ts)
-                _otc_edge_watcher_state["last_alert_at"] = now_iso()
-                _otc_edge_watcher_state["alerts_sent"] = int(_otc_edge_watcher_state.get("alerts_sent", 0) or 0) + 1
-                times = list(_otc_edge_watcher_state.get("alert_times") or [])
-                times.append(now_ts)
-                _otc_edge_watcher_state["alert_times"] = [float(t) for t in times if now_ts - float(t) < 3600]
-            break
+        lines = []
+        if prefix:
+            lines.extend([str(prefix), ""])
+        lines.extend([
+            "⚡ OTC Edge",
+            "━━━━━━━━━━━━━━",
+            f"الحالة: {'شغالة ✅' if enabled else 'متوقفة ⏸'}",
+            f"نمط المراقبة: {('زوج محدد' if mode == 'pairs' else 'كل السوق') if enabled else 'غير محدد'}",
+        ])
+        if enabled and mode == "pairs":
+            lines.extend([
+                f"الزوج المحدد: {pair or 'لا يوجد'}",
+                f"تجهيز الإضافة: {'جاهز ✅' if state.get('prepared_pair') else 'قيد التجهيز…'}",
+            ])
+        elif enabled:
+            lines.append("تبديل الزوج: تلقائي عند ظهور الإشارة")
+        else:
+            lines.append("تجهيز الإضافة: —")
+        if remain > 0:
+            active = state.get("active_trade") or {}
+            lines.append(f"الصفقة الحالية: {active.get('pair')} {_otc_edge_direction_icon(active.get('direction'))} | باقي تقريبًا {remain} ثانية")
+        if state.get("last_alert_at"):
+            lines.append(f"آخر إشارة: {format_dt_ar(state.get('last_alert_at'))}")
+        if state.get("last_error"):
+            lines.append("⚠️ التجهيز أو الإرسال غير جاهز حاليًا. اترك منصة Quotex والإضافة مفتوحتين.")
+        if not enabled:
+            lines.extend(["", "اختر مراقبة كل السوق أو مراقبة زوج OTC محدد."])
+        return "\n".join(lines)[:3900]
     except Exception as e:
-        _otc_edge_watcher_state["last_error"] = str(e)
-        logger.exception("OTC Edge watcher job error: %s", e)
+        return f"Could not show OTC Edge status: {e}" if lang == "en" else f"تعذر عرض حالة OTC Edge: {e}"
+
+
+async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
+    pair_cache: dict = {}
+    all_market_cache: dict = {"items": None}
+    for owner_uid, state in _otc_edge_enabled_states():
+        try:
+            # Stop monitoring automatically when a normal user's bot access is no longer active.
+            if not is_admin(owner_uid) and not is_approved(owner_uid):
+                state["enabled"] = False
+                state["last_error"] = "bot_access_inactive"
+                save_otc_edge_watcher_state(owner_uid, state)
+                continue
+            state["last_scan_at"] = now_iso()
+
+            # Each user gets a separate targeted pre-arm command.
+            if await _otc_edge_maybe_publish_selected_pair_prepare(state=state, owner_user_id=owner_uid):
+                continue
+
+            candidates = _otc_edge_collect_watcher_candidates(
+                state=state,
+                pair_cache=pair_cache,
+                all_market_cache=all_market_cache,
+            )
+            if candidates:
+                state["last_candidate"] = {
+                    "pair": candidates[0].get("pair"),
+                    "direction": candidates[0].get("direction"),
+                    "score": candidates[0].get("score"),
+                    "payout": candidates[0].get("payout"),
+                    "pattern": candidates[0].get("pattern"),
+                }
+
+            now_ts = time_module.time()
+            for item in candidates:
+                if not _otc_edge_can_alert(item, now_ts, state=state):
+                    continue
+                chat_id = int(state.get("chat_id") or owner_uid)
+                copy_result = await publish_copy_otc_edge_signal(item, target_user_id=owner_uid, state=state)
+                state["last_copy_result"] = copy_result
+                state["last_copy_at"] = now_iso()
+                lang = get_user_language(owner_uid)
+                sent = await safe_send_message(
+                    context.bot,
+                    chat_id=chat_id,
+                    text=build_otc_edge_entry_alert_message(item, state=state, lang=lang),
+                )
+                if sent or bool((copy_result or {}).get("ok")):
+                    _otc_edge_set_active_trade_lock(item, now_ts, state=state)
+                    state["last_alert_at"] = now_iso()
+                    state["alerts_sent"] = int(state.get("alerts_sent", 0) or 0) + 1
+                    times = list(state.get("alert_times") or [])
+                    times.append(now_ts)
+                    state["alert_times"] = [float(t) for t in times if now_ts - float(t) < 3600]
+                    save_otc_edge_watcher_state(owner_uid, state)
+                break
+        except Exception as e:
+            state["last_error"] = str(e)
+            logger.exception("OTC Edge watcher job error | user=%s | error=%s", owner_uid, e)
+
+
 
 
 def build_otc_edge_patterns_report() -> str:
@@ -10180,7 +10622,7 @@ def _three_candle_channel_id():
         if raw.lstrip("-").isdigit():
             return int(raw)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 10624", exc_info=True)
     return raw
 
 
@@ -10295,7 +10737,7 @@ def _three_candle_increment_today_signal_count():
     try:
         _three_candle_channel_state["today_signals"] = int(_three_candle_channel_state.get("today_signals", 0) or 0) + 1
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 10739", exc_info=True)
 
 
 def _three_candle_daily_limit_reached() -> bool:
@@ -10407,7 +10849,7 @@ def _three_candle_note_published_pair(pair: str):
         else:
             blocks.pop(pair, None)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 10851", exc_info=True)
 
 
 def _three_candle_run_count_by_dir(by_bucket: dict, end_bucket: int, direction_value: int) -> tuple[int, list[dict]]:
@@ -10454,7 +10896,7 @@ def _three_candle_register_final_result(pair: str, result: str):
         elif result in {"win", "draw"}:
             streaks[pair] = 0
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 10898", exc_info=True)
 
 
 
@@ -13231,7 +13673,7 @@ def parse_tradingview_series(raw_message: str):
                     })
 
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 13675", exc_info=True)
 
     candles.sort(key=lambda c: c["time"])
     return candles
@@ -13289,7 +13731,7 @@ def get_tradingview_candles(pair: str, interval: str = "1", bars: int = 80):
         try:
             ws.close()
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 13733", exc_info=True)
         return None, str(e)
 
 
@@ -13700,7 +14142,7 @@ def get_user_language(user_id: int, context: ContextTypes.DEFAULT_TYPE | None = 
                 context.user_data["language"] = lang
             return lang
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 14144", exc_info=True)
     return default
 
 
@@ -13721,7 +14163,7 @@ def set_user_language(user_id: int, lang: str, context: ContextTypes.DEFAULT_TYP
     try:
         save_user_record(int(user_id), {"language": lang, "updated_at": now_iso()})
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 14165", exc_info=True)
     return lang
 
 
@@ -13769,7 +14211,7 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
             return ReplyKeyboardMarkup(
                 [
                     ["📊 Generate Signals"],
-                    ["🧠 Trading Session Room"],
+                    ["🧠 Trading Session Room", "⚡ OTC Edge"],
                     ["👤 My Account", "📞 Contact Support"],
                     ["🌐 Change Language", "🛠 Admin Panel"],
                 ],
@@ -13778,7 +14220,7 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
         return ReplyKeyboardMarkup(
             [
                 ["📊 توليد إشارات"],
-                ["🧠 غرفة جلسة تداول"],
+                ["🧠 غرفة جلسة تداول", "⚡ OTC Edge"],
                 ["👤 حالة حسابي", "📞 تواصل مع المسؤول"],
                 ["🌐 تغيير اللغة", "🛠 لوحة الأدمن"],
             ],
@@ -13787,163 +14229,32 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
     return main_keyboard_en if lang == "en" else main_keyboard
 
 
-# ===== Signal usage / account status helpers =====
-def signal_usage_ref(user_id: int):
-    return system_ref().child("signal_usage").child(str(int(user_id)))
-
-
-def get_signal_usage_data(user_id: int) -> dict:
-    try:
-        data = signal_usage_ref(user_id).get() or {}
-        return data if isinstance(data, dict) else {}
-    except Exception as e:
-        logger.exception("Could not read signal usage for %s: %s", user_id, e)
-        return {}
-
-
-def get_signal_day_key(dt: datetime | None = None) -> str:
-    return get_utc3_day_key(dt or now_utc())
-
-
-def get_signal_plan_info(user_id: int) -> dict:
+# ===== Account status helpers (signal limits permanently removed) =====
+def get_subscription_plan_info(user_id: int) -> dict:
     uid = int(user_id)
-
     if is_admin(uid):
-        return {"key": "admin", "label": "أدمن", "limit_type": "unlimited", "limit": None}
-
+        return {"key": "admin", "label": "أدمن"}
     approved_data = get_approved_user(uid) or {}
     user_data = get_user_record(uid) or {}
-
     mode = str(approved_data.get("mode") or approved_data.get("plan") or user_data.get("plan") or "").lower()
     expires_at = approved_data.get("expires_at") or user_data.get("expires_at")
-
     source = str(approved_data.get("source") or user_data.get("trial_source") or "").lower()
     if mode == "video_trial" or source == "youtube_video_trial":
-        return {
-            "key": "trial",
-            "label": "تجربة مجانية",
-            "limit_type": "total",
-            "limit": FREE_TRIAL_SIGNAL_TOTAL_LIMIT,
-        }
-
+        return {"key": "trial", "label": "تجربة مجانية"}
     if expires_at == "forever" or mode == "forever":
-        return {"key": "forever", "label": "VIP دائم", "limit_type": "unlimited", "limit": None}
-
-    if mode == "week":
-        return {"key": "week", "label": "اشتراك أسبوع", "limit_type": "daily", "limit": WEEKLY_SIGNAL_DAILY_LIMIT}
-
+        return {"key": "forever", "label": "VIP دائم"}
     if mode == "month":
-        return {"key": "month", "label": "اشتراك شهر", "limit_type": "daily", "limit": MONTHLY_SIGNAL_DAILY_LIMIT}
-
-    # دعم المستخدمين القدامى الذين لا يملكون plan مخزن.
+        return {"key": "month", "label": "اشتراك شهر"}
+    if mode == "week":
+        return {"key": "week", "label": "اشتراك أسبوع"}
     if expires_at and expires_at != "forever":
         exp = parse_iso(str(expires_at).replace("Z", "+00:00"))
         if exp:
             if exp.tzinfo is None:
                 exp = exp.replace(tzinfo=timezone.utc)
-            remaining_days = (exp - now_utc()).total_seconds() / 86400
-            if remaining_days <= 10:
-                return {"key": "week", "label": "اشتراك أسبوع", "limit_type": "daily", "limit": WEEKLY_SIGNAL_DAILY_LIMIT}
-            return {"key": "month", "label": "اشتراك شهر", "limit_type": "daily", "limit": MONTHLY_SIGNAL_DAILY_LIMIT}
-
-    return {"key": "week", "label": "اشتراك أسبوع", "limit_type": "daily", "limit": WEEKLY_SIGNAL_DAILY_LIMIT}
-
-
-def get_signal_usage_summary(user_id: int) -> dict:
-    data = get_signal_usage_data(user_id)
-    day_key = get_signal_day_key()
-    daily = data.get("daily") or {}
-    today = daily.get(day_key) or {}
-    return {
-        "day_key": day_key,
-        "total": safe_int(data.get("total"), 0),
-        "today": safe_int(today.get("count"), 0),
-        "last_at": float(data.get("last_at") or 0),
-    }
-
-
-def check_signal_usage_allowed(user_id: int, amount: int = 1) -> tuple[bool, str]:
-    # Usage limits disabled by request: all approved users can generate signals without limits.
-    uid = int(user_id)
-    amount = max(1, int(amount or 1))
-    return True, ""
-
-    if is_admin(uid):
-        return True, ""
-
-    plan = get_signal_plan_info(uid)
-    usage = get_signal_usage_summary(uid)
-
-    last_at = float(usage.get("last_at") or 0)
-    now_ts = time_module.time()
-    if SIGNAL_USAGE_COOLDOWN_SECONDS > 0 and last_at and now_ts - last_at < SIGNAL_USAGE_COOLDOWN_SECONDS:
-        wait = int(max(1, SIGNAL_USAGE_COOLDOWN_SECONDS - (now_ts - last_at)))
-        return False, f"⏳ انتظر {wait} ثانية قبل طلب إشارة جديدة."
-
-    if plan["limit_type"] == "unlimited":
-        return True, ""
-
-    limit = int(plan.get("limit") or 0)
-    used = int(usage["total"] if plan["limit_type"] == "total" else usage["today"])
-    remaining = max(0, limit - used)
-
-    if amount > remaining:
-        if remaining <= 0:
-            if plan["limit_type"] == "total":
-                return False, (
-                    "⛔ انتهى حد التجربة المجانية.\n\n"
-                    f"استخدمت {used}/{limit} إشارات.\n"
-                    "للاستمرار تواصل مع الأدمن لتفعيل اشتراكك."
-                )
-            return False, (
-                "⛔ وصلت للحد اليومي لتوليد الإشارات.\n\n"
-                f"الخطة: {plan['label']}\n"
-                f"استخدمت اليوم: {used}/{limit}\n"
-                "يرجع العداد من جديد مع بداية اليوم بتوقيت UTC+3."
-            )
-
-        return False, (
-            f"⚠️ المتبقي لك حاليًا {remaining} إشارات فقط.\n"
-            f"طلبك الحالي يحتاج {amount} إشارات.\n"
-            "اختر عددًا أقل أو انتظر تجدد الحد اليومي إذا كان اشتراكك يوميًا."
-        )
-
-    return True, ""
-
-
-def record_signal_usage(user_id: int, amount: int = 1, source: str = "manual_signal"):
-    # Usage counting disabled by request. Keep the function as no-op for compatibility.
-    uid = int(user_id)
-    amount = max(1, int(amount or 1))
-    return
-
-    if is_admin(uid):
-        return
-
-    try:
-        ref = signal_usage_ref(uid)
-        data = ref.get() or {}
-        if not isinstance(data, dict):
-            data = {}
-
-        day_key = get_signal_day_key()
-        total = safe_int(data.get("total"), 0) + amount
-        daily = data.get("daily") or {}
-        today = daily.get(day_key) or {}
-        today_count = safe_int(today.get("count"), 0) + amount
-
-        ref.update({
-            "total": total,
-            "last_at": time_module.time(),
-            "last_source": source,
-            "updated_at": now_iso(),
-        })
-        ref.child("daily").child(day_key).update({
-            "count": today_count,
-            "updated_at": now_iso(),
-        })
-    except Exception as e:
-        logger.exception("Could not record signal usage for %s: %s", uid, e)
+            return {"key": "week" if (exp - now_utc()).total_seconds() <= 10 * 86400 else "month",
+                    "label": "اشتراك أسبوع" if (exp - now_utc()).total_seconds() <= 10 * 86400 else "اشتراك شهر"}
+    return {"key": "active" if is_approved(uid) else "inactive", "label": "مفعّل" if is_approved(uid) else "غير مفعل"}
 
 
 def format_expiry_for_account(expires_at, lang: str = "ar") -> str:
@@ -13962,8 +14273,7 @@ def build_account_status_message(user, lang: str = "ar") -> str:
     data = get_user_record(uid) or {}
     approved_data = get_approved_user(uid) or {}
     status = get_user_status(uid)
-    plan = get_signal_plan_info(uid) if is_approved(uid) or is_admin(uid) else {"label": "غير مفعل", "limit_type": "none", "limit": 0}
-    usage = get_signal_usage_summary(uid)
+    plan = get_subscription_plan_info(uid) if is_approved(uid) or is_admin(uid) else {"key": "inactive", "label": "غير مفعل"}
 
     if lang == "en":
         plan_labels = {
@@ -13979,8 +14289,6 @@ def build_account_status_message(user, lang: str = "ar") -> str:
         trial_used = "Yes" if has_used_video_trial(uid) else "No"
         plan_label = plan_labels.get(str(plan.get("key") or ""), "Not active" if not is_approved(uid) else str(plan.get("label", "Not specified")))
 
-        usage_line = "Usage: Unlimited ♾"
-
         return (
             "👤 My Account\n\n"
             f"• Name: {html.escape(user.full_name or '')}\n"
@@ -13990,16 +14298,13 @@ def build_account_status_message(user, lang: str = "ar") -> str:
             f"• Status: {html.escape(str(status))}\n"
             f"• Plan: {html.escape(str(plan_label))}\n"
             f"• Expiration: {html.escape(format_expiry_for_account(expires_at, lang='en'))}\n"
-            f"• Free trial used: {trial_used}\n"
-            f"• {html.escape(usage_line)}"
+            f"• Free trial used: {trial_used}"
         )
 
     username = f"@{user.username}" if getattr(user, "username", None) else "لا يوجد"
     quotex_id = data.get("quotex_id") or approved_data.get("quotex_id") or "غير مسجل"
     expires_at = approved_data.get("expires_at") or data.get("expires_at")
     trial_used = "نعم" if has_used_video_trial(uid) else "لا"
-
-    usage_line = "الاستخدام: غير محدود ♾"
 
     return (
         "👤 حالة حسابي\n\n"
@@ -14010,8 +14315,7 @@ def build_account_status_message(user, lang: str = "ar") -> str:
         f"• الحالة: {html.escape(str(status))}\n"
         f"• نوع الاشتراك: {html.escape(str(plan.get('label', 'غير محدد')))}\n"
         f"• انتهاء الصلاحية: {html.escape(format_expiry_for_account(expires_at))}\n"
-        f"• التجربة المجانية مستخدمة: {trial_used}\n"
-        f"• {html.escape(usage_line)}"
+        f"• التجربة المجانية مستخدمة: {trial_used}"
     )
 
 
@@ -14019,7 +14323,6 @@ def build_bot_stats_message() -> str:
     all_users = get_all_users() or {}
     approved_users = get_all_approved_users() or {}
     pending_users = get_all_pending_users() or {}
-
     active_approved = 0
     expired_or_blocked = 0
     for uid in list(approved_users.keys()):
@@ -14028,36 +14331,14 @@ def build_bot_stats_message() -> str:
                 active_approved += 1
             else:
                 expired_or_blocked += 1
-        except Exception:
-            pass
-
-    day_key = get_signal_day_key()
-    try:
-        usage_data = system_ref().child("signal_usage").get() or {}
-    except Exception:
-        usage_data = {}
-
-    today_signals = 0
-    total_signals = 0
-    top_user = None
-    top_today = -1
-    if isinstance(usage_data, dict):
-        for uid, item in usage_data.items():
-            if not isinstance(item, dict):
-                continue
-            total_signals += safe_int(item.get("total"), 0)
-            today_count = safe_int(((item.get("daily") or {}).get(day_key) or {}).get("count"), 0)
-            today_signals += today_count
-            if today_count > top_today:
-                top_today = today_count
-                top_user = str(uid)
-
+        except Exception as exc:
+            logger.debug("Could not classify approved user %r: %s", uid, exc, exc_info=True)
     try:
         video_trials = db.reference("video_trials").get() or {}
-        trial_used_count = sum(1 for x in (video_trials or {}).values() if isinstance(x, dict) and x.get("used"))
-    except Exception:
+        trial_used_count = sum(1 for x in video_trials.values() if isinstance(x, dict) and x.get("used"))
+    except Exception as exc:
+        logger.exception("Could not read video trial statistics: %s", exc)
         trial_used_count = 0
-
     active_today = 0
     cutoff = now_utc() - timedelta(hours=24)
     for item in all_users.values():
@@ -14069,13 +14350,6 @@ def build_bot_stats_message() -> str:
                 last_seen = last_seen.replace(tzinfo=timezone.utc)
             if last_seen >= cutoff:
                 active_today += 1
-
-    top_user_line = "لا يوجد"
-    if top_user and top_today > 0:
-        user_data = all_users.get(top_user, {}) if isinstance(all_users, dict) else {}
-        top_name = user_data.get("name", "غير معروف") if isinstance(user_data, dict) else "غير معروف"
-        top_user_line = f"{top_name} | <code>{top_user}</code> | {top_today} إشارات اليوم"
-
     return (
         "📊 إحصائيات البوت\n"
         "━━━━━━━━━━━━━━\n"
@@ -14084,10 +14358,7 @@ def build_bot_stats_message() -> str:
         f"📥 الطلبات المعلقة: {len(pending_users)}\n"
         f"⛔ منتهون/محظورون: {expired_or_blocked}\n"
         f"🟢 نشطوا آخر 24 ساعة: {active_today}\n"
-        f"🎁 مستخدمو التجربة: {trial_used_count}\n\n"
-        f"📌 إشارات اليوم: {today_signals}\n"
-        f"📌 إجمالي الإشارات المسجلة: {total_signals}\n"
-        f"🏆 أعلى مستخدم اليوم: {top_user_line}\n"
+        f"🎁 مستخدمو التجربة: {trial_used_count}\n"
         "━━━━━━━━━━━━━━"
     )
 
@@ -14097,20 +14368,13 @@ def build_users_export_csv_bytes() -> bytes:
     approved_users = get_all_approved_users() or {}
     pending_users = get_all_pending_users() or {}
 
-    try:
-        usage_data = system_ref().child("signal_usage").get() or {}
-    except Exception:
-        usage_data = {}
-
-    day_key = get_signal_day_key()
     ids = set(str(x) for x in all_users.keys()) | set(str(x) for x in approved_users.keys()) | set(str(x) for x in pending_users.keys())
 
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow([
         "telegram_id", "name", "username", "quotex_id", "status", "plan",
-        "expires_at", "approved_at", "pending", "trial_used",
-        "signals_today", "signals_total", "last_seen"
+        "expires_at", "approved_at", "pending", "trial_used", "last_seen"
     ])
 
     for uid in sorted(ids, key=lambda x: int(x) if str(x).lstrip('-').isdigit() else 0):
@@ -14121,10 +14385,6 @@ def build_users_export_csv_bytes() -> bytes:
         for source in (user_data, approved_data, pending_data):
             if isinstance(source, dict):
                 merged.update({k: v for k, v in source.items() if v not in {None, ""}})
-
-        usage = usage_data.get(uid, {}) if isinstance(usage_data, dict) else {}
-        signals_today = safe_int(((usage.get("daily") or {}).get(day_key) or {}).get("count"), 0) if isinstance(usage, dict) else 0
-        signals_total = safe_int(usage.get("total"), 0) if isinstance(usage, dict) else 0
 
         writer.writerow([
             uid,
@@ -14137,8 +14397,6 @@ def build_users_export_csv_bytes() -> bytes:
             merged.get("approved_at") or merged.get("activated_at", ""),
             "yes" if uid in pending_users else "no",
             "yes" if (str(uid).lstrip('-').isdigit() and has_used_video_trial(int(uid))) else "",
-            signals_today,
-            signals_total,
             merged.get("last_seen", ""),
         ])
 
@@ -14280,6 +14538,7 @@ async def handle_trading_room_callback(update: Update, context: ContextTypes.DEF
             return True
         state["pending_ready"] = False
         state["ready_confirmed"] = True
+        save_trading_room_state(context, uid, state)
         await safe_send_message(context.bot, chat_id=uid, text=t("بسم الله، جاري البحث عن زوج مناسب...", "Starting now. Searching for a suitable pair..."), reply_markup=get_trading_room_active_keyboard(uid))
         try:
             context.job_queue.run_once(
@@ -14397,14 +14656,15 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         await query.answer("هذا الزر للأدمن فقط", show_alert=True)
         return
 
-    await query.answer()
-
     try:
-        action, target_id_str = data.split(":")
+        action, target_id_str = data.split(":", 1)
         target_id = int(target_id_str)
     except Exception:
         await query.answer("بيانات غير صالحة", show_alert=True)
         return
+
+    # Answer exactly once, after validation.
+    await query.answer()
 
     user_data = get_user_record(target_id)
     target_name = user_data.get("name", "المستخدم") if user_data else "المستخدم"
@@ -14433,7 +14693,7 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
                 text="✅ تم تفعيل حسابك بنجاح لمدة أسبوع\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
             )
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 14695", exc_info=True)
         return
 
     if action == "approve_month":
@@ -14449,7 +14709,7 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
                 text="✅ تم تفعيل حسابك بنجاح لمدة شهر\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
             )
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 14711", exc_info=True)
         return
 
     if action == "approve_forever":
@@ -14465,7 +14725,7 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
                 text="✅ تم تفعيل حسابك بنجاح بشكل دائم\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
             )
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 14727", exc_info=True)
         return
 
     if action == "reject":
@@ -14483,7 +14743,7 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
                 reply_markup=welcome_keyboard
             )
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 14745", exc_info=True)
         return
 
 
@@ -14500,7 +14760,7 @@ async def show_otc_list_manager_panel(update: Update):
             "role": "otc_list_manager",
         })
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 14762", exc_info=True)
 
     await update.message.reply_text(
         "🧾 لوحة فحص ليستات OTC 👇",
@@ -14608,7 +14868,7 @@ def recover_otc_list_result_now(user_id: int) -> tuple[str | None, dict]:
             try:
                 save_otc_list_trade_result(user_id, list_id, idx, item)
             except Exception:
-                pass
+                logger.debug("Suppressed exception at line 14870", exc_info=True)
 
         items.sort(key=lambda x: int(x.get("index", 0)))
         result_text, meta = build_otc_list_results_message_from_items(items)
@@ -14624,7 +14884,7 @@ def recover_otc_list_result_now(user_id: int) -> tuple[str | None, dict]:
                 "meta": meta,
             })
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 14886", exc_info=True)
 
         return result_text, meta
 
@@ -14659,7 +14919,7 @@ def mark_video_trial_used_permanent(user_id: int, expires_at=None):
             payload["expires_at"] = expires_at.isoformat() if hasattr(expires_at, "isoformat") else str(expires_at)
         video_trial_permanent_ref(user_id).update(payload)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 14921", exc_info=True)
 
 
 def video_trial_ref(user_id: int):
@@ -14696,7 +14956,7 @@ def mark_video_trial_started(user_id: int):
             "eligible_after": int(time_module.time()) + int(VIDEO_TRIAL_DELAY_SECONDS),
         })
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 14958", exc_info=True)
 
 
 def get_video_trial_eligible_after(user_id: int) -> int:
@@ -14735,58 +14995,13 @@ def activate_video_trial_for_user(user_id: int):
     try:
         clear_user_cache(user_id)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 14997", exc_info=True)
 
     mark_video_trial_used_permanent(user_id, expire_at)
     clear_user_cache(user_id)
 
     return expire_at
 
-
-
-def check_signal_usage_allowed_lang(user_id: int, amount: int = 1, lang: str = "ar") -> tuple[bool, str]:
-    # Usage limits disabled by request.
-    return True, ""
-    allowed, msg = check_signal_usage_allowed(user_id, amount)
-    if allowed or lang != "en":
-        return allowed, msg
-
-    uid = int(user_id)
-    amount = max(1, int(amount or 1))
-    plan = get_signal_plan_info(uid)
-    usage = get_signal_usage_summary(uid)
-
-    last_at = float(usage.get("last_at") or 0)
-    now_ts = time_module.time()
-    if SIGNAL_USAGE_COOLDOWN_SECONDS > 0 and last_at and now_ts - last_at < SIGNAL_USAGE_COOLDOWN_SECONDS:
-        wait = int(max(1, SIGNAL_USAGE_COOLDOWN_SECONDS - (now_ts - last_at)))
-        return False, f"⏳ Please wait {wait} seconds before requesting a new signal."
-
-    limit = int(plan.get("limit") or 0)
-    used = int(usage["total"] if plan["limit_type"] == "total" else usage["today"])
-    remaining = max(0, limit - used)
-    plan_names = {"trial": "Free Trial", "week": "Weekly Subscription", "month": "Monthly Subscription", "forever": "VIP Forever"}
-    plan_label = plan_names.get(str(plan.get("key") or ""), str(plan.get("label") or "Subscription"))
-
-    if remaining <= 0:
-        if plan["limit_type"] == "total":
-            return False, (
-                "⛔ Your free trial signal limit has ended.\n\n"
-                f"You used {used}/{limit} signals.\n"
-                "To continue, contact the admin to activate your subscription."
-            )
-        return False, (
-            "⛔ You reached your daily signal limit.\n\n"
-            f"Plan: {plan_label}\n"
-            f"Used today: {used}/{limit}\n"
-            "The counter resets at the start of the day, UTC+3."
-        )
-
-    return False, (
-        f"⚠️ You currently have only {remaining} signals remaining.\n"
-        f"Your request needs {amount} signals.\n"
-        "Choose a smaller count or wait for the daily limit to reset."
-    )
 
 
 def build_signals_message_en(pair: str, count: int, interval_minutes: int, signals: list[str]) -> str:
@@ -14892,8 +15107,9 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Admin owner can still open the admin panel while testing English mode.
     if is_admin(user.id) and text in {"🛠 Admin Panel", "Admin Panel", "🛠 لوحة الأدمن"}:
         reset_signal_state(context)
+        context.user_data["admin_panel_active"] = True
         await update.message.reply_text(
-            "🛠 Admin panel opened.",
+            "🛠 Admin panel opened. Administrative controls are shown in Arabic.",
             reply_markup=admin_main_keyboard
         )
         return
@@ -15082,12 +15298,65 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     # Approved English user flow
-    if text in {"📊 Generate Signals", "Generate Signals", "📊 توليد إشارات", "توليد إشارات"}:
-        allowed, limit_msg = check_signal_usage_allowed_lang(user.id, 1, "en")
-        if not allowed:
-            reset_signal_state(context)
-            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id, "en"))
+    if text in {"⚡ OTC Edge", "OTC Edge"}:
+        reset_signal_state(context)
+        await update.message.reply_text(
+            "⚡ OTC Edge\n\n"
+            "Choose how you want the bot to monitor OTC opportunities:\n\n"
+            "🚀 Monitor All OTC: scans all supported OTC pairs and switches the extension when a signal appears.\n"
+            "🎯 Monitor Specific Pair: preselects one pair in advance for the fastest entry.\n\n"
+            "Signals are routed only to the extension linked to your Telegram ID.",
+            reply_markup=otc_edge_user_keyboard_en
+        )
+        return
+
+    if text == "🚀 Monitor All OTC":
+        context.user_data["step"] = None
+        await update.message.reply_text(
+            start_otc_edge_watcher(user.id, user.id, mode="all", pairs=[], lang="en"),
+            reply_markup=otc_edge_user_keyboard_en
+        )
+        return
+
+    if text in {"🎯 Monitor Specific Pair", "🎯 Choose OTC Pair"}:
+        context.user_data["step"] = "otc_edge_user_watch_waiting_pair_en"
+        await update.message.reply_text(
+            "🎯 Send one OTC pair, for example:\nGBP/NZD (OTC)\n\n"
+            "Keep Quotex and the extension open so the pair can be prepared in advance.",
+            reply_markup=otc_edge_user_keyboard_en
+        )
+        return
+
+    if step == "otc_edge_user_watch_waiting_pair_en":
+        pairs, errors = parse_otc_edge_watch_pairs(text)
+        context.user_data["step"] = None
+        if not pairs:
+            await update.message.reply_text(
+                "❌ I could not read the pair. Send it like this:\nGBP/NZD (OTC)",
+                reply_markup=otc_edge_user_keyboard_en
+            )
             return
+        pair = pairs[0]
+        extra = "\n\nℹ️ Only the first pair was used because preselection works with one pair." if len(pairs) > 1 else ""
+        msg = start_otc_edge_watcher(user.id, user.id, mode="pairs", pairs=[pair], lang="en") + extra
+        await update.message.reply_text(msg, reply_markup=otc_edge_user_keyboard_en)
+        return
+
+    if text == "📋 OTC Edge Status":
+        await update.message.reply_text(
+            build_otc_edge_user_status_message(user.id, lang="en"),
+            reply_markup=otc_edge_user_keyboard_en
+        )
+        return
+
+    if text == "🛑 Stop OTC Edge":
+        await update.message.reply_text(
+            stop_otc_edge_watcher(user.id, lang="en"),
+            reply_markup=otc_edge_user_keyboard_en
+        )
+        return
+
+    if text in {"📊 Generate Signals", "Generate Signals", "📊 توليد إشارات", "توليد إشارات"}:
         reset_signal_state(context)
         context.user_data["step"] = "choose_market_mode_en"
         await update.message.reply_text("📊 Choose market type 👇", reply_markup=market_mode_keyboard_en)
@@ -15146,11 +15415,6 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("📈 Choose the number of trades from the buttons 👇", reply_markup=count_keyboard_en)
             return
         count = int(text)
-        allowed, limit_msg = check_signal_usage_allowed_lang(user.id, count, "en")
-        if not allowed:
-            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id, "en"))
-            reset_signal_state(context)
-            return
         interval_minutes = 3
         pair = context.user_data["pair"]
         start_dt = next_full_minute(now_utc())
@@ -15161,7 +15425,6 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_main_menu_for_user(user.id, "en"),
             parse_mode="Markdown"
         )
-        record_signal_usage(user.id, count, "otc_timed")
         await publish_copy_timed_list_signals(pair, signals, interval_minutes, start_dt, source="timed_list", creator_user_id=user.id)
         reset_signal_state(context)
         return
@@ -15173,11 +15436,6 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=otc_live_search_keyboard_en
             )
             return
-        allowed, limit_msg = check_signal_usage_allowed_lang(user.id, 1, "en")
-        if not allowed:
-            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id, "en"))
-            reset_signal_state(context)
-            return
         await update.message.reply_text("🔎 Checking live OTC pairs on M1...")
         result = analyze_best_live_otc_now(lang="en")
         await update.message.reply_text(
@@ -15186,7 +15444,6 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         if result.get("ok"):
-            record_signal_usage(user.id, 1, "otc_live_now")
             await maybe_publish_copy_signal(result, source="otc_live", enabled=COPY_SEND_OTC_LIVE_NOW, creator_user_id=user.id)
         reset_signal_state(context)
         return
@@ -15205,11 +15462,6 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text not in interval_map and text != "🔥 Best Opportunity":
             await update.message.reply_text("⏳ Choose the timeframe from the buttons 👇", reply_markup=real_interval_keyboard_en)
             return
-        allowed, limit_msg = check_signal_usage_allowed_lang(user.id, 1, "en")
-        if not allowed:
-            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id, "en"))
-            reset_signal_state(context)
-            return
         pair = context.user_data["pair"]
         if text == "🔥 Best Opportunity":
             result = analyze_real_market_best(pair)
@@ -15221,7 +15473,6 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_main_menu_for_user(user.id, "en")
         )
         if result.get("ok"):
-            record_signal_usage(user.id, 1, "real_market")
             await maybe_publish_copy_signal(result, source="real_market", enabled=COPY_SEND_REAL_MARKET, creator_user_id=user.id)
         reset_signal_state(context)
         return
@@ -15270,6 +15521,7 @@ SIGNAL_BLOCK_KEYWORDS = [
     "صفقة مباشرة",
     "ابحث عن صفقة",
     "سوق عالمي",
+    "OTC Edge",
 ]
 
 
@@ -15377,7 +15629,7 @@ def is_user_revoked_or_not_allowed(user_id: int) -> bool:
                 _cache_set(f"user_status:{uid}", status)
                 return True
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 15631", exc_info=True)
 
     return not is_approved(uid)
 
@@ -15418,6 +15670,7 @@ async def handle_trading_room_message(update: Update, context: ContextTypes.DEFA
             return True
         state["pending_ready"] = False
         state["ready_confirmed"] = True
+        save_trading_room_state(context, user.id, state)
         await safe_send_message(
             context.bot,
             chat_id=user.id,
@@ -15580,6 +15833,7 @@ async def handle_trading_room_message(update: Update, context: ContextTypes.DEFA
             state["smart_exit_waiting"] = False
             state["smart_exit_reason"] = None
             state["smart_exit_last_suggested_at"] = time_module.time()
+            save_trading_room_state(context, user.id, state)
             await safe_send_message(
                 context.bot,
                 chat_id=user.id,
@@ -15598,6 +15852,7 @@ async def handle_trading_room_message(update: Update, context: ContextTypes.DEFA
             losses = int(state.get("losses", 0) or 0)
             state["active"] = False
             state["smart_exit_waiting"] = False
+            save_trading_room_state(context, user.id, state)
             reason = _tr_room_text(user.id, "إيقاف ذكي لحفظ نتيجة الجلسة الحالية.", "Smart stop to secure the current session result.")
             end_text = (
                 (_tr_room_text(user.id, "🏁 تم إيقاف جلسة التداول", "🏁 Trading session stopped") + "\n\n")
@@ -15712,8 +15967,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if lang == "en":
-        await handle_message_en(update, context)
-        return
+        # The admin panel itself currently uses Arabic labels. Once opened, route
+        # those internal buttons through the full Arabic admin handler instead of
+        # sending them to the public English fallback.
+        if is_admin(user.id) and context.user_data.get("admin_panel_active"):
+            if text == "⬅️ رجوع" and not step:
+                context.user_data["admin_panel_active"] = False
+            else:
+                pass  # continue into the complete admin handler below
+        else:
+            await handle_message_en(update, context)
+            return
 
     if "تواصل مع المسؤول" in text:
         await update.message.reply_text(
@@ -15879,7 +16143,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         # أزرار البوت العادي مسموحة لهذا الشخص أيضًا، لذلك نتركها تكمل للمعالجة العادية.
-        if text in {"📊 توليد إشارات", "📞 تواصل مع المسؤول", "⚡ OTC", "🕒 زمني", "⚡ صفقة مباشرة", "🔎 ابحث عن صفقة الآن"}:
+        if text in {
+            "📊 توليد إشارات", "📞 تواصل مع المسؤول", "⚡ OTC", "🕒 زمني",
+            "⚡ صفقة مباشرة", "🔎 ابحث عن صفقة الآن", "⚡ OTC Edge",
+            "🚀 مراقبة كل السوق", "🎯 مراقبة زوج محدد", "🎯 اختيار زوج OTC",
+            "📋 حالة OTC Edge", "🛑 إيقاف OTC Edge",
+            "📊 Generate Signals", "📞 Contact Support",
+            "🚀 Monitor All OTC", "🎯 Monitor Specific Pair", "🎯 Choose OTC Pair",
+            "📋 OTC Edge Status", "🛑 Stop OTC Edge",
+        } or step in {"otc_edge_user_watch_waiting_pair", "otc_edge_user_watch_waiting_pair_en"}:
             pass
         else:
             context.user_data["step"] = None
@@ -16019,7 +16291,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=build_pending_request_keyboard(user.id)
                 )
             except Exception:
-                pass
+                logger.debug("Suppressed exception at line 16293", exc_info=True)
 
             context.user_data["step"] = "pending_review"
             return
@@ -16140,7 +16412,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             otc_list_results_ref(user.id).delete()
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 16414", exc_info=True)
 
         list_id = str(int(time_module.time()))
         parsed_trades = parse_otc_list_trades(raw_list)
@@ -16291,6 +16563,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         state["pending_ready"] = False
         state["ready_confirmed"] = True
+        save_trading_room_state(context, user.id, state)
         await safe_send_message(
             context.bot,
             chat_id=user.id,
@@ -16542,11 +16815,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if text == "📊 توليد إشارات":
-        allowed, limit_msg = check_signal_usage_allowed(user.id, 1)
-        if not allowed:
-            reset_signal_state(context)
-            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id))
-            return
 
         reset_signal_state(context)
         context.user_data["step"] = "choose_market_mode"
@@ -16568,10 +16836,70 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ===== Public OTC Edge (v0.71) =====
+    if text in {"⚡ OTC Edge", "OTC Edge"}:
+        reset_signal_state(context)
+        await update.message.reply_text(
+            "⚡ OTC Edge\n\n"
+            "اختر طريقة المراقبة التي تناسبك:\n\n"
+            "🚀 مراقبة كل السوق: يفحص البوت جميع أزواج OTC، وعند ظهور فرصة يحوّل الإضافة إلى الزوج وينفذها.\n"
+            "🎯 مراقبة زوج محدد: يجهز زوجًا واحدًا مسبقًا داخل الإضافة، وهو الأسرع من ناحية الدخول.\n\n"
+            "كل إشارة تذهب فقط إلى إضافتك المرتبطة بنفس Telegram ID.",
+            reply_markup=otc_edge_user_keyboard
+        )
+        return
+
+    if text == "🚀 مراقبة كل السوق" and not is_admin(user.id):
+        context.user_data["step"] = None
+        await update.message.reply_text(
+            start_otc_edge_watcher(user.id, user.id, mode="all", pairs=[], lang="ar"),
+            reply_markup=otc_edge_user_keyboard
+        )
+        return
+
+    if text in {"🎯 مراقبة زوج محدد", "🎯 اختيار زوج OTC"} and not is_admin(user.id):
+        context.user_data["step"] = "otc_edge_user_watch_waiting_pair"
+        await update.message.reply_text(
+            "🎯 أرسل زوج OTC واحد فقط، مثال:\nGBP/NZD (OTC)\n\n"
+            "اترك منصة Quotex والإضافة مفتوحتين حتى يتم تجهيز الزوج مسبقًا والدخول عند وصول الإشارة.",
+            reply_markup=otc_edge_user_keyboard
+        )
+        return
+
+    if step == "otc_edge_user_watch_waiting_pair":
+        pairs, errors = parse_otc_edge_watch_pairs(text)
+        context.user_data["step"] = None
+        if not pairs:
+            await update.message.reply_text(
+                "❌ لم أستطع قراءة الزوج.\n\nأرسله بهذا الشكل:\nGBP/NZD (OTC)",
+                reply_markup=otc_edge_user_keyboard
+            )
+            return
+        pair = pairs[0]
+        extra = "\n\nℹ️ تم اعتماد أول زوج فقط لأن التجهيز المسبق يعمل على زوج واحد." if len(pairs) > 1 else ""
+        msg = start_otc_edge_watcher(user.id, user.id, mode="pairs", pairs=[pair], lang="ar") + extra
+        await update.message.reply_text(msg, reply_markup=otc_edge_user_keyboard)
+        return
+
+    if text == "📋 حالة OTC Edge":
+        await update.message.reply_text(
+            build_otc_edge_user_status_message(user.id, lang="ar"),
+            reply_markup=otc_edge_user_keyboard
+        )
+        return
+
+    if text == "🛑 إيقاف OTC Edge":
+        await update.message.reply_text(
+            stop_otc_edge_watcher(user.id, lang="ar"),
+            reply_markup=otc_edge_user_keyboard
+        )
+        return
+
     # ===== Admin panel =====
     if is_admin(user.id):
         if text == "🛠 لوحة الأدمن":
             reset_signal_state(context)
+            context.user_data["admin_panel_active"] = True
             await update.message.reply_text(
                 "🛠 مرحبًا بك في لوحة الأدمن",
                 reply_markup=admin_main_keyboard
@@ -16678,7 +17006,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["step"] = "copy_delete_waiting_token"
             await update.message.reply_text(
                 "🗑 أرسل كود Copy الذي تريد حذفه نهائيًا من Firebase.\n\n"
-                "ملاحظة: كود DEMO-111 أو أي كود موجود في Render Env لا يمكن حذفه من هنا؛ احذفه من COPY_LICENSES إذا أردت.",
+                "ملاحظة: أي كود موجود في Render Env لا يمكن حذفه من هنا؛ احذفه من COPY_LICENSES إذا أردت.",
                 reply_markup=copy_admin_keyboard
             )
             return
@@ -16791,14 +17119,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == "🛑 إيقاف مراقبة Edge":
             await update.message.reply_text(
-                stop_otc_edge_watcher(),
+                stop_otc_edge_watcher(user.id),
                 reply_markup=admin_otc_edge_keyboard
             )
             return
 
         if text == "📋 حالة مراقبة Edge":
             await update.message.reply_text(
-                build_otc_edge_watcher_status_message(),
+                build_otc_edge_watcher_status_message(state=_otc_edge_get_state(user.id)),
                 reply_markup=admin_otc_edge_keyboard
             )
             return
@@ -16957,11 +17285,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             try:
                 csv_bytes = build_users_export_csv_bytes()
                 bio = io.BytesIO(csv_bytes)
-                bio.name = f"trading_time_users_{get_signal_day_key()}.csv"
+                bio.name = f"trading_time_users_{now_utc().strftime('%Y-%m-%d')}.csv"
                 await update.message.reply_document(
                     document=bio,
                     filename=bio.name,
-                    caption="📤 نسخة احتياطية من المستخدمين وحالة الاستخدام.",
+                    caption="📤 نسخة احتياطية من المستخدمين وحالة التفعيل.",
                     reply_markup=admin_main_keyboard
                 )
             except Exception as e:
@@ -17249,7 +17577,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text="✅ تم تفعيل حسابك بنجاح لمدة أسبوع\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
                     )
                 except Exception:
-                    pass
+                    logger.debug("Suppressed exception at line 17579", exc_info=True)
                 context.user_data["step"] = None
                 return
 
@@ -17262,7 +17590,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text="✅ تم تفعيل حسابك بنجاح لمدة شهر\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
                     )
                 except Exception:
-                    pass
+                    logger.debug("Suppressed exception at line 17592", exc_info=True)
                 context.user_data["step"] = None
                 return
 
@@ -17275,7 +17603,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         text="✅ تم تفعيل حسابك بنجاح بشكل دائم\n\nأصبح بإمكانك الآن استخدام بوت TRADING TIME.\nاضغط /start للدخول إلى القائمة الرئيسية."
                     )
                 except Exception:
-                    pass
+                    logger.debug("Suppressed exception at line 17605", exc_info=True)
                 context.user_data["step"] = None
                 return
 
@@ -17285,7 +17613,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 try:
                     await send_revoked_welcome_keyboard(context, target_id)
                 except Exception:
-                    pass
+                    logger.debug("Suppressed exception at line 17615", exc_info=True)
                 context.user_data["step"] = None
                 return
 
@@ -17359,12 +17687,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         count = context.user_data["count"]
         start_dt = next_full_minute(now_utc())
 
-        allowed, limit_msg = check_signal_usage_allowed(user.id, count)
-        if not allowed:
-            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id))
-            reset_signal_state(context)
-            return
-
         signals = generate_signals(pair, count, interval_minutes, start_dt)
         message_text = build_signals_message(pair, count, interval_minutes, signals)
 
@@ -17373,7 +17695,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_main_menu_for_user(user.id),
             parse_mode="Markdown"
         )
-        record_signal_usage(user.id, count, "otc_timed")
         await publish_copy_timed_list_signals(pair, signals, interval_minutes, start_dt, source="timed_list", creator_user_id=user.id)
 
         reset_signal_state(context)
@@ -17388,12 +17709,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        allowed, limit_msg = check_signal_usage_allowed(user.id, 1)
-        if not allowed:
-            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id))
-            reset_signal_state(context)
-            return
-
         await update.message.reply_text("🔎 جاري فحص أزواج OTC الحية على فريم الدقيقة...")
         result = analyze_best_live_otc_now()
 
@@ -17403,7 +17718,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
         if result.get("ok"):
-            record_signal_usage(user.id, 1, "otc_live_now")
             await maybe_publish_copy_signal(result, source="otc_live", enabled=COPY_SEND_OTC_LIVE_NOW, creator_user_id=user.id)
 
         reset_signal_state(context)
@@ -17431,12 +17745,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("⏳ اختر الفريم من الأزرار 👇", reply_markup=real_interval_keyboard)
             return
 
-        allowed, limit_msg = check_signal_usage_allowed(user.id, 1)
-        if not allowed:
-            await update.message.reply_text(limit_msg, reply_markup=build_main_menu_for_user(user.id))
-            reset_signal_state(context)
-            return
-
         pair = context.user_data["pair"]
 
         if text == "🔥 أفضل فرصة":
@@ -17450,7 +17758,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=build_main_menu_for_user(user.id)
         )
         if result.get("ok"):
-            record_signal_usage(user.id, 1, "real_market")
             await maybe_publish_copy_signal(result, source="real_market", enabled=COPY_SEND_REAL_MARKET, creator_user_id=user.id)
 
         reset_signal_state(context)
@@ -17523,7 +17830,7 @@ def _copy_server_duration_seconds(data: dict) -> int:
         if tf.startswith("M") and tf[1:].isdigit():
             return max(5, int(tf[1:]) * 60)
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 17832", exc_info=True)
     return 60
 
 
@@ -17731,10 +18038,11 @@ def create_embedded_copy_api():
     from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
 
-    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version="0.62.0")
+    copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version=COPY_SERVER_VERSION)
     copy_api.add_middleware(
         CORSMiddleware,
         allow_origins=COPY_ALLOWED_ORIGINS,
+        allow_origin_regex=COPY_ALLOWED_ORIGIN_REGEX,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -17746,7 +18054,7 @@ def create_embedded_copy_api():
         return {
             "ok": True,
             "app": "TRADING TIME COPY EMBEDDED SERVER",
-            "version": "0.62.0",
+            "version": COPY_SERVER_VERSION,
             "time": now_iso(),
             "copy_settings": copy_public_settings_payload(),
             "online_clients": len(_copy_clients),
@@ -17780,6 +18088,9 @@ def create_embedded_copy_api():
         except ValueError as e:
             raise HTTPException(status_code=401, detail=str(e))
         return {
+            "server_version": COPY_SERVER_VERSION,
+            "extension_version": COPY_EXTENSION_VERSION,
+            "secret_source": COPY_SERVER_SECRET_SOURCE,
             "online_clients": len(_copy_clients),
             "clients": [
                 {
@@ -17840,6 +18151,11 @@ def create_embedded_copy_api():
     @copy_api.websocket("/ws/extension")
     async def copy_extension_ws(websocket: WebSocket, token: str = Query(...), device_id: str = Query(default="unknown"), telegram_user_id: str = Query(default="")):
         await websocket.accept()
+        origin = websocket.headers.get("origin")
+        if not is_copy_origin_allowed(origin):
+            logger.warning("Rejected COPY WebSocket origin: %r", origin)
+            await websocket.close(code=4403, reason="origin not allowed")
+            return
         token = normalize_copy_license_token(token)
         telegram_user_id = normalize_copy_telegram_user_id(telegram_user_id)
         ok, reason, license_record = copy_validate_license_for_device(token, device_id, telegram_user_id=telegram_user_id, touch=True)
@@ -17911,7 +18227,7 @@ def create_embedded_copy_api():
                 else:
                     await _copy_send_json_safe(websocket, {"type": "event_saved", "server_time": now_iso()})
         except WebSocketDisconnect:
-            pass
+            logger.debug("Suppressed exception at line 18229", exc_info=True)
         finally:
             _copy_clients.pop(client_id, None)
 
@@ -17966,7 +18282,7 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
             logger.warning("Ignored Telegram timeout error: %s", context.error)
             return
     except Exception:
-        pass
+        logger.debug("Suppressed exception at line 18284", exc_info=True)
 
     error_text = "".join(traceback.format_exception(None, context.error, context.error.__traceback__)) if context.error else ""
     logger.error(
@@ -17989,7 +18305,7 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
                 parse_mode="HTML"
             )
         except Exception:
-            pass
+            logger.debug("Suppressed exception at line 18307", exc_info=True)
 
 def run_telegram_bot_only():
     if not BOT_TOKEN:
@@ -18007,12 +18323,19 @@ def run_telegram_bot_only():
     logger.info("OTC Live auto publish channel is removed/disabled by owner request.")
 
     job_queue = app.job_queue
-    # مراقبة OTC Edge خاصة بالأدمن فقط. لا ترسل للمستخدمين ولا تنشر على أي قناة.
+
+    # Restore user runtime state before periodic jobs begin.
+    restore_otc_edge_watcher_states()
+    restore_trading_room_states(app)
+    restored_room_jobs = schedule_restored_trading_room_jobs(app)
+    logger.warning("Persistent runtime restored | trading_room_jobs=%s", restored_room_jobs)
+
+    # v0.71: OTC Edge watcher serves independent all-market/selected-pair user states and routes each signal to its owner extension only.
     job_queue.run_repeating(
         otc_edge_watcher_job,
         interval=OTC_EDGE_WATCHER_SCAN_SECONDS,
         first=OTC_EDGE_WATCHER_SCAN_SECONDS,
-        name="admin_otc_edge_watcher",
+        name="multi_user_otc_edge_watcher",
     )
 
     # قناة اختبار استراتيجية 3 شموع + ذاكرة تحليل v0.59. تعمل فقط عند ضبط THREE_CANDLE_CHANNEL_ID وتفعيلها من env.
