@@ -963,8 +963,8 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.74"
-COPY_SERVER_VERSION = "0.74.0"
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.72").strip() or "v0.72"
+COPY_SERVER_VERSION = "0.75.0"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.75").strip() or "v0.75"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -1086,6 +1086,10 @@ COPY_ALLOWED_ORIGIN_REGEX = (
 COPY_LICENSES = os.getenv("COPY_LICENSES", "").strip()
 COPY_LICENSE_DEFAULT_MAX_DEVICES = int(os.getenv("COPY_LICENSE_DEFAULT_MAX_DEVICES", "1"))
 COPY_LICENSE_DEVICE_TOUCH_SECONDS = int(os.getenv("COPY_LICENSE_DEVICE_TOUCH_SECONDS", "600"))
+# Owner-only Copy license. It is accepted only with the bot admin Telegram ID and
+# becomes atomically bound to the first admin device that activates it.
+COPY_ADMIN_LICENSE_TOKEN = "DEMO-111"
+COPY_ADMIN_LICENSE_MAX_DEVICES = max(1, int(os.getenv("COPY_ADMIN_LICENSE_MAX_DEVICES", "1")))
 COPY_SETTINGS_CACHE_TTL_SECONDS = int(os.getenv("COPY_SETTINGS_CACHE_TTL_SECONDS", "60"))
 COPY_SIGNAL_HISTORY_LIMIT = int(os.getenv("COPY_SIGNAL_HISTORY_LIMIT", "200"))
 COPY_UVICORN_LOG_LEVEL = os.getenv("COPY_UVICORN_LOG_LEVEL", "info")
@@ -2319,8 +2323,13 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tel
     if not token:
         return False, "invalid license", None
 
+    is_admin_license = token == COPY_ADMIN_LICENSE_TOKEN
+    admin_tid = str(int(ADMIN_TELEGRAM_ID))
+    if is_admin_license and telegram_user_id != admin_tid:
+        return False, "admin license restricted to owner Telegram ID", None
+
     # Explicit legacy env licenses remain read-only and opt-in.
-    env_record = copy_license_env_records().get(token)
+    env_record = None if is_admin_license else copy_license_env_records().get(token)
     if env_record is not None:
         if str(env_record.get("status") or "").lower() != "active":
             return False, "inactive license", env_record
@@ -2340,9 +2349,38 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tel
 
     def _transaction(current):
         if not isinstance(current, dict):
-            decision.update(ok=False, reason="invalid license", record=current)
-            return current
+            if not is_admin_license:
+                decision.update(ok=False, reason="invalid license", record=current)
+                return current
+            current = {
+                "token": COPY_ADMIN_LICENSE_TOKEN,
+                "status": "active",
+                "plan": "admin",
+                "source": "firebase",
+                "created_by": int(ADMIN_TELEGRAM_ID),
+                "created_at": now_value,
+                "expires_at": "forever",
+                "max_devices": COPY_ADMIN_LICENSE_MAX_DEVICES,
+                "telegram_user_id": admin_tid,
+                "owner_telegram_id": admin_tid,
+                "is_admin_license": True,
+                "role": "admin",
+                "devices": {},
+            }
         record = dict(current)
+        if is_admin_license:
+            # Never trust mutable Firebase fields for the owner license.
+            record.update({
+                "token": COPY_ADMIN_LICENSE_TOKEN,
+                "status": "active",
+                "plan": "admin",
+                "expires_at": "forever",
+                "max_devices": COPY_ADMIN_LICENSE_MAX_DEVICES,
+                "telegram_user_id": admin_tid,
+                "owner_telegram_id": admin_tid,
+                "is_admin_license": True,
+                "role": "admin",
+            })
         decision["record"] = record
         if str(record.get("status") or "").lower() != "active":
             decision.update(ok=False, reason="inactive license")
@@ -18249,6 +18287,8 @@ def create_embedded_copy_api():
                 "max_devices": (license_record or {}).get("max_devices"),
                 "telegram_user_id": normalize_copy_telegram_user_id((license_record or {}).get("telegram_user_id") or telegram_user_id),
                 "route_mode": "personal" if telegram_user_id else "broadcast_only_until_telegram_id_is_set",
+                "is_admin_license": bool((license_record or {}).get("is_admin_license")),
+                "role": (license_record or {}).get("role") or ("admin" if (license_record or {}).get("is_admin_license") else "user"),
             },
         })
         try:
