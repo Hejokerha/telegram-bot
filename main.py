@@ -963,8 +963,8 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.74"
-COPY_SERVER_VERSION = "0.75.0"
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.75").strip() or "v0.75"
+COPY_SERVER_VERSION = "0.78.0"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.78").strip() or "v0.78"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -1087,7 +1087,7 @@ COPY_LICENSES = os.getenv("COPY_LICENSES", "").strip()
 COPY_LICENSE_DEFAULT_MAX_DEVICES = int(os.getenv("COPY_LICENSE_DEFAULT_MAX_DEVICES", "1"))
 COPY_LICENSE_DEVICE_TOUCH_SECONDS = int(os.getenv("COPY_LICENSE_DEVICE_TOUCH_SECONDS", "600"))
 # Owner-only Copy license. It is accepted only with the bot admin Telegram ID and
-# becomes atomically bound to the first admin device that activates it.
+# is owner-only and keeps exactly one active admin device. A newly installed owner build may take over safely.
 COPY_ADMIN_LICENSE_TOKEN = "DEMO-111"
 COPY_ADMIN_LICENSE_MAX_DEVICES = max(1, int(os.getenv("COPY_ADMIN_LICENSE_MAX_DEVICES", "1")))
 COPY_SETTINGS_CACHE_TTL_SECONDS = int(os.getenv("COPY_SETTINGS_CACHE_TTL_SECONDS", "60"))
@@ -2310,7 +2310,7 @@ def normalize_copy_telegram_user_id(value) -> str:
         return ""
 
 
-def copy_validate_license_for_device(token: str, device_id: str = "unknown", telegram_user_id=None, touch: bool = True) -> tuple[bool, str, dict | None]:
+def copy_validate_license_for_device(token: str, device_id: str = "unknown", telegram_user_id=None, touch: bool = True, allow_admin_rebind: bool = False) -> tuple[bool, str, dict | None]:
     """Validate and atomically bind a Firebase license to Telegram/device.
 
     New-device capacity and first Telegram binding are decided inside one Firebase
@@ -2399,27 +2399,65 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tel
         devices = record.get("devices") if isinstance(record.get("devices"), dict) else {}
         devices = dict(devices)
         max_devices = max(1, int(record.get("max_devices") or COPY_LICENSE_DEFAULT_MAX_DEVICES or 1))
-        if device_key not in devices and len(devices) >= max_devices:
-            decision.update(ok=False, reason="device limit reached")
-            return current
 
         changed = False
         if telegram_user_id and not existing_tid:
             record["telegram_user_id"] = telegram_user_id
             record["telegram_linked_at"] = now_value
             changed = True
-        if device_key not in devices:
-            devices[device_key] = {
-                "device_id": device_id,
-                "bound_at": now_value,
-                "last_seen_at": now_value,
-            }
-            changed = True
-        elif touch and now_ts - last_touch >= int(COPY_LICENSE_DEVICE_TOUCH_SECONDS):
-            device_row = dict(devices.get(device_key) or {})
-            device_row["last_seen_at"] = now_value
-            devices[device_key] = device_row
-            changed = True
+
+        if is_admin_license:
+            # The owner frequently tests unpacked builds. Chrome gives a fresh local
+            # installation a new device id, so permanently binding DEMO-111 to the
+            # first build locks the owner out. Keep the license owner-only by exact
+            # Telegram ID, but allow the initial authenticated connection to move the
+            # single active slot to the latest owner device. Keepalive validation does
+            # not rebind, preventing an old superseded build from taking the slot back.
+            active_device_key = safe_key(record.get("active_device_id") or "")
+            is_active_device = bool(active_device_key and active_device_key == device_key)
+            if not is_active_device:
+                if not allow_admin_rebind:
+                    decision.update(ok=False, reason="admin device replaced")
+                    return current
+                devices = {
+                    device_key: {
+                        "device_id": device_id,
+                        "bound_at": now_value,
+                        "last_seen_at": now_value,
+                    }
+                }
+                record["active_device_id"] = device_id
+                record["admin_device_rebound_at"] = now_value
+                changed = True
+            elif device_key not in devices:
+                devices[device_key] = {
+                    "device_id": device_id,
+                    "bound_at": now_value,
+                    "last_seen_at": now_value,
+                }
+                changed = True
+            elif touch and now_ts - last_touch >= int(COPY_LICENSE_DEVICE_TOUCH_SECONDS):
+                device_row = dict(devices.get(device_key) or {})
+                device_row["last_seen_at"] = now_value
+                devices[device_key] = device_row
+                changed = True
+        else:
+            if device_key not in devices and len(devices) >= max_devices:
+                decision.update(ok=False, reason="device limit reached")
+                return current
+            if device_key not in devices:
+                devices[device_key] = {
+                    "device_id": device_id,
+                    "bound_at": now_value,
+                    "last_seen_at": now_value,
+                }
+                changed = True
+            elif touch and now_ts - last_touch >= int(COPY_LICENSE_DEVICE_TOUCH_SECONDS):
+                device_row = dict(devices.get(device_key) or {})
+                device_row["last_seen_at"] = now_value
+                devices[device_key] = device_row
+                changed = True
+
         if changed:
             record["devices"] = devices
             record["last_seen_at"] = now_value
@@ -18157,7 +18195,7 @@ def create_embedded_copy_api():
 
     @copy_api.get("/api/license/check")
     async def copy_license_check(token: str = Query(...), device_id: str = Query(default="unknown"), telegram_user_id: str = Query(default="")):
-        ok, reason, record = copy_validate_license_for_device(token, device_id, telegram_user_id=telegram_user_id, touch=True)
+        ok, reason, record = copy_validate_license_for_device(token, device_id, telegram_user_id=telegram_user_id, touch=True, allow_admin_rebind=True)
         if not ok:
             raise HTTPException(status_code=401, detail=reason)
         return {
@@ -18244,7 +18282,7 @@ def create_embedded_copy_api():
         token = normalize_copy_license_token(token)
         telegram_user_id = normalize_copy_telegram_user_id(telegram_user_id)
         ok, reason, license_record = copy_validate_license_for_device(
-            token, device_id, telegram_user_id=telegram_user_id, touch=True
+            token, device_id, telegram_user_id=telegram_user_id, touch=True, allow_admin_rebind=True
         )
         if not ok:
             await websocket.close(code=4401, reason=reason)
@@ -18261,6 +18299,21 @@ def create_embedded_copy_api():
             )
             await websocket.close(code=4403, reason="origin not allowed")
             return
+
+        # Exactly one live owner extension is allowed. When a new unpacked/store
+        # build takes over DEMO-111, close the previous build so signals can never
+        # be delivered to two admin installations at the same time.
+        if token == COPY_ADMIN_LICENSE_TOKEN:
+            for old_client_id, old_client in list(_copy_clients.items()):
+                if (
+                    old_client.get("license") == token
+                    and str(old_client.get("device_id") or "") != str(device_id or "")
+                ):
+                    try:
+                        await old_client.get("ws").close(code=4410, reason="admin device replaced")
+                    except Exception:
+                        logger.debug("Could not close superseded admin client", exc_info=True)
+                    _copy_clients.pop(old_client_id, None)
 
         client_id = hashlib.sha256(f"{token}:{device_id}:{telegram_user_id}:{time_module.time()}".encode("utf-8")).hexdigest()[:16]
         _copy_clients[client_id] = {
@@ -18296,7 +18349,7 @@ def create_embedded_copy_api():
                 raw = await websocket.receive_text()
                 if client_id in _copy_clients:
                     _copy_clients[client_id]["last_seen_at"] = now_iso()
-                ok, reason, _record = copy_validate_license_for_device(token, device_id, telegram_user_id=telegram_user_id, touch=True)
+                ok, reason, _record = copy_validate_license_for_device(token, device_id, telegram_user_id=telegram_user_id, touch=True, allow_admin_rebind=False)
                 if not ok:
                     await websocket.close(code=4401, reason=reason)
                     break
