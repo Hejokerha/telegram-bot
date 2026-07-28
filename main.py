@@ -532,6 +532,17 @@ copy_admin_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# v0.84: focused keyboards for admin workflows. Keeping only confirmation/cancel
+# actions prevents unrelated menu labels from being submitted as message bodies or tokens.
+admin_input_cancel_keyboard = ReplyKeyboardMarkup(
+    [["❌ إلغاء", "⬅️ رجوع"]],
+    resize_keyboard=True,
+)
+admin_confirm_keyboard = ReplyKeyboardMarkup(
+    [["✅ نعم، تأكيد", "❌ إلغاء"]],
+    resize_keyboard=True,
+)
+
 otc_list_manager_keyboard = ReplyKeyboardMarkup(
     [
         ["📊 توليد إشارات"],
@@ -962,9 +973,9 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 # اتركه false حتى تكون جاهزًا للتجربة، ثم فعّله من .env.
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
-BOT_RELEASE_VERSION = "v0.74"
-COPY_SERVER_VERSION = "0.78.0"
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.78").strip() or "v0.78"
+BOT_RELEASE_VERSION = "v0.84"
+COPY_SERVER_VERSION = "0.84.0"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.82").strip() or "v0.82"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -9269,7 +9280,6 @@ OTC_EDGE_WATCHER_MIN_SCORE = int(os.getenv("OTC_EDGE_WATCHER_MIN_SCORE", "78"))
 OTC_EDGE_WATCHER_MIN_PAYOUT = int(os.getenv("OTC_EDGE_WATCHER_MIN_PAYOUT", "85"))
 OTC_EDGE_WATCHER_COOLDOWN_SECONDS = int(os.getenv("OTC_EDGE_WATCHER_COOLDOWN_SECONDS", "75"))
 OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS = int(os.getenv("OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS", "5"))
-OTC_EDGE_WATCHER_MAX_ALERTS_PER_HOUR = int(os.getenv("OTC_EDGE_WATCHER_MAX_ALERTS_PER_HOUR", "25"))
 OTC_EDGE_WATCHER_TOP_ALERT_POOL = int(os.getenv("OTC_EDGE_WATCHER_TOP_ALERT_POOL", "8"))
 # ===== OTC Edge Timing Gate =====
 # لا نغيّر عقل التحليل ولا Edge Score. هذه طبقة توقيت فقط حتى يكون الدخول والانتهاء مطابقين لطريقة الصفقة.
@@ -9302,8 +9312,11 @@ def _new_otc_edge_watcher_state(user_id: int | None = None) -> dict:
         "last_candidate": None,
         "last_error": None,
         "last_alerts": {},
-        "alert_times": [],
         "alerts_sent": 0,
+        "last_delivery_status": None,
+        "last_delivery_at": None,
+        "last_delivery_error": None,
+        "last_delivery_notice_ts": 0.0,
         "active_trade_until_ts": 0.0,
         "active_trade": None,
         "entry_window_skips": 0,
@@ -9359,7 +9372,8 @@ def _otc_edge_durable_state(state: dict) -> dict:
     """Keep only JSON-safe state needed to survive a Render restart."""
     durable_keys = (
         "enabled", "mode", "pairs", "chat_id", "owner_user_id", "started_at", "started_by",
-        "last_alert_at", "last_candidate", "last_alerts", "alert_times", "alerts_sent",
+        "last_alert_at", "last_candidate", "last_alerts", "alerts_sent",
+        "last_delivery_status", "last_delivery_at", "last_delivery_error", "last_delivery_notice_ts",
         "active_trade_until_ts", "active_trade", "entry_window_skips", "last_copy_result",
         "last_copy_at", "last_timing_skip", "last_timing_skip_at",
     )
@@ -9403,6 +9417,8 @@ def restore_otc_edge_watcher_states() -> int:
                 continue
             state = _new_otc_edge_watcher_state(uid)
             state.update(saved)
+            # v0.83: remove the retired hourly alert counter from legacy Firebase rows.
+            state.pop("alert_times", None)
             state["owner_user_id"] = uid
             state["chat_id"] = int(saved.get("chat_id") or uid)
             state["mode"] = "pairs" if str(saved.get("mode")) == "pairs" else "all"
@@ -9420,6 +9436,9 @@ def restore_otc_edge_watcher_states() -> int:
                 _otc_edge_watcher_state.clear()
                 _otc_edge_watcher_state.update(state)
                 _otc_edge_watcher_states[uid] = _otc_edge_watcher_state
+                state = _otc_edge_watcher_state
+            # Rewrite once so old alert_times data disappears permanently.
+            save_otc_edge_watcher_state(uid, state)
             restored += 1
         logger.warning("Restored %s OTC Edge watcher(s) from Firebase", restored)
     except Exception as exc:
@@ -10041,8 +10060,11 @@ def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pai
             "last_candidate": None,
             "last_error": None,
             "last_alerts": {},
-            "alert_times": [],
             "alerts_sent": 0,
+            "last_delivery_status": None,
+            "last_delivery_at": None,
+            "last_delivery_error": None,
+            "last_delivery_notice_ts": 0.0,
             "active_trade_until_ts": 0.0,
             "active_trade": None,
             "entry_window_skips": 0,
@@ -10084,18 +10106,6 @@ def stop_otc_edge_watcher(user_id: int | None = None, lang: str = "ar") -> str:
         return "🛑 تم إيقاف مراقبة OTC Edge." if was_enabled else "مراقبة OTC Edge متوقفة أصلًا."
     except Exception as e:
         return f"Could not stop monitoring: {e}" if lang == "en" else f"تعذر إيقاف المراقبة: {e}"
-
-
-
-
-def _otc_edge_alert_rate_limited(now_ts: float, state: dict | None = None) -> bool:
-    try:
-        state = state if isinstance(state, dict) else _otc_edge_watcher_state
-        times = [float(t) for t in (state.get("alert_times") or []) if now_ts - float(t) < 3600]
-        state["alert_times"] = times
-        return len(times) >= int(OTC_EDGE_WATCHER_MAX_ALERTS_PER_HOUR)
-    except Exception:
-        return False
 
 
 
@@ -10246,18 +10256,67 @@ def _otc_edge_can_alert(item: dict, now_ts: float, state: dict | None = None) ->
             return False
         if float(item.get("tick_age", 999) or 999) > max(3, int(OTC_EDGE_TICK_MAX_AGE_SECONDS)):
             return False
-        if _otc_edge_alert_rate_limited(now_ts, state=state):
-            return False
         key = f"{item.get('pair')}|{item.get('direction')}|{item.get('pattern')}"
         last_alerts = state.setdefault("last_alerts", {})
         last_ts = float(last_alerts.get(key, 0) or 0)
         if now_ts - last_ts < int(OTC_EDGE_WATCHER_COOLDOWN_SECONDS):
             return False
-        last_alerts[key] = now_ts
         return True
     except Exception:
         return False
 
+
+
+
+def _otc_edge_alert_key(item: dict) -> str:
+    return f"{item.get('pair')}|{item.get('direction')}|{item.get('pattern')}"
+
+
+def _otc_edge_copy_delivered_count(copy_result: dict | None) -> int:
+    try:
+        delivery = (copy_result or {}).get("delivery") or {}
+        return max(0, int(delivery.get("delivered", 0) or 0))
+    except Exception:
+        return 0
+
+
+def _otc_edge_copy_delivery_succeeded(copy_result: dict | None) -> bool:
+    """A server HTTP 200 is not enough: at least one targeted extension must receive it."""
+    try:
+        return bool((copy_result or {}).get("ok")) and _otc_edge_copy_delivered_count(copy_result) > 0
+    except Exception:
+        return False
+
+
+def _otc_edge_delivery_failure_reason(copy_result: dict | None) -> str:
+    try:
+        result = copy_result or {}
+        delivery = result.get("delivery") or {}
+        if not result.get("ok"):
+            return str(result.get("reason") or result.get("error") or result.get("text") or "Copy server rejected the signal")[:300]
+        if delivery.get("global_enabled") is False:
+            return str(delivery.get("reason") or "Copy Trading is stopped by admin")[:300]
+        online = int(delivery.get("online_clients", 0) or 0)
+        delivered = int(delivery.get("delivered", 0) or 0)
+        target_uid = delivery.get("target_user_id")
+        if delivered <= 0:
+            return f"لم تصل الإشارة إلى إضافة المستخدم (online={online}, delivered=0, target={target_uid})"
+        return "unknown delivery failure"
+    except Exception as exc:
+        return f"تعذر قراءة نتيجة الإرسال: {exc}"
+
+
+def _otc_edge_mark_alert_delivered(item: dict, now_ts: float, state: dict | None = None):
+    """Reserve pattern cooldown only after the targeted extension really received the signal."""
+    try:
+        state = state if isinstance(state, dict) else _otc_edge_watcher_state
+        state.setdefault("last_alerts", {})[_otc_edge_alert_key(item)] = float(now_ts)
+        state["last_delivery_status"] = "delivered"
+        state["last_delivery_at"] = now_iso()
+        state["last_delivery_error"] = None
+        state["last_error"] = None
+    except Exception:
+        logger.exception("Could not mark OTC Edge alert as delivered")
 
 
 
@@ -10416,7 +10475,8 @@ def build_otc_edge_watcher_status_message(prefix: str | None = None, state: dict
             f"📡 بث Quotex: {'متصل ✅' if connected else 'غير متصل ⚠️'} | started={started}",
             f"🎯 حد التنبيه: Edge {OTC_EDGE_WATCHER_MIN_SCORE}% | payout {OTC_EDGE_WATCHER_MIN_PAYOUT}%",
             f"⏱ الفحص كل: {OTC_EDGE_WATCHER_SCAN_SECONDS} ثواني",
-            f"🧊 منع تكرار نفس النمط: {OTC_EDGE_WATCHER_COOLDOWN_SECONDS} ثانية",
+            f"🧊 منع تكرار نفس النمط: {OTC_EDGE_WATCHER_COOLDOWN_SECONDS} ثانية (بعد وصول الإشارة فقط)",
+            "🚀 حد الإشارات بالساعة: غير محدود",
             f"🧭 وضع التوقيت: {'إغلاق شمعة M1 ✅' if _otc_edge_timing_mode() == 'm1_candle_close' else 'Fixed 60s'}",
             f"🪟 نافذة التنبيه: من الثانية {OTC_EDGE_ENTRY_MIN_SECOND} إلى {min(OTC_EDGE_ENTRY_LAST_ALERT_SECOND, OTC_EDGE_ENTRY_WINDOW_SECONDS - OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS)} | الدخول مسموح حتى الثانية {OTC_EDGE_ENTRY_WINDOW_SECONDS}",
             "🔒 القفل بعد التنبيه: حتى نهاية الصفقة الحالية",
@@ -10438,6 +10498,10 @@ def build_otc_edge_watcher_status_message(prefix: str | None = None, state: dict
             lines.append(f"آخر إرسال للنسخ: ok={bool(cr.get('ok'))} | delivered={delivered} | online={online}")
         if state.get("last_copy_at"):
             lines.append(f"آخر Copy: {format_dt_ar(state.get('last_copy_at'))}")
+        if state.get("last_delivery_status"):
+            lines.append(f"حالة آخر توصيل: {state.get('last_delivery_status')}")
+        if state.get("last_delivery_error"):
+            lines.append(f"⚠️ سبب آخر فشل توصيل: {state.get('last_delivery_error')}")
         remain = _otc_edge_active_trade_remaining(time_module.time(), state=state)
         if remain > 0:
             active_trade = state.get("active_trade") or {}
@@ -10505,7 +10569,9 @@ def build_otc_edge_user_status_message(user_id: int, prefix: str | None = None, 
                 lines.append(f"Current trade: {active.get('pair')} {_otc_edge_direction_icon(active.get('direction'))} | about {remain}s left")
             if state.get("last_alert_at"):
                 lines.append(f"Last signal: {format_dt_ar(state.get('last_alert_at'))}")
-            if state.get("last_error"):
+            if state.get("last_delivery_error"):
+                lines.append("⚠️ The last signal did not reach the extension. Keep Quotex and the extension open.")
+            elif state.get("last_error"):
                 lines.append("⚠️ Preparation or delivery is not ready yet. Keep Quotex and the extension open.")
             if not enabled:
                 lines.extend(["", "Choose all-market monitoring or one specific OTC pair."])
@@ -10534,7 +10600,9 @@ def build_otc_edge_user_status_message(user_id: int, prefix: str | None = None, 
             lines.append(f"الصفقة الحالية: {active.get('pair')} {_otc_edge_direction_icon(active.get('direction'))} | باقي تقريبًا {remain} ثانية")
         if state.get("last_alert_at"):
             lines.append(f"آخر إشارة: {format_dt_ar(state.get('last_alert_at'))}")
-        if state.get("last_error"):
+        if state.get("last_delivery_error"):
+            lines.append("⚠️ آخر إشارة لم تصل إلى الإضافة. اترك منصة Quotex والإضافة مفتوحتين.")
+        elif state.get("last_error"):
             lines.append("⚠️ التجهيز أو الإرسال غير جاهز حاليًا. اترك منصة Quotex والإضافة مفتوحتين.")
         if not enabled:
             lines.extend(["", "اختر مراقبة كل السوق أو مراقبة زوج OTC محدد."])
@@ -10583,22 +10651,49 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                 state["last_copy_result"] = copy_result
                 state["last_copy_at"] = now_iso()
                 lang = get_user_language(owner_uid)
-                sent = await safe_send_message(
-                    context.bot,
-                    chat_id=chat_id,
-                    text=build_otc_edge_entry_alert_message(item, state=state, lang=lang),
-                )
-                if sent or bool((copy_result or {}).get("ok")):
+
+                if _otc_edge_copy_delivery_succeeded(copy_result):
+                    # The extension really received the targeted signal. Only now reserve
+                    # the pattern cooldown and active-trade lock.
+                    _otc_edge_mark_alert_delivered(item, now_ts, state=state)
                     _otc_edge_set_active_trade_lock(item, now_ts, state=state)
                     state["last_alert_at"] = now_iso()
                     state["alerts_sent"] = int(state.get("alerts_sent", 0) or 0) + 1
-                    times = list(state.get("alert_times") or [])
-                    times.append(now_ts)
-                    state["alert_times"] = [float(t) for t in times if now_ts - float(t) < 3600]
-                    save_otc_edge_watcher_state(owner_uid, state)
+                    await safe_send_message(
+                        context.bot,
+                        chat_id=chat_id,
+                        text=build_otc_edge_entry_alert_message(item, state=state, lang=lang),
+                    )
+                else:
+                    # Do not consume cooldown or lock the watcher when no extension received
+                    # the signal. The same valid opportunity may be retried on the next scan.
+                    reason = _otc_edge_delivery_failure_reason(copy_result)
+                    state["last_delivery_status"] = "failed"
+                    state["last_delivery_at"] = now_iso()
+                    state["last_delivery_error"] = reason
+                    state["last_error"] = f"OTC Edge delivery failed: {reason}"
+                    logger.warning(
+                        "OTC Edge signal not delivered | user=%s | pair=%s | reason=%s | result=%s",
+                        owner_uid, item.get("pair"), reason, copy_result,
+                    )
+                    # Notify at most once per minute to avoid chat spam while preserving visibility.
+                    last_notice = float(state.get("last_delivery_notice_ts") or 0)
+                    if now_ts - last_notice >= 60:
+                        state["last_delivery_notice_ts"] = now_ts
+                        warning_text = (
+                            "⚠️ ظهرت فرصة OTC Edge لكن لم تصل إلى الإضافة. افتح Quotex وتأكد أن الإضافة متصلة."
+                            if lang != "en" else
+                            "⚠️ An OTC Edge opportunity appeared but did not reach the extension. Open Quotex and check the connection."
+                        )
+                        await safe_send_message(context.bot, chat_id=chat_id, text=warning_text)
+
+                save_otc_edge_watcher_state(owner_uid, state)
                 break
         except Exception as e:
             state["last_error"] = str(e)
+            state["last_delivery_status"] = "job_error"
+            state["last_delivery_error"] = str(e)
+            save_otc_edge_watcher_state(owner_uid, state)
             logger.exception("OTC Edge watcher job error | user=%s | error=%s", owner_uid, e)
 
 
@@ -14232,6 +14327,77 @@ def reset_signal_state(context: ContextTypes.DEFAULT_TYPE):
     context.user_data["admin_target_id"] = None
 
 
+# v0.84: one authoritative list for every admin text-input / confirmation session.
+# This prevents navigation labels such as "رجوع" from being consumed as message bodies
+# or Copy license tokens, and keeps unrelated generic replies such as "نعم" from being
+# stolen by the Trading Room handler.
+ADMIN_CANCEL_TEXTS = {
+    "رجوع", "⬅️ رجوع", "🔙 رجوع", "إلغاء", "الغاء", "❌ إلغاء",
+    "Back", "🔙 Back", "⬅️ Back", "Cancel", "❌ Cancel",
+}
+
+ADMIN_CONFIRM_TEXTS = {
+    "نعم", "✅ نعم، تأكيد", "✅ نعم تأكيد", "yes", "y", "confirm", "تأكيد", "تاكيد",
+}
+
+ADMIN_PENDING_STEPS = {
+    "admin_direct_message_waiting",
+    "admin_broadcast_waiting_message",
+    "admin_waiting_user_id",
+    "copy_reset_device_waiting_token",
+    "copy_reset_all_devices_confirm",
+    "copy_cleanup_codes_confirm",
+    "copy_delete_waiting_token",
+    "copy_update_notice_waiting_text",
+    "copy_disable_waiting_token",
+    "otc_stats_waiting_count",
+    "otc_list_waiting_text",
+    "otc_pair_diagnostics_waiting",
+    "otc_candle_diagnostics_waiting",
+    "otc_edge_waiting_pair",
+    "otc_edge_watch_waiting_pair",
+    "three_candle_waiting_daily_limit",
+    "three_candle_waiting_summary_count",
+    "three_candle_confirm_reset_memory",
+}
+
+
+def is_admin_cancel_text(value: str) -> bool:
+    return str(value or "").strip() in ADMIN_CANCEL_TEXTS
+
+
+def is_admin_confirm_text(value: str) -> bool:
+    return str(value or "").strip().lower() in {x.lower() for x in ADMIN_CONFIRM_TEXTS}
+
+
+def admin_pending_keyboard(step: str):
+    step = str(step or "")
+    if step.startswith("copy_"):
+        return copy_admin_keyboard
+    if step.startswith("three_candle_"):
+        return three_candle_admin_keyboard
+    if step.startswith("otc_edge_"):
+        return admin_otc_edge_keyboard
+    if step in {
+        "otc_stats_waiting_count", "otc_list_waiting_text",
+        "otc_pair_diagnostics_waiting", "otc_candle_diagnostics_waiting",
+    }:
+        return admin_otc_stats_keyboard
+    return admin_main_keyboard
+
+
+def clear_admin_pending_state(context: ContextTypes.DEFAULT_TYPE) -> str:
+    previous_step = str(context.user_data.get("step") or "")
+    context.user_data["step"] = None
+    for key in (
+        "admin_message_target_id",
+        "target_message_user_id",
+        "target_user_id",
+    ):
+        context.user_data.pop(key, None)
+    return previous_step
+
+
 def build_pending_request_keyboard(user_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -14804,7 +14970,7 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
             f"💬 اكتب الآن الرسالة التي تريد إرسالها إلى {target_name}\n"
             f"🆔 Telegram ID: <code>{target_id}</code>",
             parse_mode="HTML",
-            reply_markup=admin_main_keyboard
+            reply_markup=admin_input_cancel_keyboard
         )
         return
 
@@ -15794,6 +15960,10 @@ async def handle_trading_room_message(update: Update, context: ContextTypes.DEFA
     if (is_admin(user.id) or is_approved(user.id)) and text in {"✅ نعم، أنا مستعد", "نعم", "انا مستعد", "أنا مستعد", "جاهز", "✅ Yes, I am ready"}:
         state = get_trading_room_state(context, user.id)
         if not state or not state.get("active") or not state.get("pending_ready"):
+            # "نعم" is also used by Copy/3-candle admin confirmations. Do not
+            # consume the generic reply unless a Trading Room confirmation is active.
+            if text == "نعم":
+                return False
             await update.message.reply_text(_tr_room_text(user.id, "لا توجد جلسة بانتظار التأكيد الآن.", "There is no session waiting for confirmation right now."), reply_markup=get_trading_room_menu_keyboard(user.id))
             return True
         state["pending_ready"] = False
@@ -16084,6 +16254,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lang = get_user_language(user.id, context)
 
+    # ===== v0.84 global admin cancellation guard =====
+    # It must run before Trading Room because generic words/buttons can overlap with
+    # admin confirmations and message-entry workflows.
+    if is_admin(user.id) and step in ADMIN_PENDING_STEPS and is_admin_cancel_text(text):
+        pending_step = clear_admin_pending_state(context)
+        await update.message.reply_text(
+            "تم إلغاء العملية.",
+            reply_markup=admin_pending_keyboard(pending_step),
+        )
+        return
+
     # ===== Maintenance mode =====
     # يسمح بتغيير اللغة فقط، لكن أي استخدام آخر أثناء الإيقاف يُسجل ليتم إعلامه عند عودة البوت.
     if not is_admin(user.id) and not get_bot_enabled():
@@ -16287,22 +16468,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
 
-    # ===== Absolute cancel guard for admin waiting states =====
-    if is_admin(user.id) and text.strip() in {"رجوع", "⬅️ رجوع", "🔙 رجوع"}:
-        if context.user_data.get("step") in {
-            "admin_broadcast_waiting_message",
-            "admin_message_user_waiting_text",
-            "otc_stats_waiting_count",
-            "otc_list_waiting_text",
-            "otc_pair_diagnostics_waiting",
-            "otc_candle_diagnostics_waiting",
-            "copy_disable_waiting_token",
-        }:
-            context.user_data["step"] = None
-            context.user_data.pop("target_user_id", None)
-            context.user_data.pop("target_message_user_id", None)
-            await update.message.reply_text("تم إلغاء العملية.", reply_markup=admin_main_keyboard)
-            return
+    # Cancellation is handled centrally near the start of handle_message (v0.84).
 
     save_user_record(user.id, {
         "telegram_id": user.id,
@@ -16434,6 +16600,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         target_id = context.user_data.get("admin_message_target_id")
         message = text.strip()
 
+        if is_admin_cancel_text(message):
+            pending_step = clear_admin_pending_state(context)
+            await update.message.reply_text(
+                "تم إلغاء الرسالة ولم يتم إرسال أي شيء للمستخدم.",
+                reply_markup=admin_pending_keyboard(pending_step),
+            )
+            return
+
         if not target_id:
             context.user_data["step"] = None
             await update.message.reply_text("❌ لا يوجد مستخدم محدد.", reply_markup=admin_main_keyboard)
@@ -16483,6 +16657,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if is_admin(user.id) and step == "admin_broadcast_waiting_message":
         message = text.strip()
+        if is_admin_cancel_text(message):
+            pending_step = clear_admin_pending_state(context)
+            await update.message.reply_text(
+                "تم إلغاء الرسالة الجماعية ولم يتم إرسالها.",
+                reply_markup=admin_pending_keyboard(pending_step),
+            )
+            return
         if not message:
             await update.message.reply_text("الرسالة فارغة، تم الإلغاء.", reply_markup=admin_main_keyboard)
             context.user_data["step"] = None
@@ -16619,7 +16800,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if is_admin(user.id) and step == "admin_broadcast_waiting_message":
         message = text.strip()
 
-        if message in {"رجوع", "⬅️ رجوع", "🔙 رجوع"}:
+        if is_admin_cancel_text(message):
             context.user_data["step"] = None
             await update.message.reply_text("تم إلغاء الرسالة الجماعية.", reply_markup=admin_main_keyboard)
             return
@@ -16667,8 +16848,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["step"] = "admin_broadcast_waiting_message"
         await update.message.reply_text(
             "📢 اكتب الآن الرسالة التي تريد إرسالها لجميع مستخدمي البوت.\n\n"
-            "لإلغاء العملية اضغط رجوع.",
-            reply_markup=admin_main_keyboard
+            "لإلغاء العملية اضغط الزر أدناه.",
+            reply_markup=admin_input_cancel_keyboard
         )
         return
 
@@ -16687,28 +16868,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if (is_admin(user.id) or is_approved(user.id)) and text in {"✅ نعم، أنا مستعد", "نعم", "انا مستعد", "أنا مستعد", "جاهز", "✅ Yes, I am ready"}:
         state = get_trading_room_state(context, user.id)
         if not state or not state.get("active") or not state.get("pending_ready"):
-            await update.message.reply_text(_tr_room_text(user.id, "لا توجد جلسة بانتظار التأكيد الآن.", "There is no session waiting for confirmation right now."), reply_markup=get_trading_room_menu_keyboard(user.id))
-            return
-        state["pending_ready"] = False
-        state["ready_confirmed"] = True
-        save_trading_room_state(context, user.id, state)
-        await safe_send_message(
-            context.bot,
-            chat_id=user.id,
-            text=_tr_room_text(user.id, "بسم الله، جاري البحث عن زوج مناسب...", "Starting now. Searching for a suitable pair..."),
-            reply_markup=get_trading_room_active_keyboard(user.id),
-        )
-        try:
-            context.job_queue.run_once(
-                trading_room_begin_market_job,
-                when=10,
-                data={"admin_id": int(user.id)},
-                name=f"trading_room_begin_{int(user.id)}_{int(time_module.time())}",
+            if text == "نعم":
+                pass
+            else:
+                await update.message.reply_text(_tr_room_text(user.id, "لا توجد جلسة بانتظار التأكيد الآن.", "There is no session waiting for confirmation right now."), reply_markup=get_trading_room_menu_keyboard(user.id))
+                return
+        else:
+            state["pending_ready"] = False
+            state["ready_confirmed"] = True
+            save_trading_room_state(context, user.id, state)
+            await safe_send_message(
+                context.bot,
+                chat_id=user.id,
+                text=_tr_room_text(user.id, "بسم الله، جاري البحث عن زوج مناسب...", "Starting now. Searching for a suitable pair..."),
+                reply_markup=get_trading_room_active_keyboard(user.id),
             )
-        except Exception as e:
-            logger.exception("Could not schedule trading room begin job: %s", e)
-            await trading_room_start_market_flow(context, int(user.id))
-        return
+            try:
+                context.job_queue.run_once(
+                    trading_room_begin_market_job,
+                    when=10,
+                    data={"admin_id": int(user.id)},
+                    name=f"trading_room_begin_{int(user.id)}_{int(time_module.time())}",
+                )
+            except Exception as e:
+                logger.exception("Could not schedule trading room begin job: %s", e)
+                await trading_room_start_market_flow(context, int(user.id))
+            return
 
     if (is_admin(user.id) or is_approved(user.id)) and text in {"❌ إلغاء الجلسة", "إلغاء الجلسة", "الغاء الجلسة", "الغاء", "إلغاء", "❌ Cancel Session"}:
         clear_trading_room_state(context, user.id)
@@ -17106,7 +17291,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["step"] = "copy_reset_device_waiting_token"
             await update.message.reply_text(
                 "♻️ أرسل كود Copy الذي تريد تصفير الأجهزة المرتبطة به.\n\nبعد التصفير، أول جهاز و Telegram ID يفتح الإضافة بهذا الكود سيرتبط من جديد.",
-                reply_markup=copy_admin_keyboard
+                reply_markup=admin_input_cancel_keyboard
             )
             return
 
@@ -17115,8 +17300,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "⚠️ هذا الخيار سيصفر الأجهزة و Telegram ID لكل الأكواد المنشأة من البوت.\n\n"
                 "استخدمه بعد تحديثات الإضافة أو عندما تريد إعادة ربط الأكواد من جديد.\n\n"
-                "أرسل: نعم\nللتأكيد، أو أي كلمة أخرى للإلغاء.",
-                reply_markup=copy_admin_keyboard
+                "اضغط ✅ نعم، تأكيد للمتابعة أو ❌ إلغاء.",
+                reply_markup=admin_confirm_keyboard
             )
             return
 
@@ -17125,8 +17310,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "🧹 هذا الخيار سيحذف فقط الأكواد المعطلة أو المنتهية من Firebase.\n"
                 "الأكواد النشطة لن تُحذف.\n\n"
-                "أرسل: نعم\nللتأكيد، أو أي كلمة أخرى للإلغاء.",
-                reply_markup=copy_admin_keyboard
+                "اضغط ✅ نعم، تأكيد للمتابعة أو ❌ إلغاء.",
+                reply_markup=admin_confirm_keyboard
             )
             return
 
@@ -17135,7 +17320,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "🗑 أرسل كود Copy الذي تريد حذفه نهائيًا من Firebase.\n\n"
                 "ملاحظة: أي كود موجود في Render Env لا يمكن حذفه من هنا؛ احذفه من COPY_LICENSES إذا أردت.",
-                reply_markup=copy_admin_keyboard
+                reply_markup=admin_input_cancel_keyboard
             )
             return
 
@@ -17143,7 +17328,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["step"] = "copy_update_notice_waiting_text"
             await update.message.reply_text(
                 "📌 أرسل رسالة التحديث التي تريد أن تظهر داخل الإضافة.\n\nأرسل كلمة: مسح\nلحذف رسالة التحديث الحالية.",
-                reply_markup=copy_admin_keyboard
+                reply_markup=admin_input_cancel_keyboard
             )
             return
 
@@ -17151,13 +17336,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["step"] = "copy_disable_waiting_token"
             await update.message.reply_text(
                 "⛔ أرسل كود Copy الذي تريد إيقافه.\n\nملاحظة: الأكواد الموجودة فقط في Render Env لا يمكن إيقافها من البوت، احذفها من COPY_LICENSES.",
-                reply_markup=copy_admin_keyboard
+                reply_markup=admin_input_cancel_keyboard
             )
             return
 
         if step == "copy_reset_all_devices_confirm":
             context.user_data["step"] = None
-            if str(text).strip().lower() in {"نعم", "yes", "y", "confirm", "تأكيد"}:
+            if is_admin_confirm_text(text):
                 result = reset_all_copy_license_devices()
                 await update.message.reply_text(build_copy_reset_all_result_message(result), reply_markup=copy_admin_keyboard)
             else:
@@ -17166,7 +17351,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if step == "copy_cleanup_codes_confirm":
             context.user_data["step"] = None
-            if str(text).strip().lower() in {"نعم", "yes", "y", "confirm", "تأكيد"}:
+            if is_admin_confirm_text(text):
                 result = cleanup_copy_licenses(delete_disabled=True, delete_expired=True)
                 await update.message.reply_text(build_copy_cleanup_result_message(result), reply_markup=copy_admin_keyboard)
             else:
@@ -17383,14 +17568,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "🧹 تصفير الذاكرة":
             context.user_data["step"] = "three_candle_confirm_reset_memory"
             await update.message.reply_text(
-                "⚠️ تصفير ذاكرة استراتيجية 3 شموع سيحذف نتائج الذاكرة القديمة ويجعل التقرير والفلتر الديناميكي يبدآن من جديد.\n\nأرسل: تأكيد\nللإلغاء أرسل أي شيء آخر.",
-                reply_markup=three_candle_admin_keyboard
+                "⚠️ تصفير ذاكرة استراتيجية 3 شموع سيحذف نتائج الذاكرة القديمة ويجعل التقرير والفلتر الديناميكي يبدآن من جديد.\n\nاضغط ✅ نعم، تأكيد للمتابعة أو ❌ إلغاء.",
+                reply_markup=admin_confirm_keyboard
             )
             return
 
         if step == "three_candle_confirm_reset_memory":
             context.user_data["step"] = None
-            if str(text or "").strip().lower() in {"تأكيد", "تاكيد", "نعم", "yes", "confirm"}:
+            if is_admin_confirm_text(text):
                 ok, msg = _three_candle_reset_strategy_memory()
                 await update.message.reply_text(msg, reply_markup=three_candle_admin_keyboard)
             else:
@@ -17749,8 +17934,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["admin_message_target_id"] = target_id
                 context.user_data["step"] = "admin_direct_message_waiting"
                 await update.message.reply_text(
-                    "💬 اكتب الآن الرسالة التي تريد إرسالها لهذا المستخدم.",
-                    reply_markup=admin_main_keyboard
+                    "💬 اكتب الآن الرسالة التي تريد إرسالها لهذا المستخدم.\n\nللإلغاء اضغط الزر أدناه.",
+                    reply_markup=admin_input_cancel_keyboard
                 )
                 return
 
