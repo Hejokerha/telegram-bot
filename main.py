@@ -527,10 +527,12 @@ copy_admin_keyboard = ReplyKeyboardMarkup(
         ["🟢 تشغيل Copy", "🔴 إيقاف Copy"],
         ["🔑 كود أسبوع", "🔑 كود شهر"],
         ["🔑 كود دائم", "📋 أكواد Copy"],
-        ["⛔ إيقاف كود", "♻️ تصفير جهاز كود"],
-        ["♻️ تصفير كل الأجهزة", "🗑 حذف كود"],
-        ["🧹 تنظيف الأكواد", "📌 رسالة تحديث"],
-        ["📡 حالة Copy", "⬅️ رجوع"],
+        ["♻️ تجديد كود", "⛔ إيقاف كود"],
+        ["📱 تصفير جهاز كود", "🔄 إعادة تدوير كود"],
+        ["🗑 حذف كود نهائيًا", "🧹 حذف المنتهي والموقوف"],
+        ["⚠️ تصفير كل الأجهزة", "ℹ️ شرح خيارات الأكواد"],
+        ["📌 رسالة تحديث", "📡 حالة Copy"],
+        ["⬅️ رجوع"],
     ],
     resize_keyboard=True
 )
@@ -543,6 +545,24 @@ admin_input_cancel_keyboard = ReplyKeyboardMarkup(
 )
 admin_confirm_keyboard = ReplyKeyboardMarkup(
     [["✅ نعم، تأكيد", "❌ إلغاء"]],
+    resize_keyboard=True,
+)
+
+copy_renew_keyboard = ReplyKeyboardMarkup(
+    [
+        ["➕ تجديد أسبوع", "➕ تجديد شهر"],
+        ["♾ تحويل إلى دائم", "📅 تاريخ مخصص"],
+        ["❌ إلغاء", "⬅️ رجوع"],
+    ],
+    resize_keyboard=True,
+)
+
+copy_recycle_plan_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🗓 تجهيز أسبوع", "🗓 تجهيز شهر"],
+        ["♾ تجهيز دائم"],
+        ["❌ إلغاء", "⬅️ رجوع"],
+    ],
     resize_keyboard=True,
 )
 
@@ -977,8 +997,8 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
-COPY_SERVER_VERSION = "0.89.0"
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.89").strip() or "v0.89"
+COPY_SERVER_VERSION = "0.94.0"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.94").strip() or "v0.94"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -1014,7 +1034,7 @@ COPY_SIGNAL_ALLOWED_TELEGRAM_IDS = parse_id_set_from_env("COPY_SIGNAL_ALLOWED_TE
 COPY_SIGNAL_ALLOWED_TELEGRAM_IDS.add(int(ADMIN_TELEGRAM_ID))
 
 
-def is_copy_origin_allowed(origin: str | None, *, authenticated: bool = False, is_admin_license: bool = False) -> bool:
+def is_copy_origin_allowed(origin: str | None, *, authenticated: bool = False, is_admin_license: bool = False, trusted_owner_device: bool = False) -> bool:
     """Origin boundary for the hardened extension transport.
 
     Regular licenses are accepted only from the published Chrome Web Store
@@ -1025,7 +1045,7 @@ def is_copy_origin_allowed(origin: str | None, *, authenticated: bool = False, i
     if not value or value.lower() == "null":
         return bool(
             authenticated
-            and (is_admin_license or COPY_ALLOW_NULL_WEBSOCKET_ORIGIN)
+            and (is_admin_license or trusted_owner_device or COPY_ALLOW_NULL_WEBSOCKET_ORIGIN)
         )
 
     allowed = {
@@ -1041,7 +1061,7 @@ def is_copy_origin_allowed(origin: str | None, *, authenticated: bool = False, i
         extension_id = match.group(1).lower()
         if extension_id in COPY_ALLOWED_EXTENSION_IDS:
             return True
-        if authenticated and (is_admin_license or COPY_ALLOW_UNPACKED_EXTENSION_ORIGINS):
+        if authenticated and (is_admin_license or trusted_owner_device or COPY_ALLOW_UNPACKED_EXTENSION_ORIGINS):
             return True
 
     if COPY_ALLOWED_ORIGIN_REGEX:
@@ -1077,6 +1097,9 @@ COPY_ALLOWED_EXTENSION_IDS = {
 # still required before such an origin is accepted.
 COPY_ALLOW_UNPACKED_EXTENSION_ORIGINS = os.getenv(
     "COPY_ALLOW_UNPACKED_EXTENSION_ORIGINS", "false"
+).lower() in {"1", "true", "yes", "on"}
+COPY_ALLOW_OWNER_DEVICE_TEST_IDENTITIES = os.getenv(
+    "COPY_ALLOW_OWNER_DEVICE_TEST_IDENTITIES", "true"
 ).lower() in {"1", "true", "yes", "on"}
 COPY_ALLOW_NULL_WEBSOCKET_ORIGIN = os.getenv(
     "COPY_ALLOW_NULL_WEBSOCKET_ORIGIN", "false"
@@ -2163,11 +2186,11 @@ def reset_copy_license_devices(token: str) -> bool:
         return False
     copy_licenses_ref().child(copy_license_key(token)).update({
         "devices": {},
-        "telegram_user_id": None,
-        "telegram_linked_at": None,
         "last_seen_at": None,
+        "active_device_id": None,
+        "device_proof_repaired_v089": None,
+        "device_proof_repaired_at": None,
         "devices_reset_at": now_iso(),
-        "telegram_unlinked_at": now_iso(),
     })
     try:
         prefix = f"{token}:"
@@ -2178,6 +2201,195 @@ def reset_copy_license_devices(token: str) -> bool:
         logger.debug("Suppressed exception at line 2051", exc_info=True)
     return True
 
+
+
+
+def _copy_license_expiry_datetime(expires_at):
+    if not expires_at or str(expires_at).strip().lower() == "forever":
+        return None
+    try:
+        dt = parse_iso(str(expires_at).strip())
+        if dt is None:
+            raw = str(expires_at).strip()
+            if raw.endswith("Z"):
+                dt = datetime.fromisoformat(raw[:-1] + "+00:00")
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC)
+    except Exception:
+        return None
+
+
+def parse_copy_custom_expiry_date(value: str):
+    """Parse an admin date and return end-of-day UTC+3 converted to UTC."""
+    raw = str(value or "").strip()
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%d-%m-%Y"):
+        try:
+            local_day = datetime.strptime(raw, fmt).replace(
+                hour=23, minute=59, second=59, microsecond=0, tzinfo=UTC_PLUS_3
+            )
+            result = local_day.astimezone(UTC)
+            if result <= now_utc():
+                return None
+            return result
+        except ValueError:
+            continue
+    return None
+
+
+def renew_copy_license(token: str, renewal: str, renewed_by: int | None = None, custom_expiry=None):
+    """Renew/reactivate a Firebase Copy license without changing its identity/device binding."""
+    token = normalize_copy_license_token(token)
+    if not token or token == COPY_ADMIN_LICENSE_TOKEN:
+        return False, "هذا الكود لا يقبل التجديد من لوحة العملاء.", None
+    record = get_copy_license_record(token)
+    if not record or record.get("source") == "env":
+        return False, "الكود غير موجود أو مصدره Render Env.", record
+
+    renewal = str(renewal or "").lower()
+    now_value = now_utc()
+    decision = {"ok": False, "record": None, "message": "تعذر التجديد."}
+
+    def _transaction(current):
+        if not isinstance(current, dict):
+            decision["message"] = "الكود غير موجود."
+            return current
+        rec = dict(current)
+        old_expiry = rec.get("expires_at")
+        old_dt = _copy_license_expiry_datetime(old_expiry)
+        if str(old_expiry or "").lower() == "forever" and renewal != "forever":
+            decision.update(ok=False, record=rec, message="الكود دائم أصلًا ولا يحتاج إضافة مدة.")
+            return current
+
+        if renewal == "forever":
+            new_expiry = "forever"
+            plan = "forever"
+            renewal_days = None
+        elif renewal in {"week", "month"}:
+            days = 7 if renewal == "week" else 30
+            base = old_dt if old_dt and old_dt > now_value else now_value
+            new_expiry = (base + timedelta(days=days)).isoformat()
+            plan = renewal
+            renewal_days = days
+        elif renewal == "custom":
+            if not isinstance(custom_expiry, datetime):
+                decision.update(ok=False, record=rec, message="تاريخ الانتهاء المخصص غير صالح.")
+                return current
+            expiry_dt = custom_expiry
+            if expiry_dt.tzinfo is None:
+                expiry_dt = expiry_dt.replace(tzinfo=UTC)
+            expiry_dt = expiry_dt.astimezone(UTC)
+            if expiry_dt <= now_value:
+                decision.update(ok=False, record=rec, message="يجب أن يكون التاريخ المخصص في المستقبل.")
+                return current
+            new_expiry = expiry_dt.isoformat()
+            plan = "custom"
+            renewal_days = None
+        else:
+            decision.update(ok=False, record=rec, message="نوع التجديد غير صالح.")
+            return current
+
+        history = rec.get("renewal_history") if isinstance(rec.get("renewal_history"), list) else []
+        history = list(history)[-19:]
+        history.append({
+            "at": now_iso(),
+            "by": int(renewed_by) if renewed_by else None,
+            "type": renewal,
+            "old_expires_at": old_expiry,
+            "new_expires_at": new_expiry,
+        })
+        rec.update({
+            "status": "active",
+            "plan": plan,
+            "expires_at": new_expiry,
+            "disabled_at": None,
+            "expired_at": None,
+            "renewed_at": now_iso(),
+            "renewed_by": int(renewed_by) if renewed_by else None,
+            "renewal_count": int(rec.get("renewal_count") or 0) + 1,
+            "last_renewal_days": renewal_days,
+            "renewal_history": history,
+        })
+        decision.update(ok=True, record=rec, message="تم تجديد الكود بنجاح.")
+        return rec
+
+    try:
+        final_record = copy_licenses_ref().child(copy_license_key(token)).transaction(_transaction)
+        if isinstance(final_record, dict):
+            final_record = dict(final_record)
+            final_record["token"] = normalize_copy_license_token(final_record.get("token") or token)
+            final_record["source"] = "firebase"
+            decision["record"] = final_record
+        return bool(decision["ok"]), str(decision["message"]), decision.get("record")
+    except Exception as exc:
+        logger.exception("Could not renew copy license %s: %s", token, exc)
+        return False, "تعذر التجديد بسبب خطأ في Firebase.", record
+
+
+def recycle_copy_license(token: str, plan: str, new_telegram_user_id, recycled_by: int | None = None):
+    """Prepare an existing token for a new customer, pre-bound to their Telegram ID."""
+    token = normalize_copy_license_token(token)
+    plan = str(plan or "month").lower()
+    if not token or token == COPY_ADMIN_LICENSE_TOKEN:
+        return False, "هذا الكود لا يمكن إعادة تدويره.", None
+    record = get_copy_license_record(token)
+    if not record or record.get("source") == "env":
+        return False, "الكود غير موجود أو مصدره Render Env.", record
+    if plan not in {"week", "month", "forever"}:
+        return False, "نوع الاشتراك الجديد غير صالح.", record
+    new_telegram_user_id = normalize_copy_telegram_user_id(new_telegram_user_id)
+    if not new_telegram_user_id:
+        return False, "Telegram ID الجديد غير صالح.", record
+
+    now_value = now_iso()
+    updates = {
+        "status": "active",
+        "plan": plan,
+        "expires_at": copy_license_expiry_for_plan(plan),
+        "devices": {},
+        "telegram_user_id": new_telegram_user_id,
+        "telegram_linked_at": now_value,
+        "telegram_unlinked_at": now_value,
+        "last_seen_at": None,
+        "disabled_at": None,
+        "expired_at": None,
+        "active_device_id": None,
+        "device_proof_repaired_v089": None,
+        "device_proof_repaired_at": None,
+        "recycled_at": now_value,
+        "recycled_by": int(recycled_by) if recycled_by else None,
+        "recycle_count": int(record.get("recycle_count") or 0) + 1,
+    }
+    try:
+        copy_licenses_ref().child(copy_license_key(token)).update(updates)
+        prefix = f"{token}:"
+        for key in list(_copy_license_touch_cache.keys()):
+            if str(key).startswith(prefix):
+                _copy_license_touch_cache.pop(key, None)
+        fresh = get_copy_license_record(token)
+        return True, "تمت إعادة تدوير الكود وتجهيزه لمستخدم جديد.", fresh
+    except Exception as exc:
+        logger.exception("Could not recycle copy license %s: %s", token, exc)
+        return False, "تعذر إعادة تدوير الكود.", record
+
+
+def build_copy_license_summary(record: dict, title: str = "🔑 بيانات كود Copy") -> str:
+    if not isinstance(record, dict):
+        return "❌ الكود غير موجود."
+    token = normalize_copy_license_token(record.get("token")) or "-"
+    devices = record.get("devices") if isinstance(record.get("devices"), dict) else {}
+    return (
+        f"{title}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🔑 <code>{html.escape(token)}</code>\n"
+        f"الحالة: {html.escape(str(record.get('status') or '-'))}\n"
+        f"النوع: {html.escape(str(record.get('plan') or '-'))}\n"
+        f"الانتهاء: {html.escape(format_copy_license_expiry(record.get('expires_at')))}\n"
+        f"Telegram ID: {html.escape(str(record.get('telegram_user_id') or '-'))}\n"
+        f"الأجهزة: {len(devices)}/{html.escape(str(record.get('max_devices') or 1))}"
+    )
 
 
 
@@ -2219,11 +2431,11 @@ def reset_all_copy_license_devices() -> dict:
                 token = normalize_copy_license_token(rec.get("token") or key)
                 copy_licenses_ref().child(str(key)).update({
                     "devices": {},
-                    "telegram_user_id": None,
-                    "telegram_linked_at": None,
                     "last_seen_at": None,
+                    "active_device_id": None,
+                    "device_proof_repaired_v089": None,
+                    "device_proof_repaired_at": None,
                     "devices_reset_at": now_value,
-                    "telegram_unlinked_at": now_value,
                 })
                 if token:
                     prefix = f"{token}:"
@@ -2241,7 +2453,7 @@ def reset_all_copy_license_devices() -> dict:
 
 def cleanup_copy_licenses(delete_disabled: bool = True, delete_expired: bool = True) -> dict:
     """Delete useless Firebase licenses: disabled and/or expired. Active valid licenses are kept."""
-    result = {"deleted": 0, "disabled": 0, "expired": 0, "kept": 0, "errors": 0}
+    result = {"deleted": 0, "disabled": 0, "expired": 0, "kept": 0, "errors": 0, "deleted_tokens": []}
     try:
         data = copy_licenses_ref().get() or {}
         if not isinstance(data, dict):
@@ -2260,6 +2472,7 @@ def cleanup_copy_licenses(delete_disabled: bool = True, delete_expired: bool = T
             try:
                 copy_licenses_ref().child(str(key)).delete()
                 result["deleted"] += 1
+                result["deleted_tokens"].append(normalize_copy_license_token(rec.get("token") or key))
                 if is_disabled:
                     result["disabled"] += 1
                 if is_expired:
@@ -2291,7 +2504,7 @@ def build_copy_reset_all_result_message(result: dict) -> str:
         f"✅ تم تصفير: {int(result.get('reset', 0) or 0)} كود\n"
         f"⏭ تم تخطي: {int(result.get('skipped', 0) or 0)}\n"
         f"⚠️ أخطاء: {int(result.get('errors', 0) or 0)}\n\n"
-        "بعدها أول جهاز و Telegram ID يستخدم الكود سيرتبط من جديد."
+        "بعدها يستطيع نفس Telegram ID ربط جهاز جديد لكل كود."
     )
 
 def list_copy_licenses(limit: int = 20) -> list[dict]:
@@ -2378,6 +2591,31 @@ def normalize_copy_telegram_user_id(value) -> str:
         return ""
     except Exception:
         return ""
+
+
+def copy_is_trusted_owner_device(device_id: str, device_proof_key: str) -> bool:
+    """Allow only the currently proof-bound owner installation to test regular credentials from an unpacked build."""
+    if not COPY_ALLOW_OWNER_DEVICE_TEST_IDENTITIES:
+        return False
+    device_id = str(device_id or "").strip()[:120]
+    device_proof_key = str(device_proof_key or "").strip()[:128]
+    if not device_id or not device_proof_key:
+        return False
+    try:
+        record = copy_licenses_ref().child(copy_license_key(COPY_ADMIN_LICENSE_TOKEN)).get()
+        if not isinstance(record, dict):
+            return False
+        if str(record.get("active_device_id") or "").strip() != device_id:
+            return False
+        devices = record.get("devices") if isinstance(record.get("devices"), dict) else {}
+        row = devices.get(safe_key(device_id)) if isinstance(devices, dict) else None
+        if not isinstance(row, dict):
+            return False
+        stored_key = str(row.get("device_proof_key") or "").strip()
+        return bool(stored_key and hmac.compare_digest(stored_key, device_proof_key))
+    except Exception as exc:
+        logger.debug("Owner developer-device lookup failed: %s", exc)
+        return False
 
 
 def copy_validate_license_for_device(token: str, device_id: str = "unknown", telegram_user_id=None, touch: bool = True, allow_admin_rebind: bool = False, device_proof_key: str = "", allow_device_proof_repair: bool = False) -> tuple[bool, str, dict | None]:
@@ -14535,11 +14773,21 @@ ADMIN_PENDING_STEPS = {
     "admin_broadcast_waiting_message",
     "admin_waiting_user_id",
     "copy_reset_device_waiting_token",
+    "copy_reset_device_confirm",
     "copy_reset_all_devices_confirm",
     "copy_cleanup_codes_confirm",
     "copy_delete_waiting_token",
+    "copy_delete_confirm",
     "copy_update_notice_waiting_text",
     "copy_disable_waiting_token",
+    "copy_disable_confirm",
+    "copy_renew_waiting_token",
+    "copy_renew_waiting_option",
+    "copy_renew_waiting_custom_date",
+    "copy_recycle_waiting_token",
+    "copy_recycle_waiting_new_tid",
+    "copy_recycle_waiting_plan",
+    "copy_recycle_confirm",
     "otc_stats_waiting_count",
     "otc_list_waiting_text",
     "otc_pair_diagnostics_waiting",
@@ -14583,6 +14831,10 @@ def clear_admin_pending_state(context: ContextTypes.DEFAULT_TYPE) -> str:
         "admin_message_target_id",
         "target_message_user_id",
         "target_user_id",
+        "copy_pending_token",
+        "copy_pending_plan",
+        "copy_pending_new_telegram_id",
+        "copy_pending_action",
     ):
         context.user_data.pop(key, None)
     return previous_step
@@ -17477,40 +17729,59 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if text == "♻️ تصفير جهاز كود":
+        if text in {"♻️ تجديد كود", "🔁 تجديد كود"}:
+            context.user_data["step"] = "copy_renew_waiting_token"
+            await update.message.reply_text(
+                "♻️ أرسل كود Copy الذي تريد تجديده.\n\n"
+                "سيبقى نفس Telegram ID والجهاز مرتبطين بالكود. إذا كان فعالًا تُضاف المدة فوق تاريخ الانتهاء، وإذا كان منتهيًا تبدأ المدة من الآن.",
+                reply_markup=admin_input_cancel_keyboard,
+            )
+            return
+
+        if text in {"📱 تصفير جهاز كود", "♻️ تصفير جهاز كود"}:
             context.user_data["step"] = "copy_reset_device_waiting_token"
             await update.message.reply_text(
-                "♻️ أرسل كود Copy الذي تريد تصفير الأجهزة المرتبطة به.\n\nبعد التصفير، أول جهاز و Telegram ID يفتح الإضافة بهذا الكود سيرتبط من جديد.",
-                reply_markup=admin_input_cancel_keyboard
+                "📱 أرسل كود Copy لتصفير جهاز نفس المستخدم.\n\n"
+                "سيتم مسح الأجهزة ومفاتيح الإثبات فقط، مع إبقاء Telegram ID مربوطًا بنفس العميل.",
+                reply_markup=admin_input_cancel_keyboard,
             )
             return
 
-        if text == "♻️ تصفير كل الأجهزة":
+        if text in {"⚠️ تصفير كل الأجهزة", "♻️ تصفير كل الأجهزة"}:
             context.user_data["step"] = "copy_reset_all_devices_confirm"
             await update.message.reply_text(
-                "⚠️ هذا الخيار سيصفر الأجهزة و Telegram ID لكل الأكواد المنشأة من البوت.\n\n"
-                "استخدمه بعد تحديثات الإضافة أو عندما تريد إعادة ربط الأكواد من جديد.\n\n"
+                "⚠️ خطر: سيتم مسح الأجهزة ومفاتيح الإثبات من جميع الأكواد مع إبقاء Telegram ID لكل عميل.\n"
+                "كل العملاء سيحتاجون إعادة ربط أجهزتهم. لا تستخدمه إلا بحالة صيانة عامة.\n\n"
                 "اضغط ✅ نعم، تأكيد للمتابعة أو ❌ إلغاء.",
-                reply_markup=admin_confirm_keyboard
+                reply_markup=admin_confirm_keyboard,
             )
             return
 
-        if text == "🧹 تنظيف الأكواد":
+        if text in {"🧹 حذف المنتهي والموقوف", "🧹 تنظيف الأكواد"}:
             context.user_data["step"] = "copy_cleanup_codes_confirm"
             await update.message.reply_text(
-                "🧹 هذا الخيار سيحذف فقط الأكواد المعطلة أو المنتهية من Firebase.\n"
-                "الأكواد النشطة لن تُحذف.\n\n"
+                "🧹 سيتم حذف كل الأكواد المعطلة أو المنتهية نهائيًا من Firebase.\n"
+                "الأكواد النشطة لن تتأثر.\n\n"
                 "اضغط ✅ نعم، تأكيد للمتابعة أو ❌ إلغاء.",
-                reply_markup=admin_confirm_keyboard
+                reply_markup=admin_confirm_keyboard,
             )
             return
 
-        if text == "🗑 حذف كود":
+        if text in {"🗑 حذف كود نهائيًا", "🗑 حذف كود"}:
             context.user_data["step"] = "copy_delete_waiting_token"
             await update.message.reply_text(
-                "🗑 أرسل كود Copy الذي تريد حذفه نهائيًا من Firebase.\n\n"
-                "ملاحظة: أي كود موجود في Render Env لا يمكن حذفه من هنا؛ احذفه من COPY_LICENSES إذا أردت.",
-                reply_markup=admin_input_cancel_keyboard
+                "🗑 أرسل كود Copy الذي تريد حذفه نهائيًا.\n\n"
+                "⚠️ الحذف يمسح السجل بالكامل ولا يمكن التراجع عنه.",
+                reply_markup=admin_input_cancel_keyboard,
+            )
+            return
+
+        if text == "🔄 إعادة تدوير كود":
+            context.user_data["step"] = "copy_recycle_waiting_token"
+            await update.message.reply_text(
+                "🔄 أرسل الكود القديم الذي تريد تجهيزه لمستخدم جديد.\n\n"
+                "سيتم لاحقًا مسح Telegram ID والجهاز ومفتاح الإثبات والجلسات القديمة، ثم تعيين مدة جديدة للكود.",
+                reply_markup=admin_input_cancel_keyboard,
             )
             return
 
@@ -17518,23 +17789,164 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["step"] = "copy_update_notice_waiting_text"
             await update.message.reply_text(
                 "📌 أرسل رسالة التحديث التي تريد أن تظهر داخل الإضافة.\n\nأرسل كلمة: مسح\nلحذف رسالة التحديث الحالية.",
-                reply_markup=admin_input_cancel_keyboard
+                reply_markup=admin_input_cancel_keyboard,
             )
             return
 
         if text == "⛔ إيقاف كود":
             context.user_data["step"] = "copy_disable_waiting_token"
             await update.message.reply_text(
-                "⛔ أرسل كود Copy الذي تريد إيقافه.\n\nملاحظة: الأكواد الموجودة فقط في Render Env لا يمكن إيقافها من البوت، احذفها من COPY_LICENSES.",
-                reply_markup=admin_input_cancel_keyboard
+                "⛔ أرسل كود Copy الذي تريد إيقافه.\n\n"
+                "سيتم فصله فورًا مع إبقاء سجله محفوظًا.",
+                reply_markup=admin_input_cancel_keyboard,
             )
+            return
+
+        if text == "ℹ️ شرح خيارات الأكواد":
+            await update.message.reply_text(
+                "ℹ️ إدارة أكواد Copy\n"
+                "━━━━━━━━━━━━━━\n"
+                "♻️ تجديد كود: تمديد نفس العميل مع بقاء جهازه وربطه.\n"
+                "⛔ إيقاف كود: منع الكود مع إبقاء سجله.\n"
+                "📱 تصفير جهاز: لنفس العميل عند تغيير جهازه؛ يمسح الأجهزة فقط ويبقي Telegram ID.\n"
+                "🔄 إعادة تدوير: تجهيز نفس الرمز لعميل جديد ومسح كل ارتباط قديم.\n"
+                "🗑 حذف نهائي: إزالة الكود وسجله بالكامل.\n"
+                "🧹 حذف المنتهي والموقوف: تنظيف جماعي نهائي.\n"
+                "⚠️ تصفير كل الأجهزة: إجراء صيانة خطير يؤثر على الجميع.",
+                reply_markup=copy_admin_keyboard,
+            )
+            return
+
+        if step == "copy_renew_waiting_token":
+            token = normalize_copy_license_token(text)
+            record = get_copy_license_record(token)
+            if not record or record.get("source") == "env" or token == COPY_ADMIN_LICENSE_TOKEN:
+                context.user_data["step"] = None
+                await update.message.reply_text("❌ الكود غير موجود أو لا يقبل التجديد من هنا.", reply_markup=copy_admin_keyboard)
+                return
+            context.user_data["copy_pending_token"] = token
+            context.user_data["step"] = "copy_renew_waiting_option"
+            await update.message.reply_text(
+                build_copy_license_summary(record, "♻️ الكود المراد تجديده") + "\n\nاختر مدة التجديد:",
+                parse_mode="HTML",
+                reply_markup=copy_renew_keyboard,
+            )
+            return
+
+        if step == "copy_renew_waiting_option":
+            token = normalize_copy_license_token(context.user_data.get("copy_pending_token"))
+            if text == "📅 تاريخ مخصص":
+                context.user_data["step"] = "copy_renew_waiting_custom_date"
+                await update.message.reply_text(
+                    "📅 أرسل تاريخ الانتهاء الجديد بأحد الأشكال:\n"
+                    "2026-12-31\nأو 31/12/2026\n\nسيكون الانتهاء الساعة 23:59 بتوقيت UTC+3.",
+                    reply_markup=admin_input_cancel_keyboard,
+                )
+                return
+            renewal = "week" if text == "➕ تجديد أسبوع" else ("month" if text == "➕ تجديد شهر" else ("forever" if text == "♾ تحويل إلى دائم" else ""))
+            if not renewal:
+                await update.message.reply_text("اختر أحد خيارات التجديد الظاهرة.", reply_markup=copy_renew_keyboard)
+                return
+            context.user_data["step"] = None
+            context.user_data.pop("copy_pending_token", None)
+            ok, message, record = renew_copy_license(token, renewal, renewed_by=user.id)
+            if ok:
+                await update.message.reply_text(build_copy_license_summary(record, "✅ تم تجديد الكود"), parse_mode="HTML", reply_markup=copy_admin_keyboard)
+            else:
+                await update.message.reply_text(f"❌ {message}", reply_markup=copy_admin_keyboard)
+            return
+
+        if step == "copy_renew_waiting_custom_date":
+            token = normalize_copy_license_token(context.user_data.get("copy_pending_token"))
+            custom_expiry = parse_copy_custom_expiry_date(text)
+            if custom_expiry is None:
+                await update.message.reply_text("❌ التاريخ غير صالح أو ليس بالمستقبل. مثال: 2026-12-31", reply_markup=admin_input_cancel_keyboard)
+                return
+            context.user_data["step"] = None
+            context.user_data.pop("copy_pending_token", None)
+            ok, message, record = renew_copy_license(token, "custom", renewed_by=user.id, custom_expiry=custom_expiry)
+            if ok:
+                await update.message.reply_text(build_copy_license_summary(record, "✅ تم تعيين تاريخ الانتهاء"), parse_mode="HTML", reply_markup=copy_admin_keyboard)
+            else:
+                await update.message.reply_text(f"❌ {message}", reply_markup=copy_admin_keyboard)
+            return
+
+        if step == "copy_recycle_waiting_token":
+            token = normalize_copy_license_token(text)
+            record = get_copy_license_record(token)
+            if not record or record.get("source") == "env" or token == COPY_ADMIN_LICENSE_TOKEN:
+                context.user_data["step"] = None
+                await update.message.reply_text("❌ الكود غير موجود أو لا يمكن إعادة تدويره.", reply_markup=copy_admin_keyboard)
+                return
+            context.user_data["copy_pending_token"] = token
+            context.user_data["step"] = "copy_recycle_waiting_new_tid"
+            await update.message.reply_text(
+                build_copy_license_summary(record, "🔄 الكود المراد إعادة تدويره") +
+                "\n\nأرسل Telegram ID الرقمي للعميل الجديد. سيتم ربط الكود به مسبقًا حتى لا يستطيع العميل القديم استعادته.",
+                parse_mode="HTML",
+                reply_markup=admin_input_cancel_keyboard,
+            )
+            return
+
+        if step == "copy_recycle_waiting_new_tid":
+            new_tid = normalize_copy_telegram_user_id(text)
+            if not new_tid:
+                await update.message.reply_text("❌ Telegram ID غير صالح. أرسل أرقام فقط.", reply_markup=admin_input_cancel_keyboard)
+                return
+            context.user_data["copy_pending_new_telegram_id"] = new_tid
+            context.user_data["step"] = "copy_recycle_waiting_plan"
+            await update.message.reply_text(
+                f"👤 العميل الجديد: <code>{html.escape(new_tid)}</code>\n\nاختر مدة الاشتراك الجديدة:",
+                parse_mode="HTML",
+                reply_markup=copy_recycle_plan_keyboard,
+            )
+            return
+
+        if step == "copy_recycle_waiting_plan":
+            plan = "week" if text == "🗓 تجهيز أسبوع" else ("month" if text == "🗓 تجهيز شهر" else ("forever" if text == "♾ تجهيز دائم" else ""))
+            if not plan:
+                await update.message.reply_text("اختر مدة العميل الجديد من الأزرار.", reply_markup=copy_recycle_plan_keyboard)
+                return
+            context.user_data["copy_pending_plan"] = plan
+            context.user_data["step"] = "copy_recycle_confirm"
+            token = normalize_copy_license_token(context.user_data.get("copy_pending_token"))
+            await update.message.reply_text(
+                f"⚠️ تأكيد إعادة تدوير الكود:\n<code>{html.escape(token)}</code>\n\n"
+                f"سيُفصل المستخدم القديم وتُمسح أجهزته ومفتاح الإثبات والجلسات، ثم يُربط الكود مسبقًا بـ Telegram ID الجديد: {html.escape(str(context.user_data.get('copy_pending_new_telegram_id') or '-'))}.",
+                parse_mode="HTML",
+                reply_markup=admin_confirm_keyboard,
+            )
+            return
+
+        if step == "copy_recycle_confirm":
+            token = normalize_copy_license_token(context.user_data.get("copy_pending_token"))
+            plan = str(context.user_data.get("copy_pending_plan") or "")
+            context.user_data["step"] = None
+            context.user_data.pop("copy_pending_token", None)
+            new_tid = normalize_copy_telegram_user_id(context.user_data.get("copy_pending_new_telegram_id"))
+            context.user_data.pop("copy_pending_plan", None)
+            context.user_data.pop("copy_pending_new_telegram_id", None)
+            if not is_admin_confirm_text(text):
+                await update.message.reply_text("تم إلغاء إعادة تدوير الكود.", reply_markup=copy_admin_keyboard)
+                return
+            ok, message, record = recycle_copy_license(token, plan, new_tid, recycled_by=user.id)
+            if ok:
+                disconnected = await disconnect_copy_license_runtime(token, code=4413, reason="license recycled")
+                await update.message.reply_text(
+                    build_copy_license_summary(record, "✅ الكود جاهز لمستخدم جديد") + f"\n\n🔌 تم فصل {disconnected} اتصال قديم.",
+                    parse_mode="HTML",
+                    reply_markup=copy_admin_keyboard,
+                )
+            else:
+                await update.message.reply_text(f"❌ {message}", reply_markup=copy_admin_keyboard)
             return
 
         if step == "copy_reset_all_devices_confirm":
             context.user_data["step"] = None
             if is_admin_confirm_text(text):
                 result = reset_all_copy_license_devices()
-                await update.message.reply_text(build_copy_reset_all_result_message(result), reply_markup=copy_admin_keyboard)
+                disconnected = await disconnect_all_copy_clients(code=4412, reason="all device bindings reset")
+                await update.message.reply_text(build_copy_reset_all_result_message(result) + f"\n🔌 تم فصل {disconnected} اتصال.", reply_markup=copy_admin_keyboard)
             else:
                 await update.message.reply_text("تم إلغاء تصفير كل الأجهزة.", reply_markup=copy_admin_keyboard)
             return
@@ -17543,36 +17955,90 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             context.user_data["step"] = None
             if is_admin_confirm_text(text):
                 result = cleanup_copy_licenses(delete_disabled=True, delete_expired=True)
-                await update.message.reply_text(build_copy_cleanup_result_message(result), reply_markup=copy_admin_keyboard)
+                disconnected = 0
+                for deleted_token in result.get("deleted_tokens") or []:
+                    disconnected += await disconnect_copy_license_runtime(deleted_token, code=4401, reason="license removed")
+                await update.message.reply_text(build_copy_cleanup_result_message(result) + f"\n🔌 تم فصل {disconnected} اتصال.", reply_markup=copy_admin_keyboard)
             else:
                 await update.message.reply_text("تم إلغاء تنظيف الأكواد.", reply_markup=copy_admin_keyboard)
             return
 
         if step == "copy_delete_waiting_token":
-            context.user_data["step"] = None
             token = normalize_copy_license_token(text)
+            record = get_copy_license_record(token)
+            if not record or record.get("source") == "env" or token == COPY_ADMIN_LICENSE_TOKEN:
+                context.user_data["step"] = None
+                await update.message.reply_text("❌ الكود غير موجود أو لا يمكن حذفه.", reply_markup=copy_admin_keyboard)
+                return
+            context.user_data["copy_pending_token"] = token
+            context.user_data["step"] = "copy_delete_confirm"
+            await update.message.reply_text(build_copy_license_summary(record, "🗑 تأكيد الحذف النهائي") + "\n\n⚠️ اضغط تأكيد لحذف السجل بلا رجعة.", parse_mode="HTML", reply_markup=admin_confirm_keyboard)
+            return
+
+        if step == "copy_delete_confirm":
+            token = normalize_copy_license_token(context.user_data.get("copy_pending_token"))
+            context.user_data["step"] = None
+            context.user_data.pop("copy_pending_token", None)
+            if not is_admin_confirm_text(text):
+                await update.message.reply_text("تم إلغاء حذف الكود.", reply_markup=copy_admin_keyboard)
+                return
             if delete_copy_license(token):
-                await update.message.reply_text(f"🗑 تم حذف الكود نهائيًا:\n<code>{html.escape(token)}</code>", parse_mode="HTML", reply_markup=copy_admin_keyboard)
+                disconnected = await disconnect_copy_license_runtime(token, code=4401, reason="license deleted")
+                await update.message.reply_text(f"🗑 تم حذف الكود نهائيًا:\n<code>{html.escape(token)}</code>\n🔌 تم فصل {disconnected} اتصال.", parse_mode="HTML", reply_markup=copy_admin_keyboard)
             else:
-                await update.message.reply_text("❌ لم أستطع حذف الكود. تأكد أنه كود منشأ من البوت وليس من Render Env.", reply_markup=copy_admin_keyboard)
+                await update.message.reply_text("❌ لم أستطع حذف الكود.", reply_markup=copy_admin_keyboard)
             return
 
         if step == "copy_disable_waiting_token":
-            context.user_data["step"] = None
             token = normalize_copy_license_token(text)
+            record = get_copy_license_record(token)
+            if not record or record.get("source") == "env" or token == COPY_ADMIN_LICENSE_TOKEN:
+                context.user_data["step"] = None
+                await update.message.reply_text("❌ الكود غير موجود أو لا يمكن إيقافه.", reply_markup=copy_admin_keyboard)
+                return
+            context.user_data["copy_pending_token"] = token
+            context.user_data["step"] = "copy_disable_confirm"
+            await update.message.reply_text(build_copy_license_summary(record, "⛔ تأكيد إيقاف الكود") + "\n\nسيتم فصل الإضافة فورًا مع بقاء السجل.", parse_mode="HTML", reply_markup=admin_confirm_keyboard)
+            return
+
+        if step == "copy_disable_confirm":
+            token = normalize_copy_license_token(context.user_data.get("copy_pending_token"))
+            context.user_data["step"] = None
+            context.user_data.pop("copy_pending_token", None)
+            if not is_admin_confirm_text(text):
+                await update.message.reply_text("تم إلغاء إيقاف الكود.", reply_markup=copy_admin_keyboard)
+                return
             if disable_copy_license(token):
-                await update.message.reply_text(f"✅ تم إيقاف الكود:\n<code>{html.escape(token)}</code>", parse_mode="HTML", reply_markup=copy_admin_keyboard)
+                disconnected = await disconnect_copy_license_runtime(token, code=4401, reason="inactive license")
+                await update.message.reply_text(f"✅ تم إيقاف الكود:\n<code>{html.escape(token)}</code>\n🔌 تم فصل {disconnected} اتصال.", parse_mode="HTML", reply_markup=copy_admin_keyboard)
             else:
-                await update.message.reply_text("❌ لم أستطع إيقاف الكود. تأكد أنه كود منشأ من البوت وليس من Render Env.", reply_markup=copy_admin_keyboard)
+                await update.message.reply_text("❌ لم أستطع إيقاف الكود.", reply_markup=copy_admin_keyboard)
             return
 
         if step == "copy_reset_device_waiting_token":
-            context.user_data["step"] = None
             token = normalize_copy_license_token(text)
+            record = get_copy_license_record(token)
+            if not record or record.get("source") == "env" or token == COPY_ADMIN_LICENSE_TOKEN:
+                context.user_data["step"] = None
+                await update.message.reply_text("❌ الكود غير موجود أو لا يمكن تصفيره.", reply_markup=copy_admin_keyboard)
+                return
+            context.user_data["copy_pending_token"] = token
+            context.user_data["step"] = "copy_reset_device_confirm"
+            await update.message.reply_text(build_copy_license_summary(record, "📱 تأكيد تصفير الجهاز") + "\n\nسيتم مسح الأجهزة ومفاتيح الإثبات فقط، وسيبقى Telegram ID الحالي محميًا.", parse_mode="HTML", reply_markup=admin_confirm_keyboard)
+            return
+
+        if step == "copy_reset_device_confirm":
+            token = normalize_copy_license_token(context.user_data.get("copy_pending_token"))
+            context.user_data["step"] = None
+            context.user_data.pop("copy_pending_token", None)
+            if not is_admin_confirm_text(text):
+                await update.message.reply_text("تم إلغاء تصفير الجهاز.", reply_markup=copy_admin_keyboard)
+                return
             if reset_copy_license_devices(token):
-                await update.message.reply_text(f"✅ تم تصفير الأجهزة وربط Telegram للكود:\n<code>{html.escape(token)}</code>", parse_mode="HTML", reply_markup=copy_admin_keyboard)
+                disconnected = await disconnect_copy_license_runtime(token, code=4412, reason="device binding reset")
+                await update.message.reply_text(f"✅ تم تصفير أجهزة الكود مع إبقاء Telegram ID:\n<code>{html.escape(token)}</code>\n🔌 تم فصل {disconnected} اتصال.", parse_mode="HTML", reply_markup=copy_admin_keyboard)
             else:
-                await update.message.reply_text("❌ لم أستطع تصفير الأجهزة. تأكد أن الكود منشأ من البوت وليس من Render Env.", reply_markup=copy_admin_keyboard)
+                await update.message.reply_text("❌ لم أستطع تصفير الجهاز.", reply_markup=copy_admin_keyboard)
             return
 
         if step == "copy_update_notice_waiting_text":
@@ -18447,6 +18913,45 @@ async def _copy_send_json_safe(ws, payload: dict) -> bool:
         return False
 
 
+def purge_copy_license_sessions(token: str) -> int:
+    token = normalize_copy_license_token(token)
+    removed = 0
+    for session_id, row in list(_copy_ws_sessions.items()):
+        if normalize_copy_license_token((row or {}).get("token")) == token:
+            _copy_ws_sessions.pop(session_id, None)
+            removed += 1
+    return removed
+
+
+async def disconnect_copy_license_runtime(token: str, code: int = 4401, reason: str = "license changed") -> int:
+    token = normalize_copy_license_token(token)
+    disconnected = 0
+    purge_copy_license_sessions(token)
+    for client_id, client in list(_copy_clients.items()):
+        if normalize_copy_license_token((client or {}).get("license")) != token:
+            continue
+        try:
+            await (client or {}).get("ws").close(code=code, reason=str(reason)[:120])
+        except Exception:
+            logger.debug("Could not close Copy client after license change", exc_info=True)
+        _copy_clients.pop(client_id, None)
+        disconnected += 1
+    return disconnected
+
+
+async def disconnect_all_copy_clients(code: int = 4412, reason: str = "device bindings reset") -> int:
+    disconnected = 0
+    _copy_ws_sessions.clear()
+    for client_id, client in list(_copy_clients.items()):
+        try:
+            await (client or {}).get("ws").close(code=code, reason=str(reason)[:120])
+        except Exception:
+            logger.debug("Could not close Copy client during global reset", exc_info=True)
+        _copy_clients.pop(client_id, None)
+        disconnected += 1
+    return disconnected
+
+
 async def _copy_broadcast_signal(signal: dict) -> dict:
     if not is_copy_global_enabled():
         return {
@@ -18798,9 +19303,14 @@ def create_embedded_copy_api():
             return
         origin = websocket.headers.get("origin")
 
-        async def _run_authenticated(token: str, device_id: str, telegram_user_id: str, device_proof_key: str, license_record: dict | None, *, legacy_auth: bool):
+        async def _run_authenticated(token: str, device_id: str, telegram_user_id: str, device_proof_key: str, license_record: dict | None, *, legacy_auth: bool, trusted_owner_device: bool = False):
             is_admin_license = bool((license_record or {}).get("is_admin_license"))
-            if not is_copy_origin_allowed(origin, authenticated=True, is_admin_license=is_admin_license):
+            if not is_copy_origin_allowed(
+                origin,
+                authenticated=True,
+                is_admin_license=is_admin_license,
+                trusted_owner_device=trusted_owner_device,
+            ):
                 logger.warning(
                     "Rejected authenticated COPY WebSocket origin | origin=%r | device=%s | telegram_user_id=%s | admin=%s",
                     origin, device_id, telegram_user_id or "-", is_admin_license,
@@ -18812,7 +19322,7 @@ def create_embedded_copy_api():
             _copy_ws_auth_success(auth_ip)
             if legacy_auth:
                 logger.warning(
-                    "Legacy COPY WebSocket authentication in use; update extension to v0.89 | device=%s | telegram_user_id=%s",
+                    "Legacy COPY WebSocket authentication in use; update extension to v0.94 | device=%s | telegram_user_id=%s",
                     device_id, telegram_user_id or "-",
                 )
 
@@ -18915,7 +19425,7 @@ def create_embedded_copy_api():
                 _copy_clients.pop(client_id, None)
 
         # Transitional legacy protocol for already-installed v0.87 and older builds.
-        # Disable it on Render after v0.89 has reached users:
+        # Disable it on Render after v0.94 has reached users:
         # COPY_ALLOW_LEGACY_WS_AUTH=false
         legacy_token = normalize_copy_license_token(websocket.query_params.get("token"))
         if legacy_token:
@@ -18998,6 +19508,7 @@ def create_embedded_copy_api():
             origin_value in {str(x).strip().rstrip("/") for x in COPY_ALLOWED_ORIGINS}
             or extension_id_value in COPY_ALLOWED_EXTENSION_IDS
         )
+        trusted_owner_device = copy_is_trusted_owner_device(device_id, device_proof_key)
         ok, reason, license_record = copy_validate_license_for_device(
             token,
             device_id,
@@ -19016,7 +19527,15 @@ def create_embedded_copy_api():
             await websocket.close(code=4401, reason="legacy environment license must be migrated to Firebase")
             return
 
-        await _run_authenticated(token, device_id, telegram_user_id, device_proof_key, license_record, legacy_auth=False)
+        await _run_authenticated(
+            token,
+            device_id,
+            telegram_user_id,
+            device_proof_key,
+            license_record,
+            legacy_auth=False,
+            trusted_owner_device=trusted_owner_device,
+        )
 
     return copy_api
 
