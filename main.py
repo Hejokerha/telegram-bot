@@ -6,6 +6,8 @@ import csv
 import io
 import hashlib
 import hmac
+import base64
+import secrets
 import asyncio
 import random
 import re
@@ -975,8 +977,8 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
-COPY_SERVER_VERSION = "0.86.0"
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.86").strip() or "v0.86"
+COPY_SERVER_VERSION = "0.88.0"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.88").strip() or "v0.88"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -1012,20 +1014,19 @@ COPY_SIGNAL_ALLOWED_TELEGRAM_IDS = parse_id_set_from_env("COPY_SIGNAL_ALLOWED_TE
 COPY_SIGNAL_ALLOWED_TELEGRAM_IDS.add(int(ADMIN_TELEGRAM_ID))
 
 
-def is_copy_origin_allowed(origin: str | None, *, authenticated: bool = False) -> bool:
-    """Validate browser origins without breaking Chrome extension WebSockets.
+def is_copy_origin_allowed(origin: str | None, *, authenticated: bool = False, is_admin_license: bool = False) -> bool:
+    """Origin boundary for the hardened extension transport.
 
-    Chrome uses the installed extension id in the Origin header. An unpacked build
-    receives a different id from the Chrome Web Store build, so matching one fixed
-    id disconnects legitimate development/update packages. Authentication remains
-    the license token/device binding; Origin is an additional browser boundary.
+    Regular licenses are accepted only from the published Chrome Web Store
+    extension id. Unpacked/null origins are owner/admin-only by default and can be
+    opened explicitly through Render environment flags during development.
     """
     value = str(origin or "").strip().rstrip("/")
-
-    # Some Chromium extension/service-worker versions send no Origin or ``null``.
-    # Accept that compatibility case only after the license has already passed.
     if not value or value.lower() == "null":
-        return bool(authenticated and COPY_ALLOW_NULL_WEBSOCKET_ORIGIN)
+        return bool(
+            authenticated
+            and (is_admin_license or COPY_ALLOW_NULL_WEBSOCKET_ORIGIN)
+        )
 
     allowed = {
         str(x).strip().rstrip("/")
@@ -1035,13 +1036,12 @@ def is_copy_origin_allowed(origin: str | None, *, authenticated: bool = False) -
     if value in allowed:
         return True
 
-    # Store and unpacked Chrome extensions both use a 32-character a-p id.
     match = re.fullmatch(r"chrome-extension://([a-p]{32})", value, flags=re.IGNORECASE)
     if match:
         extension_id = match.group(1).lower()
         if extension_id in COPY_ALLOWED_EXTENSION_IDS:
             return True
-        if authenticated and COPY_ALLOW_UNPACKED_EXTENSION_ORIGINS:
+        if authenticated and (is_admin_license or COPY_ALLOW_UNPACKED_EXTENSION_ORIGINS):
             return True
 
     if COPY_ALLOWED_ORIGIN_REGEX:
@@ -1060,10 +1060,6 @@ COPY_EMBEDDED_SERVER_ENABLED = os.getenv("COPY_EMBEDDED_SERVER_ENABLED", "true")
 # treated as "open to every site"; safe defaults are retained instead.
 _COPY_DEFAULT_ALLOWED_ORIGINS = [
     "chrome-extension://akmgmickemnpecjoooponaijmihmlcmm",
-    "https://qxbroker.com",
-    "https://www.qxbroker.com",
-    "https://quotex.com",
-    "https://www.quotex.com",
 ]
 _COPY_ALLOWED_ORIGINS_ENV = [
     x.strip().rstrip("/")
@@ -1080,14 +1076,14 @@ COPY_ALLOWED_EXTENSION_IDS = {
 # Chrome assigns it an id different from the Web Store id. A valid license is
 # still required before such an origin is accepted.
 COPY_ALLOW_UNPACKED_EXTENSION_ORIGINS = os.getenv(
-    "COPY_ALLOW_UNPACKED_EXTENSION_ORIGINS", "true"
+    "COPY_ALLOW_UNPACKED_EXTENSION_ORIGINS", "false"
 ).lower() in {"1", "true", "yes", "on"}
 COPY_ALLOW_NULL_WEBSOCKET_ORIGIN = os.getenv(
-    "COPY_ALLOW_NULL_WEBSOCKET_ORIGIN", "true"
+    "COPY_ALLOW_NULL_WEBSOCKET_ORIGIN", "false"
 ).lower() in {"1", "true", "yes", "on"}
 _COPY_CUSTOM_ALLOWED_ORIGIN_REGEX = os.getenv("COPY_ALLOWED_ORIGIN_REGEX", "").strip()
 _COPY_SAFE_ALLOWED_ORIGIN_REGEX = (
-    r"(?:chrome-extension://[a-p]{32}|https://(?:[a-z0-9-]+\.)?(?:qxbroker\.com|quotex\.com))"
+    r"(?:chrome-extension://akmgmickemnpecjoooponaijmihmlcmm)"
 )
 COPY_ALLOWED_ORIGIN_REGEX = (
     rf"^(?:{_COPY_SAFE_ALLOWED_ORIGIN_REGEX}|(?:{_COPY_CUSTOM_ALLOWED_ORIGIN_REGEX}))$"
@@ -1105,6 +1101,68 @@ COPY_ADMIN_LICENSE_MAX_DEVICES = max(1, int(os.getenv("COPY_ADMIN_LICENSE_MAX_DE
 COPY_SETTINGS_CACHE_TTL_SECONDS = int(os.getenv("COPY_SETTINGS_CACHE_TTL_SECONDS", "60"))
 COPY_SIGNAL_HISTORY_LIMIT = int(os.getenv("COPY_SIGNAL_HISTORY_LIMIT", "200"))
 COPY_UVICORN_LOG_LEVEL = os.getenv("COPY_UVICORN_LOG_LEVEL", "info")
+
+COPY_WS_AUTH_TIMEOUT_SECONDS = int(os.getenv("COPY_WS_AUTH_TIMEOUT_SECONDS", "12"))
+COPY_SESSION_TOKEN_TTL_SECONDS = int(os.getenv("COPY_SESSION_TOKEN_TTL_SECONDS", "1800"))
+COPY_DEVICE_PROOF_REQUIRED = os.getenv("COPY_DEVICE_PROOF_REQUIRED", "true").lower() in {"1", "true", "yes", "on"}
+COPY_ALLOW_LEGACY_WS_AUTH = os.getenv("COPY_ALLOW_LEGACY_WS_AUTH", "true").lower() in {"1", "true", "yes", "on"}
+
+
+def _copy_b64url_encode(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+
+def _copy_b64url_decode(value: str) -> bytes:
+    text = str(value or "")
+    text += "=" * ((4 - len(text) % 4) % 4)
+    return base64.urlsafe_b64decode(text.encode("ascii"))
+
+
+def _copy_session_token_issue(token: str, device_id: str, telegram_user_id: str, device_proof_key: str) -> str:
+    session_id = secrets.token_urlsafe(32)
+    now_ts = int(time_module.time())
+    _copy_ws_sessions[session_id] = {
+        "token": normalize_copy_license_token(token),
+        "device_id": str(device_id or "")[:120],
+        "telegram_user_id": normalize_copy_telegram_user_id(telegram_user_id),
+        "device_proof_key": str(device_proof_key or "")[:128],
+        "created_at": now_ts,
+        "expires_at": now_ts + max(60, int(COPY_SESSION_TOKEN_TTL_SECONDS)),
+    }
+    # Keep the cache bounded and purge expired sessions opportunistically.
+    for key, row in list(_copy_ws_sessions.items()):
+        if int((row or {}).get("expires_at") or 0) < now_ts:
+            _copy_ws_sessions.pop(key, None)
+    if len(_copy_ws_sessions) > 5000:
+        oldest = sorted(_copy_ws_sessions.items(), key=lambda item: int((item[1] or {}).get("created_at") or 0))[:1000]
+        for key, _row in oldest:
+            _copy_ws_sessions.pop(key, None)
+    return session_id
+
+
+def _copy_session_token_verify(value: str) -> tuple[bool, str, dict | None]:
+    session_id = str(value or "").strip()
+    if not session_id:
+        return False, "invalid session token", None
+    payload = _copy_ws_sessions.get(session_id)
+    if not isinstance(payload, dict):
+        return False, "invalid session token", None
+    if int(payload.get("expires_at") or 0) < int(time_module.time()):
+        _copy_ws_sessions.pop(session_id, None)
+        return False, "session expired", None
+    return True, "ok", dict(payload)
+
+
+def _copy_device_proof_valid(proof_key: str, proof: str, nonce: str, device_id: str, telegram_user_id: str) -> bool:
+    try:
+        key = _copy_b64url_decode(str(proof_key or ""))
+        if len(key) != 32:
+            return False
+        message = f"{nonce}|{device_id}|{normalize_copy_telegram_user_id(telegram_user_id)}".encode("utf-8")
+        expected = _copy_b64url_encode(hmac.new(key, message, hashlib.sha256).digest())
+        return hmac.compare_digest(str(proof or ""), expected)
+    except Exception:
+        return False
 
 
 _firebase_cache = {}
@@ -2322,7 +2380,7 @@ def normalize_copy_telegram_user_id(value) -> str:
         return ""
 
 
-def copy_validate_license_for_device(token: str, device_id: str = "unknown", telegram_user_id=None, touch: bool = True, allow_admin_rebind: bool = False) -> tuple[bool, str, dict | None]:
+def copy_validate_license_for_device(token: str, device_id: str = "unknown", telegram_user_id=None, touch: bool = True, allow_admin_rebind: bool = False, device_proof_key: str = "") -> tuple[bool, str, dict | None]:
     """Validate and atomically bind a Firebase license to Telegram/device.
 
     New-device capacity and first Telegram binding are decided inside one Firebase
@@ -2332,6 +2390,7 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tel
     token = normalize_copy_license_token(token)
     device_id = str(device_id or "unknown").strip()[:120] or "unknown"
     telegram_user_id = normalize_copy_telegram_user_id(telegram_user_id)
+    device_proof_key = str(device_proof_key or "").strip()[:128]
     if not token:
         return False, "invalid license", None
 
@@ -2436,6 +2495,7 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tel
                         "device_id": device_id,
                         "bound_at": now_value,
                         "last_seen_at": now_value,
+                        "device_proof_key": device_proof_key,
                     }
                 }
                 record["active_device_id"] = device_id
@@ -2446,9 +2506,20 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tel
                     "device_id": device_id,
                     "bound_at": now_value,
                     "last_seen_at": now_value,
+                    "device_proof_key": device_proof_key,
                 }
                 changed = True
-            elif touch and now_ts - last_touch >= int(COPY_LICENSE_DEVICE_TOUCH_SECONDS):
+            else:
+                device_row = dict(devices.get(device_key) or {})
+                stored_proof_key = str(device_row.get("device_proof_key") or "")
+                if stored_proof_key and device_proof_key and not hmac.compare_digest(stored_proof_key, device_proof_key):
+                    decision.update(ok=False, reason="device proof mismatch")
+                    return current
+                if device_proof_key and not stored_proof_key:
+                    device_row["device_proof_key"] = device_proof_key
+                    devices[device_key] = device_row
+                    changed = True
+            if touch and now_ts - last_touch >= int(COPY_LICENSE_DEVICE_TOUCH_SECONDS):
                 device_row = dict(devices.get(device_key) or {})
                 device_row["last_seen_at"] = now_value
                 devices[device_key] = device_row
@@ -2462,13 +2533,22 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tel
                     "device_id": device_id,
                     "bound_at": now_value,
                     "last_seen_at": now_value,
+                    "device_proof_key": device_proof_key,
                 }
                 changed = True
-            elif touch and now_ts - last_touch >= int(COPY_LICENSE_DEVICE_TOUCH_SECONDS):
+            else:
                 device_row = dict(devices.get(device_key) or {})
-                device_row["last_seen_at"] = now_value
+                stored_proof_key = str(device_row.get("device_proof_key") or "")
+                if stored_proof_key and device_proof_key and not hmac.compare_digest(stored_proof_key, device_proof_key):
+                    decision.update(ok=False, reason="device proof mismatch")
+                    return current
+                if device_proof_key and not stored_proof_key:
+                    device_row["device_proof_key"] = device_proof_key
+                    changed = True
+                if touch and now_ts - last_touch >= int(COPY_LICENSE_DEVICE_TOUCH_SECONDS):
+                    device_row["last_seen_at"] = now_value
+                    changed = True
                 devices[device_key] = device_row
-                changed = True
 
         if changed:
             record["devices"] = devices
@@ -18192,6 +18272,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # هذا السيرفر يستقبل الصفقات من البوت ويبثها لإضافات Chrome المتصلة على نفس رابط Render.
 _copy_server_started = False
 _copy_clients = {}
+_copy_ws_sessions = {}
+_copy_ws_auth_failures = {}
 _copy_signal_history = []
 _copy_client_events = []
 
@@ -18541,6 +18623,33 @@ async def _copy_send_extension_alert_to_user(event: dict, client: dict | None = 
         return False
 
 
+def _copy_ws_auth_ip(websocket) -> str:
+    try:
+        client = getattr(websocket, "client", None)
+        return str(getattr(client, "host", "") or "unknown")[:80]
+    except Exception:
+        return "unknown"
+
+
+def _copy_ws_auth_rate_limited(ip: str) -> bool:
+    now_ts = time_module.time()
+    window = 300.0
+    rows = [float(x) for x in (_copy_ws_auth_failures.get(ip) or []) if now_ts - float(x) <= window]
+    _copy_ws_auth_failures[ip] = rows
+    return len(rows) >= 12
+
+
+def _copy_ws_auth_failure(ip: str):
+    now_ts = time_module.time()
+    rows = [float(x) for x in (_copy_ws_auth_failures.get(ip) or []) if now_ts - float(x) <= 300.0]
+    rows.append(now_ts)
+    _copy_ws_auth_failures[ip] = rows[-30:]
+
+
+def _copy_ws_auth_success(ip: str):
+    _copy_ws_auth_failures.pop(ip, None)
+
+
 def create_embedded_copy_api():
     from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
@@ -18551,8 +18660,8 @@ def create_embedded_copy_api():
         allow_origins=COPY_ALLOWED_ORIGINS,
         allow_origin_regex=COPY_ALLOWED_ORIGIN_REGEX,
         allow_credentials=True,
-        allow_methods=["*"],
-        allow_headers=["*"],
+        allow_methods=["GET", "POST"],
+        allow_headers=["Content-Type", "X-TTCopy-Secret"],
     )
 
 
@@ -18572,15 +18681,18 @@ def create_embedded_copy_api():
     async def copy_health_alias():
         return await copy_health()
 
-    @copy_api.get("/api/license/check")
-    async def copy_license_check(token: str = Query(...), device_id: str = Query(default="unknown"), telegram_user_id: str = Query(default="")):
+    @copy_api.post("/api/license/check")
+    async def copy_license_check(request: Request):
+        body = await request.json()
+        token = normalize_copy_license_token(body.get("token"))
+        device_id = str(body.get("device_id") or "unknown")
+        telegram_user_id = normalize_copy_telegram_user_id(body.get("telegram_user_id"))
         ok, reason, record = copy_validate_license_for_device(token, device_id, telegram_user_id=telegram_user_id, touch=True, allow_admin_rebind=True)
         if not ok:
             raise HTTPException(status_code=401, detail=reason)
         return {
             "ok": True,
             "status": "active",
-            "token": normalize_copy_license_token(token),
             "plan": (record or {}).get("plan"),
             "expires_at": (record or {}).get("expires_at"),
             "max_devices": (record or {}).get("max_devices"),
@@ -18602,7 +18714,7 @@ def create_embedded_copy_api():
             "clients": [
                 {
                     "client_id": k,
-                    "license": v.get("license"),
+                    "license_fingerprint": hashlib.sha256(str(v.get("license") or "").encode("utf-8")).hexdigest()[:12],
                     "device_id": v.get("device_id"),
                     "telegram_user_id": v.get("telegram_user_id"),
                     "connected_at": v.get("connected_at"),
@@ -18656,118 +18768,224 @@ def create_embedded_copy_api():
         return {"ok": True, "signal": normalized, "delivery": delivery}
 
     @copy_api.websocket("/ws/extension")
-    async def copy_extension_ws(websocket: WebSocket, token: str = Query(...), device_id: str = Query(default="unknown"), telegram_user_id: str = Query(default="")):
+    async def copy_extension_ws(websocket: WebSocket):
         await websocket.accept()
-        token = normalize_copy_license_token(token)
-        telegram_user_id = normalize_copy_telegram_user_id(telegram_user_id)
-        ok, reason, license_record = copy_validate_license_for_device(
-            token, device_id, telegram_user_id=telegram_user_id, touch=True, allow_admin_rebind=True
-        )
-        if not ok:
-            await websocket.close(code=4401, reason=reason)
+        auth_ip = _copy_ws_auth_ip(websocket)
+        if _copy_ws_auth_rate_limited(auth_ip):
+            await websocket.close(code=4429, reason="too many authentication attempts")
             return
-
-        # Check Origin only after authentication. This keeps the boundary useful
-        # against arbitrary websites while allowing the Web Store build, locally
-        # loaded packages and Chromium's occasional null Origin behaviour.
         origin = websocket.headers.get("origin")
-        if not is_copy_origin_allowed(origin, authenticated=True):
-            logger.warning(
-                "Rejected authenticated COPY WebSocket origin | origin=%r | device=%s | telegram_user_id=%s",
-                origin, device_id, telegram_user_id or "-"
+
+        async def _run_authenticated(token: str, device_id: str, telegram_user_id: str, device_proof_key: str, license_record: dict | None, *, legacy_auth: bool):
+            is_admin_license = bool((license_record or {}).get("is_admin_license"))
+            if not is_copy_origin_allowed(origin, authenticated=True, is_admin_license=is_admin_license):
+                logger.warning(
+                    "Rejected authenticated COPY WebSocket origin | origin=%r | device=%s | telegram_user_id=%s | admin=%s",
+                    origin, device_id, telegram_user_id or "-", is_admin_license,
+                )
+                _copy_ws_auth_failure(auth_ip)
+                await websocket.close(code=4403, reason="origin not allowed")
+                return
+
+            _copy_ws_auth_success(auth_ip)
+            if legacy_auth:
+                logger.warning(
+                    "Legacy COPY WebSocket authentication in use; update extension to v0.88 | device=%s | telegram_user_id=%s",
+                    device_id, telegram_user_id or "-",
+                )
+
+            if token == COPY_ADMIN_LICENSE_TOKEN:
+                for old_client_id, old_client in list(_copy_clients.items()):
+                    if old_client.get("license") == token and str(old_client.get("device_id") or "") != device_id:
+                        try:
+                            await old_client.get("ws").close(code=4410, reason="admin device replaced")
+                        except Exception:
+                            logger.debug("Could not close superseded admin client", exc_info=True)
+                        _copy_clients.pop(old_client_id, None)
+
+            client_id = hashlib.sha256(f"{token}:{device_id}:{telegram_user_id}:{time_module.time()}".encode("utf-8")).hexdigest()[:16]
+            _copy_clients[client_id] = {
+                "ws": websocket,
+                "license": token,
+                "device_id": device_id,
+                "telegram_user_id": telegram_user_id,
+                "device_proof_key": device_proof_key,
+                "origin": origin,
+                "transport": "legacy_query" if legacy_auth else "challenge_v2",
+                "connected_at": now_iso(),
+                "last_seen_at": now_iso(),
+                "last_sent_at": None,
+            }
+            hello = {
+                "type": "hello",
+                "ok": True,
+                "client_id": client_id,
+                "server_time": now_iso(),
+                "message": "TRADING TIME COPY connected",
+                "copy_settings": copy_public_settings_payload(),
+                "license": {
+                    "status": "active",
+                    "plan": (license_record or {}).get("plan"),
+                    "expires_at": (license_record or {}).get("expires_at"),
+                    "max_devices": (license_record or {}).get("max_devices"),
+                    "telegram_user_id": normalize_copy_telegram_user_id((license_record or {}).get("telegram_user_id") or telegram_user_id),
+                    "route_mode": "personal" if telegram_user_id else "broadcast_only_until_telegram_id_is_set",
+                    "is_admin_license": is_admin_license,
+                    "role": (license_record or {}).get("role") or ("admin" if is_admin_license else "user"),
+                },
+            }
+            if not legacy_auth:
+                hello["session_token"] = _copy_session_token_issue(token, device_id, telegram_user_id, device_proof_key)
+                hello["session_expires_in"] = int(COPY_SESSION_TOKEN_TTL_SECONDS)
+            await _copy_send_json_safe(websocket, hello)
+
+            try:
+                while True:
+                    raw = await websocket.receive_text()
+                    if client_id in _copy_clients:
+                        _copy_clients[client_id]["last_seen_at"] = now_iso()
+                    ok, reason, _record = copy_validate_license_for_device(
+                        token,
+                        device_id,
+                        telegram_user_id=telegram_user_id,
+                        touch=True,
+                        allow_admin_rebind=False,
+                        device_proof_key=device_proof_key,
+                    )
+                    if not ok:
+                        await websocket.close(code=4401, reason=reason)
+                        break
+                    try:
+                        event = json.loads(raw)
+                    except Exception:
+                        event = {"type": "raw", "raw": raw[:500]}
+                    event["client_id"] = client_id
+                    event["license_fingerprint"] = hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+                    event["server_received_at"] = now_iso()
+                    _copy_client_events.append(event)
+                    del _copy_client_events[:-int(COPY_SIGNAL_HISTORY_LIMIT)]
+
+                    if event.get("type") == "ping":
+                        await _copy_send_json_safe(websocket, {
+                            "type": "pong",
+                            "server_time": now_iso(),
+                            "copy_settings": copy_public_settings_payload(),
+                        })
+                    elif event.get("type") == "ack":
+                        await _copy_send_json_safe(websocket, {"type": "ack_saved", "signal_id": event.get("signal_id")})
+                    elif event.get("type") == "extension_event":
+                        payload_event = event.get("event") if isinstance(event.get("event"), dict) else {}
+                        payload_event["telegram_user_id"] = payload_event.get("telegram_user_id") or telegram_user_id
+                        sent = False
+                        if payload_event.get("type") == "extension_alert":
+                            sent = await _copy_send_extension_alert_to_user(payload_event, _copy_clients.get(client_id) or {})
+                        await _copy_send_json_safe(websocket, {
+                            "type": "extension_event_saved",
+                            "sent": bool(sent),
+                            "client_event_id": event.get("client_event_id") or payload_event.get("client_event_id"),
+                            "server_time": now_iso(),
+                        })
+                    else:
+                        await _copy_send_json_safe(websocket, {"type": "event_saved", "server_time": now_iso()})
+            except WebSocketDisconnect:
+                logger.debug("COPY WebSocket disconnected | client_id=%s", client_id)
+            finally:
+                _copy_clients.pop(client_id, None)
+
+        # Transitional legacy protocol for already-installed v0.87 and older builds.
+        # Disable it on Render after v0.88 has reached users:
+        # COPY_ALLOW_LEGACY_WS_AUTH=false
+        legacy_token = normalize_copy_license_token(websocket.query_params.get("token"))
+        if legacy_token:
+            if not COPY_ALLOW_LEGACY_WS_AUTH:
+                await websocket.close(code=4406, reason="extension update required")
+                return
+            legacy_device_id = str(websocket.query_params.get("device_id") or "unknown").strip()[:120] or "unknown"
+            legacy_telegram_id = normalize_copy_telegram_user_id(websocket.query_params.get("telegram_user_id"))
+            ok, reason, license_record = copy_validate_license_for_device(
+                legacy_token,
+                legacy_device_id,
+                telegram_user_id=legacy_telegram_id,
+                touch=True,
+                allow_admin_rebind=True,
             )
-            await websocket.close(code=4403, reason="origin not allowed")
+            if not ok:
+                _copy_ws_auth_failure(auth_ip)
+                await websocket.close(code=4401, reason=reason)
+                return
+            await _run_authenticated(legacy_token, legacy_device_id, legacy_telegram_id, "", license_record, legacy_auth=True)
             return
 
-        # Exactly one live owner extension is allowed. When a new unpacked/store
-        # build takes over DEMO-111, close the previous build so signals can never
-        # be delivered to two admin installations at the same time.
-        if token == COPY_ADMIN_LICENSE_TOKEN:
-            for old_client_id, old_client in list(_copy_clients.items()):
-                if (
-                    old_client.get("license") == token
-                    and str(old_client.get("device_id") or "") != str(device_id or "")
-                ):
-                    try:
-                        await old_client.get("ws").close(code=4410, reason="admin device replaced")
-                    except Exception:
-                        logger.debug("Could not close superseded admin client", exc_info=True)
-                    _copy_clients.pop(old_client_id, None)
-
-        client_id = hashlib.sha256(f"{token}:{device_id}:{telegram_user_id}:{time_module.time()}".encode("utf-8")).hexdigest()[:16]
-        _copy_clients[client_id] = {
-            "ws": websocket,
-            "license": token,
-            "device_id": device_id,
-            "telegram_user_id": telegram_user_id,
-            "connected_at": now_iso(),
-            "last_seen_at": now_iso(),
-            "last_sent_at": None,
-        }
+        nonce = secrets.token_urlsafe(32)
         await _copy_send_json_safe(websocket, {
-            "type": "hello",
-            "ok": True,
-            "client_id": client_id,
+            "type": "auth_challenge",
+            "nonce": nonce,
             "server_time": now_iso(),
-            "message": "TRADING TIME COPY connected",
-            "copy_settings": copy_public_settings_payload(),
-            "license": {
-                "token": token,
-                "status": "active",
-                "plan": (license_record or {}).get("plan"),
-                "expires_at": (license_record or {}).get("expires_at"),
-                "max_devices": (license_record or {}).get("max_devices"),
-                "telegram_user_id": normalize_copy_telegram_user_id((license_record or {}).get("telegram_user_id") or telegram_user_id),
-                "route_mode": "personal" if telegram_user_id else "broadcast_only_until_telegram_id_is_set",
-                "is_admin_license": bool((license_record or {}).get("is_admin_license")),
-                "role": (license_record or {}).get("role") or ("admin" if (license_record or {}).get("is_admin_license") else "user"),
-            },
+            "protocol": 2,
         })
         try:
-            while True:
-                raw = await websocket.receive_text()
-                if client_id in _copy_clients:
-                    _copy_clients[client_id]["last_seen_at"] = now_iso()
-                ok, reason, _record = copy_validate_license_for_device(token, device_id, telegram_user_id=telegram_user_id, touch=True, allow_admin_rebind=False)
-                if not ok:
-                    await websocket.close(code=4401, reason=reason)
-                    break
-                try:
-                    event = json.loads(raw)
-                except Exception:
-                    event = {"type": "raw", "raw": raw[:500]}
-                event["client_id"] = client_id
-                event["license"] = token
-                event["server_received_at"] = now_iso()
-                _copy_client_events.append(event)
-                del _copy_client_events[:-int(COPY_SIGNAL_HISTORY_LIMIT)]
+            raw_auth = await asyncio.wait_for(websocket.receive_text(), timeout=max(5, int(COPY_WS_AUTH_TIMEOUT_SECONDS)))
+            auth = json.loads(raw_auth)
+        except asyncio.TimeoutError:
+            _copy_ws_auth_failure(auth_ip)
+            await websocket.close(code=4408, reason="authentication timeout")
+            return
+        except Exception:
+            _copy_ws_auth_failure(auth_ip)
+            await websocket.close(code=4400, reason="invalid authentication packet")
+            return
 
-                if event.get("type") == "ping":
-                    await _copy_send_json_safe(websocket, {
-                        "type": "pong",
-                        "server_time": now_iso(),
-                        "copy_settings": copy_public_settings_payload(),
-                    })
-                elif event.get("type") == "ack":
-                    await _copy_send_json_safe(websocket, {"type": "ack_saved", "signal_id": event.get("signal_id")})
-                elif event.get("type") == "extension_event":
-                    payload_event = event.get("event") if isinstance(event.get("event"), dict) else {}
-                    payload_event["telegram_user_id"] = payload_event.get("telegram_user_id") or telegram_user_id
-                    sent = False
-                    if payload_event.get("type") == "extension_alert":
-                        sent = await _copy_send_extension_alert_to_user(payload_event, _copy_clients.get(client_id) or {})
-                    await _copy_send_json_safe(websocket, {
-                        "type": "extension_event_saved",
-                        "sent": bool(sent),
-                        "client_event_id": event.get("client_event_id") or payload_event.get("client_event_id"),
-                        "server_time": now_iso(),
-                    })
-                else:
-                    await _copy_send_json_safe(websocket, {"type": "event_saved", "server_time": now_iso()})
-        except WebSocketDisconnect:
-            logger.debug("Suppressed exception at line 18229", exc_info=True)
-        finally:
-            _copy_clients.pop(client_id, None)
+        if str(auth.get("type") or "") != "authenticate" or str(auth.get("nonce") or "") != nonce:
+            _copy_ws_auth_failure(auth_ip)
+            await websocket.close(code=4400, reason="invalid authentication challenge")
+            return
+
+        device_id = str(auth.get("device_id") or "unknown").strip()[:120] or "unknown"
+        telegram_user_id = normalize_copy_telegram_user_id(auth.get("telegram_user_id"))
+        device_proof_key = str(auth.get("device_proof_key") or "").strip()[:128]
+        device_proof = str(auth.get("device_proof") or "").strip()[:256]
+        if COPY_DEVICE_PROOF_REQUIRED and not _copy_device_proof_valid(device_proof_key, device_proof, nonce, device_id, telegram_user_id):
+            _copy_ws_auth_failure(auth_ip)
+            await websocket.close(code=4401, reason="device proof failed")
+            return
+
+        token = normalize_copy_license_token(auth.get("token"))
+        session_token = str(auth.get("session_token") or "").strip()
+        if session_token:
+            session_ok, session_reason, session_payload = _copy_session_token_verify(session_token)
+            if session_ok and session_payload:
+                token = normalize_copy_license_token(session_payload.get("token"))
+                if str(session_payload.get("device_id") or "") != device_id:
+                    session_ok, session_reason = False, "session device mismatch"
+                if normalize_copy_telegram_user_id(session_payload.get("telegram_user_id")) != telegram_user_id:
+                    session_ok, session_reason = False, "session Telegram mismatch"
+                if str(session_payload.get("device_proof_key") or "") != device_proof_key:
+                    session_ok, session_reason = False, "session device proof mismatch"
+            if not session_ok:
+                token = normalize_copy_license_token(auth.get("token"))
+                if not token:
+                    _copy_ws_auth_failure(auth_ip)
+                    await websocket.close(code=4401, reason=session_reason)
+                    return
+
+        ok, reason, license_record = copy_validate_license_for_device(
+            token,
+            device_id,
+            telegram_user_id=telegram_user_id,
+            touch=True,
+            allow_admin_rebind=True,
+            device_proof_key=device_proof_key,
+        )
+        if not ok:
+            _copy_ws_auth_failure(auth_ip)
+            await websocket.close(code=4401, reason=reason)
+            return
+        if COPY_DEVICE_PROOF_REQUIRED and str((license_record or {}).get("source") or "").lower() == "env":
+            _copy_ws_auth_failure(auth_ip)
+            await websocket.close(code=4401, reason="legacy environment license must be migrated to Firebase")
+            return
+
+        await _run_authenticated(token, device_id, telegram_user_id, device_proof_key, license_record, legacy_auth=False)
 
     return copy_api
 
