@@ -451,7 +451,6 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
         ["🔐 Copy Trading", "📡 حالة Copy"],
-        ["🧠 غرفة جلسة تداول", "🧠 OTC Edge Engine"],
         ["📡 قناة 3 شموع", "🧾 فحص ليستة OTC"],
         ["📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
@@ -997,7 +996,7 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
-COPY_SERVER_VERSION = "0.94.0"
+COPY_SERVER_VERSION = "0.95.0"
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.94").strip() or "v0.94"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
