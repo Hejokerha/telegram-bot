@@ -481,6 +481,7 @@ admin_otc_edge_keyboard = ReplyKeyboardMarkup(
         ["🔎 فحص السوق الآن", "🚀 مراقبة كل السوق"],
         ["🎯 مراقبة زوج محدد", "🛑 إيقاف مراقبة Edge"],
         ["📋 حالة مراقبة Edge", "📊 تقرير الأنماط"],
+        ["🔔 نمط رسائل Edge", "🧾 آخر تحليل Edge"],
         ["🧪 فحص زوج محدد"],
         ["⬅️ رجوع"],
     ],
@@ -973,9 +974,9 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 # اتركه false حتى تكون جاهزًا للتجربة، ثم فعّله من .env.
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
-BOT_RELEASE_VERSION = "v0.84"
-COPY_SERVER_VERSION = "0.84.0"
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.82").strip() or "v0.82"
+BOT_RELEASE_VERSION = "v0.86"
+COPY_SERVER_VERSION = "0.86.0"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.86").strip() or "v0.86"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -9310,6 +9311,8 @@ def _new_otc_edge_watcher_state(user_id: int | None = None) -> dict:
         "last_scan_at": None,
         "last_alert_at": None,
         "last_candidate": None,
+        "last_technical_signal": None,
+        "telegram_alert_mode": "silent",
         "last_error": None,
         "last_alerts": {},
         "alerts_sent": 0,
@@ -9372,7 +9375,7 @@ def _otc_edge_durable_state(state: dict) -> dict:
     """Keep only JSON-safe state needed to survive a Render restart."""
     durable_keys = (
         "enabled", "mode", "pairs", "chat_id", "owner_user_id", "started_at", "started_by",
-        "last_alert_at", "last_candidate", "last_alerts", "alerts_sent",
+        "last_alert_at", "last_candidate", "last_technical_signal", "telegram_alert_mode", "last_alerts", "alerts_sent",
         "last_delivery_status", "last_delivery_at", "last_delivery_error", "last_delivery_notice_ts",
         "active_trade_until_ts", "active_trade", "entry_window_skips", "last_copy_result",
         "last_copy_at", "last_timing_skip", "last_timing_skip_at",
@@ -9843,6 +9846,70 @@ def scan_otc_edge_market(limit: int | None = None, include_weak: bool = False) -
         return results
 
 
+def _otc_edge_admin_alert_mode(state: dict | None = None) -> str:
+    state = state if isinstance(state, dict) else _otc_edge_watcher_state
+    mode = str(state.get("telegram_alert_mode") or "silent").strip().lower()
+    return mode if mode in {"silent", "compact", "full"} else "silent"
+
+
+def _otc_edge_admin_alert_mode_text(state: dict | None = None) -> str:
+    mode = _otc_edge_admin_alert_mode(state)
+    return {
+        "silent": "صامت 🔕",
+        "compact": "مختصر 🔔",
+        "full": "فني كامل 🧪",
+    }.get(mode, "صامت 🔕")
+
+
+def cycle_otc_edge_admin_alert_mode(user_id: int) -> str:
+    state = _otc_edge_get_state(user_id)
+    current = _otc_edge_admin_alert_mode(state)
+    order = ["silent", "compact", "full"]
+    state["telegram_alert_mode"] = order[(order.index(current) + 1) % len(order)]
+    save_otc_edge_watcher_state(user_id, state)
+    return _otc_edge_admin_alert_mode_text(state)
+
+
+def _otc_edge_safe_technical_signal(item: dict | None) -> dict | None:
+    if not isinstance(item, dict):
+        return None
+    keep = (
+        "ok", "status", "pair", "symbol", "direction", "score", "pattern", "reason",
+        "detail", "risk", "price", "payout", "tick_age", "metrics", "history", "candidates",
+    )
+    return json.loads(json.dumps({k: item.get(k) for k in keep}, ensure_ascii=False, default=str))
+
+
+def build_otc_edge_compact_entry_message(item: dict, state: dict | None = None, lang: str = "ar") -> str:
+    if lang == "en":
+        return (
+            "⚡ OTC Edge\n"
+            "✅ Trade sent to the extension\n"
+            f"💱 {item.get('pair')}\n"
+            f"📌 {_otc_edge_direction_icon(item.get('direction'))}\n"
+            "⏳ Waiting for the confirmed result"
+        )
+    return (
+        "⚡ OTC Edge\n"
+        "✅ تم إرسال الصفقة للإضافة\n"
+        f"💱 {item.get('pair')}\n"
+        f"📌 {_otc_edge_direction_icon(item.get('direction'))}\n"
+        "⏳ بانتظار النتيجة المؤكدة"
+    )
+
+
+def build_otc_edge_last_technical_message(state: dict | None = None) -> str:
+    state = state if isinstance(state, dict) else _otc_edge_watcher_state
+    item = state.get("last_technical_signal")
+    if not isinstance(item, dict):
+        return "🧾 لا يوجد تحليل فني محفوظ بعد. شغّل المراقبة وانتظر أول صفقة تصل للإضافة."
+    return (
+        "🧾 آخر تحليل فني وصل للإضافة\n"
+        "━━━━━━━━━━━━━━\n"
+        + format_otc_edge_item(item, detailed=True)
+    )[:3900]
+
+
 def build_otc_edge_menu_message() -> str:
     watcher_status = "شغالة ✅" if _otc_edge_watcher_state.get("enabled") else "متوقفة ⏸"
     return (
@@ -9850,13 +9917,16 @@ def build_otc_edge_menu_message() -> str:
         "━━━━━━━━━━━━━━\n\n"
         "هذا القسم خاص بالأدمن فقط.\n"
         "وظيفته كشف الأنماط السلوكية المتكررة في OTC من بث Quotex Live، بدون نشر للمستخدمين وبدون تغيير نظام الإشارات.\n\n"
-        f"👁 حالة المراقبة التلقائية: {watcher_status}\n\n"
+        f"👁 حالة المراقبة التلقائية: {watcher_status}\n"
+        f"🔔 رسائل الدخول للأدمن: {_otc_edge_admin_alert_mode_text(_otc_edge_watcher_state)}\n\n"
         "الأزرار:\n"
         "🔎 فحص السوق الآن: يعرض أفضل الفرص الحالية فورًا.\n"
-        "🚀 مراقبة كل السوق: البوت يراقب كل الأزواج ويرسل لك فرصة مباشرة عند ظهور Edge قوي.\n"
+        "🚀 مراقبة كل السوق: البوت يراقب كل الأزواج وينفذ الفرصة عبر الإضافة.\n"
         "🎯 مراقبة زوج محدد: تختار زوجًا أو عدة أزواج، والبوت ينبهك فقط عليها.\n"
         "📋 حالة مراقبة Edge: يعرض وضع المراقبة والآخر فرصة رآها البوت.\n"
         "📊 تقرير الأنماط: يلخص نتائج الأنماط السابقة المسجلة إن وجدت.\n"
+        "🔔 نمط رسائل Edge: صامت أو مختصر أو فني كامل للأدمن فقط.\n"
+        "🧾 آخر تحليل Edge: يعرض تفاصيل آخر صفقة وصلت للإضافة بدون إرسالها مع كل دخول.\n"
         "🧪 فحص زوج محدد: يعطيك قراءة تفصيلية مرة واحدة لزوج واحد.\n\n"
         "قاعدة الدخول من تنبيه المراقبة:\n"
         f"ادخل فقط خلال صلاحية التنبيه، والصفقة تكون على إغلاق شمعة M1 الحالية حتى يطابق الدخول تحليل البوت.\n\n"
@@ -10047,6 +10117,9 @@ def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pai
             return "❌ No pair was selected." if lang == "en" else "❌ لم يتم تشغيل المراقبة لأن قائمة الأزواج فارغة."
 
         state = _otc_edge_get_state(uid)
+        preserved_alert_mode = str(state.get("telegram_alert_mode") or "silent").strip().lower()
+        if preserved_alert_mode not in {"silent", "compact", "full"}:
+            preserved_alert_mode = "silent"
         state.update({
             "enabled": True,
             "mode": "pairs" if mode == "pairs" else "all",
@@ -10058,6 +10131,8 @@ def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pai
             "last_scan_at": None,
             "last_alert_at": None,
             "last_candidate": None,
+            "last_technical_signal": None,
+            "telegram_alert_mode": preserved_alert_mode if is_admin(uid) else "silent",
             "last_error": None,
             "last_alerts": {},
             "alerts_sent": 0,
@@ -10480,7 +10555,8 @@ def build_otc_edge_watcher_status_message(prefix: str | None = None, state: dict
             f"🧭 وضع التوقيت: {'إغلاق شمعة M1 ✅' if _otc_edge_timing_mode() == 'm1_candle_close' else 'Fixed 60s'}",
             f"🪟 نافذة التنبيه: من الثانية {OTC_EDGE_ENTRY_MIN_SECOND} إلى {min(OTC_EDGE_ENTRY_LAST_ALERT_SECOND, OTC_EDGE_ENTRY_WINDOW_SECONDS - OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS)} | الدخول مسموح حتى الثانية {OTC_EDGE_ENTRY_WINDOW_SECONDS}",
             "🔒 القفل بعد التنبيه: حتى نهاية الصفقة الحالية",
-            f"📨 تنبيهات مرسلة منذ التشغيل: {state.get('alerts_sent', 0)}",
+            f"📨 صفقات وصلت للإضافة منذ التشغيل: {state.get('alerts_sent', 0)}",
+            f"🔔 رسائل الدخول للأدمن: {_otc_edge_admin_alert_mode_text(state)}",
             f"📤 Copy OTC Edge: {'مفعل ✅' if COPY_SEND_OTC_EDGE else 'متوقف ⛔'} | صلاحية النسخ {max(10, int(COPY_OTC_EDGE_SIGNAL_VALID_SECONDS))}ث",
             f"⚙️ تجهيز الزوج المحدد مسبقًا: {'مفعل ✅' if COPY_OTC_EDGE_PREPARE_ENABLED else 'متوقف ⛔'}",
         ])
@@ -10658,12 +10734,24 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                     _otc_edge_mark_alert_delivered(item, now_ts, state=state)
                     _otc_edge_set_active_trade_lock(item, now_ts, state=state)
                     state["last_alert_at"] = now_iso()
+                    state["last_technical_signal"] = _otc_edge_safe_technical_signal(item)
                     state["alerts_sent"] = int(state.get("alerts_sent", 0) or 0) + 1
-                    await safe_send_message(
-                        context.bot,
-                        chat_id=chat_id,
-                        text=build_otc_edge_entry_alert_message(item, state=state, lang=lang),
-                    )
+                    # Public OTC Edge is execution-first: no successful-entry Telegram spam.
+                    # Admin can explicitly choose silent, compact, or full technical entry messages.
+                    if is_admin(owner_uid):
+                        alert_mode = _otc_edge_admin_alert_mode(state)
+                        if alert_mode == "compact":
+                            await safe_send_message(
+                                context.bot,
+                                chat_id=chat_id,
+                                text=build_otc_edge_compact_entry_message(item, state=state, lang=lang),
+                            )
+                        elif alert_mode == "full":
+                            await safe_send_message(
+                                context.bot,
+                                chat_id=chat_id,
+                                text=build_otc_edge_entry_alert_message(item, state=state, lang=lang),
+                            )
                 else:
                     # Do not consume cooldown or lock the watcher when no extension received
                     # the signal. The same valid opportunity may be retried on the next scan.
@@ -17469,6 +17557,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
+        if text == "🔔 نمط رسائل Edge":
+            mode_text = cycle_otc_edge_admin_alert_mode(user.id)
+            await update.message.reply_text(
+                f"✅ نمط رسائل دخول OTC Edge للأدمن صار: {mode_text}\n\n"
+                "المستخدمون العاديون يبقون على تنفيذ صامت، وتصلهم النتيجة المختصرة والأخطاء فقط.",
+                reply_markup=admin_otc_edge_keyboard
+            )
+            return
+
+        if text == "🧾 آخر تحليل Edge":
+            await update.message.reply_text(
+                build_otc_edge_last_technical_message(_otc_edge_get_state(user.id)),
+                reply_markup=admin_otc_edge_keyboard
+            )
+            return
+
         if text == "🧪 فحص زوج محدد":
             context.user_data["step"] = "otc_edge_waiting_pair"
             await update.message.reply_text(
@@ -18286,13 +18390,76 @@ def _copy_event_alert_title(kind: str) -> str:
         return '🛑 تم تحقيق تارجت الخسارة'
     if kind == 'sequence_result_uncertain_stop':
         return '⚠️ توقفت الإضافة للحماية'
+    if kind == 'otc_edge_trade_result':
+        return '⚡ OTC Edge — نتيجة الصفقة'
     return '🔔 تنبيه من TRADING TIME COPY'
 
 
-def _copy_event_alert_text(event: dict, client: dict | None = None) -> str:
+def _copy_money_text(value, fallback: str = "") -> str:
+    if fallback:
+        return str(fallback)
+    try:
+        n = float(value or 0)
+        return ("+$" if n >= 0 else "-$") + f"{abs(n):g}"
+    except Exception:
+        return str(value or "")
+
+
+def _copy_otc_edge_result_text(event: dict, lang: str = "ar") -> str:
+    outcome = str(event.get("outcome") or "").strip().lower()
+    icon = {"win": "✅", "loss": "❌", "draw": "⚖️"}.get(outcome, "ℹ️")
+    label_ar = {"win": "WIN", "loss": "LOSS", "draw": "DRAW"}.get(outcome, outcome.upper() or "RESULT")
+    label_en = label_ar
+    pair = str(event.get("pair") or "").strip()
+    direction = str(event.get("direction") or "").strip().upper()
+    stake = event.get("amount")
+    delta_text = _copy_money_text(event.get("net_delta"), str(event.get("net_delta_text") or ""))
+    pnl_text = _copy_money_text(event.get("pnl"), str(event.get("pnl_text") or ""))
+    next_amount = event.get("next_amount")
+    next_action = str(event.get("next_action") or "").strip()
+    sequence_mode = bool(event.get("sequence_mode"))
+    cycle_reset = bool(event.get("cycle_reset"))
+
+    if lang == "en":
+        lines = [f"<b>⚡ OTC Edge — {html.escape(label_en)} {icon}</b>"]
+        if pair: lines.append(f"Pair: <b>{html.escape(pair)}</b>")
+        if direction: lines.append(f"Direction: <b>{html.escape(direction)}</b>")
+        if stake not in (None, ""):
+            try: lines.append(f"Amount: <b>${float(stake):g}</b>")
+            except Exception: lines.append(f"Amount: <b>{html.escape(str(stake))}</b>")
+        if delta_text: lines.append(f"Trade result: <b>{html.escape(delta_text)}</b>")
+        if pnl_text: lines.append(f"Today: <b>{html.escape(pnl_text)}</b>")
+        if next_amount not in (None, ""):
+            try: lines.append(f"Next amount: <b>${float(next_amount):g}</b>")
+            except Exception: lines.append(f"Next amount: <b>{html.escape(str(next_amount))}</b>")
+        if sequence_mode and cycle_reset: lines.append("Sequence: <b>cycle completed — reset to first amount</b>")
+        elif next_action == "martingale_next_candle": lines.append("Next: <b>regular martingale on the next candle</b>")
+        elif sequence_mode: lines.append("Next: <b>waiting for the next OTC Edge signal</b>")
+        return "\n".join(lines)[:3900]
+
+    lines = [f"<b>⚡ OTC Edge — {html.escape(label_ar)} {icon}</b>"]
+    if pair: lines.append(f"الزوج: <b>{html.escape(pair)}</b>")
+    if direction: lines.append(f"الاتجاه: <b>{html.escape(direction)}</b>")
+    if stake not in (None, ""):
+        try: lines.append(f"المبلغ: <b>${float(stake):g}</b>")
+        except Exception: lines.append(f"المبلغ: <b>{html.escape(str(stake))}</b>")
+    if delta_text: lines.append(f"نتيجة الصفقة: <b>{html.escape(delta_text)}</b>")
+    if pnl_text: lines.append(f"نتيجة اليوم: <b>{html.escape(pnl_text)}</b>")
+    if next_amount not in (None, ""):
+        try: lines.append(f"المبلغ القادم: <b>${float(next_amount):g}</b>")
+        except Exception: lines.append(f"المبلغ القادم: <b>{html.escape(str(next_amount))}</b>")
+    if sequence_mode and cycle_reset: lines.append("السستم: <b>اكتملت الدورة ورجع لأول مبلغ</b>")
+    elif next_action == "martingale_next_candle": lines.append("التالي: <b>مضاعفة عادية على الشمعة القادمة</b>")
+    elif sequence_mode: lines.append("التالي: <b>بانتظار إشارة OTC Edge القادمة</b>")
+    return "\n".join(lines)[:3900]
+
+
+def _copy_event_alert_text(event: dict, client: dict | None = None, lang: str = "ar") -> str:
     event = event or {}
     client = client or {}
     kind = str(event.get('kind') or '')
+    if kind == "otc_edge_trade_result":
+        return _copy_otc_edge_result_text(event, lang=lang)
     title = _copy_event_alert_title(kind)
     amount = event.get('amount')
     pnl_text = event.get('pnl_text') or ''
@@ -18320,6 +18487,30 @@ def _copy_event_alert_text(event: dict, client: dict | None = None) -> str:
     return "\n".join(lines)[:3900]
 
 
+_copy_extension_alert_dedup: dict[str, float] = {}
+
+
+def _copy_claim_extension_alert(event: dict) -> bool:
+    try:
+        now_ts = time_module.time()
+        for key, at in list(_copy_extension_alert_dedup.items()):
+            if now_ts - float(at or 0) > 7200:
+                _copy_extension_alert_dedup.pop(key, None)
+        kind = str(event.get("kind") or "")
+        signal_id = str(event.get("signal_id") or "")
+        outcome = str(event.get("outcome") or "")
+        event_id = str(event.get("event_id") or "")
+        key = event_id or f"{kind}|{signal_id}|{outcome}"
+        if kind != "otc_edge_trade_result" or not signal_id:
+            key += "|" + str(event.get("at") or now_ts)
+        if key in _copy_extension_alert_dedup:
+            return False
+        _copy_extension_alert_dedup[key] = now_ts
+        return True
+    except Exception:
+        return True
+
+
 async def _copy_send_extension_alert_to_user(event: dict, client: dict | None = None) -> bool:
     try:
         event = event or {}
@@ -18329,10 +18520,13 @@ async def _copy_send_extension_alert_to_user(event: dict, client: dict | None = 
         )
         if not chat_id:
             return False
+        if not _copy_claim_extension_alert(event):
+            return True
         if not BOT_TOKEN:
             logger.warning("COPY alert skipped: BOT_TOKEN is missing")
             return False
-        text = _copy_event_alert_text(event, client)
+        lang = get_user_language(chat_id) if "get_user_language" in globals() else "ar"
+        text = _copy_event_alert_text(event, client, lang=lang)
         url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
         payload = {"chat_id": chat_id, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
         def _post():
@@ -18562,7 +18756,12 @@ def create_embedded_copy_api():
                     sent = False
                     if payload_event.get("type") == "extension_alert":
                         sent = await _copy_send_extension_alert_to_user(payload_event, _copy_clients.get(client_id) or {})
-                    await _copy_send_json_safe(websocket, {"type": "extension_event_saved", "sent": bool(sent), "server_time": now_iso()})
+                    await _copy_send_json_safe(websocket, {
+                        "type": "extension_event_saved",
+                        "sent": bool(sent),
+                        "client_event_id": event.get("client_event_id") or payload_event.get("client_event_id"),
+                        "server_time": now_iso(),
+                    })
                 else:
                     await _copy_send_json_safe(websocket, {"type": "event_saved", "server_time": now_iso()})
         except WebSocketDisconnect:
