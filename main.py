@@ -977,8 +977,8 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
-COPY_SERVER_VERSION = "0.88.0"
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.88").strip() or "v0.88"
+COPY_SERVER_VERSION = "0.89.0"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.89").strip() or "v0.89"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -2380,7 +2380,7 @@ def normalize_copy_telegram_user_id(value) -> str:
         return ""
 
 
-def copy_validate_license_for_device(token: str, device_id: str = "unknown", telegram_user_id=None, touch: bool = True, allow_admin_rebind: bool = False, device_proof_key: str = "") -> tuple[bool, str, dict | None]:
+def copy_validate_license_for_device(token: str, device_id: str = "unknown", telegram_user_id=None, touch: bool = True, allow_admin_rebind: bool = False, device_proof_key: str = "", allow_device_proof_repair: bool = False) -> tuple[bool, str, dict | None]:
     """Validate and atomically bind a Firebase license to Telegram/device.
 
     New-device capacity and first Telegram binding are decided inside one Firebase
@@ -2513,8 +2513,19 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tel
                 device_row = dict(devices.get(device_key) or {})
                 stored_proof_key = str(device_row.get("device_proof_key") or "")
                 if stored_proof_key and device_proof_key and not hmac.compare_digest(stored_proof_key, device_proof_key):
-                    decision.update(ok=False, reason="device proof mismatch")
-                    return current
+                    # v0.89 owner repair: v0.88 could race two first-run initializers
+                    # and persist a different proof secret from the one first bound.
+                    # Only the owner/admin full-auth path may rotate that proof;
+                    # keepalive validation still has allow_admin_rebind=False.
+                    if allow_admin_rebind:
+                        device_row["device_proof_key"] = device_proof_key
+                        device_row["proof_repaired_at"] = now_value
+                        devices[device_key] = device_row
+                        record["admin_proof_repaired_at"] = now_value
+                        changed = True
+                    else:
+                        decision.update(ok=False, reason="device proof mismatch")
+                        return current
                 if device_proof_key and not stored_proof_key:
                     device_row["device_proof_key"] = device_proof_key
                     devices[device_key] = device_row
@@ -2540,8 +2551,19 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tel
                 device_row = dict(devices.get(device_key) or {})
                 stored_proof_key = str(device_row.get("device_proof_key") or "")
                 if stored_proof_key and device_proof_key and not hmac.compare_digest(stored_proof_key, device_proof_key):
-                    decision.update(ok=False, reason="device proof mismatch")
-                    return current
+                    # v0.89 one-time recovery for the v0.88 first-run race. This is
+                    # enabled only for an initial authenticated connection from the
+                    # official Store build (or the verified owner path). Keepalive
+                    # calls never enable it, and the record can be repaired once.
+                    if allow_device_proof_repair and not bool(record.get("device_proof_repaired_v089")):
+                        device_row["device_proof_key"] = device_proof_key
+                        device_row["proof_repaired_at"] = now_value
+                        record["device_proof_repaired_v089"] = True
+                        record["device_proof_repaired_at"] = now_value
+                        changed = True
+                    else:
+                        decision.update(ok=False, reason="device proof mismatch")
+                        return current
                 if device_proof_key and not stored_proof_key:
                     device_row["device_proof_key"] = device_proof_key
                     changed = True
@@ -18790,7 +18812,7 @@ def create_embedded_copy_api():
             _copy_ws_auth_success(auth_ip)
             if legacy_auth:
                 logger.warning(
-                    "Legacy COPY WebSocket authentication in use; update extension to v0.88 | device=%s | telegram_user_id=%s",
+                    "Legacy COPY WebSocket authentication in use; update extension to v0.89 | device=%s | telegram_user_id=%s",
                     device_id, telegram_user_id or "-",
                 )
 
@@ -18893,7 +18915,7 @@ def create_embedded_copy_api():
                 _copy_clients.pop(client_id, None)
 
         # Transitional legacy protocol for already-installed v0.87 and older builds.
-        # Disable it on Render after v0.88 has reached users:
+        # Disable it on Render after v0.89 has reached users:
         # COPY_ALLOW_LEGACY_WS_AUTH=false
         legacy_token = normalize_copy_license_token(websocket.query_params.get("token"))
         if legacy_token:
@@ -18940,6 +18962,8 @@ def create_embedded_copy_api():
             await websocket.close(code=4400, reason="invalid authentication challenge")
             return
 
+        extension_version = str(auth.get("extension_version") or "").strip()[:40]
+        extension_id = str(auth.get("extension_id") or "").strip()[:80]
         device_id = str(auth.get("device_id") or "unknown").strip()[:120] or "unknown"
         telegram_user_id = normalize_copy_telegram_user_id(auth.get("telegram_user_id"))
         device_proof_key = str(auth.get("device_proof_key") or "").strip()[:128]
@@ -18968,6 +18992,12 @@ def create_embedded_copy_api():
                     await websocket.close(code=4401, reason=session_reason)
                     return
 
+        origin_value = str(origin or "").strip().rstrip("/")
+        extension_id_value = str(extension_id or "").strip().lower()
+        official_store_origin = (
+            origin_value in {str(x).strip().rstrip("/") for x in COPY_ALLOWED_ORIGINS}
+            or extension_id_value in COPY_ALLOWED_EXTENSION_IDS
+        )
         ok, reason, license_record = copy_validate_license_for_device(
             token,
             device_id,
@@ -18975,6 +19005,7 @@ def create_embedded_copy_api():
             touch=True,
             allow_admin_rebind=True,
             device_proof_key=device_proof_key,
+            allow_device_proof_repair=bool(official_store_origin or token == COPY_ADMIN_LICENSE_TOKEN),
         )
         if not ok:
             _copy_ws_auth_failure(auth_ip)
