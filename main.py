@@ -996,7 +996,7 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
-COPY_SERVER_VERSION = "0.95.0"
+COPY_SERVER_VERSION = "0.97.0"
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.94").strip() or "v0.94"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
@@ -9621,6 +9621,11 @@ OTC_EDGE_WATCHER_MIN_PAYOUT = int(os.getenv("OTC_EDGE_WATCHER_MIN_PAYOUT", "85")
 OTC_EDGE_WATCHER_COOLDOWN_SECONDS = int(os.getenv("OTC_EDGE_WATCHER_COOLDOWN_SECONDS", "75"))
 OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS = int(os.getenv("OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS", "5"))
 OTC_EDGE_WATCHER_TOP_ALERT_POOL = int(os.getenv("OTC_EDGE_WATCHER_TOP_ALERT_POOL", "8"))
+# v0.97: stale watchers do not remain enabled forever when the owner's extension is offline.
+OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS = max(60, int(os.getenv("OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS", "300")))
+# Per-trade OTC Edge Telegram result messages are intentionally disabled. Results are
+# collected into one session summary shown in status and when monitoring stops.
+OTC_EDGE_INDIVIDUAL_RESULT_MESSAGES = os.getenv("OTC_EDGE_INDIVIDUAL_RESULT_MESSAGES", "false").lower() in {"1", "true", "yes", "on"}
 # ===== OTC Edge Timing Gate =====
 # لا نغيّر عقل التحليل ولا Edge Score. هذه طبقة توقيت فقط حتى يكون الدخول والانتهاء مطابقين لطريقة الصفقة.
 # الوضع الافتراضي: الصفقة تنتهي عند إغلاق شمعة M1 الحالية، لذلك لا نرسل التنبيه إلا ببداية الشمعة.
@@ -9671,6 +9676,24 @@ def _new_otc_edge_watcher_state(user_id: int | None = None) -> dict:
         "last_copy_at": None,
         "last_timing_skip": None,
         "last_timing_skip_at": None,
+        # v0.97: OTC Edge pauses until the same user extension connects and auto-stops after timeout.
+        "extension_online": False,
+        "extension_online_clients": 0,
+        "extension_gate_status": "idle",
+        "extension_waiting_since": None,
+        "extension_last_seen_at": None,
+        "extension_resumed_at": None,
+        # v0.97: one quiet session summary instead of one Telegram message per trade.
+        "session_started_at": None,
+        "session_trades": 0,
+        "session_wins": 0,
+        "session_losses": 0,
+        "session_draws": 0,
+        "session_net_delta": 0.0,
+        "session_last_result_at": None,
+        "session_last_outcome": None,
+        "session_last_pair": None,
+        "last_stop_reason": None,
     }
 
 
@@ -9700,7 +9723,70 @@ def _otc_edge_enabled_states() -> list[tuple[int, dict]]:
     ]
 
 
+def _copy_online_clients_for_user(user_id: int | str | None) -> int:
+    """Return authenticated live COPY sockets that belong to exactly one Telegram user."""
+    try:
+        target_uid = normalize_copy_telegram_user_id(user_id)
+        if not target_uid:
+            return 0
+        clients = globals().get("_copy_clients") or {}
+        if not isinstance(clients, dict):
+            return 0
+        return sum(
+            1
+            for client in list(clients.values())
+            if isinstance(client, dict)
+            and client.get("ws") is not None
+            and normalize_copy_telegram_user_id(client.get("telegram_user_id")) == target_uid
+        )
+    except Exception:
+        return 0
 
+
+def _otc_edge_mark_waiting_for_extension(owner_uid: int, state: dict, *, persist: bool = True) -> bool:
+    """Pause one watcher silently without disabling it; return True only on a state transition."""
+    now_text = now_iso()
+    transitioned = bool(state.get("extension_online")) or str(state.get("extension_gate_status") or "") != "waiting_extension"
+    state["extension_online"] = False
+    state["extension_online_clients"] = 0
+    state["extension_gate_status"] = "waiting_extension"
+    if not state.get("extension_waiting_since"):
+        state["extension_waiting_since"] = now_text
+    state["last_delivery_status"] = "waiting_extension"
+    # Old delivery failures are not errors while the owner's extension is simply offline.
+    state["last_delivery_error"] = None
+    if str(state.get("last_error") or "").startswith("OTC Edge delivery failed"):
+        state["last_error"] = None
+    # A selected pair must be prepared again after that browser reconnects.
+    if str(state.get("mode") or "") == "pairs" and len(list(state.get("pairs") or [])) == 1:
+        state["prepared_pair"] = None
+        state["prepare_pending"] = bool(COPY_OTC_EDGE_PREPARE_ENABLED)
+    if persist and transitioned:
+        save_otc_edge_watcher_state(owner_uid, state)
+    return transitioned
+
+
+def _otc_edge_mark_extension_online(owner_uid: int, state: dict, online_count: int, *, persist: bool = True) -> bool:
+    """Resume a waiting watcher when its own authenticated extension returns."""
+    now_text = now_iso()
+    was_waiting = str(state.get("extension_gate_status") or "") == "waiting_extension" or not bool(state.get("extension_online"))
+    state["extension_online"] = True
+    state["extension_online_clients"] = max(1, int(online_count or 0))
+    state["extension_gate_status"] = "online"
+    state["extension_waiting_since"] = None
+    state["extension_last_seen_at"] = now_text
+    if was_waiting:
+        state["extension_resumed_at"] = now_text
+        state["last_delivery_status"] = "ready"
+        state["last_delivery_error"] = None
+        if str(state.get("last_error") or "").startswith("OTC Edge delivery failed"):
+            state["last_error"] = None
+        if str(state.get("mode") or "") == "pairs" and len(list(state.get("pairs") or [])) == 1:
+            state["prepared_pair"] = None
+            state["prepare_pending"] = bool(COPY_OTC_EDGE_PREPARE_ENABLED)
+        if persist:
+            save_otc_edge_watcher_state(owner_uid, state)
+    return was_waiting
 
 
 OTC_EDGE_WATCHERS_FIREBASE_PATH = "otc_edge_watchers_v1"
@@ -9708,6 +9794,33 @@ OTC_EDGE_WATCHERS_FIREBASE_PATH = "otc_edge_watchers_v1"
 
 def otc_edge_watchers_ref():
     return system_ref().child(OTC_EDGE_WATCHERS_FIREBASE_PATH)
+
+
+def _otc_edge_firebase_map_key(value) -> str:
+    """Stable Firebase-safe key for dynamic OTC Edge maps.
+
+    Firebase Realtime Database forbids . $ # [ ] / inside object keys. A hash also
+    avoids collisions that simple character replacement can create.
+    """
+    try:
+        raw = str(value or "").strip()
+        if re.fullmatch(r"oe_[0-9a-f]{32}", raw):
+            return raw
+        return "oe_" + hashlib.sha256(raw.encode("utf-8")).hexdigest()[:32]
+    except Exception:
+        return "oe_" + hashlib.sha256(b"unknown").hexdigest()[:32]
+
+
+def _otc_edge_normalize_last_alerts(value) -> dict:
+    safe = {}
+    if not isinstance(value, dict):
+        return safe
+    for key, timestamp in value.items():
+        try:
+            safe[_otc_edge_firebase_map_key(key)] = float(timestamp or 0)
+        except Exception:
+            continue
+    return safe
 
 
 def _otc_edge_durable_state(state: dict) -> dict:
@@ -9718,8 +9831,15 @@ def _otc_edge_durable_state(state: dict) -> dict:
         "last_delivery_status", "last_delivery_at", "last_delivery_error", "last_delivery_notice_ts",
         "active_trade_until_ts", "active_trade", "entry_window_skips", "last_copy_result",
         "last_copy_at", "last_timing_skip", "last_timing_skip_at",
+        "extension_online", "extension_online_clients", "extension_gate_status",
+        "extension_waiting_since", "extension_last_seen_at", "extension_resumed_at",
+        "session_started_at", "session_trades", "session_wins", "session_losses",
+        "session_draws", "session_net_delta", "session_last_result_at",
+        "session_last_outcome", "session_last_pair", "last_stop_reason",
     )
     raw = {key: state.get(key) for key in durable_keys}
+    # v0.97: migrate legacy keys such as "USD/ZAR (OTC)|PUT|..." before Firebase sees them.
+    raw["last_alerts"] = _otc_edge_normalize_last_alerts(raw.get("last_alerts"))
     raw["updated_at"] = now_iso()
     # Round-trip through JSON so Firebase never receives sets/tuples/custom values.
     return json.loads(json.dumps(raw, ensure_ascii=False, default=str))
@@ -9759,6 +9879,7 @@ def restore_otc_edge_watcher_states() -> int:
                 continue
             state = _new_otc_edge_watcher_state(uid)
             state.update(saved)
+            state["last_alerts"] = _otc_edge_normalize_last_alerts(state.get("last_alerts"))
             # v0.83: remove the retired hourly alert counter from legacy Firebase rows.
             state.pop("alert_times", None)
             state["owner_user_id"] = uid
@@ -10448,6 +10569,81 @@ def parse_otc_edge_watch_pairs(text: str) -> tuple[list[str], list[str]]:
     return pairs, errors
 
 
+def _otc_edge_reset_session_stats(state: dict):
+    state["session_started_at"] = now_iso()
+    state["session_trades"] = 0
+    state["session_wins"] = 0
+    state["session_losses"] = 0
+    state["session_draws"] = 0
+    state["session_net_delta"] = 0.0
+    state["session_last_result_at"] = None
+    state["session_last_outcome"] = None
+    state["session_last_pair"] = None
+    state["last_stop_reason"] = None
+
+
+def _otc_edge_session_summary_text(state: dict | None, lang: str = "ar", *, include_title: bool = True) -> str:
+    state = state if isinstance(state, dict) else {}
+    trades = max(0, int(state.get("session_trades", 0) or 0))
+    wins = max(0, int(state.get("session_wins", 0) or 0))
+    losses = max(0, int(state.get("session_losses", 0) or 0))
+    draws = max(0, int(state.get("session_draws", 0) or 0))
+    net = float(state.get("session_net_delta", 0) or 0)
+    if lang == "en":
+        lines = ["📊 OTC Edge session summary", "━━━━━━━━━━━━━━"] if include_title else []
+        if trades <= 0:
+            lines.append("No completed trades in this session.")
+        else:
+            lines.extend([
+                f"Completed trades: {trades}",
+                f"✅ Win: {wins} | ❌ Loss: {losses} | ⚖️ Draw: {draws}",
+                f"Session net: {_money_signed(net)}",
+            ])
+        return "\n".join(lines)
+    lines = ["📊 ملخص جلسة OTC Edge", "━━━━━━━━━━━━━━"] if include_title else []
+    if trades <= 0:
+        lines.append("لا توجد صفقات مكتملة في هذه الجلسة.")
+    else:
+        lines.extend([
+            f"الصفقات المكتملة: {trades}",
+            f"✅ ربح: {wins} | ❌ خسارة: {losses} | ⚖️ تعادل: {draws}",
+            f"صافي الجلسة: {_money_signed(net)}",
+        ])
+    return "\n".join(lines)
+
+
+def _otc_edge_apply_stop_state(user_id: int, state: dict, reason: str | None = None) -> tuple[bool, str]:
+    was_enabled = bool(state.get("enabled"))
+    summary_ar = _otc_edge_session_summary_text(state, lang="ar")
+    state["enabled"] = False
+    state["last_error"] = None
+    state["prepare_pending"] = False
+    state["prepared_pair"] = None
+    state["active_trade_until_ts"] = 0.0
+    state["active_trade"] = None
+    state["extension_online"] = False
+    state["extension_online_clients"] = 0
+    state["extension_gate_status"] = "idle"
+    state["extension_waiting_since"] = None
+    state["last_stop_reason"] = reason
+    save_otc_edge_watcher_state(int(user_id), state)
+    return was_enabled, summary_ar
+
+
+def _otc_edge_extension_wait_seconds(state: dict | None, now_dt=None) -> int:
+    try:
+        state = state if isinstance(state, dict) else {}
+        started = _copy_parse_iso(state.get("extension_waiting_since"))
+        if not started:
+            return 0
+        current = now_dt or now_utc()
+        if current.tzinfo is None:
+            current = current.replace(tzinfo=UTC)
+        return max(0, int((current.astimezone(UTC) - started).total_seconds()))
+    except Exception:
+        return 0
+
+
 def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pairs: list[str] | None = None, lang: str = "ar") -> str:
     try:
         uid = int(started_by)
@@ -10491,9 +10687,35 @@ def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pai
             "last_copy_at": None,
             "last_timing_skip": None,
             "last_timing_skip_at": None,
+            "extension_online": False,
+            "extension_online_clients": 0,
+            "extension_gate_status": "idle",
+            "extension_waiting_since": None,
+            "extension_last_seen_at": None,
+            "extension_resumed_at": None,
+            "session_started_at": now_iso(),
+            "session_trades": 0,
+            "session_wins": 0,
+            "session_losses": 0,
+            "session_draws": 0,
+            "session_net_delta": 0.0,
+            "session_last_result_at": None,
+            "session_last_outcome": None,
+            "session_last_pair": None,
+            "last_stop_reason": None,
         })
+        online_count = _copy_online_clients_for_user(uid)
+        if online_count > 0:
+            _otc_edge_mark_extension_online(uid, state, online_count, persist=False)
+            prefix = "✅ OTC Edge monitoring started." if lang == "en" else "✅ تم تشغيل مراقبة OTC Edge."
+        else:
+            _otc_edge_mark_waiting_for_extension(uid, state, persist=False)
+            prefix = (
+                f"✅ Monitoring was saved. Connect your extension within {OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS // 60} minutes or monitoring will stop automatically."
+                if lang == "en" else
+                f"✅ تم حفظ المراقبة. وصّل إضافتك خلال {OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS // 60} دقائق، وإلا ستتوقف المراقبة تلقائيًا."
+            )
         save_otc_edge_watcher_state(uid, state)
-        prefix = "✅ OTC Edge monitoring started." if lang == "en" else "✅ تم تشغيل مراقبة OTC Edge."
         if is_admin(uid):
             return build_otc_edge_watcher_status_message(prefix=prefix, state=state)
         return build_otc_edge_user_status_message(uid, prefix=prefix, lang=lang)
@@ -10506,18 +10728,16 @@ def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pai
 
 def stop_otc_edge_watcher(user_id: int | None = None, lang: str = "ar") -> str:
     try:
-        state = _otc_edge_get_state(user_id)
+        uid = int(user_id or ADMIN_TELEGRAM_ID)
+        state = _otc_edge_get_state(uid)
         was_enabled = bool(state.get("enabled"))
-        state["enabled"] = False
-        state["last_error"] = None
-        state["prepare_pending"] = False
-        state["prepared_pair"] = None
-        state["active_trade_until_ts"] = 0.0
-        state["active_trade"] = None
-        save_otc_edge_watcher_state(int(user_id or ADMIN_TELEGRAM_ID), state)
+        summary = _otc_edge_session_summary_text(state, lang=lang)
+        _otc_edge_apply_stop_state(uid, state, reason="manual")
         if lang == "en":
-            return "🛑 OTC Edge monitoring stopped." if was_enabled else "OTC Edge monitoring is already stopped."
-        return "🛑 تم إيقاف مراقبة OTC Edge." if was_enabled else "مراقبة OTC Edge متوقفة أصلًا."
+            headline = "🛑 OTC Edge monitoring stopped." if was_enabled else "OTC Edge monitoring is already stopped."
+        else:
+            headline = "🛑 تم إيقاف مراقبة OTC Edge." if was_enabled else "مراقبة OTC Edge متوقفة أصلًا."
+        return f"{headline}\n\n{summary}"
     except Exception as e:
         return f"Could not stop monitoring: {e}" if lang == "en" else f"تعذر إيقاف المراقبة: {e}"
 
@@ -10670,7 +10890,7 @@ def _otc_edge_can_alert(item: dict, now_ts: float, state: dict | None = None) ->
             return False
         if float(item.get("tick_age", 999) or 999) > max(3, int(OTC_EDGE_TICK_MAX_AGE_SECONDS)):
             return False
-        key = f"{item.get('pair')}|{item.get('direction')}|{item.get('pattern')}"
+        key = _otc_edge_alert_key(item)
         last_alerts = state.setdefault("last_alerts", {})
         last_ts = float(last_alerts.get(key, 0) or 0)
         if now_ts - last_ts < int(OTC_EDGE_WATCHER_COOLDOWN_SECONDS):
@@ -10683,7 +10903,8 @@ def _otc_edge_can_alert(item: dict, now_ts: float, state: dict | None = None) ->
 
 
 def _otc_edge_alert_key(item: dict) -> str:
-    return f"{item.get('pair')}|{item.get('direction')}|{item.get('pattern')}"
+    raw = f"{item.get('pair')}|{item.get('direction')}|{item.get('pattern')}"
+    return _otc_edge_firebase_map_key(raw)
 
 
 def _otc_edge_copy_delivered_count(copy_result: dict | None) -> int:
@@ -10800,10 +11021,15 @@ async def _otc_edge_maybe_publish_selected_pair_prepare(state: dict | None = Non
         result = await publish_copy_otc_edge_prepare_signal(pair, target_user_id=owner_uid, state=state)
         state["last_prepare_result"] = result
         state["last_prepare_at"] = now_iso()
-        if bool((result or {}).get("ok")):
+        if _otc_edge_copy_delivery_succeeded(result):
             state["last_prepare_ts"] = now_ts
             state["prepare_pending"] = False
             state["prepared_pair"] = pair
+            return True
+        # The extension can disconnect in the tiny race between the online gate and send.
+        # Treat that as a silent wait, not as a preparation error or a signal attempt.
+        if _copy_online_clients_for_user(owner_uid) <= 0:
+            _otc_edge_mark_waiting_for_extension(owner_uid, state, persist=True)
             return True
         state["last_error"] = f"تعذر تجهيز الزوج مسبقًا: {(result or {}).get('error') or (result or {}).get('reason') or result}"
         return False
@@ -10871,6 +11097,9 @@ def build_otc_edge_watcher_status_message(prefix: str | None = None, state: dict
     try:
         state = state if isinstance(state, dict) else _otc_edge_watcher_state
         enabled = bool(state.get("enabled"))
+        owner_uid = int(state.get("owner_user_id") or state.get("started_by") or state.get("chat_id") or ADMIN_TELEGRAM_ID)
+        extension_online_count = _copy_online_clients_for_user(owner_uid) if enabled else 0
+        waiting_extension = bool(enabled and extension_online_count <= 0)
         connected = bool(getattr(quotex_otc_feed, "connected", False)) if "quotex_otc_feed" in globals() else False
         started = bool(getattr(quotex_otc_feed, "started", False)) if "quotex_otc_feed" in globals() else False
         started_at = state.get("started_at")
@@ -10884,8 +11113,9 @@ def build_otc_edge_watcher_status_message(prefix: str | None = None, state: dict
         lines.extend([
             "📋 حالة مراقبة OTC Edge",
             "━━━━━━━━━━━━━━",
-            f"الحالة: {'شغالة ✅' if enabled else 'متوقفة ⏸'}",
+            f"الحالة: {'بانتظار إضافة المستخدم ⏳' if waiting_extension else ('شغالة ✅' if enabled else 'متوقفة ⏸')}",
             f"الوضع: {_otc_edge_watch_mode_text(state=state)}",
+            f"🧩 إضافة المستخدم: {'متصلة ✅' if extension_online_count > 0 else ('غير متصلة — التحليل متوقف مؤقتًا' if enabled else '—')} | online={extension_online_count}",
             f"📡 بث Quotex: {'متصل ✅' if connected else 'غير متصل ⚠️'} | started={started}",
             f"🎯 حد التنبيه: Edge {OTC_EDGE_WATCHER_MIN_SCORE}% | payout {OTC_EDGE_WATCHER_MIN_PAYOUT}%",
             f"⏱ الفحص كل: {OTC_EDGE_WATCHER_SCAN_SECONDS} ثواني",
@@ -10895,6 +11125,7 @@ def build_otc_edge_watcher_status_message(prefix: str | None = None, state: dict
             f"🪟 نافذة التنبيه: من الثانية {OTC_EDGE_ENTRY_MIN_SECOND} إلى {min(OTC_EDGE_ENTRY_LAST_ALERT_SECOND, OTC_EDGE_ENTRY_WINDOW_SECONDS - OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS)} | الدخول مسموح حتى الثانية {OTC_EDGE_ENTRY_WINDOW_SECONDS}",
             "🔒 القفل بعد التنبيه: حتى نهاية الصفقة الحالية",
             f"📨 صفقات وصلت للإضافة منذ التشغيل: {state.get('alerts_sent', 0)}",
+            f"📊 نتائج الجلسة: {int(state.get('session_trades', 0) or 0)} صفقة | ✅ {int(state.get('session_wins', 0) or 0)} | ❌ {int(state.get('session_losses', 0) or 0)} | ⚖️ {int(state.get('session_draws', 0) or 0)} | الصافي {_money_signed(state.get('session_net_delta', 0))}",
             f"🔔 رسائل الدخول للأدمن: {_otc_edge_admin_alert_mode_text(state)}",
             f"📤 Copy OTC Edge: {'مفعل ✅' if COPY_SEND_OTC_EDGE else 'متوقف ⛔'} | صلاحية النسخ {max(10, int(COPY_OTC_EDGE_SIGNAL_VALID_SECONDS))}ث",
             f"⚙️ تجهيز الزوج المحدد مسبقًا: {'مفعل ✅' if COPY_OTC_EDGE_PREPARE_ENABLED else 'متوقف ⛔'}",
@@ -10956,6 +11187,8 @@ def build_otc_edge_user_status_message(user_id: int, prefix: str | None = None, 
     try:
         state = _otc_edge_get_state(user_id)
         enabled = bool(state.get("enabled"))
+        extension_online_count = _copy_online_clients_for_user(user_id) if enabled else 0
+        waiting_extension = bool(enabled and extension_online_count <= 0)
         mode = str(state.get("mode") or "all")
         pairs = list(state.get("pairs") or [])
         pair = pairs[0] if pairs else None
@@ -10967,8 +11200,10 @@ def build_otc_edge_user_status_message(user_id: int, prefix: str | None = None, 
             lines.extend([
                 "⚡ OTC Edge",
                 "━━━━━━━━━━━━━━",
-                f"Status: {'Running ✅' if enabled else 'Stopped ⏸'}",
+                f"Status: {'Waiting for your extension ⏳' if waiting_extension else ('Running ✅' if enabled else 'Stopped ⏸')}",
+                f"Extension: {'Connected ✅' if extension_online_count > 0 else ('Offline — analysis is paused' if enabled else '—')}",
                 f"Monitoring mode: {('Specific pair' if mode == 'pairs' else 'Whole OTC market') if enabled else 'Not selected'}",
+                f"Session: {int(state.get('session_trades', 0) or 0)} trades | ✅ {int(state.get('session_wins', 0) or 0)} | ❌ {int(state.get('session_losses', 0) or 0)} | ⚖️ {int(state.get('session_draws', 0) or 0)} | net {_money_signed(state.get('session_net_delta', 0))}",
             ])
             if enabled and mode == "pairs":
                 lines.extend([
@@ -10984,7 +11219,9 @@ def build_otc_edge_user_status_message(user_id: int, prefix: str | None = None, 
                 lines.append(f"Current trade: {active.get('pair')} {_otc_edge_direction_icon(active.get('direction'))} | about {remain}s left")
             if state.get("last_alert_at"):
                 lines.append(f"Last signal: {format_dt_ar(state.get('last_alert_at'))}")
-            if state.get("last_delivery_error"):
+            if waiting_extension:
+                lines.append(f"⏳ No analysis or signals will run while offline. Monitoring stops automatically after {OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS // 60} minutes.")
+            elif state.get("last_delivery_error"):
                 lines.append("⚠️ The last signal did not reach the extension. Keep Quotex and the extension open.")
             elif state.get("last_error"):
                 lines.append("⚠️ Preparation or delivery is not ready yet. Keep Quotex and the extension open.")
@@ -10998,8 +11235,10 @@ def build_otc_edge_user_status_message(user_id: int, prefix: str | None = None, 
         lines.extend([
             "⚡ OTC Edge",
             "━━━━━━━━━━━━━━",
-            f"الحالة: {'شغالة ✅' if enabled else 'متوقفة ⏸'}",
+            f"الحالة: {'بانتظار إضافتك ⏳' if waiting_extension else ('شغالة ✅' if enabled else 'متوقفة ⏸')}",
+            f"الإضافة: {'متصلة ✅' if extension_online_count > 0 else ('غير متصلة — التحليل متوقف مؤقتًا' if enabled else '—')}",
             f"نمط المراقبة: {('زوج محدد' if mode == 'pairs' else 'كل السوق') if enabled else 'غير محدد'}",
+            f"نتيجة الجلسة: {int(state.get('session_trades', 0) or 0)} صفقة | ✅ {int(state.get('session_wins', 0) or 0)} | ❌ {int(state.get('session_losses', 0) or 0)} | ⚖️ {int(state.get('session_draws', 0) or 0)} | الصافي {_money_signed(state.get('session_net_delta', 0))}",
         ])
         if enabled and mode == "pairs":
             lines.extend([
@@ -11015,7 +11254,9 @@ def build_otc_edge_user_status_message(user_id: int, prefix: str | None = None, 
             lines.append(f"الصفقة الحالية: {active.get('pair')} {_otc_edge_direction_icon(active.get('direction'))} | باقي تقريبًا {remain} ثانية")
         if state.get("last_alert_at"):
             lines.append(f"آخر إشارة: {format_dt_ar(state.get('last_alert_at'))}")
-        if state.get("last_delivery_error"):
+        if waiting_extension:
+            lines.append(f"⏳ لا تحليل ولا إشارات أثناء فصل الإضافة، وتتوقف المراقبة تلقائيًا بعد {OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS // 60} دقائق.")
+        elif state.get("last_delivery_error"):
             lines.append("⚠️ آخر إشارة لم تصل إلى الإضافة. اترك منصة Quotex والإضافة مفتوحتين.")
         elif state.get("last_error"):
             lines.append("⚠️ التجهيز أو الإرسال غير جاهز حاليًا. اترك منصة Quotex والإضافة مفتوحتين.")
@@ -11037,6 +11278,33 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                 state["last_error"] = "bot_access_inactive"
                 save_otc_edge_watcher_state(owner_uid, state)
                 continue
+            # v0.97 online gate + timeout: do not prepare, scan, analyze, or generate a candidate
+            # unless the authenticated extension for this exact Telegram user is connected.
+            online_count = _copy_online_clients_for_user(owner_uid)
+            if online_count <= 0:
+                if _otc_edge_mark_waiting_for_extension(owner_uid, state, persist=True):
+                    logger.info("OTC Edge paused; waiting for owner's extension | user=%s", owner_uid)
+                waited_seconds = _otc_edge_extension_wait_seconds(state)
+                if waited_seconds >= int(OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS):
+                    # Recheck once at the boundary so a just-reconnected extension is never stopped by a race.
+                    if _copy_online_clients_for_user(owner_uid) > 0:
+                        _otc_edge_mark_extension_online(owner_uid, state, 1, persist=True)
+                        continue
+                    lang = get_user_language(owner_uid)
+                    summary = _otc_edge_session_summary_text(state, lang=lang)
+                    _otc_edge_apply_stop_state(owner_uid, state, reason="extension_offline_timeout")
+                    minutes = max(1, int(OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS // 60))
+                    notice = (
+                        f"🛑 OTC Edge monitoring stopped automatically because your extension remained offline for {minutes} minutes.\n\n{summary}"
+                        if lang == "en" else
+                        f"🛑 تم إيقاف مراقبة OTC Edge تلقائيًا لأن إضافتك بقيت غير متصلة لمدة {minutes} دقائق.\n\n{summary}"
+                    )
+                    await safe_send_message(context.bot, chat_id=int(state.get("chat_id") or owner_uid), text=notice)
+                    logger.info("OTC Edge auto-stopped after extension offline timeout | user=%s | waited=%ss", owner_uid, waited_seconds)
+                continue
+            if _otc_edge_mark_extension_online(owner_uid, state, online_count, persist=True):
+                logger.info("OTC Edge resumed after owner's extension connected | user=%s | clients=%s", owner_uid, online_count)
+
             state["last_scan_at"] = now_iso()
 
             # Each user gets a separate targeted pre-arm command.
@@ -11092,27 +11360,33 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                                 text=build_otc_edge_entry_alert_message(item, state=state, lang=lang),
                             )
                 else:
-                    # Do not consume cooldown or lock the watcher when no extension received
-                    # the signal. The same valid opportunity may be retried on the next scan.
-                    reason = _otc_edge_delivery_failure_reason(copy_result)
-                    state["last_delivery_status"] = "failed"
-                    state["last_delivery_at"] = now_iso()
-                    state["last_delivery_error"] = reason
-                    state["last_error"] = f"OTC Edge delivery failed: {reason}"
-                    logger.warning(
-                        "OTC Edge signal not delivered | user=%s | pair=%s | reason=%s | result=%s",
-                        owner_uid, item.get("pair"), reason, copy_result,
-                    )
-                    # Notify at most once per minute to avoid chat spam while preserving visibility.
-                    last_notice = float(state.get("last_delivery_notice_ts") or 0)
-                    if now_ts - last_notice >= 60:
-                        state["last_delivery_notice_ts"] = now_ts
-                        warning_text = (
-                            "⚠️ ظهرت فرصة OTC Edge لكن لم تصل إلى الإضافة. افتح Quotex وتأكد أن الإضافة متصلة."
-                            if lang != "en" else
-                            "⚠️ An OTC Edge opportunity appeared but did not reach the extension. Open Quotex and check the connection."
+                    # The socket can close in the tiny race after the online gate. In that
+                    # normal case, switch to silent waiting instead of logging repeated warnings.
+                    if _copy_online_clients_for_user(owner_uid) <= 0:
+                        _otc_edge_mark_waiting_for_extension(owner_uid, state, persist=False)
+                        logger.info("OTC Edge delivery paused after extension disconnected | user=%s", owner_uid)
+                    else:
+                        # A same-user socket still exists, so this is a real delivery failure.
+                        # Do not consume cooldown or lock the watcher.
+                        reason = _otc_edge_delivery_failure_reason(copy_result)
+                        state["last_delivery_status"] = "failed"
+                        state["last_delivery_at"] = now_iso()
+                        state["last_delivery_error"] = reason
+                        state["last_error"] = f"OTC Edge delivery failed: {reason}"
+                        logger.warning(
+                            "OTC Edge signal not delivered despite owner extension being online | user=%s | pair=%s | reason=%s | result=%s",
+                            owner_uid, item.get("pair"), reason, copy_result,
                         )
-                        await safe_send_message(context.bot, chat_id=chat_id, text=warning_text)
+                        # Notify at most once per minute only for an actual online delivery error.
+                        last_notice = float(state.get("last_delivery_notice_ts") or 0)
+                        if now_ts - last_notice >= 60:
+                            state["last_delivery_notice_ts"] = now_ts
+                            warning_text = (
+                                "⚠️ إضافتك متصلة لكن تعذر تسليم فرصة OTC Edge. أعد فتح Quotex وتأكد أن الإضافة مفعلة."
+                                if lang != "en" else
+                                "⚠️ Your extension is connected, but the OTC Edge opportunity could not be delivered. Reopen Quotex and ensure the extension is enabled."
+                            )
+                            await safe_send_message(context.bot, chat_id=chat_id, text=warning_text)
 
                 save_otc_edge_watcher_state(owner_uid, state)
                 break
@@ -18990,6 +19264,75 @@ async def _copy_broadcast_signal(signal: dict) -> dict:
     }
 
 
+def _copy_event_numeric(value, fallback=None) -> float:
+    candidates = [value, fallback]
+    for candidate in candidates:
+        if candidate in (None, ""):
+            continue
+        try:
+            return float(candidate)
+        except Exception:
+            cleaned = re.sub(r"[^0-9+\-.]", "", str(candidate).replace(",", ""))
+            try:
+                return float(cleaned)
+            except Exception:
+                match = re.search(r"\d+(?:\.\d+)?", cleaned)
+                if match:
+                    try:
+                        number = float(match.group(0))
+                        return -number if "-" in cleaned else number
+                    except Exception:
+                        pass
+    return 0.0
+
+
+def _copy_record_otc_edge_trade_result(event: dict, client: dict | None = None) -> bool:
+    """Record one OTC Edge result silently for the owner's session summary."""
+    try:
+        event = event or {}
+        client = client or {}
+        if not _copy_claim_extension_alert(event):
+            return True
+        user_id = normalize_copy_telegram_user_id(
+            event.get("telegram_user_id") or client.get("telegram_user_id") or event.get("target_user_id")
+        )
+        if not user_id:
+            return False
+        state = _otc_edge_get_state(int(user_id), create=False)
+        if not isinstance(state, dict):
+            logger.info("OTC Edge result accepted silently without active watcher state | user=%s", user_id)
+            return True
+        outcome = str(event.get("outcome") or "").strip().lower()
+        if outcome not in {"win", "loss", "draw"}:
+            logger.info("OTC Edge result ignored because outcome is unknown | user=%s | outcome=%r", user_id, outcome)
+            return True
+        state["session_trades"] = int(state.get("session_trades", 0) or 0) + 1
+        if outcome == "win":
+            state["session_wins"] = int(state.get("session_wins", 0) or 0) + 1
+        elif outcome == "loss":
+            state["session_losses"] = int(state.get("session_losses", 0) or 0) + 1
+        else:
+            state["session_draws"] = int(state.get("session_draws", 0) or 0) + 1
+        delta = _copy_event_numeric(event.get("net_delta"), event.get("net_delta_text"))
+        state["session_net_delta"] = round(float(state.get("session_net_delta", 0) or 0) + delta, 6)
+        state["session_last_result_at"] = now_iso()
+        state["session_last_outcome"] = outcome
+        state["session_last_pair"] = str(event.get("pair") or "")[:80] or None
+        state["active_trade_until_ts"] = 0.0
+        state["active_trade"] = None
+        if state.get("enabled"):
+            save_otc_edge_watcher_state(int(user_id), state)
+        logger.info(
+            "OTC Edge result recorded silently | user=%s | outcome=%s | delta=%s | session=%s/%s/%s | net=%s",
+            user_id, outcome, delta, state.get("session_wins"), state.get("session_losses"),
+            state.get("session_draws"), state.get("session_net_delta"),
+        )
+        return True
+    except Exception as exc:
+        logger.warning("Could not record OTC Edge result summary: %s", exc)
+        return False
+
+
 def _copy_event_alert_title(kind: str) -> str:
     kind = str(kind or '').strip()
     if kind == 'target_profit_reached':
@@ -19409,7 +19752,11 @@ def create_embedded_copy_api():
                         payload_event["telegram_user_id"] = payload_event.get("telegram_user_id") or telegram_user_id
                         sent = False
                         if payload_event.get("type") == "extension_alert":
-                            sent = await _copy_send_extension_alert_to_user(payload_event, _copy_clients.get(client_id) or {})
+                            if str(payload_event.get("kind") or "") == "otc_edge_trade_result" and not OTC_EDGE_INDIVIDUAL_RESULT_MESSAGES:
+                                # v0.97: accept and aggregate silently; send one session summary on stop.
+                                sent = _copy_record_otc_edge_trade_result(payload_event, _copy_clients.get(client_id) or {})
+                            else:
+                                sent = await _copy_send_extension_alert_to_user(payload_event, _copy_clients.get(client_id) or {})
                         await _copy_send_json_safe(websocket, {
                             "type": "extension_event_saved",
                             "sent": bool(sent),
