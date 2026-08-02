@@ -525,16 +525,18 @@ copy_admin_keyboard = ReplyKeyboardMarkup(
     [
         ["🟢 تشغيل Copy", "🔴 إيقاف Copy"],
         ["🔑 كود أسبوع", "🔑 كود شهر"],
-        ["🔑 كود دائم", "📋 أكواد Copy"],
-        ["♻️ تجديد كود", "⛔ إيقاف كود"],
-        ["📱 تصفير جهاز كود", "🔄 إعادة تدوير كود"],
-        ["🗑 حذف كود نهائيًا", "🧹 حذف المنتهي والموقوف"],
-        ["⚠️ تصفير كل الأجهزة", "ℹ️ شرح خيارات الأكواد"],
-        ["📌 رسالة تحديث", "📡 حالة Copy"],
+        ["🔑 كود دائم", "🔎 البحث بـ Telegram ID"],
+        ["📋 أكواد Copy", "♻️ تجديد كود"],
+        ["⛔ إيقاف كود", "📱 تصفير جهاز كود"],
+        ["🔄 إعادة تدوير كود", "🗑 حذف كود نهائيًا"],
+        ["🧹 حذف المنتهي والموقوف", "⚠️ تصفير كل الأجهزة"],
+        ["ℹ️ شرح خيارات الأكواد", "📌 رسالة تحديث"],
+        ["📡 حالة Copy"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
 )
+
 
 # v0.84: focused keyboards for admin workflows. Keeping only confirmation/cancel
 # actions prevents unrelated menu labels from being submitted as message bodies or tokens.
@@ -560,6 +562,14 @@ copy_recycle_plan_keyboard = ReplyKeyboardMarkup(
     [
         ["🗓 تجهيز أسبوع", "🗓 تجهيز شهر"],
         ["♾ تجهيز دائم"],
+        ["❌ إلغاء", "⬅️ رجوع"],
+    ],
+    resize_keyboard=True,
+)
+
+copy_create_duplicate_keyboard = ReplyKeyboardMarkup(
+    [
+        ["✅ إنشاء رغم ذلك"],
         ["❌ إلغاء", "⬅️ رجوع"],
     ],
     resize_keyboard=True,
@@ -996,8 +1006,9 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
-COPY_SERVER_VERSION = "0.97.0"
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.94").strip() or "v0.94"
+# v1.00 is a bot/admin-panel release; extension protocol remains v0.99.
+COPY_SERVER_VERSION = "1.00.0"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.99").strip() or "v0.99"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -2131,9 +2142,16 @@ def get_copy_license_record(token: str):
     return copy_license_env_records().get(token)
 
 
-def create_copy_license(plan: str, created_by: int | None = None, max_devices: int | None = None) -> dict:
+def create_copy_license(
+    plan: str,
+    created_by: int | None = None,
+    max_devices: int | None = None,
+    telegram_user_id: int | str | None = None,
+) -> dict:
     plan = str(plan or "month").lower()
     max_devices = max(1, int(max_devices or COPY_LICENSE_DEFAULT_MAX_DEVICES or 1))
+    linked_tid = normalize_copy_telegram_user_id(telegram_user_id)
+    created_at = now_iso()
 
     # Avoid collisions, even though they are very unlikely.
     token = generate_copy_license_token(plan)
@@ -2148,12 +2166,14 @@ def create_copy_license(plan: str, created_by: int | None = None, max_devices: i
         "plan": plan,
         "source": "firebase",
         "created_by": int(created_by) if created_by else None,
-        "created_at": now_iso(),
+        "created_at": created_at,
         "expires_at": copy_license_expiry_for_plan(plan),
         "max_devices": max_devices,
         "devices": {},
-        "telegram_user_id": None,
-        "telegram_linked_at": None,
+        # v1.00: pre-bind new codes to the intended Telegram ID so duplicate
+        # subscriptions can be detected before issuing another active code.
+        "telegram_user_id": linked_tid or None,
+        "telegram_linked_at": created_at if linked_tid else None,
         "disabled_at": None,
         "last_seen_at": None,
     }
@@ -2530,6 +2550,123 @@ def list_copy_licenses(limit: int = 20) -> list[dict]:
     return items[: int(limit or 20)]
 
 
+def find_copy_licenses_by_telegram_id(telegram_user_id: int | str, limit: int = 100) -> list[dict]:
+    """Return every Copy license bound to exactly one normalized Telegram ID."""
+    target = normalize_copy_telegram_user_id(telegram_user_id)
+    if not target:
+        return []
+    matches = [
+        rec for rec in list_copy_licenses(max(1000, int(limit or 100)))
+        if normalize_copy_telegram_user_id((rec or {}).get("telegram_user_id")) == target
+    ]
+    return matches[: max(1, int(limit or 100))]
+
+
+def copy_license_effective_status(record: dict) -> str:
+    raw = str((record or {}).get("status") or "active").strip().lower()
+    if raw == "disabled":
+        return "disabled"
+    if raw == "expired" or copy_license_is_expired((record or {}).get("expires_at")):
+        return "expired"
+    return "active"
+
+
+def copy_active_licenses_for_telegram_id(telegram_user_id: int | str) -> list[dict]:
+    return [
+        rec for rec in find_copy_licenses_by_telegram_id(telegram_user_id, 100)
+        if copy_license_effective_status(rec) == "active"
+        and normalize_copy_license_token((rec or {}).get("token")) != COPY_ADMIN_LICENSE_TOKEN
+    ]
+
+
+def _copy_license_device_binding_label(record: dict) -> str:
+    devices = (record or {}).get("devices") if isinstance((record or {}).get("devices"), dict) else {}
+    if not devices:
+        return "غير مربوط بجهاز"
+    states = {
+        str((row or {}).get("binding_state") or (row or {}).get("state") or "legacy").strip().lower()
+        for row in devices.values() if isinstance(row, dict)
+    }
+    if "confirmed" in states or "legacy" in states:
+        return "مربوط ومؤكد"
+    if "pending" in states:
+        return "ربط معلّق"
+    return "مربوط"
+
+
+def _copy_online_clients_for_token(token: str) -> int:
+    target = normalize_copy_license_token(token)
+    if not target:
+        return 0
+    clients = globals().get("_copy_clients") or {}
+    if not isinstance(clients, dict):
+        return 0
+    return sum(
+        1 for client in list(clients.values())
+        if isinstance(client, dict)
+        and client.get("ws") is not None
+        and normalize_copy_license_token(client.get("license")) == target
+    )
+
+
+def build_copy_license_search_card(record: dict, index: int = 1, total: int = 1) -> str:
+    token = normalize_copy_license_token((record or {}).get("token")) or "-"
+    status_key = copy_license_effective_status(record)
+    status_ar = {"active": "🟢 فعال", "disabled": "⛔ موقوف", "expired": "⏳ منتهي"}.get(status_key, status_key)
+    devices = (record or {}).get("devices") if isinstance((record or {}).get("devices"), dict) else {}
+    last_seen = (record or {}).get("last_seen_at")
+    last_seen_text = format_dt_ar(str(last_seen)) if last_seen else "لا يوجد اتصال مسجل"
+    online = _copy_online_clients_for_token(token)
+    return (
+        f"🔎 نتيجة {index}/{total}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🔑 <code>{html.escape(token)}</code>\n"
+        f"الحالة: {html.escape(status_ar)}\n"
+        f"النوع: {html.escape(str((record or {}).get('plan') or '-'))}\n"
+        f"الانتهاء: {html.escape(format_copy_license_expiry((record or {}).get('expires_at')))}\n"
+        f"Telegram ID: <code>{html.escape(str((record or {}).get('telegram_user_id') or '-'))}</code>\n"
+        f"الجهاز: {html.escape(_copy_license_device_binding_label(record))} ({len(devices)}/{html.escape(str((record or {}).get('max_devices') or 1))})\n"
+        f"متصل الآن: {'نعم' if online else 'لا'}\n"
+        f"آخر اتصال: {html.escape(last_seen_text)}"
+    )
+
+
+def build_copy_license_actions_keyboard(record: dict) -> InlineKeyboardMarkup:
+    token = normalize_copy_license_token((record or {}).get("token"))
+    status = copy_license_effective_status(record)
+    rows = [[
+        InlineKeyboardButton("♻️ تجديد", callback_data=f"cpl:renew:{token}"),
+        InlineKeyboardButton("📱 تصفير الجهاز", callback_data=f"cpl:reset:{token}"),
+    ]]
+    if status != "disabled":
+        rows.append([InlineKeyboardButton("⛔ إيقاف", callback_data=f"cpl:disable:{token}")])
+    rows.append([InlineKeyboardButton("🗑 حذف نهائي", callback_data=f"cpl:delete:{token}")])
+    return InlineKeyboardMarkup(rows)
+
+
+def build_copy_duplicate_warning(telegram_user_id: int | str, records: list[dict]) -> str:
+    lines = [
+        "⚠️ يوجد كود فعال مسبقًا لهذا Telegram ID",
+        "━━━━━━━━━━━━━━",
+        f"👤 <code>{html.escape(str(normalize_copy_telegram_user_id(telegram_user_id) or '-'))}</code>",
+        "",
+    ]
+    for rec in records[:10]:
+        lines.append(
+            f"• <code>{html.escape(normalize_copy_license_token((rec or {}).get('token')))}</code> — "
+            f"{html.escape(format_copy_license_expiry((rec or {}).get('expires_at')))}"
+        )
+    if len(records) > 10:
+        lines.append(f"• ويوجد {len(records) - 10} كود إضافي")
+    lines.extend([
+        "",
+        "الأفضل تجديد أو تصفير الكود الموجود بدل إنشاء كود ثانٍ، لأن وجود كودين فعالين لنفس Telegram ID قد يسبب تنفيذ الصفقة على أكثر من جهاز.",
+        "",
+        "اضغط «✅ إنشاء رغم ذلك» فقط إذا كنت متأكدًا.",
+    ])
+    return "\n".join(lines)
+
+
 def format_copy_license_expiry(expires_at) -> str:
     if not expires_at or str(expires_at).lower() == "forever":
         return "دائم"
@@ -2544,13 +2681,19 @@ def build_copy_license_message(record: dict) -> str:
     plan = record.get("plan") or "-"
     expires = format_copy_license_expiry(record.get("expires_at"))
     max_devices = record.get("max_devices", 1)
+    linked_tid = normalize_copy_telegram_user_id(record.get("telegram_user_id"))
+    binding_line = (
+        f"👤 مربوط مسبقًا بـ Telegram ID: <code>{html.escape(linked_tid)}</code>"
+        if linked_tid else
+        "👤 الربط: أول Telegram ID يوضع داخل الإضافة سيثبت على هذا الكود"
+    )
     return (
         "🔑 كود تفعيل Copy Trading جاهز\n\n"
         f"<code>{html.escape(str(token))}</code>\n\n"
         f"📦 النوع: {html.escape(str(plan))}\n"
         f"⏳ الصلاحية: {html.escape(str(expires))}\n"
         f"📱 عدد الأجهزة: {html.escape(str(max_devices))}\n"
-        "👤 الربط: أول Telegram ID يوضع داخل الإضافة سيثبت على هذا الكود\n\n"
+        f"{binding_line}\n\n"
         "انسخ الكود وضعه داخل إضافة TRADING TIME COPY مع Telegram ID الخاص بالمستخدم ثم اضغط حفظ وربط."
     )
 
@@ -2617,7 +2760,7 @@ def copy_is_trusted_owner_device(device_id: str, device_proof_key: str) -> bool:
         return False
 
 
-def copy_validate_license_for_device(token: str, device_id: str = "unknown", telegram_user_id=None, touch: bool = True, allow_admin_rebind: bool = False, device_proof_key: str = "", allow_device_proof_repair: bool = False) -> tuple[bool, str, dict | None]:
+def copy_validate_license_for_device(token: str, device_id: str = "unknown", telegram_user_id=None, touch: bool = True, allow_admin_rebind: bool = False, device_proof_key: str = "", allow_device_proof_repair: bool = False, allow_pending_binding_repair: bool = False) -> tuple[bool, str, dict | None]:
     """Validate and atomically bind a Firebase license to Telegram/device.
 
     New-device capacity and first Telegram binding are decided inside one Firebase
@@ -2782,17 +2925,39 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tel
                     "bound_at": now_value,
                     "last_seen_at": now_value,
                     "device_proof_key": device_proof_key,
+                    # v0.99: a new device is only considered fully established after
+                    # the authenticated socket passes the origin boundary and receives
+                    # its hello. This marker also permits a narrow repair window for a
+                    # connection interrupted between the atomic bind and hello.
+                    "binding_state": "pending",
                 }
                 changed = True
             else:
                 device_row = dict(devices.get(device_key) or {})
                 stored_proof_key = str(device_row.get("device_proof_key") or "")
                 if stored_proof_key and device_proof_key and not hmac.compare_digest(stored_proof_key, device_proof_key):
+                    pending_bound_at = parse_iso(str(device_row.get("bound_at") or ""))
+                    if pending_bound_at and pending_bound_at.tzinfo is None:
+                        pending_bound_at = pending_bound_at.replace(tzinfo=UTC)
+                    fresh_pending_binding = bool(
+                        allow_pending_binding_repair
+                        and str(device_row.get("binding_state") or "").lower() == "pending"
+                        and pending_bound_at
+                        and (now_utc() - pending_bound_at.astimezone(UTC)) <= timedelta(minutes=15)
+                    )
+                    # v0.99: repair only a fresh, explicitly-pending v0.99 binding.
+                    # Older/confirmed bindings still require an administrator reset.
+                    if fresh_pending_binding:
+                        device_row["device_proof_key"] = device_proof_key
+                        device_row["proof_repaired_at"] = now_value
+                        device_row["pending_binding_repaired_at"] = now_value
+                        record["pending_binding_repaired_at"] = now_value
+                        changed = True
                     # v0.89 one-time recovery for the v0.88 first-run race. This is
                     # enabled only for an initial authenticated connection from the
                     # official Store build (or the verified owner path). Keepalive
                     # calls never enable it, and the record can be repaired once.
-                    if allow_device_proof_repair and not bool(record.get("device_proof_repaired_v089")):
+                    elif allow_device_proof_repair and not bool(record.get("device_proof_repaired_v089")):
                         device_row["device_proof_key"] = device_proof_key
                         device_row["proof_repaired_at"] = now_value
                         record["device_proof_repaired_v089"] = True
@@ -2828,6 +2993,82 @@ def copy_validate_license_for_device(token: str, device_id: str = "unknown", tel
     except Exception as exc:
         logger.exception("Atomic copy license binding failed for %s: %s", token, exc)
         return False, "license service unavailable", decision.get("record")
+
+
+def copy_mark_device_auth_confirmed(token: str, device_id: str, device_proof_key: str = "") -> bool:
+    """Mark a proof-bound device as fully authenticated without changing ownership.
+
+    v0.99 uses this marker to distinguish a completed authenticated connection from
+    a very short pending bind if the socket disappears before the hello is sent.
+    """
+    token = normalize_copy_license_token(token)
+    device_id = str(device_id or "").strip()[:120]
+    device_proof_key = str(device_proof_key or "").strip()[:128]
+    if not token or not device_id:
+        return False
+    record = get_copy_license_record(token)
+    if not isinstance(record, dict) or str(record.get("source") or "").lower() == "env":
+        return False
+    device_key = safe_key(device_id)
+    now_value = now_iso()
+    confirmed = {"ok": False}
+
+    def _transaction(current):
+        if not isinstance(current, dict):
+            return current
+        rec = dict(current)
+        devices = rec.get("devices") if isinstance(rec.get("devices"), dict) else {}
+        devices = dict(devices)
+        row = devices.get(device_key)
+        if not isinstance(row, dict):
+            return current
+        row = dict(row)
+        stored_key = str(row.get("device_proof_key") or "").strip()
+        if stored_key and device_proof_key and not hmac.compare_digest(stored_key, device_proof_key):
+            return current
+        row["binding_state"] = "confirmed"
+        row["auth_confirmed_at"] = now_value
+        row["last_seen_at"] = now_value
+        devices[device_key] = row
+        rec["devices"] = devices
+        rec["last_successful_auth_at"] = now_value
+        confirmed["ok"] = True
+        return rec
+
+    try:
+        copy_licenses_ref().child(copy_license_key(token)).transaction(_transaction)
+        return bool(confirmed["ok"])
+    except Exception as exc:
+        logger.warning("Could not mark COPY device authentication confirmed | token=%s | device=%s | error=%s", token, device_id, exc)
+        return False
+
+
+def _copy_auth_error_details(reason: str) -> tuple[str, int, str, bool]:
+    """Map internal auth failures to stable machine codes and clear Arabic UI text."""
+    value = str(reason or "authentication failed").strip().lower()
+    if value == "invalid license":
+        return "invalid_license", 4430, "كود التفعيل غير صالح.", False
+    if value == "inactive license":
+        return "inactive_license", 4431, "كود التفعيل موقوف من الإدارة.", False
+    if value == "expired license":
+        return "expired_license", 4432, "انتهت صلاحية كود التفعيل. اطلب تجديد الاشتراك.", True
+    if value == "license linked to another telegram id":
+        return "telegram_mismatch", 4433, "هذا الكود مربوط بحساب Telegram مختلف.", False
+    if value == "device limit reached":
+        return "device_already_bound", 4434, "هذا الكود مرتبط بجهاز آخر. اطلب من الإدارة تصفير جهاز الكود ثم اضغط حفظ وربط.", False
+    if value in {"device proof mismatch", "device proof failed"}:
+        return "device_proof_mismatch", 4435, "تعذر التحقق من هوية هذا الجهاز. اطلب تصفير جهاز الكود ثم أعد الربط.", False
+    if value == "origin not allowed":
+        return "origin_not_allowed", 4436, "نسخة الإضافة الحالية غير مسموح لها بالاتصال بهذا الكود.", False
+    if value == "legacy environment license must be migrated to firebase":
+        return "legacy_license", 4437, "هذا الكود قديم ويحتاج نقله إلى نظام التفعيل الجديد.", False
+    if value == "license service unavailable":
+        return "license_service_unavailable", 4438, "خدمة التفعيل غير متاحة مؤقتاً. ستتم إعادة المحاولة.", True
+    if value == "admin device replaced":
+        return "admin_device_replaced", 4410, "تم نقل كود الأدمن إلى نسخة إضافة أحدث.", False
+    if value == "admin license restricted to owner telegram id":
+        return "admin_telegram_restricted", 4433, "كود الأدمن مخصص لحساب المالك فقط.", False
+    return "authentication_failed", 4401, str(reason or "فشل التحقق من كود التفعيل."), False
 
 
 def build_copy_status_message() -> str:
@@ -15045,6 +15286,9 @@ ADMIN_PENDING_STEPS = {
     "admin_direct_message_waiting",
     "admin_broadcast_waiting_message",
     "admin_waiting_user_id",
+    "copy_search_by_telegram_waiting_id",
+    "copy_create_waiting_telegram_id",
+    "copy_create_duplicate_confirm",
     "copy_reset_device_waiting_token",
     "copy_reset_device_confirm",
     "copy_reset_all_devices_confirm",
@@ -15107,6 +15351,7 @@ def clear_admin_pending_state(context: ContextTypes.DEFAULT_TYPE) -> str:
         "copy_pending_token",
         "copy_pending_plan",
         "copy_pending_new_telegram_id",
+        "copy_pending_create_telegram_id",
         "copy_pending_action",
     ):
         context.user_data.pop(key, None)
@@ -15651,6 +15896,75 @@ async def handle_trading_room_callback(update: Update, context: ContextTypes.DEF
 
     return True
 
+async def handle_copy_license_admin_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    query = update.callback_query
+    if not query or not str(query.data or "").startswith("cpl:"):
+        return False
+    user = query.from_user
+    if not is_admin(user.id):
+        await query.answer("هذا الزر للأدمن فقط", show_alert=True)
+        return True
+
+    try:
+        _prefix, action, raw_token = str(query.data or "").split(":", 2)
+        token = normalize_copy_license_token(raw_token)
+    except Exception:
+        await query.answer("بيانات غير صالحة", show_alert=True)
+        return True
+
+    record = get_copy_license_record(token)
+    if not record or record.get("source") == "env" or token == COPY_ADMIN_LICENSE_TOKEN:
+        await query.answer("الكود غير موجود أو لا يمكن إدارته من هنا", show_alert=True)
+        return True
+
+    await query.answer()
+    context.user_data["copy_pending_token"] = token
+
+    if action == "renew":
+        context.user_data["step"] = "copy_renew_waiting_option"
+        await query.message.reply_text(
+            build_copy_license_summary(record, "♻️ الكود المراد تجديده") + "\n\nاختر مدة التجديد:",
+            parse_mode="HTML",
+            reply_markup=copy_renew_keyboard,
+        )
+        return True
+
+    if action == "reset":
+        context.user_data["step"] = "copy_reset_device_confirm"
+        await query.message.reply_text(
+            build_copy_license_summary(record, "📱 تأكيد تصفير الجهاز") +
+            "\n\nسيتم مسح الأجهزة ومفاتيح الإثبات فقط، وسيبقى Telegram ID الحالي محميًا.",
+            parse_mode="HTML",
+            reply_markup=admin_confirm_keyboard,
+        )
+        return True
+
+    if action == "disable":
+        context.user_data["step"] = "copy_disable_confirm"
+        await query.message.reply_text(
+            build_copy_license_summary(record, "⛔ تأكيد إيقاف الكود") +
+            "\n\nسيتم فصل الإضافة فورًا مع بقاء السجل.",
+            parse_mode="HTML",
+            reply_markup=admin_confirm_keyboard,
+        )
+        return True
+
+    if action == "delete":
+        context.user_data["step"] = "copy_delete_confirm"
+        await query.message.reply_text(
+            build_copy_license_summary(record, "🗑 تأكيد الحذف النهائي") +
+            "\n\n⚠️ اضغط تأكيد لحذف السجل بلا رجعة.",
+            parse_mode="HTML",
+            reply_markup=admin_confirm_keyboard,
+        )
+        return True
+
+    context.user_data.pop("copy_pending_token", None)
+    context.user_data["step"] = None
+    await query.message.reply_text("❌ الإجراء غير معروف.", reply_markup=copy_admin_keyboard)
+    return True
+
+
 async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     user = query.from_user
@@ -15658,6 +15972,11 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
 
     if data.startswith("tr_"):
         handled = await handle_trading_room_callback(update, context)
+        if handled:
+            return
+
+    if data.startswith("cpl:"):
+        handled = await handle_copy_license_admin_callback(update, context)
         if handled:
             return
 
@@ -17981,17 +18300,22 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if text in {"🔑 كود أسبوع", "🔑 كود شهر", "🔑 كود دائم"}:
-            plan = "week" if "أسبوع" in text else ("forever" if "دائم" in text else "month")
-            try:
-                record = create_copy_license(plan=plan, created_by=user.id, max_devices=COPY_LICENSE_DEFAULT_MAX_DEVICES)
-                await update.message.reply_text(
-                    build_copy_license_message(record),
-                    parse_mode="HTML",
-                    reply_markup=copy_admin_keyboard
-                )
-            except Exception as e:
-                logger.exception("Could not create copy license: %s", e)
-                await update.message.reply_text("❌ تعذر إنشاء كود التفعيل. راجع لوج Render.", reply_markup=copy_admin_keyboard)
+            context.user_data["copy_pending_plan"] = "week" if "أسبوع" in text else ("forever" if "دائم" in text else "month")
+            context.user_data["step"] = "copy_create_waiting_telegram_id"
+            await update.message.reply_text(
+                "👤 أرسل Telegram ID الرقمي للشخص الذي سيستخدم الكود.\n\n"
+                "سأفحص أولًا إذا عنده كود فعال قديم حتى لا نعطيه كودين ويصير تنفيذ مزدوج.",
+                reply_markup=admin_input_cancel_keyboard,
+            )
+            return
+
+        if text == "🔎 البحث بـ Telegram ID":
+            context.user_data["step"] = "copy_search_by_telegram_waiting_id"
+            await update.message.reply_text(
+                "🔎 أرسل Telegram ID الرقمي.\n\n"
+                "سيظهر كل كود مرتبط فيه مع حالة الاشتراك والجهاز وآخر اتصال وأزرار الإدارة.",
+                reply_markup=admin_input_cancel_keyboard,
+            )
             return
 
         if text == "📋 أكواد Copy":
@@ -18079,6 +18403,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "ℹ️ إدارة أكواد Copy\n"
                 "━━━━━━━━━━━━━━\n"
+                "🔎 البحث بـ Telegram ID: يعرض كل الأكواد المرتبطة بالشخص مع أزرار الإدارة.\n"
+                "🔑 إنشاء كود: يطلب Telegram ID أولًا وينبّهك إذا لديه كود فعال سابق.\n"
                 "♻️ تجديد كود: تمديد نفس العميل مع بقاء جهازه وربطه.\n"
                 "⛔ إيقاف كود: منع الكود مع إبقاء سجله.\n"
                 "📱 تصفير جهاز: لنفس العميل عند تغيير جهازه؛ يمسح الأجهزة فقط ويبقي Telegram ID.\n"
@@ -18088,6 +18414,91 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚠️ تصفير كل الأجهزة: إجراء صيانة خطير يؤثر على الجميع.",
                 reply_markup=copy_admin_keyboard,
             )
+            return
+
+        if step == "copy_search_by_telegram_waiting_id":
+            target_tid = normalize_copy_telegram_user_id(text)
+            context.user_data["step"] = None
+            if not target_tid:
+                await update.message.reply_text("❌ Telegram ID غير صالح. أرسل أرقام فقط.", reply_markup=copy_admin_keyboard)
+                return
+            records = find_copy_licenses_by_telegram_id(target_tid, 100)
+            if not records:
+                await update.message.reply_text(
+                    f"🔎 لا يوجد أي كود مرتبط بـ Telegram ID:\n<code>{html.escape(target_tid)}</code>",
+                    parse_mode="HTML",
+                    reply_markup=copy_admin_keyboard,
+                )
+                return
+            await update.message.reply_text(
+                f"✅ تم العثور على {len(records)} كود مرتبط بـ <code>{html.escape(target_tid)}</code>.",
+                parse_mode="HTML",
+                reply_markup=copy_admin_keyboard,
+            )
+            for idx, record in enumerate(records, start=1):
+                token = normalize_copy_license_token((record or {}).get("token"))
+                markup = None if (record or {}).get("source") == "env" or token == COPY_ADMIN_LICENSE_TOKEN else build_copy_license_actions_keyboard(record)
+                await update.message.reply_text(
+                    build_copy_license_search_card(record, idx, len(records)),
+                    parse_mode="HTML",
+                    reply_markup=markup,
+                )
+            return
+
+        if step == "copy_create_waiting_telegram_id":
+            target_tid = normalize_copy_telegram_user_id(text)
+            if not target_tid:
+                await update.message.reply_text("❌ Telegram ID غير صالح. أرسل أرقام فقط.", reply_markup=admin_input_cancel_keyboard)
+                return
+            plan = str(context.user_data.get("copy_pending_plan") or "month")
+            active_records = copy_active_licenses_for_telegram_id(target_tid)
+            if active_records:
+                context.user_data["copy_pending_create_telegram_id"] = target_tid
+                context.user_data["step"] = "copy_create_duplicate_confirm"
+                await update.message.reply_text(
+                    build_copy_duplicate_warning(target_tid, active_records),
+                    parse_mode="HTML",
+                    reply_markup=copy_create_duplicate_keyboard,
+                )
+                return
+            context.user_data["step"] = None
+            context.user_data.pop("copy_pending_plan", None)
+            try:
+                record = create_copy_license(
+                    plan=plan,
+                    created_by=user.id,
+                    max_devices=COPY_LICENSE_DEFAULT_MAX_DEVICES,
+                    telegram_user_id=target_tid,
+                )
+                await update.message.reply_text(build_copy_license_message(record), parse_mode="HTML", reply_markup=copy_admin_keyboard)
+            except Exception as e:
+                logger.exception("Could not create copy license: %s", e)
+                await update.message.reply_text("❌ تعذر إنشاء كود التفعيل. راجع لوج Render.", reply_markup=copy_admin_keyboard)
+            return
+
+        if step == "copy_create_duplicate_confirm":
+            plan = str(context.user_data.get("copy_pending_plan") or "month")
+            target_tid = normalize_copy_telegram_user_id(context.user_data.get("copy_pending_create_telegram_id"))
+            if text != "✅ إنشاء رغم ذلك":
+                clear_admin_pending_state(context)
+                await update.message.reply_text("تم إلغاء إنشاء الكود الإضافي.", reply_markup=copy_admin_keyboard)
+                return
+            clear_admin_pending_state(context)
+            try:
+                record = create_copy_license(
+                    plan=plan,
+                    created_by=user.id,
+                    max_devices=COPY_LICENSE_DEFAULT_MAX_DEVICES,
+                    telegram_user_id=target_tid,
+                )
+                await update.message.reply_text(
+                    "⚠️ تم إنشاء كود إضافي بعد تأكيدك. تأكد أن الكود القديم موقوف أو غير مستخدم.\n\n" + build_copy_license_message(record),
+                    parse_mode="HTML",
+                    reply_markup=copy_admin_keyboard,
+                )
+            except Exception as e:
+                logger.exception("Could not create duplicate copy license: %s", e)
+                await update.message.reply_text("❌ تعذر إنشاء كود التفعيل. راجع لوج Render.", reply_markup=copy_admin_keyboard)
             return
 
         if step == "copy_renew_waiting_token":
@@ -19645,6 +20056,45 @@ def create_embedded_copy_api():
             return
         origin = websocket.headers.get("origin")
 
+        async def _reject_auth(reason: str, *, fallback_code: int | None = None):
+            machine_code, close_code, message, retryable = _copy_auth_error_details(reason)
+            if fallback_code is not None:
+                close_code = int(fallback_code)
+            await _copy_send_json_safe(websocket, {
+                "type": "auth_error",
+                "code": machine_code,
+                "message": message,
+                "retryable": bool(retryable),
+                "server_time": now_iso(),
+            })
+            # Give Chromium a short opportunity to deliver the structured error
+            # before the close frame. The extension also maps the close code as a
+            # fallback when a proxy/browser omits the close reason (1005).
+            await asyncio.sleep(0.04)
+            try:
+                await websocket.close(code=close_code, reason=machine_code[:120])
+            except Exception:
+                logger.debug("COPY auth reject close failed", exc_info=True)
+
+        async def _origin_precheck(token: str, device_id: str, telegram_user_id: str, device_proof_key: str) -> tuple[bool, bool]:
+            is_admin_token = normalize_copy_license_token(token) == COPY_ADMIN_LICENSE_TOKEN
+            trusted_owner = copy_is_trusted_owner_device(device_id, device_proof_key)
+            allowed = is_copy_origin_allowed(
+                origin,
+                authenticated=True,
+                is_admin_license=is_admin_token,
+                trusted_owner_device=trusted_owner,
+            )
+            if not allowed:
+                logger.warning(
+                    "Rejected COPY WebSocket origin before license binding | origin=%r | device=%s | telegram_user_id=%s | admin_token=%s | trusted_owner=%s",
+                    origin, device_id, telegram_user_id or "-", is_admin_token, trusted_owner,
+                )
+                _copy_ws_auth_failure(auth_ip)
+                await _reject_auth("origin not allowed")
+                return False, trusted_owner
+            return True, trusted_owner
+
         async def _run_authenticated(token: str, device_id: str, telegram_user_id: str, device_proof_key: str, license_record: dict | None, *, legacy_auth: bool, trusted_owner_device: bool = False):
             is_admin_license = bool((license_record or {}).get("is_admin_license"))
             if not is_copy_origin_allowed(
@@ -19658,9 +20108,12 @@ def create_embedded_copy_api():
                     origin, device_id, telegram_user_id or "-", is_admin_license,
                 )
                 _copy_ws_auth_failure(auth_ip)
-                await websocket.close(code=4403, reason="origin not allowed")
+                await _reject_auth("origin not allowed")
                 return
 
+            # All authentication and origin checks have now passed. Only here is
+            # the device binding considered fully established.
+            copy_mark_device_auth_confirmed(token, device_id, device_proof_key)
             _copy_ws_auth_success(auth_ip)
             if legacy_auth:
                 logger.warning(
@@ -19727,7 +20180,7 @@ def create_embedded_copy_api():
                         device_proof_key=device_proof_key,
                     )
                     if not ok:
-                        await websocket.close(code=4401, reason=reason)
+                        await _reject_auth(reason)
                         break
                     try:
                         event = json.loads(raw)
@@ -19780,6 +20233,9 @@ def create_embedded_copy_api():
                 return
             legacy_device_id = str(websocket.query_params.get("device_id") or "unknown").strip()[:120] or "unknown"
             legacy_telegram_id = normalize_copy_telegram_user_id(websocket.query_params.get("telegram_user_id"))
+            origin_ok, trusted_owner_device = await _origin_precheck(legacy_token, legacy_device_id, legacy_telegram_id, "")
+            if not origin_ok:
+                return
             ok, reason, license_record = copy_validate_license_for_device(
                 legacy_token,
                 legacy_device_id,
@@ -19789,9 +20245,12 @@ def create_embedded_copy_api():
             )
             if not ok:
                 _copy_ws_auth_failure(auth_ip)
-                await websocket.close(code=4401, reason=reason)
+                await _reject_auth(reason)
                 return
-            await _run_authenticated(legacy_token, legacy_device_id, legacy_telegram_id, "", license_record, legacy_auth=True)
+            await _run_authenticated(
+                legacy_token, legacy_device_id, legacy_telegram_id, "", license_record,
+                legacy_auth=True, trusted_owner_device=trusted_owner_device,
+            )
             return
 
         nonce = secrets.token_urlsafe(32)
@@ -19826,7 +20285,7 @@ def create_embedded_copy_api():
         device_proof = str(auth.get("device_proof") or "").strip()[:256]
         if COPY_DEVICE_PROOF_REQUIRED and not _copy_device_proof_valid(device_proof_key, device_proof, nonce, device_id, telegram_user_id):
             _copy_ws_auth_failure(auth_ip)
-            await websocket.close(code=4401, reason="device proof failed")
+            await _reject_auth("device proof failed")
             return
 
         token = normalize_copy_license_token(auth.get("token"))
@@ -19845,7 +20304,7 @@ def create_embedded_copy_api():
                 token = normalize_copy_license_token(auth.get("token"))
                 if not token:
                     _copy_ws_auth_failure(auth_ip)
-                    await websocket.close(code=4401, reason=session_reason)
+                    await _reject_auth(session_reason)
                     return
 
         origin_value = str(origin or "").strip().rstrip("/")
@@ -19854,7 +20313,14 @@ def create_embedded_copy_api():
             origin_value in {str(x).strip().rstrip("/") for x in COPY_ALLOWED_ORIGINS}
             or extension_id_value in COPY_ALLOWED_EXTENSION_IDS
         )
-        trusted_owner_device = copy_is_trusted_owner_device(device_id, device_proof_key)
+        # v0.99 critical order: reject an untrusted extension origin before the
+        # license transaction can bind a new device. v0.97 could bind first and
+        # reject second, leaving a brand-new code apparently occupied after a
+        # failed local/unauthorized connection attempt.
+        origin_ok, trusted_owner_device = await _origin_precheck(token, device_id, telegram_user_id, device_proof_key)
+        if not origin_ok:
+            return
+
         ok, reason, license_record = copy_validate_license_for_device(
             token,
             device_id,
@@ -19862,15 +20328,16 @@ def create_embedded_copy_api():
             touch=True,
             allow_admin_rebind=True,
             device_proof_key=device_proof_key,
-            allow_device_proof_repair=bool(official_store_origin or token == COPY_ADMIN_LICENSE_TOKEN),
+            allow_device_proof_repair=bool(official_store_origin or trusted_owner_device or token == COPY_ADMIN_LICENSE_TOKEN),
+            allow_pending_binding_repair=bool(official_store_origin or trusted_owner_device or token == COPY_ADMIN_LICENSE_TOKEN),
         )
         if not ok:
             _copy_ws_auth_failure(auth_ip)
-            await websocket.close(code=4401, reason=reason)
+            await _reject_auth(reason)
             return
         if COPY_DEVICE_PROOF_REQUIRED and str((license_record or {}).get("source") or "").lower() == "env":
             _copy_ws_auth_failure(auth_ip)
-            await websocket.close(code=4401, reason="legacy environment license must be migrated to Firebase")
+            await _reject_auth("legacy environment license must be migrated to Firebase")
             return
 
         await _run_authenticated(
