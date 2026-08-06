@@ -19941,7 +19941,7 @@ def create_embedded_copy_api():
         allow_origin_regex=COPY_ALLOWED_ORIGIN_REGEX,
         allow_credentials=True,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "X-TTCopy-Secret"],
+        allow_headers=["Content-Type", "Authorization", "X-TTCopy-Secret"],
     )
 
 
@@ -19979,6 +19979,79 @@ def create_embedded_copy_api():
             "telegram_user_id": normalize_copy_telegram_user_id((record or {}).get("telegram_user_id") or telegram_user_id),
             "copy_settings": copy_public_settings_payload(),
         }
+
+    def _copy_mobile_session(authorization: str | None):
+        """Validate a mobile session without exposing the server secret to the app."""
+        raw = str(authorization or "").strip()
+        session_token = raw[7:].strip() if raw.lower().startswith("bearer ") else ""
+        ok, reason, session = _copy_session_token_verify(session_token)
+        if not ok or not isinstance(session, dict):
+            raise HTTPException(status_code=401, detail=reason)
+        return session
+
+    @copy_api.post("/api/mobile/session")
+    async def copy_mobile_session(request: Request):
+        """Bind an approved mobile device and return a short-lived app session."""
+        body = await request.json()
+        token = normalize_copy_license_token(body.get("token"))
+        device_id = str(body.get("device_id") or "unknown")[:120]
+        telegram_user_id = normalize_copy_telegram_user_id(body.get("telegram_user_id"))
+        ok, reason, record = copy_validate_license_for_device(
+            token,
+            device_id,
+            telegram_user_id=telegram_user_id,
+            touch=True,
+            allow_admin_rebind=True,
+        )
+        if not ok:
+            raise HTTPException(status_code=401, detail=reason)
+        session_token = _copy_session_token_issue(token, device_id, telegram_user_id, "mobile")
+        return {
+            "ok": True,
+            "session_token": session_token,
+            "expires_in_seconds": max(60, int(COPY_SESSION_TOKEN_TTL_SECONDS)),
+            "account": {
+                "plan": (record or {}).get("plan"),
+                "expires_at": (record or {}).get("expires_at"),
+                "telegram_user_id": normalize_copy_telegram_user_id((record or {}).get("telegram_user_id") or telegram_user_id),
+                "role": "admin" if str((record or {}).get("role") or "").lower() == "admin" else "member",
+            },
+        }
+
+    @copy_api.get("/api/mobile/signals/recent")
+    async def copy_mobile_recent_signals(authorization: str | None = Header(default=None)):
+        """Return only broadcast signals and signals intended for this licensed user."""
+        session = _copy_mobile_session(authorization)
+        owner_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
+        rows = []
+        for signal in reversed(_copy_signal_history[-50:]):
+            target_id = normalize_copy_telegram_user_id((signal or {}).get("target_user_id"))
+            if target_id and target_id != owner_id:
+                continue
+            rows.append(dict(signal or {}))
+            if len(rows) >= 20:
+                break
+        return {"ok": True, "signals": rows}
+
+    @copy_api.post("/api/mobile/signals/request")
+    async def copy_mobile_signal_request(request: Request, authorization: str | None = Header(default=None)):
+        """Run the existing analysis engine for the signed-in mobile user.
+
+        This endpoint returns an analysis only. It never submits or automates a trade.
+        """
+        _copy_mobile_session(authorization)
+        body = await request.json()
+        market = str(body.get("market") or "GLOBAL").upper().strip()
+        if market == "OTC":
+            result = await asyncio.to_thread(analyze_best_live_otc_now, "ar")
+        elif market == "GLOBAL":
+            pair = str(body.get("pair") or "EUR/USD").upper().strip()
+            if pair not in REAL_PAIRS:
+                raise HTTPException(status_code=400, detail="unsupported market pair")
+            result = await asyncio.to_thread(analyze_real_market_best, pair)
+        else:
+            raise HTTPException(status_code=400, detail="unsupported market")
+        return {"ok": bool((result or {}).get("ok")), "market": market, "signal": result or {}}
 
     @copy_api.get("/api/admin/status")
     async def copy_admin_status(x_ttcopy_secret: str | None = Header(default=None)):
