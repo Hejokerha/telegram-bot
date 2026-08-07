@@ -451,8 +451,8 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
         ["🔐 Copy Trading", "📡 حالة Copy"],
-        ["📡 قناة 3 شموع", "🧾 فحص ليستة OTC"],
-        ["📋 عرض نتائج الليستة"],
+        ["📡 قناة 3 شموع", "🌐 Public Three Candle"],
+        ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
         ["📢 رسالة جماعية"],
         ["⬅️ رجوع"],
@@ -516,6 +516,19 @@ three_candle_admin_keyboard = ReplyKeyboardMarkup(
         ["📊 ملخص القناة", "🧠 تقرير الذاكرة"],
         ["🧹 تصفير الذاكرة"],
         ["📋 حالة القناة"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+# v1.01: Public Three Candle is a free/limited mirror of the private 3-candle channel.
+# It never publishes a second Copy Trading command; it only mirrors Telegram messages/results.
+three_candle_public_admin_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🟢 تشغيل Public", "🔴 إيقاف Public"],
+        ["🎯 عدد صفقات النشر", "♾ Public مفتوح"],
+        ["📊 ملخص Public", "📋 حالة Public"],
+        ["🧹 تصفير نتائج Public"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -1006,8 +1019,8 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
-# v1.00 is a bot/admin-panel release; extension protocol remains v0.99.
-COPY_SERVER_VERSION = "1.00.0"
+# v1.02 tunes Three Candle timing/filters and unifies pair repeat protection; extension protocol remains v0.99.
+COPY_SERVER_VERSION = "1.02.0"
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.99").strip() or "v0.99"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
@@ -11705,10 +11718,19 @@ def build_otc_edge_patterns_report() -> str:
 # تنشر على قناة Telegram فقط إذا تم ضبط THREE_CANDLE_CHANNEL_ID وتفعيل THREE_CANDLE_CHANNEL_ENABLED.
 THREE_CANDLE_CHANNEL_ID_RAW = os.getenv("THREE_CANDLE_CHANNEL_ID", "").strip()
 THREE_CANDLE_CHANNEL_ENABLED = os.getenv("THREE_CANDLE_CHANNEL_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+# v1.01: Optional public/free mirror channel. Keep the private channel untouched.
+# v1.02: Three Candle timing/filter tuning only; Public remains a mirror of accepted private signals.
+# Set this to a public @username or numeric -100... Telegram channel ID.
+THREE_CANDLE_PUBLIC_CHANNEL_ID_RAW = os.getenv("THREE_CANDLE_PUBLIC_CHANNEL_ID", "").strip()
+THREE_CANDLE_PUBLIC_ENABLED_DEFAULT = os.getenv("THREE_CANDLE_PUBLIC_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+THREE_CANDLE_PUBLIC_LIMIT_DEFAULT = max(0, int(os.getenv("THREE_CANDLE_PUBLIC_LIMIT", "0") or 0))
+
 THREE_CANDLE_MIN_PAYOUT = int(os.getenv("THREE_CANDLE_MIN_PAYOUT", "80"))
 THREE_CANDLE_SCAN_SECONDS = int(os.getenv("THREE_CANDLE_SCAN_SECONDS", "2"))
-THREE_CANDLE_ALERT_REMAINING_SECONDS = float(os.getenv("THREE_CANDLE_ALERT_REMAINING_SECONDS", "10"))
-THREE_CANDLE_MIN_REMAINING_SECONDS = float(os.getenv("THREE_CANDLE_MIN_REMAINING_SECONDS", "2"))
+# v1.02: only lock a signal in the 15s→10s window before the current candle closes.
+THREE_CANDLE_ALERT_REMAINING_SECONDS = float(os.getenv("THREE_CANDLE_ALERT_REMAINING_SECONDS", "15"))
+THREE_CANDLE_MIN_REMAINING_SECONDS = float(os.getenv("THREE_CANDLE_MIN_REMAINING_SECONDS", "10"))
 THREE_CANDLE_RESULT_DELAY_SECONDS = int(os.getenv("THREE_CANDLE_RESULT_DELAY_SECONDS", "5"))
 THREE_CANDLE_PAIR_LOSS_LIMIT = int(os.getenv("THREE_CANDLE_PAIR_LOSS_LIMIT", "2"))
 THREE_CANDLE_PAIR_COOLDOWN_SECONDS = int(os.getenv("THREE_CANDLE_PAIR_COOLDOWN_SECONDS", "1800"))
@@ -11717,12 +11739,14 @@ THREE_CANDLE_DAILY_LIMIT_DEFAULT = int(os.getenv("THREE_CANDLE_DAILY_LIMIT", "0"
 # v0.57: private public message - strategy internals hidden from channel posts.
 THREE_CANDLE_MOMENTUM_MIN = int(os.getenv("THREE_CANDLE_MOMENTUM_MIN", "4"))
 THREE_CANDLE_MAX_CORRECTION_CANDLES = int(os.getenv("THREE_CANDLE_MAX_CORRECTION_CANDLES", "2"))
-# After a pair gets a signal, block it for the next N published signals, regardless of result.
-THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT = int(os.getenv("THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT", "2"))
+# v1.02: normal anti-repeat protection only blocks the immediately next published signal.
+# A second consecutive final loss escalates the same pair to the 30-minute cooldown below.
+# This is intentionally fixed at 1 so the old double-gate cannot return through a stale Render env value.
+THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT = 1
 THREE_CANDLE_TEST_LABEL = os.getenv("THREE_CANDLE_TEST_LABEL", "").strip()
 
 # v0.66: Firebase-efficient Strategy Memory.
-# - memory_v2: compact records used by reports and the dynamic pair filter.
+# - memory_v2: compact records kept for reports/history; the old dynamic pair filter is retired in v1.02.
 # - memory_details_v2: detailed features kept for future deep analysis, never auto-read.
 # - legacy /results is queried only once (last N only) for an optional migration.
 THREE_CANDLE_MEMORY_ENABLED = os.getenv("THREE_CANDLE_MEMORY_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -11743,9 +11767,12 @@ THREE_CANDLE_SMART_FILTER_ENABLED = os.getenv("THREE_CANDLE_SMART_FILTER_ENABLED
 THREE_CANDLE_SMART_MIN_PAYOUT = int(os.getenv("THREE_CANDLE_SMART_MIN_PAYOUT", "85"))
 # Empty means allow all. Default test: correction setups only.
 THREE_CANDLE_SMART_ALLOWED_PATTERNS = [x.strip() for x in os.getenv("THREE_CANDLE_SMART_ALLOWED_PATTERNS", "momentum_correction,momentum_continuation").split(",") if x.strip()]
-# Empty means allow all. Balanced test: momentum_count 4 or 5 to avoid over-filtering.
-THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS = [int(x) for x in re.findall(r"\d+", os.getenv("THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS", "4,5"))]
-THREE_CANDLE_SMART_PAIR_FILTER_ENABLED = os.getenv("THREE_CANDLE_SMART_PAIR_FILTER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+# v1.02: correction setups accept any momentum run >= THREE_CANDLE_MOMENTUM_MIN (4+ by default).
+# Keep the legacy env list parsed only for backward diagnostics; it no longer blocks correction setups.
+THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS = [int(x) for x in re.findall(r"\d+", os.getenv("THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS", ""))]
+# v1.02: retire the old memory-based dynamic pair filter completely.
+# Hard-disabled intentionally so a stale Render env value cannot turn it back on.
+THREE_CANDLE_SMART_PAIR_FILTER_ENABLED = False
 THREE_CANDLE_SMART_PAIR_LOOKBACK = int(os.getenv("THREE_CANDLE_SMART_PAIR_LOOKBACK", "200"))
 THREE_CANDLE_SMART_PAIR_MIN_SAMPLE = int(os.getenv("THREE_CANDLE_SMART_PAIR_MIN_SAMPLE", "5"))
 THREE_CANDLE_SMART_PAIR_MIN_FINAL_WR = float(os.getenv("THREE_CANDLE_SMART_PAIR_MIN_FINAL_WR", "65"))
@@ -11777,6 +11804,300 @@ _three_candle_channel_state = {
     "memory_migration_checked": False,
     "memory_legacy_migrated": 0,
 }
+
+
+# Runtime-only diagnostics for the public mirror. Persistent counters/settings live in Firebase.
+_three_candle_public_state = {
+    "signals_sent": 0,
+    "results_sent": 0,
+    "last_publish_at": None,
+    "last_result_at": None,
+    "last_error": None,
+}
+
+
+def _three_candle_public_channel_id():
+    raw = str(THREE_CANDLE_PUBLIC_CHANNEL_ID_RAW or "").strip()
+    if not raw:
+        return None
+    try:
+        if raw.lstrip("-").isdigit():
+            return int(raw)
+    except Exception:
+        logger.debug("Could not parse public three-candle channel id", exc_info=True)
+    return raw
+
+
+def _three_candle_public_base_ref():
+    return system_ref().child("three_candle_public")
+
+
+def _three_candle_public_settings_ref():
+    return _three_candle_public_base_ref().child("settings")
+
+
+def _three_candle_public_stats_ref():
+    return _three_candle_public_base_ref().child("stats")
+
+
+def _three_candle_public_results_ref():
+    return _three_candle_public_base_ref().child("results")
+
+
+def _three_candle_public_daily_ref(day_key: str | None = None):
+    return _three_candle_public_base_ref().child("daily").child(day_key or get_utc3_day_key())
+
+
+def _three_candle_public_get_settings() -> dict:
+    default = {
+        "enabled": bool(THREE_CANDLE_PUBLIC_ENABLED_DEFAULT),
+        "session_limit": int(THREE_CANDLE_PUBLIC_LIMIT_DEFAULT),
+        "session_sent": 0,
+        "session_started_at": None,
+    }
+    try:
+        data = _three_candle_public_settings_ref().get() or {}
+        if not isinstance(data, dict):
+            data = {}
+        return {
+            "enabled": bool(data.get("enabled", default["enabled"])),
+            "session_limit": max(0, int(data.get("session_limit", default["session_limit"]) or 0)),
+            "session_sent": max(0, int(data.get("session_sent", 0) or 0)),
+            "session_started_at": data.get("session_started_at"),
+            "auto_stopped_at": data.get("auto_stopped_at"),
+            "updated_at": data.get("updated_at"),
+        }
+    except Exception as e:
+        _three_candle_public_state["last_error"] = str(e)
+        return default
+
+
+def _three_candle_public_set_enabled(enabled: bool) -> tuple[bool, str]:
+    try:
+        if enabled and not _three_candle_public_channel_id():
+            return False, "❌ قناة Public غير مضبوطة. أضف THREE_CANDLE_PUBLIC_CHANNEL_ID على Render أولاً."
+        payload = {"enabled": bool(enabled), "updated_at": now_iso()}
+        if enabled:
+            # Every explicit start is a fresh free-publication session.
+            payload.update({"session_sent": 0, "session_started_at": now_iso(), "auto_stopped_at": None})
+        _three_candle_public_settings_ref().update(payload)
+        return True, "✅ تم تشغيل Public Three Candle بجلسة نشر جديدة." if enabled else "⛔ تم إيقاف Public Three Candle."
+    except Exception as e:
+        _three_candle_public_state["last_error"] = str(e)
+        logger.exception("Could not set Public Three Candle enabled=%s: %s", enabled, e)
+        return False, "❌ تعذر حفظ حالة Public. راجع اللوج."
+
+
+def _three_candle_public_set_session_limit(limit: int) -> tuple[bool, str]:
+    try:
+        normalized = max(0, int(limit or 0))
+        _three_candle_public_settings_ref().update({
+            "session_limit": normalized,
+            "session_sent": 0,
+            "session_started_at": now_iso(),
+            "auto_stopped_at": None,
+            "updated_at": now_iso(),
+        })
+        label = "مفتوح ♾" if normalized <= 0 else str(normalized)
+        return True, f"✅ تم ضبط عدد صفقات جلسة Public على: {label}\nتم تصفير عداد الجلسة الحالية."
+    except Exception as e:
+        _three_candle_public_state["last_error"] = str(e)
+        logger.exception("Could not set Public Three Candle limit: %s", e)
+        return False, "❌ تعذر حفظ عدد الصفقات. راجع اللوج."
+
+
+def _three_candle_public_is_enabled() -> bool:
+    try:
+        settings = _three_candle_public_get_settings()
+        if not settings.get("enabled") or not _three_candle_public_channel_id():
+            return False
+        limit = int(settings.get("session_limit", 0) or 0)
+        sent = int(settings.get("session_sent", 0) or 0)
+        return limit <= 0 or sent < limit
+    except Exception:
+        return False
+
+
+def _three_candle_public_increment_signal() -> dict:
+    """Persist one successfully published public signal and auto-stop at the configured quota."""
+    settings = _three_candle_public_get_settings()
+    try:
+        sent = int(settings.get("session_sent", 0) or 0) + 1
+        limit = int(settings.get("session_limit", 0) or 0)
+        payload = {"session_sent": sent, "updated_at": now_iso()}
+        if limit > 0 and sent >= limit:
+            payload.update({"enabled": False, "auto_stopped_at": now_iso()})
+        _three_candle_public_settings_ref().update(payload)
+
+        stats = _three_candle_public_stats_ref().get() or {}
+        if not isinstance(stats, dict):
+            stats = {}
+        _three_candle_public_stats_ref().update({
+            "signals": int(stats.get("signals", 0) or 0) + 1,
+            "updated_at": now_iso(),
+        })
+
+        daily = _three_candle_public_daily_ref().get() or {}
+        if not isinstance(daily, dict):
+            daily = {}
+        _three_candle_public_daily_ref().update({
+            "signals": int(daily.get("signals", 0) or 0) + 1,
+            "day": get_utc3_day_key(),
+            "updated_at": now_iso(),
+        })
+        settings.update(payload)
+        return settings
+    except Exception as e:
+        _three_candle_public_state["last_error"] = str(e)
+        logger.exception("Could not increment Public Three Candle signal count: %s", e)
+        return settings
+
+
+def _three_candle_public_record_result(trade: dict, result_type: str, result_text: str) -> None:
+    try:
+        record = {
+            "created_at": now_iso(),
+            "day": get_utc3_day_key(),
+            "pair": str((trade or {}).get("pair") or ""),
+            "symbol": str((trade or {}).get("symbol") or ""),
+            "direction": str((trade or {}).get("direction") or ""),
+            "payout": safe_int((trade or {}).get("payout", 0), 0),
+            "result_type": str(result_type or ""),
+            "result_text": str(result_text or ""),
+            "private_trade_created_at": (trade or {}).get("created_at"),
+            "public_session_started_at": (trade or {}).get("public_session_started_at"),
+        }
+        key = f"{int(time_module.time() * 1000)}_{safe_key(record.get('pair'))}"
+        _three_candle_public_results_ref().child(key).set(record)
+
+        stats = _three_candle_public_stats_ref().get() or {}
+        if not isinstance(stats, dict):
+            stats = {}
+        _three_candle_public_stats_ref().update({
+            "results": int(stats.get("results", 0) or 0) + 1,
+            "updated_at": now_iso(),
+        })
+    except Exception as e:
+        _three_candle_public_state["last_error"] = str(e)
+        logger.exception("Could not record Public Three Candle result: %s", e)
+
+
+def _three_candle_public_fetch_results(limit: int | None = None) -> list[dict]:
+    try:
+        if limit is None:
+            data = _three_candle_public_results_ref().get() or {}
+        else:
+            limit = max(1, min(int(limit), 5000))
+            data = _three_candle_query_last_dict(_three_candle_public_results_ref(), limit)
+        rows = _three_candle_records_from_dict(data if isinstance(data, dict) else {})
+        rows.sort(key=lambda row: str(row.get("_key", "")))
+        return rows[-limit:] if limit else rows
+    except Exception as e:
+        _three_candle_public_state["last_error"] = str(e)
+        logger.exception("Could not fetch Public Three Candle results: %s", e)
+        return []
+
+
+def build_three_candle_public_summary(limit: int | None = None) -> str:
+    records = _three_candle_public_fetch_results(limit)
+    title = "📊 ملخص Public Three Candle - كامل القناة" if limit is None else f"📊 ملخص Public Three Candle - آخر {int(limit)} نتيجة"
+    direct_win = sum(1 for r in records if r.get("result_type") == "direct_win")
+    mg_win = sum(1 for r in records if r.get("result_type") == "mg_win")
+    loss = sum(1 for r in records if r.get("result_type") == "loss")
+    draw = sum(1 for r in records if r.get("result_type") == "draw")
+    total = direct_win + mg_win + loss + draw
+    wins = direct_win + mg_win
+    win_rate = round((wins / total) * 100, 1) if total else 0.0
+    return (
+        f"{title}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"📌 النتائج المحسوبة: {total}\n"
+        f"Win✅ مباشر: {direct_win}\n"
+        f"Win✅. مضاعفة: {mg_win}\n"
+        f"Lose💔: {loss}\n"
+        f"🟰doji: {draw}\n"
+        f"📈 نسبة الربح: {win_rate}%"
+    )[:3900]
+
+
+def build_three_candle_public_status() -> str:
+    settings = _three_candle_public_get_settings()
+    channel_id = _three_candle_public_channel_id()
+    limit = int(settings.get("session_limit", 0) or 0)
+    sent = int(settings.get("session_sent", 0) or 0)
+    remaining = "مفتوح ♾" if limit <= 0 else max(0, limit - sent)
+    try:
+        stats = _three_candle_public_stats_ref().get() or {}
+        daily = _three_candle_public_daily_ref().get() or {}
+        if not isinstance(stats, dict): stats = {}
+        if not isinstance(daily, dict): daily = {}
+    except Exception:
+        stats, daily = {}, {}
+    pending = _three_candle_channel_state.get("pending_trade")
+    pending_public = bool(isinstance(pending, dict) and pending.get("public_three_candle_published"))
+    return (
+        "📋 حالة Public Three Candle\n"
+        "━━━━━━━━━━━━━━\n"
+        f"النشر: {'شغال ✅' if _three_candle_public_is_enabled() else 'متوقف ⛔'}\n"
+        f"القناة: {channel_id or 'غير مضبوطة'}\n"
+        f"حد جلسة النشر: {'مفتوح ♾' if limit <= 0 else limit}\n"
+        f"منشور بهذه الجلسة: {sent}\n"
+        f"المتبقي بهذه الجلسة: {remaining}\n"
+        f"منشور اليوم: {int(daily.get('signals', 0) or 0)}\n"
+        f"إجمالي الإشارات العامة: {int(stats.get('signals', 0) or 0)}\n"
+        f"إجمالي النتائج العامة: {int(stats.get('results', 0) or 0)}\n"
+        f"نتيجة Public قيد المتابعة: {'نعم' if pending_public else 'لا'}\n"
+        f"بداية الجلسة: {settings.get('session_started_at') or 'لا يوجد'}\n"
+        f"آخر نشر: {_three_candle_public_state.get('last_publish_at') or 'لا يوجد'}\n"
+        f"آخر نتيجة: {_three_candle_public_state.get('last_result_at') or 'لا يوجد'}\n"
+        f"آخر خطأ: {_three_candle_public_state.get('last_error') or 'لا يوجد'}"
+    )[:3900]
+
+
+def _three_candle_public_reset_results() -> tuple[bool, str]:
+    try:
+        _three_candle_public_base_ref().update({"results": None, "stats": None, "daily": None})
+        _three_candle_public_state.update({
+            "signals_sent": 0,
+            "results_sent": 0,
+            "last_publish_at": None,
+            "last_result_at": None,
+            "last_error": None,
+        })
+        return True, "✅ تم تصفير نتائج وإحصائيات Public Three Candle. إعدادات التشغيل والحد بقيت كما هي."
+    except Exception as e:
+        _three_candle_public_state["last_error"] = str(e)
+        logger.exception("Could not reset Public Three Candle results: %s", e)
+        return False, "❌ تعذر تصفير نتائج Public. راجع اللوج."
+
+
+async def _three_candle_public_publish_signal(context: ContextTypes.DEFAULT_TYPE, trade: dict) -> bool:
+    """Mirror a private 3-candle signal to the public channel only. Never send Copy Trading here."""
+    try:
+        if not _three_candle_public_is_enabled():
+            return False
+        channel_id = _three_candle_public_channel_id()
+        if not channel_id:
+            return False
+        settings = _three_candle_public_get_settings()
+        sent = await safe_send_message(context.bot, chat_id=channel_id, text=_three_candle_signal_message(trade))
+        if not sent:
+            _three_candle_public_state["last_error"] = "تعذر إرسال إشارة Public إلى Telegram"
+            return False
+        trade["public_three_candle_published"] = True
+        trade["public_session_started_at"] = settings.get("session_started_at")
+        _three_candle_channel_state["pending_trade"] = trade
+        updated = _three_candle_public_increment_signal()
+        _three_candle_public_state["signals_sent"] = int(_three_candle_public_state.get("signals_sent", 0) or 0) + 1
+        _three_candle_public_state["last_publish_at"] = now_iso()
+        # Nth signal is still fully tracked; only future public signals are stopped.
+        if int(updated.get("session_limit", 0) or 0) > 0 and int(updated.get("session_sent", 0) or 0) >= int(updated.get("session_limit", 0) or 0):
+            logger.info("Public Three Candle quota reached; auto-stopped after %s signals", updated.get("session_sent"))
+        return True
+    except Exception as e:
+        _three_candle_public_state["last_error"] = str(e)
+        logger.exception("Public Three Candle signal publish failed: %s", e)
+        return False
 
 
 def _three_candle_channel_id():
@@ -11991,8 +12312,8 @@ def _three_candle_pair_signal_block_remaining(pair: str) -> int:
 def _three_candle_note_published_pair(pair: str):
     """Block the just-used pair for the next N published three-candle signals.
 
-    Example with N=2: after EUR/CHF gets a signal, the next two published signals
-    must be on other pairs before EUR/CHF becomes eligible again.
+    v1.02 uses N=1: after EUR/CHF gets a signal, the very next published signal
+    must be on another pair. A second consecutive final loss escalates to cooldown.
     """
     try:
         pair = str(pair or "").strip()
@@ -12050,12 +12371,26 @@ def _three_candle_avg_body_score(parts_list: list[dict]) -> float:
 
 
 def _three_candle_register_final_result(pair: str, result: str):
+    """Register final pair quality and escalate repeat protection after losses.
+
+    v1.02 policy:
+    - Normal signal: the pair is only prevented from being the very next published signal.
+    - Second consecutive final loss: the normal one-signal block is removed and replaced by
+      the 30-minute cooldown. After the cooldown expires, the pair is immediately eligible
+      again without an extra signal-count block.
+    """
     try:
+        pair = str(pair or "").strip()
+        if not pair:
+            return
         streaks = _three_candle_channel_state.setdefault("pair_loss_streaks", {})
         cooldowns = _three_candle_channel_state.setdefault("pair_cooldowns", {})
+        blocks = _three_candle_channel_state.setdefault("pair_signal_blocks", {})
         if result == "loss":
             streaks[pair] = int(streaks.get(pair, 0) or 0) + 1
             if int(streaks[pair]) >= int(THREE_CANDLE_PAIR_LOSS_LIMIT):
+                # Escalation replaces the normal anti-repeat block; the two gates do not stack.
+                blocks.pop(pair, None)
                 cooldowns[pair] = time_module.time() + int(THREE_CANDLE_PAIR_COOLDOWN_SECONDS)
                 streaks[pair] = 0
         elif result in {"win", "draw"}:
@@ -12548,14 +12883,15 @@ def _three_candle_apply_smart_filter(candidate: dict) -> dict | None:
         if allowed_patterns and pattern not in allowed_patterns:
             reasons.append(f"pattern_blocked:{pattern}")
 
-        allowed_counts = list(THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS or [])
         momentum_count = int(candidate.get("momentum_count", 0) or 0)
         if pattern == "momentum_continuation":
             continuation_exact = int(THREE_CANDLE_CONTINUATION_EXACT_MOMENTUM or 0)
             if continuation_exact <= 0 or momentum_count != continuation_exact:
                 reasons.append(f"continuation_exact_blocked:{momentum_count}!= {continuation_exact}")
-        elif allowed_counts and momentum_count not in allowed_counts:
-            reasons.append(f"momentum_blocked:{momentum_count}")
+        elif pattern == "momentum_correction":
+            # v1.02: 4, 5, 6, 7... are all valid as long as the base strategy minimum is met.
+            if momentum_count < max(4, int(THREE_CANDLE_MOMENTUM_MIN)):
+                reasons.append(f"correction_momentum_too_short:{momentum_count}")
 
         pair_allowed, pair_reason = _three_candle_smart_pair_allowed(str(candidate.get("pair") or ""))
         candidate["smart_pair_reason"] = pair_reason
@@ -12615,12 +12951,14 @@ def build_three_candle_channel_status() -> str:
         f"حد الصفقات اليومي: {'مفتوح ♾' if limit <= 0 else limit}\n"
         f"منشور اليوم: {today_count}\n"
         f"النمط الحالي: مومنتم {THREE_CANDLE_MOMENTUM_MIN}+ شموع + تصحيح حتى {THREE_CANDLE_MAX_CORRECTION_CANDLES} شمعة\n"
-        f"منع تكرار الزوج: بعد كل صفقة يمنع {THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT} صفقتين منشورتين\n"
+        f"نافذة التقاط الإشارة: من {THREE_CANDLE_ALERT_REMAINING_SECONDS:g} إلى {THREE_CANDLE_MIN_REMAINING_SECONDS:g} ثانية قبل إغلاق الشمعة\n"
+        f"منع تكرار الزوج: لا يسمح لنفس الزوج بالصفقة المنشورة التالية مباشرة ({THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT} إشارة فاصلة)\n"
+        f"حماية الخسائر: بعد {THREE_CANDLE_PAIR_LOSS_LIMIT} خسارتين نهائيتين متتاليتين → Cooldown {int(THREE_CANDLE_PAIR_COOLDOWN_SECONDS/60)} دقيقة بدل منع التكرار العادي\n"
         f"ذاكرة الاستراتيجية: {'شغالة 🧠' if THREE_CANDLE_MEMORY_ENABLED else 'متوقفة'}\n"
         f"ذاكرة Firebase المضغوطة: {THREE_CANDLE_MEMORY_COMPACT_PATH} | آخر {THREE_CANDLE_MEMORY_QUERY_LIMIT} كحد أقصى\n"
         f"كاش الذاكرة: {THREE_CANDLE_SMART_MEMORY_CACHE_SECONDS} ثانية | كاش الإعدادات: {THREE_CANDLE_SETTINGS_CACHE_SECONDS} ثانية\n"
-        f"فلتر v0.66: {'شغال ✅' if THREE_CANDLE_SMART_FILTER_ENABLED else 'متوقف'} | pattern={','.join(THREE_CANDLE_SMART_ALLOWED_PATTERNS or ['الكل'])} | correction_momentum={','.join(map(str, THREE_CANDLE_SMART_ALLOWED_MOMENTUM_COUNTS or ['الكل']))} | continuation_exact={THREE_CANDLE_CONTINUATION_EXACT_MOMENTUM} | payout>={THREE_CANDLE_SMART_MIN_PAYOUT}\n"
-        f"فلتر الأزواج: {'ديناميكي ✅' if THREE_CANDLE_SMART_PAIR_FILTER_ENABLED else 'متوقف'} | عينة {THREE_CANDLE_SMART_PAIR_LOOKBACK} | لا يوجد حظر دائم\n"
+        f"فلتر Three Candle: {'شغال ✅' if THREE_CANDLE_SMART_FILTER_ENABLED else 'متوقف'} | patterns={','.join(THREE_CANDLE_SMART_ALLOWED_PATTERNS or ['الكل'])} | correction_momentum={max(4, THREE_CANDLE_MOMENTUM_MIN)}+ بدون حد أعلى | continuation_exact={THREE_CANDLE_CONTINUATION_EXACT_MOMENTUM} | payout>={THREE_CANDLE_SMART_MIN_PAYOUT}\n"
+        "فلتر الأزواج الديناميكي القديم: متوقف نهائياً ⛔\n"
         f"تجاهلات الفلتر بهذه الجلسة: {_three_candle_channel_state.get('smart_filter_skips', 0)} | آخر سبب: {_three_candle_channel_state.get('last_smart_skip') or 'لا يوجد'}\n"
         f"سجلات الذاكرة بهذه الجلسة: {_three_candle_channel_state.get('memory_records_written', 0)}\n"
         f"ترحيل الذاكرة القديمة: {_three_candle_channel_state.get('memory_legacy_migrated', 0)} سجل\n"
@@ -12878,6 +13216,19 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
             result_type = "draw"
         _three_candle_record_result(trade, result_type, result_text, candle=candle)
 
+        # v1.01: Public mirror gets a result only for signals that were actually published there.
+        # This runs even when Public was manually stopped or auto-stopped after reaching its quota.
+        if bool(trade.get("public_three_candle_published")):
+            public_channel_id = _three_candle_public_channel_id()
+            if public_channel_id:
+                public_result_sent = await safe_send_message(context.bot, chat_id=public_channel_id, text=result_text)
+                if public_result_sent:
+                    _three_candle_public_state["results_sent"] = int(_three_candle_public_state.get("results_sent", 0) or 0) + 1
+                    _three_candle_public_state["last_result_at"] = now_iso()
+                else:
+                    _three_candle_public_state["last_error"] = "تعذر إرسال نتيجة Public إلى Telegram"
+            _three_candle_public_record_result(trade, result_type, result_text)
+
         _three_candle_channel_state["pending_trade"] = None
         return False
     except Exception as e:
@@ -12923,6 +13274,8 @@ async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
             _three_candle_channel_state["signals_sent"] = int(_three_candle_channel_state.get("signals_sent", 0) or 0) + 1
             _three_candle_increment_today_signal_count()
             _three_candle_note_published_pair(str(trade.get("pair") or ""))
+            # Public channel is a Telegram-only mirror. No second Copy Trading command is generated.
+            await _three_candle_public_publish_signal(context, trade)
             await publish_copy_three_candle_signal(trade)
         else:
             _three_candle_channel_state["pending_trade"] = None
@@ -15314,6 +15667,9 @@ ADMIN_PENDING_STEPS = {
     "three_candle_waiting_daily_limit",
     "three_candle_waiting_summary_count",
     "three_candle_confirm_reset_memory",
+    "three_candle_public_waiting_limit",
+    "three_candle_public_waiting_summary_count",
+    "three_candle_public_confirm_reset_results",
 }
 
 
@@ -15329,6 +15685,8 @@ def admin_pending_keyboard(step: str):
     step = str(step or "")
     if step.startswith("copy_"):
         return copy_admin_keyboard
+    if step.startswith("three_candle_public_"):
+        return three_candle_public_admin_keyboard
     if step.startswith("three_candle_"):
         return three_candle_admin_keyboard
     if step.startswith("otc_edge_"):
@@ -18113,7 +18471,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # ===== Common buttons =====
     if text == "🔙 رجوع":
-        if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message", "otc_list_waiting_text", "otc_pair_diagnostics_waiting", "otc_candle_diagnostics_waiting", "otc_edge_waiting_pair", "otc_edge_watch_waiting_pair", "three_candle_waiting_daily_limit", "three_candle_waiting_summary_count", "trading_room_waiting_balance"}:
+        if is_admin(user.id) and step in {"otc_stats_waiting_count", "admin_broadcast_waiting_message", "otc_list_waiting_text", "otc_pair_diagnostics_waiting", "otc_candle_diagnostics_waiting", "otc_edge_waiting_pair", "otc_edge_watch_waiting_pair", "three_candle_waiting_daily_limit", "three_candle_waiting_summary_count", "three_candle_public_waiting_limit", "three_candle_public_waiting_summary_count", "trading_room_waiting_balance"}:
             context.user_data["step"] = None
             await update.message.reply_text("تم الرجوع.", reply_markup=admin_main_keyboard)
             return
@@ -18839,6 +19197,96 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 build_otc_edge_single_pair_message(text),
                 reply_markup=admin_otc_edge_keyboard
             )
+            return
+
+
+        if text == "🌐 Public Three Candle":
+            reset_signal_state(context)
+            await update.message.reply_text(
+                "🌐 Public Three Candle - القناة المجانية المحدودة\n"
+                "تنشر نسخة من إشارات قناة 3 شموع الخاصة فقط، بدون أي أمر Copy إضافي.\n"
+                "حدد عدد الصفقات ثم شغّل جلسة النشر:",
+                reply_markup=three_candle_public_admin_keyboard
+            )
+            return
+
+        if text == "🟢 تشغيل Public":
+            ok, msg = _three_candle_public_set_enabled(True)
+            await update.message.reply_text(msg, reply_markup=three_candle_public_admin_keyboard)
+            return
+
+        if text == "🔴 إيقاف Public":
+            ok, msg = _three_candle_public_set_enabled(False)
+            await update.message.reply_text(msg, reply_markup=three_candle_public_admin_keyboard)
+            return
+
+        if text == "🎯 عدد صفقات النشر":
+            context.user_data["step"] = "three_candle_public_waiting_limit"
+            await update.message.reply_text(
+                "🎯 أرسل عدد الصفقات التي تريد نشرها في جلسة Public القادمة/الحالية.\n"
+                "مثال: 5\n\nبعد نشر العدد المحدد يتوقف Public تلقائياً.\nأرسل 0 للنشر المفتوح.",
+                reply_markup=three_candle_public_admin_keyboard
+            )
+            return
+
+        if step == "three_candle_public_waiting_limit":
+            context.user_data["step"] = None
+            value = safe_int(text, -1)
+            if value < 0:
+                await update.message.reply_text("❌ أرسل رقم صحيح، مثال: 5 أو 0 للنشر المفتوح.", reply_markup=three_candle_public_admin_keyboard)
+                return
+            ok, msg = _three_candle_public_set_session_limit(value)
+            await update.message.reply_text(msg, reply_markup=three_candle_public_admin_keyboard)
+            return
+
+        if text == "♾ Public مفتوح":
+            ok, msg = _three_candle_public_set_session_limit(0)
+            await update.message.reply_text(msg, reply_markup=three_candle_public_admin_keyboard)
+            return
+
+        if text == "📊 ملخص Public":
+            context.user_data["step"] = "three_candle_public_waiting_summary_count"
+            await update.message.reply_text(
+                "📊 أرسل عدد النتائج التي تريد تلخيصها، مثال: 20\n"
+                "أو أرسل: الكل\nلعرض ملخص كل صفقات القناة العامة منذ آخر تصفير.",
+                reply_markup=three_candle_public_admin_keyboard
+            )
+            return
+
+        if step == "three_candle_public_waiting_summary_count":
+            context.user_data["step"] = None
+            raw = str(text or "").strip().lower()
+            if raw in {"الكل", "كل", "all", "0"}:
+                await update.message.reply_text(build_three_candle_public_summary(None), reply_markup=three_candle_public_admin_keyboard)
+                return
+            count = safe_int(raw, -1)
+            if count <= 0:
+                await update.message.reply_text("❌ أرسل رقم صحيح أو كلمة: الكل", reply_markup=three_candle_public_admin_keyboard)
+                return
+            await update.message.reply_text(build_three_candle_public_summary(count), reply_markup=three_candle_public_admin_keyboard)
+            return
+
+        if text == "📋 حالة Public":
+            await update.message.reply_text(build_three_candle_public_status(), reply_markup=three_candle_public_admin_keyboard)
+            return
+
+        if text == "🧹 تصفير نتائج Public":
+            context.user_data["step"] = "three_candle_public_confirm_reset_results"
+            await update.message.reply_text(
+                "⚠️ سيتم حذف نتائج وإحصائيات Public Three Candle فقط.\n"
+                "لن تتأثر ذاكرة قناة 3 شموع الخاصة ولا Copy Trading.\n\n"
+                "اضغط ✅ نعم، تأكيد للمتابعة أو ❌ إلغاء.",
+                reply_markup=admin_confirm_keyboard
+            )
+            return
+
+        if step == "three_candle_public_confirm_reset_results":
+            context.user_data["step"] = None
+            if is_admin_confirm_text(text):
+                ok, msg = _three_candle_public_reset_results()
+                await update.message.reply_text(msg, reply_markup=three_candle_public_admin_keyboard)
+            else:
+                await update.message.reply_text("تم إلغاء تصفير نتائج Public.", reply_markup=three_candle_public_admin_keyboard)
             return
 
 
@@ -19941,7 +20389,7 @@ def create_embedded_copy_api():
         allow_origin_regex=COPY_ALLOWED_ORIGIN_REGEX,
         allow_credentials=True,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "Authorization", "X-TTCopy-Secret"],
+        allow_headers=["Content-Type", "X-TTCopy-Secret"],
     )
 
 
@@ -19979,79 +20427,6 @@ def create_embedded_copy_api():
             "telegram_user_id": normalize_copy_telegram_user_id((record or {}).get("telegram_user_id") or telegram_user_id),
             "copy_settings": copy_public_settings_payload(),
         }
-
-    def _copy_mobile_session(authorization: str | None):
-        """Validate a mobile session without exposing the server secret to the app."""
-        raw = str(authorization or "").strip()
-        session_token = raw[7:].strip() if raw.lower().startswith("bearer ") else ""
-        ok, reason, session = _copy_session_token_verify(session_token)
-        if not ok or not isinstance(session, dict):
-            raise HTTPException(status_code=401, detail=reason)
-        return session
-
-    @copy_api.post("/api/mobile/session")
-    async def copy_mobile_session(request: Request):
-        """Bind an approved mobile device and return a short-lived app session."""
-        body = await request.json()
-        token = normalize_copy_license_token(body.get("token"))
-        device_id = str(body.get("device_id") or "unknown")[:120]
-        telegram_user_id = normalize_copy_telegram_user_id(body.get("telegram_user_id"))
-        ok, reason, record = copy_validate_license_for_device(
-            token,
-            device_id,
-            telegram_user_id=telegram_user_id,
-            touch=True,
-            allow_admin_rebind=True,
-        )
-        if not ok:
-            raise HTTPException(status_code=401, detail=reason)
-        session_token = _copy_session_token_issue(token, device_id, telegram_user_id, "mobile")
-        return {
-            "ok": True,
-            "session_token": session_token,
-            "expires_in_seconds": max(60, int(COPY_SESSION_TOKEN_TTL_SECONDS)),
-            "account": {
-                "plan": (record or {}).get("plan"),
-                "expires_at": (record or {}).get("expires_at"),
-                "telegram_user_id": normalize_copy_telegram_user_id((record or {}).get("telegram_user_id") or telegram_user_id),
-                "role": "admin" if str((record or {}).get("role") or "").lower() == "admin" else "member",
-            },
-        }
-
-    @copy_api.get("/api/mobile/signals/recent")
-    async def copy_mobile_recent_signals(authorization: str | None = Header(default=None)):
-        """Return only broadcast signals and signals intended for this licensed user."""
-        session = _copy_mobile_session(authorization)
-        owner_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
-        rows = []
-        for signal in reversed(_copy_signal_history[-50:]):
-            target_id = normalize_copy_telegram_user_id((signal or {}).get("target_user_id"))
-            if target_id and target_id != owner_id:
-                continue
-            rows.append(dict(signal or {}))
-            if len(rows) >= 20:
-                break
-        return {"ok": True, "signals": rows}
-
-    @copy_api.post("/api/mobile/signals/request")
-    async def copy_mobile_signal_request(request: Request, authorization: str | None = Header(default=None)):
-        """Run the existing analysis engine for the signed-in mobile user.
-
-        This endpoint returns an analysis only. It never submits or automates a trade.
-        """
-        _copy_mobile_session(authorization)
-        body = await request.json()
-        market = str(body.get("market") or "GLOBAL").upper().strip()
-        if market == "OTC":
-            result = await asyncio.to_thread(analyze_best_live_otc_now, "ar")
-        elif market == "GLOBAL":
-            pair = str(body.get("pair") or "EUR/USD").upper().strip()
-            if pair not in REAL_PAIRS:
-                raise HTTPException(status_code=400, detail="unsupported market pair")
-            result = await asyncio.to_thread(analyze_real_market_best, pair)
-        else:
-            raise HTTPException(status_code=400, detail="unsupported market")
-        return {"ok": bool((result or {}).get("ok")), "market": market, "signal": result or {}}
 
     @copy_api.get("/api/admin/status")
     async def copy_admin_status(x_ttcopy_secret: str | None = Header(default=None)):
