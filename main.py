@@ -1019,8 +1019,8 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
-# v1.02 tunes Three Candle timing/filters and unifies pair repeat protection; extension protocol remains v0.99.
-COPY_SERVER_VERSION = "1.02.0"
+# v1.03 gives Three Candle its own live Quotex instruments/list universe; extension protocol remains v0.99.
+COPY_SERVER_VERSION = "1.03.0"
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.99").strip() or "v0.99"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
@@ -11763,6 +11763,7 @@ THREE_CANDLE_SETTINGS_CACHE_SECONDS = int(os.getenv("THREE_CANDLE_SETTINGS_CACHE
 # v0.65: Add exact 5-candle momentum continuation to the balanced filter.
 # v0.66: Optimize Firebase memory/download usage without changing the trading strategy.
 # Correction setups remain as v0.63; continuation without correction is allowed only when momentum_count == 5.
+# v1.03: Three Candle universe comes directly from Quotex instruments/list; manual OTC allowlist is not used here.
 THREE_CANDLE_SMART_FILTER_ENABLED = os.getenv("THREE_CANDLE_SMART_FILTER_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 THREE_CANDLE_SMART_MIN_PAYOUT = int(os.getenv("THREE_CANDLE_SMART_MIN_PAYOUT", "85"))
 # Empty means allow all. Default test: correction setups only.
@@ -11803,6 +11804,14 @@ _three_candle_channel_state = {
     "settings_cache_at": 0.0,
     "memory_migration_checked": False,
     "memory_legacy_migrated": 0,
+    # v1.03: live Quotex universe diagnostics for Three Candle only.
+    "universe_instruments_seen": 0,
+    "universe_otc_seen": 0,
+    "universe_currency_otc": 0,
+    "universe_payout_eligible": 0,
+    "universe_candles_ready": 0,
+    "universe_min_payout": 0,
+    "universe_last_update_at": None,
 }
 
 
@@ -12937,12 +12946,134 @@ def build_three_candle_channel_summary(limit: int | None = None) -> str:
     )[:3900]
 
 
+
+def _three_candle_normalize_live_currency_pair(name: str, symbol: str | None = None) -> str | None:
+    """v1.03: normalize a live Quotex instrument only when the platform name is a fiat/fiat pair.
+
+    This intentionally does NOT use OTC_CURRENCIES_ALLOWED_PAIRS. The platform's
+    instruments/list is the source of truth for Three Candle. We trust the visible
+    platform pair name for orientation because some Quotex internal symbols are reversed
+    (for example a displayed USD/BRL pair may use an internal BRLUSD_otc symbol).
+    """
+    try:
+        raw = str(name or "").strip().upper()
+        match = re.search(r"\b([A-Z]{3})\s*/\s*([A-Z]{3})\b", raw)
+        if not match:
+            return None
+        base, quote = match.group(1), match.group(2)
+        if base not in FIAT_CURRENCY_CODES or quote not in FIAT_CURRENCY_CODES:
+            return None
+        if base == quote:
+            return None
+        return f"{base}/{quote} (OTC)"
+    except Exception as e:
+        logger.debug("Three Candle live pair normalization failed for %r/%r: %s", name, symbol, e)
+        return None
+
+
+def get_three_candle_pair_map() -> dict:
+    """v1.03: build Three Candle universe directly from Quotex instruments/list.
+
+    Rules:
+    - only currently listed OTC instruments;
+    - only fiat/fiat currency pairs inferred from Quotex's own display name;
+    - payout must satisfy the effective Three Candle minimum (85% by default);
+    - no legacy/manual allowlist and no OTC_LIVE_MAX_DYNAMIC_PAIRS cap;
+    - every eligible symbol is followed dynamically so ticks/candles can accumulate.
+
+    Other bot sections keep using get_otc_analysis_pair_map() unchanged.
+    """
+    live_map = {}
+    try:
+        if "quotex_otc_feed" not in globals():
+            return live_map
+
+        with quotex_otc_feed.lock:
+            instruments = dict(quotex_otc_feed.instruments or {})
+
+        min_payout = max(int(THREE_CANDLE_MIN_PAYOUT), int(THREE_CANDLE_SMART_MIN_PAYOUT))
+        total_otc = 0
+        currency_otc = 0
+        eligible = 0
+        best_payout_by_pair = {}
+        symbols_to_follow = []
+
+        for symbol, info in instruments.items():
+            if not isinstance(info, dict):
+                continue
+
+            symbol = str(symbol or "").strip()
+            if not symbol or not symbol.lower().endswith("_otc"):
+                continue
+
+            is_otc = bool(info.get("is_otc", False))
+            if not is_otc:
+                continue
+            total_otc += 1
+
+            pair = _three_candle_normalize_live_currency_pair(info.get("name"), symbol)
+            if not pair:
+                continue
+            currency_otc += 1
+
+            try:
+                payout = int(float(info.get("payout", 0) or 0))
+            except Exception:
+                payout = 0
+            if payout < min_payout:
+                continue
+
+            eligible += 1
+            # Defensive duplicate handling: if Quotex exposes two internal symbols for the
+            # same visible pair, keep the one with the higher current payout.
+            previous_payout = int(best_payout_by_pair.get(pair, -1) or -1)
+            if pair in live_map and payout <= previous_payout:
+                continue
+
+            live_map[pair] = symbol
+            best_payout_by_pair[pair] = payout
+
+        symbols_to_follow = list(dict.fromkeys(live_map.values()))
+        for symbol in symbols_to_follow:
+            quotex_otc_feed.add_symbol(symbol)
+
+        min_candles = max(1, int(THREE_CANDLE_MOMENTUM_MIN) + 1)
+        candles_ready = 0
+        with quotex_otc_feed.lock:
+            for symbol in symbols_to_follow:
+                candles = quotex_otc_feed.candles.get(symbol) or {}
+                last_tick = quotex_otc_feed.last_tick.get(symbol)
+                if len(candles) >= min_candles and last_tick:
+                    candles_ready += 1
+
+        _three_candle_channel_state.update({
+            "universe_instruments_seen": len(instruments),
+            "universe_otc_seen": int(total_otc),
+            "universe_currency_otc": int(currency_otc),
+            "universe_payout_eligible": int(len(live_map)),
+            "universe_candles_ready": int(candles_ready),
+            "universe_min_payout": int(min_payout),
+            "universe_last_update_at": now_iso(),
+        })
+
+        return live_map
+    except Exception as e:
+        _three_candle_channel_state["last_error"] = f"Three Candle universe: {e}"
+        logger.exception("Could not build Three Candle live Quotex universe: %s", e)
+        return live_map
+
+
 def build_three_candle_channel_status() -> str:
     settings = _three_candle_get_settings()
     channel_id = _three_candle_channel_id()
     limit = int(settings.get("daily_limit", 0) or 0)
     today_count = _three_candle_today_signal_count()
     pending = _three_candle_channel_state.get("pending_trade")
+    # v1.03: refresh the live Three Candle universe when admin asks for channel status.
+    try:
+        get_three_candle_pair_map()
+    except Exception:
+        logger.debug("Could not refresh Three Candle universe for status", exc_info=True)
     return (
         "📋 حالة قناة 3 شموع\n"
         "━━━━━━━━━━━━━━\n"
@@ -12950,6 +13081,11 @@ def build_three_candle_channel_status() -> str:
         f"القناة: {channel_id or 'غير مضبوطة'}\n"
         f"حد الصفقات اليومي: {'مفتوح ♾' if limit <= 0 else limit}\n"
         f"منشور اليوم: {today_count}\n"
+        f"🌐 Instruments وصلت من Quotex: {int(_three_candle_channel_state.get('universe_instruments_seen', 0) or 0)}\n"
+        f"💱 أزواج عملات OTC موجودة فعلياً: {int(_three_candle_channel_state.get('universe_currency_otc', 0) or 0)}\n"
+        f"✅ مؤهلة payout ≥{int(_three_candle_channel_state.get('universe_min_payout', max(THREE_CANDLE_MIN_PAYOUT, THREE_CANDLE_SMART_MIN_PAYOUT)) or max(THREE_CANDLE_MIN_PAYOUT, THREE_CANDLE_SMART_MIN_PAYOUT))}%: {int(_three_candle_channel_state.get('universe_payout_eligible', 0) or 0)}\n"
+        f"📡 شموع جاهزة للتحليل: {int(_three_candle_channel_state.get('universe_candles_ready', 0) or 0)}\n"
+        "مصدر أزواج Three Candle: Quotex instruments/list مباشر ✅ (بدون قائمة يدوية)\n"
         f"النمط الحالي: مومنتم {THREE_CANDLE_MOMENTUM_MIN}+ شموع + تصحيح حتى {THREE_CANDLE_MAX_CORRECTION_CANDLES} شمعة\n"
         f"نافذة التقاط الإشارة: من {THREE_CANDLE_ALERT_REMAINING_SECONDS:g} إلى {THREE_CANDLE_MIN_REMAINING_SECONDS:g} ثانية قبل إغلاق الشمعة\n"
         f"منع تكرار الزوج: لا يسمح لنفس الزوج بالصفقة المنشورة التالية مباشرة ({THREE_CANDLE_PAIR_SIGNAL_BLOCK_COUNT} إشارة فاصلة)\n"
@@ -13097,7 +13233,8 @@ def _three_candle_candidate_for_pair(pair: str, symbol: str) -> dict | None:
 def _three_candle_collect_candidates() -> list[dict]:
     results = []
     try:
-        pair_map = get_otc_analysis_pair_map()
+        # v1.03: Three Candle scans every live fiat OTC pair from Quotex, not the legacy allowlist.
+        pair_map = get_three_candle_pair_map()
         for pair, symbol in pair_map.items():
             candidate = _three_candle_candidate_for_pair(pair, symbol)
             if candidate:
