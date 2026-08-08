@@ -1020,7 +1020,7 @@ COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
 # v1.03 gives Three Candle its own live Quotex instruments/list universe; extension protocol remains v0.99.
-COPY_SERVER_VERSION = "1.03.0"
+COPY_SERVER_VERSION = "1.04.0"
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.99").strip() or "v0.99"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
@@ -20564,6 +20564,119 @@ def create_embedded_copy_api():
             "telegram_user_id": normalize_copy_telegram_user_id((record or {}).get("telegram_user_id") or telegram_user_id),
             "copy_settings": copy_public_settings_payload(),
         }
+
+
+    # ===== v1.04: Mobile app API =====
+    # The Flutter mobile client uses the same Copy license/device binding as the
+    # desktop extension, but authenticates over HTTPS and receives a short-lived
+    # bearer session.  This keeps the license token out of subsequent polling
+    # requests and re-validates the bound device on each mobile API call.
+
+    def _mobile_bearer_session(authorization: str | None) -> dict:
+        raw = str(authorization or "").strip()
+        if not raw.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail="missing mobile session")
+        session_token = raw[7:].strip()
+        ok, reason, payload = _copy_session_token_verify(session_token)
+        if not ok or not isinstance(payload, dict):
+            raise HTTPException(status_code=401, detail=reason or "invalid mobile session")
+
+        token = normalize_copy_license_token(payload.get("token"))
+        device_id = str(payload.get("device_id") or "unknown").strip()[:120] or "unknown"
+        telegram_user_id = normalize_copy_telegram_user_id(payload.get("telegram_user_id"))
+        license_ok, license_reason, record = copy_validate_license_for_device(
+            token,
+            device_id,
+            telegram_user_id=telegram_user_id,
+            touch=True,
+            allow_admin_rebind=False,
+        )
+        if not license_ok:
+            raise HTTPException(status_code=401, detail=license_reason)
+        return {
+            "session_token": session_token,
+            "token": token,
+            "device_id": device_id,
+            "telegram_user_id": telegram_user_id,
+            "license_record": record or {},
+        }
+
+    @copy_api.post("/api/mobile/session")
+    async def mobile_create_session(request: Request):
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid request body")
+
+        token = normalize_copy_license_token(body.get("token"))
+        device_id = str(body.get("device_id") or "unknown").strip()[:120] or "unknown"
+        telegram_user_id = normalize_copy_telegram_user_id(body.get("telegram_user_id"))
+        if not token:
+            raise HTTPException(status_code=400, detail="license token is required")
+        if not telegram_user_id:
+            raise HTTPException(status_code=400, detail="Telegram ID is required")
+
+        ok, reason, record = copy_validate_license_for_device(
+            token,
+            device_id,
+            telegram_user_id=telegram_user_id,
+            touch=True,
+            allow_admin_rebind=True,
+        )
+        if not ok:
+            raise HTTPException(status_code=401, detail=reason)
+
+        # A successful HTTPS login is a completed authenticated client binding.
+        # Mark the device as confirmed so normal max-device / lifecycle rules apply.
+        try:
+            copy_mark_device_auth_confirmed(token, device_id)
+        except Exception:
+            logger.debug("Mobile device confirmation failed", exc_info=True)
+
+        session_token = _copy_session_token_issue(token, device_id, telegram_user_id, "")
+        return {
+            "ok": True,
+            "session_token": session_token,
+            "session_expires_in": int(COPY_SESSION_TOKEN_TTL_SECONDS),
+            "account": {
+                "telegram_user_id": normalize_copy_telegram_user_id((record or {}).get("telegram_user_id") or telegram_user_id),
+                "plan": (record or {}).get("plan") or "-",
+                "expires_at": (record or {}).get("expires_at") or "-",
+                "max_devices": (record or {}).get("max_devices"),
+                "is_admin_license": bool((record or {}).get("is_admin_license")),
+                "role": (record or {}).get("role") or ("admin" if token == COPY_ADMIN_LICENSE_TOKEN else "user"),
+            },
+        }
+
+    @copy_api.get("/api/mobile/signals/recent")
+    async def mobile_recent_signals(authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        telegram_user_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
+
+        visible = []
+        for signal in list(_copy_signal_history)[-int(COPY_SIGNAL_HISTORY_LIMIT):]:
+            if not isinstance(signal, dict):
+                continue
+            target_user_id = normalize_copy_telegram_user_id(signal.get("target_user_id"))
+            # Same routing semantics as the extension: targeted signals only go to
+            # their owner; broadcast signals remain visible to every authenticated client.
+            if target_user_id and target_user_id != telegram_user_id:
+                continue
+            visible.append(dict(signal))
+
+        return {
+            "ok": True,
+            "server_time": now_iso(),
+            "telegram_user_id": telegram_user_id,
+            "signals": visible[-100:],
+        }
+
+    @copy_api.post("/api/mobile/signals/request")
+    async def mobile_request_signal(request: Request, authorization: str | None = Header(default=None)):
+        # Authentication is intentionally checked even though on-demand analysis
+        # is not part of the v0.5 execution-link milestone yet.
+        _mobile_bearer_session(authorization)
+        raise HTTPException(status_code=501, detail="طلب تحليل يدوي من الموبايل غير مفعّل بعد")
 
     @copy_api.get("/api/admin/status")
     async def copy_admin_status(x_ttcopy_secret: str | None = Header(default=None)):
