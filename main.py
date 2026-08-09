@@ -1020,7 +1020,7 @@ COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
 # v1.03 gives Three Candle its own live Quotex instruments/list universe; extension protocol remains v0.99.
-COPY_SERVER_VERSION = "1.04.0"
+COPY_SERVER_VERSION = "1.05.0"
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.99").strip() or "v0.99"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
@@ -20584,15 +20584,39 @@ def create_embedded_copy_api():
         token = normalize_copy_license_token(payload.get("token"))
         device_id = str(payload.get("device_id") or "unknown").strip()[:120] or "unknown"
         telegram_user_id = normalize_copy_telegram_user_id(payload.get("telegram_user_id"))
-        license_ok, license_reason, record = copy_validate_license_for_device(
-            token,
-            device_id,
-            telegram_user_id=telegram_user_id,
-            touch=True,
-            allow_admin_rebind=False,
-        )
-        if not license_ok:
-            raise HTTPException(status_code=401, detail=license_reason)
+        # v1.05: the owner mobile session must be able to coexist with the
+        # desktop extension. DEMO-111 is intentionally restricted to the exact
+        # owner Telegram ID, while the desktop admin license still keeps its
+        # single active extension-device slot. A mobile bearer session was
+        # already issued only after a successful owner login, so re-checking
+        # active_device_id on every poll would make the phone and extension
+        # continuously replace each other. Keep the short-lived server-side
+        # bearer session independent from the desktop active-device pointer.
+        if token == COPY_ADMIN_LICENSE_TOKEN:
+            admin_tid = str(int(ADMIN_TELEGRAM_ID))
+            if telegram_user_id != admin_tid:
+                raise HTTPException(status_code=401, detail="admin license restricted to owner Telegram ID")
+            record = {
+                "token": COPY_ADMIN_LICENSE_TOKEN,
+                "status": "active",
+                "plan": "admin",
+                "expires_at": "forever",
+                "telegram_user_id": admin_tid,
+                "owner_telegram_id": admin_tid,
+                "is_admin_license": True,
+                "role": "admin",
+                "mobile_session": True,
+            }
+        else:
+            license_ok, license_reason, record = copy_validate_license_for_device(
+                token,
+                device_id,
+                telegram_user_id=telegram_user_id,
+                touch=True,
+                allow_admin_rebind=False,
+            )
+            if not license_ok:
+                raise HTTPException(status_code=401, detail=license_reason)
         return {
             "session_token": session_token,
             "token": token,
@@ -20616,22 +20640,44 @@ def create_embedded_copy_api():
         if not telegram_user_id:
             raise HTTPException(status_code=400, detail="Telegram ID is required")
 
-        ok, reason, record = copy_validate_license_for_device(
-            token,
-            device_id,
-            telegram_user_id=telegram_user_id,
-            touch=True,
-            allow_admin_rebind=True,
-        )
-        if not ok:
-            raise HTTPException(status_code=401, detail=reason)
+        # v1.05 owner-mobile coexistence: DEMO-111 is authenticated by the
+        # owner-only token + exact owner Telegram ID, but it does not take over
+        # the desktop extension's single active admin-device slot. This avoids
+        # a phone/Chrome rebind loop during mobile development. Regular licenses
+        # keep the normal device-binding rules unchanged.
+        if token == COPY_ADMIN_LICENSE_TOKEN:
+            admin_tid = str(int(ADMIN_TELEGRAM_ID))
+            if telegram_user_id != admin_tid:
+                raise HTTPException(status_code=401, detail="admin license restricted to owner Telegram ID")
+            record = {
+                "token": COPY_ADMIN_LICENSE_TOKEN,
+                "status": "active",
+                "plan": "admin",
+                "expires_at": "forever",
+                "max_devices": COPY_ADMIN_LICENSE_MAX_DEVICES,
+                "telegram_user_id": admin_tid,
+                "owner_telegram_id": admin_tid,
+                "is_admin_license": True,
+                "role": "admin",
+                "mobile_session": True,
+            }
+        else:
+            ok, reason, record = copy_validate_license_for_device(
+                token,
+                device_id,
+                telegram_user_id=telegram_user_id,
+                touch=True,
+                allow_admin_rebind=False,
+            )
+            if not ok:
+                raise HTTPException(status_code=401, detail=reason)
 
-        # A successful HTTPS login is a completed authenticated client binding.
-        # Mark the device as confirmed so normal max-device / lifecycle rules apply.
-        try:
-            copy_mark_device_auth_confirmed(token, device_id)
-        except Exception:
-            logger.debug("Mobile device confirmation failed", exc_info=True)
+            # A successful HTTPS login is a completed authenticated client binding.
+            # Mark the device as confirmed so normal max-device / lifecycle rules apply.
+            try:
+                copy_mark_device_auth_confirmed(token, device_id)
+            except Exception:
+                logger.debug("Mobile device confirmation failed", exc_info=True)
 
         session_token = _copy_session_token_issue(token, device_id, telegram_user_id, "")
         return {
