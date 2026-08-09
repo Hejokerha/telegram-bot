@@ -1020,7 +1020,7 @@ COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
 # v1.03 gives Three Candle its own live Quotex instruments/list universe; extension protocol remains v0.99.
-COPY_SERVER_VERSION = "1.05.0"
+COPY_SERVER_VERSION = "1.06.0"
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.99").strip() or "v0.99"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
@@ -1149,7 +1149,7 @@ COPY_SIGNAL_HISTORY_LIMIT = int(os.getenv("COPY_SIGNAL_HISTORY_LIMIT", "200"))
 COPY_UVICORN_LOG_LEVEL = os.getenv("COPY_UVICORN_LOG_LEVEL", "info")
 
 COPY_WS_AUTH_TIMEOUT_SECONDS = int(os.getenv("COPY_WS_AUTH_TIMEOUT_SECONDS", "12"))
-COPY_SESSION_TOKEN_TTL_SECONDS = int(os.getenv("COPY_SESSION_TOKEN_TTL_SECONDS", "1800"))
+COPY_SESSION_TOKEN_TTL_SECONDS = int(os.getenv("COPY_SESSION_TOKEN_TTL_SECONDS", "43200"))
 COPY_DEVICE_PROOF_REQUIRED = os.getenv("COPY_DEVICE_PROOF_REQUIRED", "true").lower() in {"1", "true", "yes", "on"}
 COPY_ALLOW_LEGACY_WS_AUTH = os.getenv("COPY_ALLOW_LEGACY_WS_AUTH", "true").lower() in {"1", "true", "yes", "on"}
 
@@ -20581,6 +20581,18 @@ def create_embedded_copy_api():
         if not ok or not isinstance(payload, dict):
             raise HTTPException(status_code=401, detail=reason or "invalid mobile session")
 
+        # v1.06 mobile sliding session: every authenticated mobile API request
+        # extends the server-side bearer lifetime. Active phones no longer fall
+        # out after 30 minutes while polling signals. The session is still
+        # bounded, device-bound, and re-validates the license below.
+        try:
+            session_row = _copy_ws_sessions.get(session_token)
+            if isinstance(session_row, dict):
+                session_row["expires_at"] = int(time_module.time()) + max(300, int(COPY_SESSION_TOKEN_TTL_SECONDS))
+                session_row["last_seen_at"] = int(time_module.time())
+        except Exception:
+            logger.debug("Mobile sliding session touch failed", exc_info=True)
+
         token = normalize_copy_license_token(payload.get("token"))
         device_id = str(payload.get("device_id") or "unknown").strip()[:120] or "unknown"
         telegram_user_id = normalize_copy_telegram_user_id(payload.get("telegram_user_id"))
@@ -20714,6 +20726,7 @@ def create_embedded_copy_api():
             "ok": True,
             "server_time": now_iso(),
             "telegram_user_id": telegram_user_id,
+            "session_expires_in": int(COPY_SESSION_TOKEN_TTL_SECONDS),
             "signals": visible[-100:],
         }
 
