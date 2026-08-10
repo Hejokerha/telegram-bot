@@ -4144,9 +4144,10 @@ def is_approved(user_id: int) -> bool:
 
 
 
-# ===== v1.07: Telegram-ID subscription identity for Copy clients =====
+# ===== v1.08: Unified Telegram-ID subscription identity for Copy + Mobile clients =====
 # The Telegram bot subscription (approved_users/{telegram_id}) is the single
-# source of truth. Copy clients no longer need a separate activation code.
+# source of truth. Chrome extension and Android mobile clients no longer need a separate activation code.
+# Client-scoped device bindings keep the extension and phone authorized at the same time.
 _copy_telegram_device_touch_cache: dict[str, float] = {}
 
 def copy_telegram_devices_ref():
@@ -4198,17 +4199,32 @@ def copy_bot_subscription_record(telegram_user_id) -> tuple[bool, str, dict]:
     })
     return True, "ok", record
 
-def copy_validate_telegram_subscription_device(telegram_user_id, device_id: str, device_proof_key: str, *, touch: bool = True) -> tuple[bool, str, dict]:
+def _copy_telegram_client_kind(value) -> str:
+    kind = str(value or "extension").strip().lower()
+    return "mobile" if kind in {"mobile", "android", "app"} else "extension"
+
+def _copy_telegram_client_binding_ref(telegram_user_id, client_kind: str = "extension"):
+    tid = normalize_copy_telegram_user_id(telegram_user_id)
+    root = copy_telegram_devices_ref().child(tid)
+    # Keep the extension on the legacy/root path so deployed v1.00 clients remain
+    # fully compatible. Mobile gets its own slot and can coexist with Chrome.
+    if _copy_telegram_client_kind(client_kind) == "mobile":
+        return root.child("clients").child("mobile")
+    return root
+
+def copy_validate_telegram_subscription_device(telegram_user_id, device_id: str, device_proof_key: str, *, touch: bool = True, client_kind: str = "extension") -> tuple[bool, str, dict]:
     ok, reason, subscription = copy_bot_subscription_record(telegram_user_id)
     if not ok:
         return False, reason, subscription
     tid = normalize_copy_telegram_user_id(telegram_user_id)
+    client_kind = _copy_telegram_client_kind(client_kind)
     device_id = str(device_id or "").strip()[:120]
     proof_key = str(device_proof_key or "").strip()[:128]
     if not device_id or not proof_key:
         return False, "device proof failed", subscription
+    binding_ref = _copy_telegram_client_binding_ref(tid, client_kind)
     try:
-        binding = copy_telegram_devices_ref().child(tid).get() or {}
+        binding = binding_ref.get() or {}
     except Exception:
         return False, "subscription service unavailable", subscription
     active_device = str((binding or {}).get("active_device_id") or "")
@@ -4216,22 +4232,23 @@ def copy_validate_telegram_subscription_device(telegram_user_id, device_id: str,
     if not active_device or active_device != device_id or not active_proof or not hmac.compare_digest(active_proof, proof_key):
         return False, "telegram device confirmation required", subscription
     if touch:
-        cache_key = f"{tid}:{device_id}"
+        cache_key = f"{client_kind}:{tid}:{device_id}"
         now_ts = time_module.time()
         last = float(_copy_telegram_device_touch_cache.get(cache_key, 0) or 0)
         if now_ts - last >= COPY_TELEGRAM_DEVICE_TOUCH_SECONDS:
             _copy_telegram_device_touch_cache[cache_key] = now_ts
             try:
                 device_key = _copy_telegram_device_key(device_id)
-                copy_telegram_devices_ref().child(tid).update({"last_seen_at": now_iso()})
-                copy_telegram_devices_ref().child(tid).child("devices").child(device_key).update({"last_seen_at": now_iso()})
+                binding_ref.update({"last_seen_at": now_iso()})
+                binding_ref.child("devices").child(device_key).update({"last_seen_at": now_iso()})
             except Exception:
                 logger.debug("Telegram Copy device touch failed", exc_info=True)
     return True, "ok", subscription
 
-def copy_get_or_create_telegram_link_request(telegram_user_id, device_id: str, device_proof_key: str, origin: str = "") -> tuple[str, dict, bool]:
+def copy_get_or_create_telegram_link_request(telegram_user_id, device_id: str, device_proof_key: str, origin: str = "", client_kind: str = "extension") -> tuple[str, dict, bool]:
     tid = normalize_copy_telegram_user_id(telegram_user_id)
-    identity = f"{tid}|{device_id}|{device_proof_key}"
+    client_kind = _copy_telegram_client_kind(client_kind)
+    identity = f"{client_kind}|{tid}|{device_id}|{device_proof_key}"
     request_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
     ref = copy_telegram_link_requests_ref().child(request_id)
     now_ts = int(time_module.time())
@@ -4248,7 +4265,7 @@ def copy_get_or_create_telegram_link_request(telegram_user_id, device_id: str, d
     payload = {
         "request_id": request_id, "telegram_user_id": tid, "device_id": str(device_id)[:120],
         "device_proof_key": str(device_proof_key)[:128], "device_key": _copy_telegram_device_key(device_id),
-        "origin": str(origin or "")[:200], "status": "pending",
+        "origin": str(origin or "")[:200], "client_kind": client_kind, "status": "pending",
         "requested_at": now_iso(), "requested_at_ts": now_ts,
         "expires_at_ts": now_ts + COPY_TELEGRAM_LINK_TTL_SECONDS,
     }
@@ -4268,9 +4285,11 @@ async def copy_send_telegram_link_confirmation(request_id: str, request_data: di
         return False
     device_id = str((request_data or {}).get("device_id") or "")
     short_device = html.escape(device_id[-10:] if device_id else "unknown")
+    client_kind = _copy_telegram_client_kind((request_data or {}).get("client_kind"))
+    client_label = "تطبيق TRADING TIME على Android" if client_kind == "mobile" else "إضافة TRADING TIME COPY"
     text = (
-        "🔐 <b>طلب ربط TRADING TIME COPY</b>\n\n"
-        "تم طلب ربط إضافة TRADING TIME باشتراك البوت الخاص بك.\n"
+        "🔐 <b>طلب ربط TRADING TIME</b>\n\n"
+        f"تم طلب ربط {client_label} باشتراك البوت الخاص بك.\n"
         f"الجهاز: <code>…{short_device}</code>\n\n"
         "إذا كان هذا الطلب منك اضغط ✅ تأكيد الربط. إذا لم يكن منك ارفضه."
     )
@@ -4313,23 +4332,25 @@ def copy_confirm_telegram_device(request_id: str, actor_telegram_id) -> tuple[bo
     if not device_id or not proof_key:
         return False, "بيانات الجهاز غير صالحة.", req
     device_key = _copy_telegram_device_key(device_id)
+    client_kind = _copy_telegram_client_kind(req.get("client_kind"))
     now_value = now_iso()
-    root = copy_telegram_devices_ref().child(tid)
+    root = _copy_telegram_client_binding_ref(tid, client_kind)
     try:
         root.update({
-            "telegram_user_id": tid, "active_device_id": device_id,
+            "telegram_user_id": tid, "client_kind": client_kind, "active_device_id": device_id,
             "active_device_proof_key": proof_key, "confirmed_at": now_value,
             "last_seen_at": now_value, "source": "telegram_confirmation",
         })
         root.child("devices").child(device_key).set({
             "device_id": device_id, "device_proof_key": proof_key, "status": "confirmed",
-            "confirmed_at": now_value, "last_seen_at": now_value,
+            "client_kind": client_kind, "confirmed_at": now_value, "last_seen_at": now_value,
         })
         ref.update({"status": "confirmed", "confirmed_at": now_value})
     except Exception as exc:
         logger.warning("Could not confirm Copy Telegram device | tid=%s | error=%s", tid, exc)
         return False, "تعذر حفظ ربط الجهاز.", req
-    return True, "تم ربط الإضافة باشتراك البوت بنجاح.", subscription
+    label = "التطبيق" if client_kind == "mobile" else "الإضافة"
+    return True, f"تم ربط {label} باشتراك البوت بنجاح.", subscription
 
 def copy_deny_telegram_device(request_id: str, actor_telegram_id) -> tuple[bool, str]:
     rid = str(request_id or "").strip()[:40]
@@ -4348,7 +4369,7 @@ def copy_reset_telegram_device(telegram_user_id) -> bool:
     try:
         copy_telegram_devices_ref().child(tid).delete()
         for key in list(_copy_telegram_device_touch_cache.keys()):
-            if key.startswith(f"{tid}:"):
+            if key.startswith(f"{tid}:") or key.startswith(f"extension:{tid}:") or key.startswith(f"mobile:{tid}:"):
                 _copy_telegram_device_touch_cache.pop(key, None)
         return True
     except Exception as exc:
@@ -20915,15 +20936,20 @@ def create_embedded_copy_api():
         token = normalize_copy_license_token(payload.get("token"))
         device_id = str(payload.get("device_id") or "unknown").strip()[:120] or "unknown"
         telegram_user_id = normalize_copy_telegram_user_id(payload.get("telegram_user_id"))
-        # v1.05: the owner mobile session must be able to coexist with the
-        # desktop extension. DEMO-111 is intentionally restricted to the exact
-        # owner Telegram ID, while the desktop admin license still keeps its
-        # single active extension-device slot. A mobile bearer session was
-        # already issued only after a successful owner login, so re-checking
-        # active_device_id on every poll would make the phone and extension
-        # continuously replace each other. Keep the short-lived server-side
-        # bearer session independent from the desktop active-device pointer.
-        if token == COPY_ADMIN_LICENSE_TOKEN:
+        device_proof_key = str(payload.get("device_proof_key") or "").strip()[:128]
+
+        # v1.08: tokenless mobile sessions use the Telegram bot subscription as
+        # the entitlement and a client-scoped confirmed device binding. Recheck
+        # on every mobile API request so expiry/disable on the bot immediately
+        # stops the app without waiting for the bearer session to expire.
+        if not token and telegram_user_id and device_proof_key:
+            mobile_ok, mobile_reason, record = copy_validate_telegram_subscription_device(
+                telegram_user_id, device_id, device_proof_key, touch=True, client_kind="mobile"
+            )
+            if not mobile_ok:
+                raise HTTPException(status_code=401, detail=mobile_reason)
+        elif token == COPY_ADMIN_LICENSE_TOKEN:
+            # Legacy v0.14 mobile compatibility during rollout.
             admin_tid = str(int(ADMIN_TELEGRAM_ID))
             if telegram_user_id != admin_tid:
                 raise HTTPException(status_code=401, detail="admin license restricted to owner Telegram ID")
@@ -20939,6 +20965,8 @@ def create_embedded_copy_api():
                 "mobile_session": True,
             }
         else:
+            # Legacy code-auth mobile clients remain accepted while the rollout
+            # flag/path is intentionally kept for backward compatibility.
             license_ok, license_reason, record = copy_validate_license_for_device(
                 token,
                 device_id,
@@ -20966,10 +20994,57 @@ def create_embedded_copy_api():
         token = normalize_copy_license_token(body.get("token"))
         device_id = str(body.get("device_id") or "unknown").strip()[:120] or "unknown"
         telegram_user_id = normalize_copy_telegram_user_id(body.get("telegram_user_id"))
-        if not token:
-            raise HTTPException(status_code=400, detail="license token is required")
+        device_proof_key = str(body.get("device_proof_key") or "").strip()[:128]
+        auth_scheme = str(body.get("auth_scheme") or "").strip().lower()
         if not telegram_user_id:
             raise HTTPException(status_code=400, detail="Telegram ID is required")
+
+        # v1.08 mobile Telegram-subscription auth. No activation/license code is
+        # required. The first Android device is confirmed by the user in Telegram.
+        telegram_mobile_auth = COPY_TELEGRAM_SUBSCRIPTION_AUTH_ENABLED and (
+            auth_scheme == "telegram_subscription_v1" or (telegram_user_id and not token)
+        )
+        if telegram_mobile_auth:
+            if not device_proof_key:
+                raise HTTPException(status_code=400, detail="device proof is required")
+            sub_ok, sub_reason, record = copy_bot_subscription_record(telegram_user_id)
+            if not sub_ok:
+                raise HTTPException(status_code=401, detail=sub_reason)
+            device_ok, device_reason, record = copy_validate_telegram_subscription_device(
+                telegram_user_id, device_id, device_proof_key, touch=True, client_kind="mobile"
+            )
+            if not device_ok:
+                if device_reason == "telegram device confirmation required":
+                    request_id, request_data, should_notify = copy_get_or_create_telegram_link_request(
+                        telegram_user_id, device_id, device_proof_key, "android_mobile", client_kind="mobile"
+                    )
+                    if should_notify:
+                        await copy_send_telegram_link_confirmation(request_id, request_data)
+                    return {
+                        "ok": False, "type": "auth_pending", "code": "telegram_link_pending",
+                        "message": "افتح Telegram وأكّد ربط تطبيق TRADING TIME من رسالة البوت.",
+                        "retry_after_ms": 3000, "request_id": request_id, "server_time": now_iso(),
+                    }
+                raise HTTPException(status_code=401, detail=device_reason)
+
+            session_token = _copy_session_token_issue("", device_id, telegram_user_id, device_proof_key)
+            return {
+                "ok": True,
+                "session_token": session_token,
+                "session_expires_in": int(COPY_SESSION_TOKEN_TTL_SECONDS),
+                "auth_scheme": "telegram_subscription_v1",
+                "account": {
+                    "telegram_user_id": telegram_user_id,
+                    "plan": (record or {}).get("plan") or "active",
+                    "expires_at": (record or {}).get("expires_at") or "forever",
+                    "max_devices": 1,
+                    "is_admin_license": bool((record or {}).get("is_admin_license")),
+                    "role": (record or {}).get("role") or ("admin" if telegram_user_id == str(int(ADMIN_TELEGRAM_ID)) else "user"),
+                },
+            }
+
+        if not token:
+            raise HTTPException(status_code=400, detail="license token is required")
 
         # v1.05 owner-mobile coexistence: DEMO-111 is authenticated by the
         # owner-only token + exact owner Telegram ID, but it does not take over
@@ -21388,7 +21463,7 @@ def create_embedded_copy_api():
         token = normalize_copy_license_token(auth.get("token"))
         session_token = str(auth.get("session_token") or "").strip()
 
-        # v1.07: new clients authenticate only with Telegram ID + device proof.
+        # v1.07/v1.08: new clients authenticate only with Telegram ID + device proof.
         # The bot subscription is the entitlement; the first device is approved
         # by pressing a confirmation button inside Telegram.
         if COPY_TELEGRAM_SUBSCRIPTION_AUTH_ENABLED and (auth_scheme == "telegram_subscription_v1" or (telegram_user_id and not token)):
