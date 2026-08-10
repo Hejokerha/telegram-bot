@@ -537,14 +537,8 @@ three_candle_public_admin_keyboard = ReplyKeyboardMarkup(
 copy_admin_keyboard = ReplyKeyboardMarkup(
     [
         ["🟢 تشغيل Copy", "🔴 إيقاف Copy"],
-        ["🔑 كود أسبوع", "🔑 كود شهر"],
-        ["🔑 كود دائم", "🔎 البحث بـ Telegram ID"],
-        ["📋 أكواد Copy", "♻️ تجديد كود"],
-        ["⛔ إيقاف كود", "📱 تصفير جهاز كود"],
-        ["🔄 إعادة تدوير كود", "🗑 حذف كود نهائيًا"],
-        ["🧹 حذف المنتهي والموقوف", "⚠️ تصفير كل الأجهزة"],
-        ["ℹ️ شرح خيارات الأكواد", "📌 رسالة تحديث"],
-        ["📡 حالة Copy"],
+        ["🔎 فحص اشتراك Telegram", "📱 تصفير جهاز Telegram"],
+        ["📡 حالة Copy", "📌 رسالة تحديث"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -1020,8 +1014,8 @@ COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
 # v1.03 gives Three Candle its own live Quotex instruments/list universe; extension protocol remains v0.99.
-COPY_SERVER_VERSION = "1.06.0"
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v0.99").strip() or "v0.99"
+COPY_SERVER_VERSION = "1.07.0"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.00").strip() or "v1.00"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -1152,6 +1146,10 @@ COPY_WS_AUTH_TIMEOUT_SECONDS = int(os.getenv("COPY_WS_AUTH_TIMEOUT_SECONDS", "12
 COPY_SESSION_TOKEN_TTL_SECONDS = int(os.getenv("COPY_SESSION_TOKEN_TTL_SECONDS", "43200"))
 COPY_DEVICE_PROOF_REQUIRED = os.getenv("COPY_DEVICE_PROOF_REQUIRED", "true").lower() in {"1", "true", "yes", "on"}
 COPY_ALLOW_LEGACY_WS_AUTH = os.getenv("COPY_ALLOW_LEGACY_WS_AUTH", "true").lower() in {"1", "true", "yes", "on"}
+COPY_TELEGRAM_SUBSCRIPTION_AUTH_ENABLED = os.getenv("COPY_TELEGRAM_SUBSCRIPTION_AUTH_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
+COPY_TELEGRAM_LINK_TTL_SECONDS = max(120, int(os.getenv("COPY_TELEGRAM_LINK_TTL_SECONDS", "600")))
+COPY_TELEGRAM_LINK_NOTIFY_COOLDOWN_SECONDS = max(30, int(os.getenv("COPY_TELEGRAM_LINK_NOTIFY_COOLDOWN_SECONDS", "180")))
+COPY_TELEGRAM_DEVICE_TOUCH_SECONDS = max(60, int(os.getenv("COPY_TELEGRAM_DEVICE_TOUCH_SECONDS", "600")))
 
 
 def _copy_b64url_encode(data: bytes) -> str:
@@ -3059,6 +3057,16 @@ def copy_mark_device_auth_confirmed(token: str, device_id: str, device_proof_key
 def _copy_auth_error_details(reason: str) -> tuple[str, int, str, bool]:
     """Map internal auth failures to stable machine codes and clear Arabic UI text."""
     value = str(reason or "authentication failed").strip().lower()
+    if value == "telegram id required":
+        return "telegram_id_required", 4440, "أدخل Telegram ID الخاص بك.", False
+    if value == "bot subscription inactive":
+        return "bot_subscription_inactive", 4441, "اشتراك بوت TRADING TIME غير فعال لهذا Telegram ID.", True
+    if value == "bot subscription expired":
+        return "bot_subscription_expired", 4442, "انتهت صلاحية اشتراك البوت. جدّد اشتراكك ليعمل البوت والإضافة معًا.", True
+    if value == "telegram device confirmation required":
+        return "telegram_link_required", 4443, "افتح Telegram وأكّد ربط هذا الجهاز من رسالة البوت.", True
+    if value in {"subscription service unavailable", "telegram subscription service unavailable"}:
+        return "subscription_service_unavailable", 4444, "تعذر التحقق من اشتراك البوت مؤقتًا. ستتم إعادة المحاولة.", True
     if value == "invalid license":
         return "invalid_license", 4430, "كود التفعيل غير صالح.", False
     if value == "inactive license":
@@ -3085,43 +3093,37 @@ def _copy_auth_error_details(reason: str) -> tuple[str, int, str, bool]:
 
 
 def build_copy_status_message() -> str:
-    licenses = list_copy_licenses(1000)
-    active = 0
-    expired = 0
-    disabled = 0
-    total_devices = 0
-    linked_telegram = 0
-    for rec in licenses:
-        status = str(rec.get("status") or "").lower()
-        devices = rec.get("devices") if isinstance(rec.get("devices"), dict) else {}
-        total_devices += len(devices)
-        if normalize_copy_telegram_user_id(rec.get("telegram_user_id")):
-            linked_telegram += 1
-        if status == "disabled":
-            disabled += 1
-        elif copy_license_is_expired(rec.get("expires_at")) or status == "expired":
-            expired += 1
-        elif status == "active":
-            active += 1
-
+    approved_users = get_all_approved_users() or {}
+    active_ids = {str(int(ADMIN_TELEGRAM_ID))}
+    expired_or_inactive = 0
+    for tid in list(approved_users.keys()):
+        try:
+            ok, _reason, _record = copy_bot_subscription_record(tid)
+            if ok:
+                active_ids.add(normalize_copy_telegram_user_id(tid))
+            else:
+                expired_or_inactive += 1
+        except Exception:
+            expired_or_inactive += 1
+    active_subscriptions = len({x for x in active_ids if x})
+    try:
+        bindings = copy_telegram_devices_ref().get() or {}
+        bound_devices = sum(1 for row in bindings.values() if isinstance(row, dict) and row.get("active_device_id"))
+    except Exception:
+        bound_devices = 0
     settings = get_copy_settings()
     enabled = bool(settings.get("global_enabled", False))
     update_notice = str(settings.get("update_notice") or "").strip()
     latest_version = settings.get("latest_version") or COPY_EXTENSION_VERSION
-
     lines = [
-        "📡 حالة Copy Trading",
-        "━━━━━━━━━━━━━━",
+        "📡 حالة Copy Trading", "━━━━━━━━━━━━━━",
         f"الحالة العامة: {'🟢 شغال' if enabled else '🔴 موقوف للجميع'}",
-        f"آخر نسخة: {html.escape(str(latest_version))}",
-        "",
-        f"🔑 الأكواد النشطة: {active}",
-        f"⏳ الأكواد المنتهية: {expired}",
-        f"⛔ الأكواد المعطلة: {disabled}",
-        f"📱 الأجهزة المربوطة: {total_devices}",
-        f"👤 الأكواد المربوطة بـ Telegram ID: {linked_telegram}",
-        "",
-        "ملاحظة: صفقات كل مستخدم تصل فقط للإضافة المربوطة بنفس Telegram ID. يمكنك تصفير الأجهزة بعد تحديث الإضافة إذا تغيّر جهاز المستخدم.",
+        f"آخر نسخة: {html.escape(str(latest_version))}", "",
+        f"👤 اشتراكات البوت الفعالة: {active_subscriptions}",
+        f"⏳ منتهي/موقوف: {expired_or_inactive}",
+        f"📱 أجهزة Copy المربوطة: {bound_devices}", "",
+        "🔗 نظام الدخول: Telegram ID + تأكيد من البوت.",
+        "اشتراك البوت هو مصدر الصلاحية الوحيد؛ لا توجد أكواد Copy للمستخدمين الجدد.",
     ]
     if update_notice:
         lines.extend(["", "📌 رسالة التحديث:", html.escape(update_notice)])
@@ -4140,6 +4142,218 @@ def is_approved(user_id: int) -> bool:
         return _cache_set(f"approved:{uid}", False)
 
 
+
+
+# ===== v1.07: Telegram-ID subscription identity for Copy clients =====
+# The Telegram bot subscription (approved_users/{telegram_id}) is the single
+# source of truth. Copy clients no longer need a separate activation code.
+_copy_telegram_device_touch_cache: dict[str, float] = {}
+
+def copy_telegram_devices_ref():
+    return system_ref().child("copy_trading").child("telegram_devices")
+
+def copy_telegram_link_requests_ref():
+    return system_ref().child("copy_trading").child("telegram_link_requests")
+
+def _copy_telegram_device_key(device_id: str) -> str:
+    return hashlib.sha256(str(device_id or "").encode("utf-8")).hexdigest()[:32]
+
+def _copy_telegram_principal(telegram_user_id) -> str:
+    tid = normalize_copy_telegram_user_id(telegram_user_id)
+    return f"TGI-{tid}" if tid else ""
+
+def copy_bot_subscription_record(telegram_user_id) -> tuple[bool, str, dict]:
+    tid = normalize_copy_telegram_user_id(telegram_user_id)
+    if not tid:
+        return False, "telegram id required", {}
+    if tid == str(int(ADMIN_TELEGRAM_ID)):
+        return True, "ok", {
+            "telegram_user_id": tid, "status": "active", "plan": "admin",
+            "expires_at": "forever", "role": "admin", "is_admin_license": True,
+            "source": "telegram_bot_subscription",
+        }
+    try:
+        approved = get_approved_user(int(tid)) or {}
+    except Exception:
+        return False, "subscription service unavailable", {}
+    if not isinstance(approved, dict) or str(approved.get("status") or "approved").lower() != "approved":
+        return False, "bot subscription inactive", approved if isinstance(approved, dict) else {}
+    expires_at = approved.get("expires_at")
+    if expires_at and str(expires_at).lower() != "forever":
+        exp = parse_iso(str(expires_at).replace("Z", "+00:00"))
+        if exp:
+            if exp.tzinfo is None:
+                exp = exp.replace(tzinfo=timezone.utc)
+            if now_utc() > exp:
+                return False, "bot subscription expired", approved
+    record = dict(approved)
+    record.update({
+        "telegram_user_id": tid,
+        "status": "active",
+        "plan": record.get("plan") or record.get("mode") or "active",
+        "expires_at": record.get("expires_at") or "forever",
+        "role": record.get("role") or "user",
+        "is_admin_license": False,
+        "source": "telegram_bot_subscription",
+    })
+    return True, "ok", record
+
+def copy_validate_telegram_subscription_device(telegram_user_id, device_id: str, device_proof_key: str, *, touch: bool = True) -> tuple[bool, str, dict]:
+    ok, reason, subscription = copy_bot_subscription_record(telegram_user_id)
+    if not ok:
+        return False, reason, subscription
+    tid = normalize_copy_telegram_user_id(telegram_user_id)
+    device_id = str(device_id or "").strip()[:120]
+    proof_key = str(device_proof_key or "").strip()[:128]
+    if not device_id or not proof_key:
+        return False, "device proof failed", subscription
+    try:
+        binding = copy_telegram_devices_ref().child(tid).get() or {}
+    except Exception:
+        return False, "subscription service unavailable", subscription
+    active_device = str((binding or {}).get("active_device_id") or "")
+    active_proof = str((binding or {}).get("active_device_proof_key") or "")
+    if not active_device or active_device != device_id or not active_proof or not hmac.compare_digest(active_proof, proof_key):
+        return False, "telegram device confirmation required", subscription
+    if touch:
+        cache_key = f"{tid}:{device_id}"
+        now_ts = time_module.time()
+        last = float(_copy_telegram_device_touch_cache.get(cache_key, 0) or 0)
+        if now_ts - last >= COPY_TELEGRAM_DEVICE_TOUCH_SECONDS:
+            _copy_telegram_device_touch_cache[cache_key] = now_ts
+            try:
+                device_key = _copy_telegram_device_key(device_id)
+                copy_telegram_devices_ref().child(tid).update({"last_seen_at": now_iso()})
+                copy_telegram_devices_ref().child(tid).child("devices").child(device_key).update({"last_seen_at": now_iso()})
+            except Exception:
+                logger.debug("Telegram Copy device touch failed", exc_info=True)
+    return True, "ok", subscription
+
+def copy_get_or_create_telegram_link_request(telegram_user_id, device_id: str, device_proof_key: str, origin: str = "") -> tuple[str, dict, bool]:
+    tid = normalize_copy_telegram_user_id(telegram_user_id)
+    identity = f"{tid}|{device_id}|{device_proof_key}"
+    request_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()[:24]
+    ref = copy_telegram_link_requests_ref().child(request_id)
+    now_ts = int(time_module.time())
+    current = ref.get() or {}
+    notified_at = int((current or {}).get("notified_at_ts") or 0)
+    status = str((current or {}).get("status") or "")
+    expires_ts = int((current or {}).get("expires_at_ts") or 0)
+    if not current or expires_ts <= now_ts:
+        should_notify = True
+    elif status == "pending":
+        should_notify = now_ts - notified_at >= COPY_TELEGRAM_LINK_NOTIFY_COOLDOWN_SECONDS
+    else:
+        should_notify = False
+    payload = {
+        "request_id": request_id, "telegram_user_id": tid, "device_id": str(device_id)[:120],
+        "device_proof_key": str(device_proof_key)[:128], "device_key": _copy_telegram_device_key(device_id),
+        "origin": str(origin or "")[:200], "status": "pending",
+        "requested_at": now_iso(), "requested_at_ts": now_ts,
+        "expires_at_ts": now_ts + COPY_TELEGRAM_LINK_TTL_SECONDS,
+    }
+    if should_notify:
+        payload["notified_at_ts"] = now_ts
+    elif notified_at:
+        payload["notified_at_ts"] = notified_at
+    if current and expires_ts > now_ts and status in {"denied", "confirmed"} and not should_notify:
+        payload = dict(current)
+    else:
+        ref.update(payload)
+    return request_id, payload, should_notify
+
+async def copy_send_telegram_link_confirmation(request_id: str, request_data: dict) -> bool:
+    tid = normalize_copy_telegram_user_id((request_data or {}).get("telegram_user_id"))
+    if not tid or not BOT_TOKEN:
+        return False
+    device_id = str((request_data or {}).get("device_id") or "")
+    short_device = html.escape(device_id[-10:] if device_id else "unknown")
+    text = (
+        "🔐 <b>طلب ربط TRADING TIME COPY</b>\n\n"
+        "تم طلب ربط إضافة TRADING TIME باشتراك البوت الخاص بك.\n"
+        f"الجهاز: <code>…{short_device}</code>\n\n"
+        "إذا كان هذا الطلب منك اضغط ✅ تأكيد الربط. إذا لم يكن منك ارفضه."
+    )
+    payload = {
+        "chat_id": tid, "text": text, "parse_mode": "HTML",
+        "reply_markup": {"inline_keyboard": [[
+            {"text": "✅ تأكيد الربط", "callback_data": f"cpbind:y:{request_id}"},
+            {"text": "❌ رفض", "callback_data": f"cpbind:n:{request_id}"},
+        ]]},
+    }
+    try:
+        url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
+        res = await asyncio.to_thread(lambda: requests.post(url, json=payload, timeout=8))
+        return 200 <= int(res.status_code) < 300
+    except Exception as exc:
+        logger.warning("Could not send Copy Telegram link confirmation | tid=%s | error=%s", tid, exc)
+        return False
+
+def copy_confirm_telegram_device(request_id: str, actor_telegram_id) -> tuple[bool, str, dict]:
+    rid = str(request_id or "").strip()[:40]
+    actor = normalize_copy_telegram_user_id(actor_telegram_id)
+    try:
+        ref = copy_telegram_link_requests_ref().child(rid)
+        req = ref.get() or {}
+    except Exception:
+        return False, "تعذر قراءة طلب الربط.", {}
+    if not isinstance(req, dict) or not req:
+        return False, "طلب الربط غير موجود أو انتهى.", {}
+    tid = normalize_copy_telegram_user_id(req.get("telegram_user_id"))
+    if not actor or actor != tid:
+        return False, "هذا الطلب لا يخص حساب Telegram الحالي.", req
+    if int(req.get("expires_at_ts") or 0) < int(time_module.time()):
+        ref.update({"status": "expired", "expired_at": now_iso()})
+        return False, "انتهت مهلة طلب الربط. اضغط حفظ وربط من الإضافة من جديد.", req
+    sub_ok, sub_reason, subscription = copy_bot_subscription_record(tid)
+    if not sub_ok:
+        return False, "اشتراك البوت غير فعال حاليًا.", subscription
+    device_id = str(req.get("device_id") or "")[:120]
+    proof_key = str(req.get("device_proof_key") or "")[:128]
+    if not device_id or not proof_key:
+        return False, "بيانات الجهاز غير صالحة.", req
+    device_key = _copy_telegram_device_key(device_id)
+    now_value = now_iso()
+    root = copy_telegram_devices_ref().child(tid)
+    try:
+        root.update({
+            "telegram_user_id": tid, "active_device_id": device_id,
+            "active_device_proof_key": proof_key, "confirmed_at": now_value,
+            "last_seen_at": now_value, "source": "telegram_confirmation",
+        })
+        root.child("devices").child(device_key).set({
+            "device_id": device_id, "device_proof_key": proof_key, "status": "confirmed",
+            "confirmed_at": now_value, "last_seen_at": now_value,
+        })
+        ref.update({"status": "confirmed", "confirmed_at": now_value})
+    except Exception as exc:
+        logger.warning("Could not confirm Copy Telegram device | tid=%s | error=%s", tid, exc)
+        return False, "تعذر حفظ ربط الجهاز.", req
+    return True, "تم ربط الإضافة باشتراك البوت بنجاح.", subscription
+
+def copy_deny_telegram_device(request_id: str, actor_telegram_id) -> tuple[bool, str]:
+    rid = str(request_id or "").strip()[:40]
+    actor = normalize_copy_telegram_user_id(actor_telegram_id)
+    ref = copy_telegram_link_requests_ref().child(rid)
+    req = ref.get() or {}
+    if not isinstance(req, dict) or normalize_copy_telegram_user_id(req.get("telegram_user_id")) != actor:
+        return False, "طلب الربط غير صالح."
+    ref.update({"status": "denied", "denied_at": now_iso(), "expires_at_ts": int(time_module.time()) + 60})
+    return True, "تم رفض طلب الربط."
+
+def copy_reset_telegram_device(telegram_user_id) -> bool:
+    tid = normalize_copy_telegram_user_id(telegram_user_id)
+    if not tid:
+        return False
+    try:
+        copy_telegram_devices_ref().child(tid).delete()
+        for key in list(_copy_telegram_device_touch_cache.keys()):
+            if key.startswith(f"{tid}:"):
+                _copy_telegram_device_touch_cache.pop(key, None)
+        return True
+    except Exception as exc:
+        logger.warning("Could not reset Telegram Copy device | tid=%s | error=%s", tid, exc)
+        return False
 
 def get_user_status(user_id: int) -> str:
     uid = int(user_id)
@@ -16465,6 +16679,41 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
     user = query.from_user
     data = query.data or ""
 
+    if data.startswith("cpbind:"):
+        try:
+            _prefix, decision, request_id = data.split(":", 2)
+        except Exception:
+            await query.answer("طلب ربط غير صالح", show_alert=True)
+            return
+        if decision == "y":
+            ok, message, _subscription = copy_confirm_telegram_device(request_id, user.id)
+            await query.answer(message, show_alert=not ok)
+            if ok:
+                # Any older device for the same Telegram ID is superseded.
+                tid = normalize_copy_telegram_user_id(user.id)
+                req = copy_telegram_link_requests_ref().child(request_id).get() or {}
+                keep_device = str((req or {}).get("device_id") or "")
+                for client_id, client in list(_copy_clients.items()):
+                    if normalize_copy_telegram_user_id((client or {}).get("telegram_user_id")) == tid and str((client or {}).get("device_id") or "") != keep_device:
+                        try:
+                            await (client or {}).get("ws").close(code=4412, reason="telegram device replaced")
+                        except Exception:
+                            pass
+                        _copy_clients.pop(client_id, None)
+                try:
+                    await query.edit_message_text("✅ تم تأكيد ربط TRADING TIME COPY بهذا الجهاز.\n\nارجع للإضافة؛ ستتصل تلقائيًا خلال ثوانٍ.")
+                except Exception:
+                    pass
+            return
+        ok, message = copy_deny_telegram_device(request_id, user.id)
+        await query.answer(message, show_alert=not ok)
+        if ok:
+            try:
+                await query.edit_message_text("❌ تم رفض طلب ربط TRADING TIME COPY.")
+            except Exception:
+                pass
+        return
+
     if data.startswith("tr_"):
         handled = await handle_trading_room_callback(update, context)
         if handled:
@@ -18767,7 +19016,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text in {"🔐 Copy Trading", "Copy Trading"}:
             reset_signal_state(context)
             await update.message.reply_text(
-                "🔐 لوحة Copy Trading\n\nإدارة الأكواد + توجيه شخصي: صفقات كل مستخدم تصل فقط لإضافته حسب Telegram ID.",
+                "🔐 لوحة Copy Trading\n\nالاشتراك موحّد مع البوت: Telegram ID فعال في البوت = الإضافة تعمل بنفس مدة الاشتراك.",
                 reply_markup=copy_admin_keyboard
             )
             return
@@ -18792,6 +19041,64 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
                 reply_markup=copy_admin_keyboard
             )
+            return
+
+        if text == "🔎 فحص اشتراك Telegram":
+            context.user_data["step"] = "copy_telegram_subscription_check_waiting_id"
+            await update.message.reply_text("🔎 أرسل Telegram ID الرقمي لفحص اشتراك البوت وربط Copy.", reply_markup=admin_input_cancel_keyboard)
+            return
+
+        if text == "📱 تصفير جهاز Telegram":
+            context.user_data["step"] = "copy_telegram_device_reset_waiting_id"
+            await update.message.reply_text("📱 أرسل Telegram ID الرقمي. سيتم حذف ربط جهاز Copy فقط، ولن يتأثر اشتراك البوت.", reply_markup=admin_input_cancel_keyboard)
+            return
+
+        if step == "copy_telegram_subscription_check_waiting_id":
+            context.user_data["step"] = None
+            tid = normalize_copy_telegram_user_id(text)
+            if not tid:
+                await update.message.reply_text("❌ Telegram ID غير صالح.", reply_markup=copy_admin_keyboard)
+                return
+            ok, reason, sub = copy_bot_subscription_record(tid)
+            try:
+                binding = copy_telegram_devices_ref().child(tid).get() or {}
+            except Exception:
+                binding = {}
+            device = "مربوط" if binding.get("active_device_id") else "غير مربوط"
+            plan = str((sub or {}).get("plan") or (sub or {}).get("mode") or "-")
+            expires = format_expiry_for_account((sub or {}).get("expires_at"))
+            await update.message.reply_text(
+                f"👤 Telegram ID: <code>{html.escape(tid)}</code>\n"
+                f"اشتراك البوت: {'🟢 فعال' if ok else '🔴 غير فعال'}\n"
+                f"الخطة: {html.escape(plan)}\n"
+                f"الانتهاء: {html.escape(expires)}\n"
+                f"جهاز Copy: {device}\n"
+                f"الحالة: {html.escape(reason)}",
+                parse_mode="HTML", reply_markup=copy_admin_keyboard,
+            )
+            return
+
+        if step == "copy_telegram_device_reset_waiting_id":
+            context.user_data["step"] = None
+            tid = normalize_copy_telegram_user_id(text)
+            if not tid:
+                await update.message.reply_text("❌ Telegram ID غير صالح.", reply_markup=copy_admin_keyboard)
+                return
+            ok = copy_reset_telegram_device(tid)
+            if ok:
+                disconnected = 0
+                for client_id, client in list(_copy_clients.items()):
+                    if normalize_copy_telegram_user_id((client or {}).get("telegram_user_id")) != tid:
+                        continue
+                    try:
+                        await (client or {}).get("ws").close(code=4412, reason="telegram device reset")
+                    except Exception:
+                        pass
+                    _copy_clients.pop(client_id, None)
+                    disconnected += 1
+                await update.message.reply_text(f"✅ تم تصفير جهاز Copy لـ {tid}. تم فصل {disconnected} اتصال.", reply_markup=copy_admin_keyboard)
+            else:
+                await update.message.reply_text("❌ تعذر تصفير الجهاز.", reply_markup=copy_admin_keyboard)
             return
 
         if text in {"🔑 كود أسبوع", "🔑 كود شهر", "🔑 كود دائم"}:
@@ -20235,8 +20542,14 @@ async def _copy_broadcast_signal(signal: dict) -> dict:
     delivered = 0
     skipped_scope = 0
     dead = []
+    inactive = []
     for client_id, client in list(_copy_clients.items()):
         client_user_id = normalize_copy_telegram_user_id(client.get("telegram_user_id"))
+        if str((client or {}).get("auth_mode") or "") == "telegram":
+            sub_ok, _sub_reason, _sub_record = copy_bot_subscription_record(client_user_id)
+            if not sub_ok:
+                inactive.append(client_id)
+                continue
         if target_user_id and client_user_id != target_user_id:
             skipped_scope += 1
             continue
@@ -20247,12 +20560,18 @@ async def _copy_broadcast_signal(signal: dict) -> dict:
             client["last_sent_at"] = now_iso()
         else:
             dead.append(client_id)
-    for client_id in dead:
-        _copy_clients.pop(client_id, None)
+    for client_id in dead + inactive:
+        client = _copy_clients.pop(client_id, None)
+        if client_id in inactive and client:
+            try:
+                await (client or {}).get("ws").close(code=4441, reason="bot_subscription_inactive")
+            except Exception:
+                pass
     return {
         "online_clients": len(_copy_clients),
         "delivered": delivered,
         "dead_removed": len(dead),
+        "inactive_removed": len(inactive),
         "skipped_scope": skipped_scope,
         "global_enabled": True,
         "target_user_id": target_user_id or None,
@@ -20566,7 +20885,7 @@ def create_embedded_copy_api():
         }
 
 
-    # ===== v1.04: Mobile app API =====
+    # ===== Legacy mobile license API (kept temporarily until Android migrates to Telegram-ID auth) =====
     # The Flutter mobile client uses the same Copy license/device binding as the
     # desktop extension, but authenticates over HTTPS and receives a short-lived
     # bearer session.  This keeps the license token out of subsequent polling
@@ -20833,26 +21152,27 @@ def create_embedded_copy_api():
             except Exception:
                 logger.debug("COPY auth reject close failed", exc_info=True)
 
-        async def _origin_precheck(token: str, device_id: str, telegram_user_id: str, device_proof_key: str) -> tuple[bool, bool]:
+        async def _origin_precheck(token: str, device_id: str, telegram_user_id: str, device_proof_key: str, *, is_admin_identity: bool = False) -> tuple[bool, bool]:
             is_admin_token = normalize_copy_license_token(token) == COPY_ADMIN_LICENSE_TOKEN
             trusted_owner = copy_is_trusted_owner_device(device_id, device_proof_key)
+            admin_identity = bool(is_admin_token or is_admin_identity)
             allowed = is_copy_origin_allowed(
                 origin,
                 authenticated=True,
-                is_admin_license=is_admin_token,
+                is_admin_license=admin_identity,
                 trusted_owner_device=trusted_owner,
             )
             if not allowed:
                 logger.warning(
                     "Rejected COPY WebSocket origin before license binding | origin=%r | device=%s | telegram_user_id=%s | admin_token=%s | trusted_owner=%s",
-                    origin, device_id, telegram_user_id or "-", is_admin_token, trusted_owner,
+                    origin, device_id, telegram_user_id or "-", admin_identity, trusted_owner,
                 )
                 _copy_ws_auth_failure(auth_ip)
                 await _reject_auth("origin not allowed")
                 return False, trusted_owner
             return True, trusted_owner
 
-        async def _run_authenticated(token: str, device_id: str, telegram_user_id: str, device_proof_key: str, license_record: dict | None, *, legacy_auth: bool, trusted_owner_device: bool = False):
+        async def _run_authenticated(token: str, device_id: str, telegram_user_id: str, device_proof_key: str, license_record: dict | None, *, legacy_auth: bool, trusted_owner_device: bool = False, auth_mode: str = "license"):
             is_admin_license = bool((license_record or {}).get("is_admin_license"))
             if not is_copy_origin_allowed(
                 origin,
@@ -20869,8 +21189,10 @@ def create_embedded_copy_api():
                 return
 
             # All authentication and origin checks have now passed. Only here is
-            # the device binding considered fully established.
-            copy_mark_device_auth_confirmed(token, device_id, device_proof_key)
+            # the device binding considered fully established. Telegram-ID auth
+            # is confirmed by the user in the bot; legacy code auth keeps the old path.
+            if auth_mode != "telegram":
+                copy_mark_device_auth_confirmed(token, device_id, device_proof_key)
             _copy_ws_auth_success(auth_ip)
             if legacy_auth:
                 logger.warning(
@@ -20878,7 +21200,15 @@ def create_embedded_copy_api():
                     device_id, telegram_user_id or "-",
                 )
 
-            if token == COPY_ADMIN_LICENSE_TOKEN:
+            if auth_mode == "telegram":
+                for old_client_id, old_client in list(_copy_clients.items()):
+                    if normalize_copy_telegram_user_id((old_client or {}).get("telegram_user_id")) == telegram_user_id and str((old_client or {}).get("device_id") or "") != device_id:
+                        try:
+                            await old_client.get("ws").close(code=4412, reason="telegram device replaced")
+                        except Exception:
+                            logger.debug("Could not close superseded Telegram Copy client", exc_info=True)
+                        _copy_clients.pop(old_client_id, None)
+            elif token == COPY_ADMIN_LICENSE_TOKEN:
                 for old_client_id, old_client in list(_copy_clients.items()):
                     if old_client.get("license") == token and str(old_client.get("device_id") or "") != device_id:
                         try:
@@ -20895,7 +21225,8 @@ def create_embedded_copy_api():
                 "telegram_user_id": telegram_user_id,
                 "device_proof_key": device_proof_key,
                 "origin": origin,
-                "transport": "legacy_query" if legacy_auth else "challenge_v2",
+                "transport": "telegram_subscription_v1" if auth_mode == "telegram" else ("legacy_query" if legacy_auth else "challenge_v2"),
+                "auth_mode": auth_mode,
                 "connected_at": now_iso(),
                 "last_seen_at": now_iso(),
                 "last_sent_at": None,
@@ -20909,15 +21240,18 @@ def create_embedded_copy_api():
                 "copy_settings": copy_public_settings_payload(),
                 "license": {
                     "status": "active",
-                    "plan": (license_record or {}).get("plan"),
+                    "plan": (license_record or {}).get("plan") or (license_record or {}).get("mode"),
                     "expires_at": (license_record or {}).get("expires_at"),
-                    "max_devices": (license_record or {}).get("max_devices"),
+                    "max_devices": 1 if auth_mode == "telegram" else (license_record or {}).get("max_devices"),
                     "telegram_user_id": normalize_copy_telegram_user_id((license_record or {}).get("telegram_user_id") or telegram_user_id),
-                    "route_mode": "personal" if telegram_user_id else "broadcast_only_until_telegram_id_is_set",
+                    "route_mode": "personal",
                     "is_admin_license": is_admin_license,
                     "role": (license_record or {}).get("role") or ("admin" if is_admin_license else "user"),
+                    "source": "telegram_bot_subscription" if auth_mode == "telegram" else "legacy_copy_license",
                 },
             }
+            if auth_mode == "telegram":
+                hello["subscription"] = dict(hello["license"])
             if not legacy_auth:
                 hello["session_token"] = _copy_session_token_issue(token, device_id, telegram_user_id, device_proof_key)
                 hello["session_expires_in"] = int(COPY_SESSION_TOKEN_TTL_SECONDS)
@@ -20928,14 +21262,19 @@ def create_embedded_copy_api():
                     raw = await websocket.receive_text()
                     if client_id in _copy_clients:
                         _copy_clients[client_id]["last_seen_at"] = now_iso()
-                    ok, reason, _record = copy_validate_license_for_device(
-                        token,
-                        device_id,
-                        telegram_user_id=telegram_user_id,
-                        touch=True,
-                        allow_admin_rebind=False,
-                        device_proof_key=device_proof_key,
-                    )
+                    if auth_mode == "telegram":
+                        ok, reason, _record = copy_validate_telegram_subscription_device(
+                            telegram_user_id, device_id, device_proof_key, touch=True
+                        )
+                    else:
+                        ok, reason, _record = copy_validate_license_for_device(
+                            token,
+                            device_id,
+                            telegram_user_id=telegram_user_id,
+                            touch=True,
+                            allow_admin_rebind=False,
+                            device_proof_key=device_proof_key,
+                        )
                     if not ok:
                         await _reject_auth(reason)
                         break
@@ -21045,8 +21384,60 @@ def create_embedded_copy_api():
             await _reject_auth("device proof failed")
             return
 
+        auth_scheme = str(auth.get("auth_scheme") or "").strip().lower()
         token = normalize_copy_license_token(auth.get("token"))
         session_token = str(auth.get("session_token") or "").strip()
+
+        # v1.07: new clients authenticate only with Telegram ID + device proof.
+        # The bot subscription is the entitlement; the first device is approved
+        # by pressing a confirmation button inside Telegram.
+        if COPY_TELEGRAM_SUBSCRIPTION_AUTH_ENABLED and (auth_scheme == "telegram_subscription_v1" or (telegram_user_id and not token)):
+            if not telegram_user_id:
+                _copy_ws_auth_failure(auth_ip)
+                await _reject_auth("telegram id required")
+                return
+            principal = _copy_telegram_principal(telegram_user_id)
+            origin_ok, trusted_owner_device = await _origin_precheck(
+                principal, device_id, telegram_user_id, device_proof_key,
+                is_admin_identity=(telegram_user_id == str(int(ADMIN_TELEGRAM_ID))),
+            )
+            if not origin_ok:
+                return
+            sub_ok, sub_reason, subscription = copy_bot_subscription_record(telegram_user_id)
+            if not sub_ok:
+                _copy_ws_auth_failure(auth_ip)
+                await _reject_auth(sub_reason)
+                return
+            device_ok, device_reason, subscription = copy_validate_telegram_subscription_device(
+                telegram_user_id, device_id, device_proof_key, touch=True
+            )
+            if not device_ok:
+                if device_reason == "telegram device confirmation required":
+                    request_id, request_data, should_notify = copy_get_or_create_telegram_link_request(
+                        telegram_user_id, device_id, device_proof_key, str(origin or "")
+                    )
+                    if should_notify:
+                        await copy_send_telegram_link_confirmation(request_id, request_data)
+                    await _copy_send_json_safe(websocket, {
+                        "type": "auth_pending", "code": "telegram_link_pending",
+                        "message": "افتح Telegram وأكّد ربط هذا الجهاز من رسالة البوت.",
+                        "retry_after_ms": 3000, "request_id": request_id,
+                        "server_time": now_iso(),
+                    })
+                    await asyncio.sleep(0.05)
+                    try:
+                        await websocket.close(code=4443, reason="telegram_link_pending")
+                    except Exception:
+                        pass
+                    return
+                _copy_ws_auth_failure(auth_ip)
+                await _reject_auth(device_reason)
+                return
+            await _run_authenticated(
+                principal, device_id, telegram_user_id, device_proof_key, subscription,
+                legacy_auth=False, trusted_owner_device=trusted_owner_device, auth_mode="telegram",
+            )
+            return
         if session_token:
             session_ok, session_reason, session_payload = _copy_session_token_verify(session_token)
             if session_ok and session_payload:
