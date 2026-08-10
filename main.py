@@ -1014,7 +1014,7 @@ COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
 # v1.03 gives Three Candle its own live Quotex instruments/list universe; extension protocol remains v0.99.
-COPY_SERVER_VERSION = "1.07.0"
+COPY_SERVER_VERSION = "1.09.0"
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.00").strip() or "v1.00"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
@@ -20906,7 +20906,7 @@ def create_embedded_copy_api():
         }
 
 
-    # ===== Legacy mobile license API (kept temporarily until Android migrates to Telegram-ID auth) =====
+    # ===== Mobile API (Telegram-ID primary; legacy code-auth compatibility retained during rollout) =====
     # The Flutter mobile client uses the same Copy license/device binding as the
     # desktop extension, but authenticates over HTTPS and receives a short-lived
     # bearer session.  This keeps the license token out of subsequent polling
@@ -21097,6 +21097,32 @@ def create_embedded_copy_api():
                 "max_devices": (record or {}).get("max_devices"),
                 "is_admin_license": bool((record or {}).get("is_admin_license")),
                 "role": (record or {}).get("role") or ("admin" if token == COPY_ADMIN_LICENSE_TOKEN else "user"),
+            },
+        }
+
+    @copy_api.get("/api/mobile/account/status")
+    async def mobile_account_status(authorization: str | None = Header(default=None)):
+        # v1.09 entitlement heartbeat: lightweight status endpoint used by the
+        # Android shell on startup/resume and periodically while signed in.
+        # _mobile_bearer_session re-validates the bot subscription + mobile
+        # device proof before this response is returned.
+        session = _mobile_bearer_session(authorization)
+        record = dict(session.get("license_record") or {})
+        telegram_user_id = normalize_copy_telegram_user_id(
+            record.get("telegram_user_id") or session.get("telegram_user_id")
+        )
+        return {
+            "ok": True,
+            "status": "active",
+            "server_time": now_iso(),
+            "account": {
+                "telegram_user_id": telegram_user_id,
+                "plan": record.get("plan") or record.get("mode") or "active",
+                "expires_at": record.get("expires_at") or "forever",
+                "role": record.get("role") or (
+                    "admin" if telegram_user_id == str(int(ADMIN_TELEGRAM_ID)) else "user"
+                ),
+                "is_admin_license": bool(record.get("is_admin_license")),
             },
         }
 
