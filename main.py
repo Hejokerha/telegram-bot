@@ -1014,7 +1014,7 @@ COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
 # v1.03 gives Three Candle its own live Quotex instruments/list universe; extension protocol remains v0.99.
-COPY_SERVER_VERSION = "1.09.0"
+COPY_SERVER_VERSION = "1.10.0"
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.00").strip() or "v1.00"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
@@ -20357,6 +20357,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # هذا السيرفر يستقبل الصفقات من البوت ويبثها لإضافات Chrome المتصلة على نفس رابط Render.
 _copy_server_started = False
 _copy_clients = {}
+_mobile_signal_clients = {}
 _copy_ws_sessions = {}
 _copy_ws_auth_failures = {}
 _copy_signal_history = []
@@ -20597,6 +20598,73 @@ async def _copy_broadcast_signal(signal: dict) -> dict:
         "global_enabled": True,
         "target_user_id": target_user_id or None,
         "scope": "user" if target_user_id else "broadcast",
+    }
+
+
+async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
+    """Push an accepted Copy signal to authenticated Android mobile sessions.
+
+    The mobile stream is intentionally separate from extension device clients,
+    so linking/using Android can never replace the Chrome extension binding.
+    """
+    target_user_id = normalize_copy_telegram_user_id((signal or {}).get("target_user_id"))
+    delivered = 0
+    skipped_scope = 0
+    dead = []
+    inactive = []
+    for client_id, client in list(_mobile_signal_clients.items()):
+        client_user_id = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
+        if target_user_id and client_user_id != target_user_id:
+            skipped_scope += 1
+            continue
+        try:
+            token = normalize_copy_license_token((client or {}).get("token"))
+            device_id = str((client or {}).get("device_id") or "unknown")
+            proof = str((client or {}).get("device_proof_key") or "")
+            if not token and client_user_id and proof:
+                ok, _reason, _record = copy_validate_telegram_subscription_device(
+                    client_user_id, device_id, proof, touch=True, client_kind="mobile"
+                )
+            else:
+                ok, _reason, _record = copy_validate_license_for_device(
+                    token, device_id, telegram_user_id=client_user_id,
+                    touch=True, allow_admin_rebind=False
+                )
+            if not ok:
+                inactive.append(client_id)
+                continue
+        except Exception:
+            inactive.append(client_id)
+            continue
+        ws = (client or {}).get("ws")
+        ok = await _copy_send_json_safe(ws, {
+            "type": "signal",
+            "signal": signal,
+            "server_time": now_iso(),
+            "transport": "mobile_push_v1",
+        })
+        if ok:
+            delivered += 1
+            client["last_sent_at"] = now_iso()
+        else:
+            dead.append(client_id)
+    for client_id in set(dead + inactive):
+        client = _mobile_signal_clients.pop(client_id, None)
+        if client:
+            try:
+                await (client or {}).get("ws").close(
+                    code=4441 if client_id in inactive else 1011,
+                    reason="mobile_subscription_inactive" if client_id in inactive else "mobile_signal_socket_dead",
+                )
+            except Exception:
+                pass
+    return {
+        "online_mobile_clients": len(_mobile_signal_clients),
+        "delivered": delivered,
+        "dead_removed": len(dead),
+        "inactive_removed": len(inactive),
+        "skipped_scope": skipped_scope,
+        "target_user_id": target_user_id or None,
     }
 
 
@@ -20856,7 +20924,7 @@ def _copy_ws_auth_success(ip: str):
 
 
 def create_embedded_copy_api():
-    from fastapi import FastAPI, Header, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
+    from fastapi import FastAPI, Header, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
     from fastapi.middleware.cors import CORSMiddleware
 
     copy_api = FastAPI(title="TRADING TIME COPY EMBEDDED SERVER", version=COPY_SERVER_VERSION)
@@ -21127,7 +21195,9 @@ def create_embedded_copy_api():
         }
 
     @copy_api.get("/api/mobile/signals/recent")
-    async def mobile_recent_signals(authorization: str | None = Header(default=None)):
+    async def mobile_recent_signals(response: Response, authorization: str | None = Header(default=None)):
+        response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+        response.headers["Pragma"] = "no-cache"
         session = _mobile_bearer_session(authorization)
         telegram_user_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
 
@@ -21156,6 +21226,78 @@ def create_embedded_copy_api():
         # is not part of the v0.5 execution-link milestone yet.
         _mobile_bearer_session(authorization)
         raise HTTPException(status_code=501, detail="طلب تحليل يدوي من الموبايل غير مفعّل بعد")
+
+    @copy_api.websocket("/ws/mobile-signals")
+    async def mobile_signal_ws(websocket: WebSocket):
+        # Android-only signal stream. Authentication uses the existing mobile
+        # bearer session, so this does not consume/replace a Chrome device slot.
+        await websocket.accept()
+        authorization = websocket.headers.get("authorization")
+        try:
+            session = _mobile_bearer_session(authorization)
+        except Exception as exc:
+            try:
+                await _copy_send_json_safe(websocket, {
+                    "type": "auth_error",
+                    "message": "invalid_mobile_session",
+                    "server_time": now_iso(),
+                })
+                await websocket.close(code=4401, reason="invalid_mobile_session")
+            except Exception:
+                pass
+            return
+
+        telegram_user_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
+        session_token = str(session.get("session_token") or "")
+        client_id = hashlib.sha256(
+            f"mobile:{telegram_user_id}:{session.get('device_id')}:{time_module.time()}".encode("utf-8")
+        ).hexdigest()[:16]
+        _mobile_signal_clients[client_id] = {
+            "ws": websocket,
+            "session_token": session_token,
+            "token": normalize_copy_license_token(session.get("token")),
+            "device_id": str(session.get("device_id") or "unknown"),
+            "telegram_user_id": telegram_user_id,
+            "device_proof_key": str((_copy_ws_sessions.get(session_token) or {}).get("device_proof_key") or ""),
+            "connected_at": now_iso(),
+            "last_seen_at": now_iso(),
+            "last_sent_at": None,
+        }
+        await _copy_send_json_safe(websocket, {
+            "type": "hello",
+            "ok": True,
+            "client_id": client_id,
+            "server_time": now_iso(),
+            "transport": "mobile_push_v1",
+        })
+        try:
+            while True:
+                raw = await websocket.receive_text()
+                # Re-use the HTTP bearer verifier on every client heartbeat. It
+                # refreshes the sliding mobile session and rechecks bot entitlement.
+                try:
+                    _mobile_bearer_session(f"Bearer {session_token}")
+                except Exception:
+                    await websocket.close(code=4441, reason="mobile_subscription_inactive")
+                    break
+                if client_id in _mobile_signal_clients:
+                    _mobile_signal_clients[client_id]["last_seen_at"] = now_iso()
+                try:
+                    event = json.loads(raw)
+                except Exception:
+                    event = {"type": "raw"}
+                if str(event.get("type") or "").lower() == "ping":
+                    await _copy_send_json_safe(websocket, {
+                        "type": "pong",
+                        "server_time": now_iso(),
+                        "transport": "mobile_push_v1",
+                    })
+        except WebSocketDisconnect:
+            pass
+        except Exception:
+            logger.debug("Mobile signal WebSocket ended", exc_info=True)
+        finally:
+            _mobile_signal_clients.pop(client_id, None)
 
     @copy_api.get("/api/admin/status")
     async def copy_admin_status(x_ttcopy_secret: str | None = Header(default=None)):
@@ -21201,7 +21343,8 @@ def create_embedded_copy_api():
         _copy_signal_history.append(normalized)
         del _copy_signal_history[:-int(COPY_SIGNAL_HISTORY_LIMIT)]
         delivery = await _copy_broadcast_signal(normalized)
-        return {"ok": True, "signal": normalized, "delivery": delivery}
+        mobile_delivery = await _copy_broadcast_mobile_signal(normalized)
+        return {"ok": True, "signal": normalized, "delivery": delivery, "mobile_delivery": mobile_delivery}
 
     @copy_api.post("/api/admin/manual-signal")
     async def copy_manual_signal(request: Request, x_ttcopy_secret: str | None = Header(default=None)):
@@ -21222,7 +21365,8 @@ def create_embedded_copy_api():
         _copy_signal_history.append(normalized)
         del _copy_signal_history[:-int(COPY_SIGNAL_HISTORY_LIMIT)]
         delivery = await _copy_broadcast_signal(normalized)
-        return {"ok": True, "signal": normalized, "delivery": delivery}
+        mobile_delivery = await _copy_broadcast_mobile_signal(normalized)
+        return {"ok": True, "signal": normalized, "delivery": delivery, "mobile_delivery": mobile_delivery}
 
     @copy_api.websocket("/ws/extension")
     async def copy_extension_ws(websocket: WebSocket):
