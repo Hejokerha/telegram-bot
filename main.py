@@ -1013,8 +1013,10 @@ ADMIN_ERROR_ALERT_COOLDOWN_SECONDS = int(os.getenv("ADMIN_ERROR_ALERT_COOLDOWN_S
 COPY_TRADING_ENABLED = os.getenv("COPY_TRADING_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 COPY_SERVER_URL = os.getenv("COPY_SERVER_URL", f"http://127.0.0.1:{os.getenv('PORT', '8080')}").rstrip("/")
 BOT_RELEASE_VERSION = "v0.86"
-# v1.03 gives Three Candle its own live Quotex instruments/list universe; extension protocol remains v0.99.
-COPY_SERVER_VERSION = "1.10.0"
+# v1.11 introduces the versioned execute/prepare signal contract shared by the
+# extension and Android transports.  It is intentionally fail-closed: malformed
+# timing data is rejected instead of being silently converted to a 60s trade.
+COPY_SERVER_VERSION = "1.11.0"
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.00").strip() or "v1.00"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
@@ -1027,6 +1029,15 @@ COPY_SERVER_SECRET_SOURCE = (
     "env" if _COPY_SERVER_SECRET_ENV else ("derived_from_bot_token" if BOT_TOKEN else "ephemeral_random")
 )
 COPY_SIGNAL_VALIDITY_SECONDS = int(os.getenv("COPY_SIGNAL_VALIDITY_SECONDS", "25"))
+COPY_SIGNAL_DURATION_MIN_SECONDS = 5
+COPY_SIGNAL_DURATION_MAX_SECONDS = 600
+COPY_SIGNAL_MAX_ENTRY_DELAY_MIN_SECONDS = 1
+COPY_SIGNAL_MAX_ENTRY_DELAY_MAX_SECONDS = 15
+COPY_SIGNAL_DEDUPE_LIMIT = max(200, int(os.getenv("COPY_SIGNAL_DEDUPE_LIMIT", "2000")))
+COPY_EXECUTABLE_SOURCES = frozenset({
+    "three_candle", "timed_list", "otc_live", "real_market", "trading_room", "otc_edge",
+})
+COPY_ALLOWED_SIGNAL_SOURCES = frozenset({*COPY_EXECUTABLE_SOURCES, "admin_manual"})
 COPY_REQUEST_TIMEOUT_SECONDS = int(os.getenv("COPY_REQUEST_TIMEOUT_SECONDS", "6"))
 COPY_SEND_OTC_LIVE_NOW = os.getenv("COPY_SEND_OTC_LIVE_NOW", "true").lower() in {"1", "true", "yes", "on"}
 COPY_SEND_REAL_MARKET = os.getenv("COPY_SEND_REAL_MARKET", "true").lower() in {"1", "true", "yes", "on"}
@@ -1035,6 +1046,17 @@ COPY_SEND_THREE_CANDLE = os.getenv("COPY_SEND_THREE_CANDLE", "true").lower() in 
 COPY_SEND_TRADING_ROOM = os.getenv("COPY_SEND_TRADING_ROOM", "true").lower() in {"1", "true", "yes", "on"}
 COPY_SEND_OTC_EDGE = os.getenv("COPY_SEND_OTC_EDGE", "true").lower() in {"1", "true", "yes", "on"}
 COPY_OTC_EDGE_SIGNAL_VALID_SECONDS = int(os.getenv("COPY_OTC_EDGE_SIGNAL_VALID_SECONDS", str(max(10, int(os.getenv("OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS", "5")) * 2))))
+# A trade received late is a different trade. Keep every producer inside the
+# same bounded admission window used by the mobile executor; never preserve the
+# former 25-30 second generic history window as permission to click late.
+COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS = {
+    "three_candle": 10,
+    "timed_list": 10,
+    "otc_live": 10,
+    "real_market": 10,
+    "trading_room": 10,
+    "otc_edge": min(15, max(10, COPY_OTC_EDGE_SIGNAL_VALID_SECONDS)),
+}
 # v0.67: عند مراقبة زوج واحد نرسل أمر تجهيز مسبق للإضافة قبل السماح بأي إشارة Edge.
 COPY_OTC_EDGE_PREPARE_ENABLED = os.getenv("COPY_OTC_EDGE_PREPARE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
 COPY_OTC_EDGE_PREPARE_REFRESH_SECONDS = int(os.getenv("COPY_OTC_EDGE_PREPARE_REFRESH_SECONDS", "60"))
@@ -2026,6 +2048,17 @@ def set_copy_global_enabled(enabled: bool, admin_id: int | None = None) -> bool:
             "updated_by": int(admin_id) if admin_id else None,
         })
         clear_copy_settings_cache()
+        if not enabled:
+            # Global stop invalidates every queued/replayable signal.  Keep the
+            # bounded id registry so an old producer retry cannot resurrect one.
+            history = globals().get("_copy_signal_history")
+            store_lock = globals().get("_copy_signal_store_lock")
+            if store_lock is not None:
+                with store_lock:
+                    if isinstance(history, list):
+                        history.clear()
+            elif isinstance(history, list):
+                history.clear()
         return True
     except Exception as e:
         logger.warning("Could not update copy global enabled: %s", e)
@@ -3233,20 +3266,50 @@ def _copy_timeframe(signal: dict) -> str:
         return "M1"
 
 
-def _copy_duration_seconds(signal: dict) -> int:
+def _copy_strict_integral_seconds(value, field_name: str, minimum: int, maximum: int) -> int:
+    """Parse a whole-second contract value without truncating or clamping it."""
+    if isinstance(value, bool):
+        raise ValueError(f"{field_name} must be a number")
     try:
-        if signal.get("duration_seconds"):
-            return max(5, int(float(signal.get("duration_seconds"))))
-        if signal.get("duration_minutes"):
-            return max(5, int(float(signal.get("duration_minutes")) * 60))
-        if signal.get("timeframe_minutes"):
-            return max(5, int(float(signal.get("timeframe_minutes")) * 60))
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"{field_name} must be a number")
+    if not number.is_integer():
+        raise ValueError(f"{field_name} must be a whole number of seconds")
+    parsed = int(number)
+    if parsed < int(minimum) or parsed > int(maximum):
+        raise ValueError(f"{field_name} must be between {minimum} and {maximum} seconds")
+    return parsed
+
+
+def _copy_duration_seconds(signal: dict, source: str | None = None) -> int:
+    """Build an explicit producer duration; unknown/malformed values fail closed."""
+    signal = dict(signal or {})
+    if signal.get("duration_seconds") not in (None, ""):
+        raw_seconds = signal.get("duration_seconds")
+    elif signal.get("duration_minutes") not in (None, ""):
+        try:
+            raw_seconds = float(signal.get("duration_minutes")) * 60
+        except (TypeError, ValueError):
+            raise ValueError("duration_minutes must be a number")
+    elif signal.get("timeframe_minutes") not in (None, ""):
+        try:
+            raw_seconds = float(signal.get("timeframe_minutes")) * 60
+        except (TypeError, ValueError):
+            raise ValueError("timeframe_minutes must be a number")
+    elif signal.get("timeframe") not in (None, ""):
         tf = _copy_timeframe(signal)
-        if tf.startswith("M") and tf[1:].isdigit():
-            return max(5, int(tf[1:]) * 60)
-    except Exception:
-        logger.debug("Suppressed exception at line 2512", exc_info=True)
-    return 60
+        if not (tf.startswith("M") and tf[1:].isdigit()):
+            raise ValueError("timeframe must be M1 through M10")
+        raw_seconds = int(tf[1:]) * 60
+    else:
+        raise ValueError("duration_seconds is required")
+    return _copy_strict_integral_seconds(
+        raw_seconds,
+        "duration_seconds",
+        COPY_SIGNAL_DURATION_MIN_SECONDS,
+        COPY_SIGNAL_DURATION_MAX_SECONDS,
+    )
 
 
 
@@ -3313,11 +3376,41 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
     source = normalize_copy_source(source)
     signal = dict(signal or {})
     entry_dt = _copy_parse_iso(signal.get("entry_time")) or now_utc()
-    expires_dt = _copy_parse_iso(signal.get("expires_at")) or (entry_dt + timedelta(seconds=int(COPY_SIGNAL_VALIDITY_SECONDS)))
+    contract_kind = _copy_signal_contract_kind({**signal, "source": source})
+    source_max_delay = COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS.get(source)
+    if contract_kind == "execute":
+        raw_max_delay = signal.get("max_entry_delay_seconds")
+        if raw_max_delay in (None, ""):
+            if source_max_delay is None:
+                raise ValueError(f"max_entry_delay_seconds is required for source {source}")
+            raw_max_delay = source_max_delay
+        max_entry_delay_seconds = _copy_strict_integral_seconds(
+            raw_max_delay,
+            "max_entry_delay_seconds",
+            COPY_SIGNAL_MAX_ENTRY_DELAY_MIN_SECONDS,
+            COPY_SIGNAL_MAX_ENTRY_DELAY_MAX_SECONDS,
+        )
+    else:
+        max_entry_delay_seconds = None
+    duration_seconds = _copy_duration_seconds(signal, source=source)
+    expires_dt = _copy_parse_iso(signal.get("expires_at"))
+    if expires_dt is None:
+        validity_seconds = max_entry_delay_seconds if contract_kind == "execute" else 60
+        expires_dt = entry_dt + timedelta(seconds=int(validity_seconds))
 
     pair_display = _copy_display_pair({**signal, "source": source})
-    platform_symbol = signal.get("platform_symbol") or signal.get("symbol") or signal.get("pair") or pair_display or ""
+    raw_platform_symbol = signal.get("platform_symbol") or signal.get("symbol")
+    pair_display, platform_symbol, _ = _copy_server_normalize_pair_contract({
+        "pair": pair_display,
+        "platform_symbol": raw_platform_symbol or pair_display,
+    })
     direction = str(signal.get("direction") or "").strip().upper()
+    expiry_time = signal.get("expiry_time") or signal.get("trade_expiry_time")
+    expiry_timestamp = signal.get("expiry_timestamp") or signal.get("trade_expiry_timestamp")
+    if expiry_time in (None, "") and expiry_timestamp in (None, ""):
+        derived_expiry = entry_dt + timedelta(seconds=duration_seconds)
+        expiry_time = derived_expiry.isoformat()
+        expiry_timestamp = int(derived_expiry.timestamp())
 
     payload = {
         "source": source,
@@ -3326,7 +3419,7 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
         "platform_symbol": platform_symbol,
         "direction": direction,
         "timeframe": _copy_timeframe(signal),
-        "duration_seconds": _copy_duration_seconds(signal),
+        "duration_seconds": duration_seconds,
         "entry_time": entry_dt.isoformat(),
         "expires_at": expires_dt.isoformat(),
         "created_at": now_iso(),
@@ -3349,24 +3442,28 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
         "direct_entry": bool(signal.get("direct_entry") or False),
         "instant_entry": bool(signal.get("instant_entry") or signal.get("immediate_entry") or False),
         "allow_background_entry": bool(signal.get("allow_background_entry") or False),
-        "max_entry_delay_seconds": signal.get("max_entry_delay_seconds"),
+        "max_entry_delay_seconds": max_entry_delay_seconds,
         # v0.67: preserve exact platform expiry and OTC Edge pre-arm control fields.
-        "expiry_time": signal.get("expiry_time") or signal.get("trade_expiry_time"),
-        "expiry_timestamp": signal.get("expiry_timestamp") or signal.get("trade_expiry_timestamp"),
+        "expiry_time": expiry_time,
+        "expiry_timestamp": expiry_timestamp,
         "trade_expiry_mode": signal.get("trade_expiry_mode"),
-        "signal_kind": signal.get("signal_kind"),
-        "prepare_only": bool(signal.get("prepare_only") or False),
+        "signal_kind": contract_kind,
+        "source_signal_kind": signal.get("signal_kind"),
+        "prepare_only": contract_kind == "prepare",
         "preselected_pair_mode": bool(signal.get("preselected_pair_mode") or False),
         "watch_pair": signal.get("watch_pair"),
         "skip_asset_switch": bool(signal.get("skip_asset_switch") or False),
     }
 
     base = "|".join([
+        str(payload.get("signal_kind") or "execute"),
         str(payload.get("source")),
         str(payload.get("pair")),
         str(payload.get("platform_symbol")),
         str(payload.get("direction")),
         str(payload.get("entry_time")),
+        str(payload.get("expiry_timestamp") or payload.get("expiry_time") or ""),
+        str(payload.get("target_user_id") or ""),
     ])
     payload["id"] = str(signal.get("id") or hashlib.sha256(base.encode("utf-8")).hexdigest()[:18])
     return payload
@@ -3379,7 +3476,9 @@ def send_copy_trading_signal_sync(signal: dict, source: str = "bot") -> dict:
 
     try:
         payload = build_copy_trading_payload(signal, source=source)
-        if not payload.get("pair") or not payload.get("direction"):
+        if not payload.get("pair") or (
+            payload.get("signal_kind") == "execute" and not payload.get("direction")
+        ):
             return {"ok": False, "skipped": True, "reason": "missing pair/direction", "payload": payload}
         res = requests.post(
             f"{COPY_SERVER_URL}/api/bot/signal",
@@ -3487,7 +3586,10 @@ async def publish_copy_timed_list_signals(pair: str, signals: list[str], interva
                 "duration_seconds": 60,
                 "duration_minutes": 1,
                 "entry_time": entry_dt.isoformat(),
-                "expires_at": (entry_dt + timedelta(seconds=max(30, int(COPY_SIGNAL_VALIDITY_SECONDS)))).isoformat(),
+                "expires_at": (
+                    entry_dt
+                    + timedelta(seconds=COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["timed_list"])
+                ).isoformat(),
                 "note": f"timed_list {index + 1}/{len(signals)} | interval={interval_minutes}m",
                 "batch_id": list_batch_id,
                 "timed_list_batch_id": list_batch_id,
@@ -3535,7 +3637,10 @@ async def publish_copy_three_candle_signal(trade: dict) -> dict:
             "duration_seconds": 60,
             "duration_minutes": 1,
             "entry_time": entry_dt.isoformat(),
-            "expires_at": (entry_dt + timedelta(seconds=max(30, int(COPY_SIGNAL_VALIDITY_SECONDS)))).isoformat(),
+            "expires_at": (
+                entry_dt
+                + timedelta(seconds=COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["three_candle"])
+            ).isoformat(),
             "quality": int(round(float((trade or {}).get("body_score", 0) or 0) * 100)) if (trade or {}).get("body_score") is not None else None,
             "payout": (trade or {}).get("payout"),
             "note": f"three_candle_channel | smart={bool((trade or {}).get('smart_filter'))} | pattern={(trade or {}).get('pattern')} | m={(trade or {}).get('momentum_count')} | c={(trade or {}).get('correction_count')}",
@@ -3670,7 +3775,7 @@ async def publish_copy_otc_edge_signal(item: dict, target_user_id: int | None = 
             "duration_seconds": max(5, int(duration_seconds)),
             "duration_minutes": 1,
             "entry_time": entry_dt.isoformat(),
-            "expires_at": (entry_dt + timedelta(seconds=max(10, int(COPY_OTC_EDGE_SIGNAL_VALID_SECONDS)))).isoformat(),
+            "expires_at": (entry_dt + timedelta(seconds=COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["otc_edge"])).isoformat(),
             "expiry_time": expiry_dt.isoformat(),
             "expiry_timestamp": expiry_timestamp,
             "trade_expiry_mode": trade_expiry_mode,
@@ -3684,7 +3789,7 @@ async def publish_copy_otc_edge_signal(item: dict, target_user_id: int | None = 
             "immediate_entry": True,
             "direct_entry": True,
             "allow_background_entry": True,
-            "max_entry_delay_seconds": max(10, int(COPY_OTC_EDGE_SIGNAL_VALID_SECONDS)),
+            "max_entry_delay_seconds": COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["otc_edge"],
             "preselected_pair_mode": single_pair_mode,
             "watch_pair": pair if single_pair_mode else None,
             "skip_asset_switch": single_pair_mode,
@@ -3730,7 +3835,10 @@ async def publish_copy_trading_room_signal(trade: dict, state: dict | None = Non
             "duration_seconds": 60,
             "duration_minutes": 1,
             "entry_time": entry_dt.isoformat(),
-            "expires_at": (entry_dt + timedelta(seconds=max(30, int(COPY_SIGNAL_VALIDITY_SECONDS)))).isoformat(),
+            "expires_at": (
+                entry_dt
+                + timedelta(seconds=COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["trading_room"])
+            ).isoformat(),
             "quality": (trade or {}).get("score"),
             "confidence": (trade or {}).get("score"),
             "entry_price": (trade or {}).get("price"),
@@ -5386,6 +5494,9 @@ def analyze_best_live_otc_now(lang: str = "ar") -> dict:
         "pair": best["pair"],
         "symbol": best["symbol"],
         "direction": best["direction"],
+        "timeframe": "M1",
+        "duration_seconds": 60,
+        "duration_minutes": 1,
         "quality": best["score"],
         "entry_price": best["price"],
         "payout": best.get("payout", 80),
@@ -19044,6 +19155,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == "🟢 تشغيل Copy":
             if set_copy_global_enabled(True, user.id):
+                await _copy_broadcast_global_control(True, user.id)
                 await update.message.reply_text("✅ تم تشغيل Copy Trading للجميع.", reply_markup=copy_admin_keyboard)
             else:
                 await update.message.reply_text("❌ تعذر تشغيل Copy Trading. راجع لوج Render.", reply_markup=copy_admin_keyboard)
@@ -19051,6 +19163,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == "🔴 إيقاف Copy":
             if set_copy_global_enabled(False, user.id):
+                await _copy_broadcast_global_control(False, user.id)
                 await update.message.reply_text("🔴 تم إيقاف Copy Trading للجميع. الإضافات تبقى متصلة لكن لن تستقبل صفقات جديدة.", reply_markup=copy_admin_keyboard)
             else:
                 await update.message.reply_text("❌ تعذر إيقاف Copy Trading. راجع لوج Render.", reply_markup=copy_admin_keyboard)
@@ -20361,7 +20474,71 @@ _mobile_signal_clients = {}
 _copy_ws_sessions = {}
 _copy_ws_auth_failures = {}
 _copy_signal_history = []
+_copy_signal_id_registry = {}
+_copy_signal_store_lock = threading.RLock()
 _copy_client_events = []
+
+# ===== TEMP DIAGNOSTIC: COPY -> MOBILE FEED (NO PROTOCOL/EXECUTION CHANGES) =====
+# This instrumentation is intentionally read-only. It does not alter signal payloads,
+# timing, routing, authentication, delivery, or dedupe behavior. Remove after diagnosis.
+COPY_FEED_DIAG_TAG = "feed_diag_20260814"
+_copy_feed_diag_state = {}
+
+def _copy_diag_signal_summary(signal: dict) -> dict:
+    row = dict(signal or {})
+    return {
+        "id": str(row.get("id") or "")[:180],
+        "source": str(row.get("source") or "")[:80],
+        "kind": str(row.get("signal_kind") or row.get("source_signal_kind") or "")[:40],
+        "pair": str(row.get("pair") or row.get("pair_display") or row.get("platform_symbol") or "")[:80],
+        "direction": str(row.get("direction") or "")[:16],
+        "entry_time": str(row.get("entry_time") or "")[:80],
+        "expires_at": str(row.get("expires_at") or "")[:80],
+        "max_entry_delay_seconds": row.get("max_entry_delay_seconds"),
+        "target_user_id": normalize_copy_telegram_user_id(row.get("target_user_id")),
+        "prepare_only": bool(row.get("prepare_only")),
+    }
+
+def _copy_diag_log_mobile_feed(telegram_user_id, global_enabled: bool, history: list, visible: list) -> None:
+    """Log only when the feed changes or every 30s; never changes returned data."""
+    try:
+        uid = normalize_copy_telegram_user_id(telegram_user_id) or "-"
+        history_rows = [row for row in list(history or []) if isinstance(row, dict)]
+        visible_rows = [row for row in list(visible or []) if isinstance(row, dict)]
+        non_exec = 0
+        scope_skip = 0
+        for row in history_rows:
+            if not _copy_signal_delivery_allowed(True, row, mobile=True):
+                non_exec += 1
+                continue
+            target_uid = normalize_copy_telegram_user_id(row.get("target_user_id"))
+            if target_uid and target_uid != uid:
+                scope_skip += 1
+        latest = [_copy_diag_signal_summary(row) for row in visible_rows[-3:]]
+        signature = json.dumps(
+            {
+                "global": bool(global_enabled),
+                "history": len(history_rows),
+                "visible": len(visible_rows),
+                "latest": latest,
+                "non_exec": non_exec,
+                "scope_skip": scope_skip,
+            },
+            sort_keys=True, ensure_ascii=True, default=str,
+        )
+        now_ts = time_module.time()
+        previous = _copy_feed_diag_state.get(uid) or {}
+        changed = signature != previous.get("signature")
+        periodic = now_ts - float(previous.get("logged_at") or 0) >= 30.0
+        if changed or periodic:
+            logger.info(
+                "[TT_COPY_DIAG] MOBILE_FEED tag=%s uid=%s global=%s history=%s visible=%s filtered_nonexec=%s filtered_scope=%s latest=%s",
+                COPY_FEED_DIAG_TAG, uid, bool(global_enabled), len(history_rows), len(visible_rows),
+                non_exec, scope_skip, json.dumps(latest, ensure_ascii=False, default=str),
+            )
+            _copy_feed_diag_state[uid] = {"signature": signature, "logged_at": now_ts}
+    except Exception:
+        logger.debug("COPY mobile feed diagnostic logging failed", exc_info=True)
 
 
 def _copy_load_licenses() -> dict:
@@ -20394,71 +20571,332 @@ def _copy_server_normalize_direction(direction: str) -> str:
     raise ValueError("direction must be CALL or PUT")
 
 
+def _copy_signal_contract_kind(payload: dict) -> str:
+    """Return the canonical non-ambiguous signal kind: prepare or execute."""
+    payload = dict(payload or {})
+    source = normalize_copy_source(payload.get("source"))
+    raw_kind = str(payload.get("contract_kind") or payload.get("signal_kind") or "").strip().lower()
+    entry_modes = {
+        str(payload.get("entry_mode") or "").strip().lower(),
+        str(payload.get("copy_entry_mode") or "").strip().lower(),
+        str(payload.get("execution_mode") or "").strip().lower(),
+    }
+    legacy_prepare_kind = raw_kind in {
+        "prepare", "prepare_only", "otc_edge_prepare", "prepare_pair", "pair_prepare",
+    }
+    prepare_marked = bool(payload.get("prepare_only")) or legacy_prepare_kind or bool(
+        entry_modes.intersection({"prepare", "prepare_only", "prepare_pair", "pair_prepare"})
+    )
+    if raw_kind == "execute" and prepare_marked:
+        raise ValueError("signal kind conflicts with prepare_only")
+    if raw_kind and raw_kind not in {
+        "execute", "trade", "signal", "prepare", "prepare_only", "otc_edge_prepare",
+        "prepare_pair", "pair_prepare",
+    }:
+        raise ValueError("signal_kind must be execute or prepare")
+    kind = "prepare" if prepare_marked else "execute"
+    if kind == "prepare" and source != "otc_edge":
+        raise ValueError("prepare signals are supported only for otc_edge")
+    return kind
+
+
 def _copy_server_normalize_timeframe(value) -> str:
-    if value is None:
-        return "M1"
+    if value in (None, ""):
+        return ""
     text = str(value).strip().upper()
     if text.isdigit():
-        return f"M{text}"
-    if text.startswith("M") and text[1:].isdigit():
-        return text
-    return text or "M1"
+        text = f"M{text}"
+    if not (text.startswith("M") and text[1:].isdigit()):
+        raise ValueError("timeframe must be M1 through M10")
+    minutes = int(text[1:])
+    if minutes < 1 or minutes > 10:
+        raise ValueError("timeframe must be M1 through M10")
+    return f"M{minutes}"
 
 
 def _copy_server_duration_seconds(data: dict) -> int:
-    try:
-        if data.get("duration_seconds"):
-            return max(5, int(float(data.get("duration_seconds"))))
-        if data.get("duration_minutes"):
-            return max(5, int(float(data.get("duration_minutes")) * 60))
-        tf = _copy_server_normalize_timeframe(data.get("timeframe"))
-        if tf.startswith("M") and tf[1:].isdigit():
-            return max(5, int(tf[1:]) * 60)
-    except Exception:
-        logger.debug("Suppressed exception at line 17832", exc_info=True)
-    return 60
+    data = dict(data or {})
+    if data.get("duration_seconds") not in (None, ""):
+        raw_seconds = data.get("duration_seconds")
+    elif data.get("duration_minutes") not in (None, ""):
+        try:
+            raw_seconds = float(data.get("duration_minutes")) * 60
+        except (TypeError, ValueError):
+            raise ValueError("duration_minutes must be a number")
+    elif data.get("timeframe") not in (None, ""):
+        timeframe = _copy_server_normalize_timeframe(data.get("timeframe"))
+        raw_seconds = int(timeframe[1:]) * 60
+    else:
+        raise ValueError("duration_seconds is required")
+    return _copy_strict_integral_seconds(
+        raw_seconds,
+        "duration_seconds",
+        COPY_SIGNAL_DURATION_MIN_SECONDS,
+        COPY_SIGNAL_DURATION_MAX_SECONDS,
+    )
+
+
+def _copy_server_normalize_expiry_mode(value) -> str:
+    """Map producer vocabulary to the two modes implemented by the app."""
+    text = str(value or "").strip().lower()
+    if text in {"timer", "duration_seconds", "fixed_60s", "fixed_duration"}:
+        return "timer"
+    if text in {"absolute_time", "time", "m1_candle_close", "candle_close"}:
+        return "absolute_time"
+    raise ValueError("trade_expiry_mode must be timer or absolute_time")
+
+
+def _copy_server_normalize_pair_contract(payload: dict) -> tuple[str, str, bool]:
+    """Return one exact pair/market identity for every downstream client."""
+    payload = dict(payload or {})
+    raw_pair = str(payload.get("pair_display") or payload.get("pair") or "").strip()
+    raw_symbol = str(payload.get("platform_symbol") or payload.get("symbol") or "").strip()
+    if not raw_pair and not raw_symbol:
+        raise ValueError("pair or platform_symbol is required")
+
+    def parse(value: str, field: str) -> tuple[str, bool]:
+        text = str(value or "").strip().upper()
+        otc = bool(re.search(r"(?:\bOTC\b|_OTC$)", text, flags=re.IGNORECASE))
+        without_otc = re.sub(r"\(\s*OTC\s*\)|[_\-\s]*OTC\b", "", text, flags=re.IGNORECASE)
+        base = re.sub(r"[^A-Z]", "", without_otc)
+        if len(base) != 6:
+            raise ValueError(f"{field} must contain one six-letter asset pair")
+        return base, otc
+
+    pair_identity = parse(raw_pair, "pair") if raw_pair else None
+    symbol_identity = parse(raw_symbol, "platform_symbol") if raw_symbol else None
+    if pair_identity and symbol_identity and pair_identity != symbol_identity:
+        raise ValueError("pair and platform_symbol market identity do not match")
+    base, otc = pair_identity or symbol_identity
+    pair_display = f"{base[:3]}/{base[3:]}" + (" (OTC)" if otc else "")
+    platform_symbol = f"{base}_otc" if otc else base
+    return pair_display, platform_symbol, otc
 
 
 def _copy_server_make_signal_id(payload: dict) -> str:
     base = "|".join([
+        str(payload.get("signal_kind") or payload.get("contract_kind") or "execute"),
         str(payload.get("source", "bot")),
         str(payload.get("pair") or payload.get("pair_display") or ""),
         str(payload.get("platform_symbol") or ""),
         str(payload.get("direction") or ""),
         str(payload.get("entry_time") or ""),
-        str(payload.get("created_at") or ""),
+        str(payload.get("expiry_timestamp") or ""),
+        str(payload.get("target_user_id") or ""),
     ])
     return hashlib.sha256(base.encode("utf-8")).hexdigest()[:18]
 
 
+def _copy_signal_fingerprint(signal: dict) -> str:
+    """Fingerprint execution identity, excluding mutable diagnostics/metadata."""
+    signal = dict(signal or {})
+    critical = {
+        key: signal.get(key)
+        for key in (
+            "signal_kind", "source", "pair", "pair_display", "platform_symbol", "direction",
+            "timeframe", "duration_seconds", "entry_time", "expires_at", "expiry_timestamp",
+            "trade_expiry_mode", "max_entry_delay_seconds", "target_user_id", "scope",
+            "prepare_only", "preselected_pair_mode", "watch_pair", "skip_asset_switch",
+        )
+    }
+    canonical = json.dumps(critical, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _copy_register_signal_id(registry: dict, signal: dict, limit: int) -> dict:
+    """Bounded idempotency registry with explicit duplicate/collision results."""
+    signal_id = str((signal or {}).get("id") or "")
+    if not signal_id:
+        raise ValueError("signal id is required")
+    fingerprint = _copy_signal_fingerprint(signal)
+    previous = registry.get(signal_id)
+    if previous is not None:
+        status = "duplicate" if hmac.compare_digest(str(previous), fingerprint) else "collision"
+        return {"accepted": False, "status": status, "id": signal_id}
+    registry[signal_id] = fingerprint
+    bounded_limit = max(1, int(limit))
+    while len(registry) > bounded_limit:
+        registry.pop(next(iter(registry)))
+    return {"accepted": True, "status": "accepted", "id": signal_id}
+
+
+def _copy_append_signal_history(history: list, signal: dict, limit: int) -> dict:
+    history.append(dict(signal or {}))
+    bounded_limit = max(1, int(limit))
+    del history[:-bounded_limit]
+    return {"accepted": True, "status": "accepted", "history_size": len(history)}
+
+
+def _copy_store_signal_if_allowed(
+    history: list,
+    registry: dict,
+    signal: dict,
+    global_enabled: bool,
+    history_limit: int,
+    dedupe_limit: int,
+    lock=None,
+) -> dict:
+    """Atomically gate, de-duplicate and append before any async broadcast."""
+    if lock is not None:
+        lock.acquire()
+    try:
+        if not bool(global_enabled):
+            return {
+                "accepted": False,
+                "status": "global_stop",
+                "history_size": len(history),
+            }
+        registration = _copy_register_signal_id(registry, signal, dedupe_limit)
+        if not registration["accepted"]:
+            return {**registration, "history_size": len(history)}
+        appended = _copy_append_signal_history(history, signal, history_limit)
+        return {**registration, "history_size": appended["history_size"]}
+    finally:
+        if lock is not None:
+            lock.release()
+
+
+def _copy_is_mobile_executable_signal(signal: dict) -> bool:
+    try:
+        return _copy_signal_contract_kind(signal) == "execute" and not bool((signal or {}).get("prepare_only"))
+    except ValueError:
+        return False
+
+
+def _copy_signal_delivery_allowed(global_enabled: bool, signal: dict, mobile: bool = False) -> bool:
+    if not bool(global_enabled):
+        return False
+    return _copy_is_mobile_executable_signal(signal) if mobile else True
+
+
+def _copy_filter_mobile_recent_signals(
+    history: list,
+    global_enabled: bool,
+    telegram_user_id,
+    limit: int = 100,
+) -> list:
+    """Pure replay filter shared by the mobile REST endpoint and unit tests."""
+    if not bool(global_enabled):
+        return []
+    user_id = normalize_copy_telegram_user_id(telegram_user_id)
+    visible = []
+    for signal in list(history or []):
+        if not isinstance(signal, dict):
+            continue
+        if not _copy_signal_delivery_allowed(True, signal, mobile=True):
+            continue
+        target_user_id = normalize_copy_telegram_user_id(signal.get("target_user_id"))
+        if target_user_id and target_user_id != user_id:
+            continue
+        visible.append(dict(signal))
+    return visible[-max(1, int(limit)):]
+
+
 def _copy_server_sanitize_signal(data: dict) -> dict:
     payload = dict(data or {})
-    direction = _copy_server_normalize_direction(payload.get("direction"))
-    timeframe = _copy_server_normalize_timeframe(payload.get("timeframe") or payload.get("duration_minutes") or "M1")
+    source = str(payload.get("source") or "").strip().lower().replace("-", "_").replace(" ", "_")
+    # Producers already canonicalize legacy aliases.  The public API boundary
+    # accepts only the documented source keys so substring aliases cannot turn
+    # an arbitrary/untrusted label into an executable source.
+    if source not in COPY_ALLOWED_SIGNAL_SOURCES:
+        raise ValueError("unsupported signal source")
+    contract_kind = _copy_signal_contract_kind({**payload, "source": source})
+    if contract_kind == "execute":
+        direction = _copy_server_normalize_direction(payload.get("direction"))
+    elif payload.get("direction") not in (None, ""):
+        direction = _copy_server_normalize_direction(payload.get("direction"))
+    else:
+        direction = None
     duration_seconds = _copy_server_duration_seconds(payload)
+    timeframe_raw = payload.get("timeframe")
+    if timeframe_raw in (None, "") and payload.get("duration_minutes") not in (None, ""):
+        timeframe_raw = payload.get("duration_minutes")
+    if timeframe_raw in (None, "") and duration_seconds % 60 == 0:
+        timeframe_raw = duration_seconds // 60
+    timeframe = _copy_server_normalize_timeframe(timeframe_raw or "M1")
 
     entry_dt = _copy_server_parse_iso(payload.get("entry_time") or payload.get("entry_time_iso"))
     created_dt = _copy_server_parse_iso(payload.get("created_at")) or datetime.now(UTC)
     if not entry_dt:
-        entry_dt = created_dt
+        raise ValueError("entry_time is required")
 
     expires_dt = _copy_server_parse_iso(payload.get("expires_at") or payload.get("valid_until"))
     if not expires_dt:
-        expires_dt = entry_dt + timedelta(seconds=int(COPY_SIGNAL_VALIDITY_SECONDS))
+        raise ValueError("expires_at is required")
+    if expires_dt <= entry_dt:
+        raise ValueError("expires_at must be after entry_time")
 
-    pair_display = str(payload.get("pair_display") or payload.get("pair") or "").strip()
-    platform_symbol = str(payload.get("platform_symbol") or payload.get("symbol") or payload.get("pair") or "").strip()
-    if not pair_display and not platform_symbol:
-        raise ValueError("pair or platform_symbol is required")
+    if contract_kind == "execute":
+        if payload.get("max_entry_delay_seconds") in (None, ""):
+            raise ValueError("max_entry_delay_seconds is required for execute signals")
+        max_entry_delay_seconds = _copy_strict_integral_seconds(
+            payload.get("max_entry_delay_seconds"),
+            "max_entry_delay_seconds",
+            COPY_SIGNAL_MAX_ENTRY_DELAY_MIN_SECONDS,
+            COPY_SIGNAL_MAX_ENTRY_DELAY_MAX_SECONDS,
+        )
+        if expires_dt > entry_dt + timedelta(seconds=max_entry_delay_seconds, milliseconds=1):
+            raise ValueError("expires_at exceeds max_entry_delay_seconds")
+    else:
+        max_entry_delay_seconds = None
 
-    return {
+    raw_expiry_iso = payload.get("expiry_time")
+    if raw_expiry_iso in (None, ""):
+        raw_expiry_iso = payload.get("trade_expiry_time")
+    expiry_from_iso = _copy_server_parse_iso(raw_expiry_iso)
+    if raw_expiry_iso not in (None, "") and expiry_from_iso is None:
+        raise ValueError("expiry_time must be a valid ISO-8601 timestamp")
+    expiry_from_epoch = None
+    raw_expiry_epoch = payload.get("expiry_timestamp")
+    if raw_expiry_epoch in (None, ""):
+        raw_expiry_epoch = payload.get("trade_expiry_timestamp")
+    if raw_expiry_epoch not in (None, ""):
+        try:
+            expiry_epoch = float(raw_expiry_epoch)
+            if expiry_epoch > 1e12:
+                expiry_epoch /= 1000.0
+            expiry_from_epoch = datetime.fromtimestamp(expiry_epoch, tz=UTC)
+        except (TypeError, ValueError, OverflowError, OSError):
+            raise ValueError("expiry_timestamp must be a valid Unix timestamp")
+    if expiry_from_iso and expiry_from_epoch:
+        if abs((expiry_from_iso - expiry_from_epoch).total_seconds()) > 2:
+            raise ValueError("expiry_time and expiry_timestamp do not match")
+    trade_expiry_dt = expiry_from_epoch or expiry_from_iso
+    if trade_expiry_dt is None:
+        trade_expiry_dt = entry_dt + timedelta(seconds=duration_seconds)
+    if trade_expiry_dt <= entry_dt:
+        raise ValueError("trade expiry must be after entry_time")
+    if contract_kind == "execute":
+        expected_expiry_dt = entry_dt + timedelta(seconds=duration_seconds)
+        if abs((trade_expiry_dt - expected_expiry_dt).total_seconds()) > 2:
+            raise ValueError("duration_seconds does not match trade expiry")
+
+    pair_display, platform_symbol, otc_market = _copy_server_normalize_pair_contract(payload)
+    if source in {"otc_live", "otc_edge"} and not otc_market:
+        raise ValueError(f"{source} requires an OTC market")
+    if source == "real_market" and otc_market:
+        raise ValueError("real_market requires a regular market")
+    expiry_mode = _copy_server_normalize_expiry_mode(
+        payload.get("trade_expiry_mode") or "duration_seconds"
+    )
+    if expiry_mode == "absolute_time":
+        if not otc_market:
+            raise ValueError("absolute_time expiry requires an OTC market")
+        if trade_expiry_dt.second != 0 or trade_expiry_dt.microsecond != 0:
+            raise ValueError("absolute_time expiry must be minute-aligned")
+
+    normalized = {
         "type": "signal",
-        "id": str(payload.get("id") or _copy_server_make_signal_id(payload)),
-        "source": str(payload.get("source") or "bot"),
+        "id": "",
+        "contract_version": 1,
+        "signal_kind": contract_kind,
+        "source_signal_kind": payload.get("source_signal_kind") or payload.get("signal_kind"),
+        "source": source,
         "mode": str(payload.get("mode") or "copy"),
         "pair": pair_display or platform_symbol,
         "pair_display": pair_display or platform_symbol,
         "platform_symbol": platform_symbol or pair_display,
+        "otc": otc_market,
         "direction": direction,
         "timeframe": timeframe,
         "duration_seconds": duration_seconds,
@@ -20485,17 +20923,21 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         "direct_entry": bool(payload.get("direct_entry") or False),
         "instant_entry": bool(payload.get("instant_entry") or payload.get("immediate_entry") or False),
         "allow_background_entry": bool(payload.get("allow_background_entry") or False),
-        "max_entry_delay_seconds": payload.get("max_entry_delay_seconds"),
+        "max_entry_delay_seconds": max_entry_delay_seconds,
         # v0.67: exact Quotex expiry + selected-pair preparation controls.
-        "expiry_time": payload.get("expiry_time") or payload.get("trade_expiry_time"),
-        "expiry_timestamp": payload.get("expiry_timestamp") or payload.get("trade_expiry_timestamp"),
-        "trade_expiry_mode": payload.get("trade_expiry_mode"),
-        "signal_kind": payload.get("signal_kind"),
-        "prepare_only": bool(payload.get("prepare_only") or False),
+        "expiry_time": trade_expiry_dt.isoformat(),
+        "expiry_timestamp": int(trade_expiry_dt.timestamp()),
+        "trade_expiry_mode": expiry_mode,
+        "prepare_only": contract_kind == "prepare",
         "preselected_pair_mode": bool(payload.get("preselected_pair_mode") or False),
         "watch_pair": payload.get("watch_pair"),
         "skip_asset_switch": bool(payload.get("skip_asset_switch") or False),
     }
+    supplied_id = str(payload.get("id") or "").strip()
+    if supplied_id and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", supplied_id):
+        raise ValueError("invalid signal id")
+    normalized["id"] = supplied_id or _copy_server_make_signal_id(normalized)
+    return normalized
 
 
 def _copy_server_check_secret(secret: str | None):
@@ -20509,6 +20951,45 @@ async def _copy_send_json_safe(ws, payload: dict) -> bool:
         return True
     except Exception:
         return False
+
+
+async def _copy_broadcast_global_control(enabled: bool, admin_id: int | None = None) -> dict:
+    """Tell every connected transport to stop and discard queued executions."""
+    action = "global_start" if enabled else "global_stop"
+    base_payload = {
+        "type": "control",
+        "action": action,
+        "global_enabled": bool(enabled),
+        "discard_pending_signals": not bool(enabled),
+        "reason": "copy trading enabled by admin" if enabled else "copy trading stopped by admin",
+        "updated_by": int(admin_id) if admin_id else None,
+        "server_time": now_iso(),
+    }
+    extension_delivered = 0
+    mobile_delivered = 0
+    dead_extension = []
+    dead_mobile = []
+    for client_id, client in list(_copy_clients.items()):
+        if await _copy_send_json_safe((client or {}).get("ws"), dict(base_payload)):
+            extension_delivered += 1
+        else:
+            dead_extension.append(client_id)
+    for client_id, client in list(_mobile_signal_clients.items()):
+        payload = {**base_payload, "transport": "mobile_push_v1"}
+        if await _copy_send_json_safe((client or {}).get("ws"), payload):
+            mobile_delivered += 1
+        else:
+            dead_mobile.append(client_id)
+    for client_id in dead_extension:
+        _copy_clients.pop(client_id, None)
+    for client_id in dead_mobile:
+        _mobile_signal_clients.pop(client_id, None)
+    return {
+        "action": action,
+        "extension_delivered": extension_delivered,
+        "mobile_delivered": mobile_delivered,
+        "dead_removed": len(dead_extension) + len(dead_mobile),
+    }
 
 
 def purge_copy_license_sessions(token: str) -> int:
@@ -20551,7 +21032,8 @@ async def disconnect_all_copy_clients(code: int = 4412, reason: str = "device bi
 
 
 async def _copy_broadcast_signal(signal: dict) -> dict:
-    if not is_copy_global_enabled():
+    global_enabled = is_copy_global_enabled()
+    if not _copy_signal_delivery_allowed(global_enabled, signal, mobile=False):
         return {
             "online_clients": len(_copy_clients),
             "delivered": 0,
@@ -20607,6 +21089,19 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
     The mobile stream is intentionally separate from extension device clients,
     so linking/using Android can never replace the Chrome extension binding.
     """
+    global_enabled = is_copy_global_enabled()
+    if not _copy_signal_delivery_allowed(global_enabled, signal, mobile=True):
+        prepare_only = not _copy_is_mobile_executable_signal(signal)
+        return {
+            "online_mobile_clients": len(_mobile_signal_clients),
+            "delivered": 0,
+            "dead_removed": 0,
+            "inactive_removed": 0,
+            "skipped_scope": 0,
+            "global_enabled": bool(global_enabled),
+            "skipped": True,
+            "reason": "prepare signals are not executable on mobile" if prepare_only and global_enabled else "copy trading stopped by admin",
+        }
     target_user_id = normalize_copy_telegram_user_id((signal or {}).get("target_user_id"))
     delivered = 0
     skipped_scope = 0
@@ -20665,6 +21160,7 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
         "inactive_removed": len(inactive),
         "skipped_scope": skipped_scope,
         "target_user_id": target_user_id or None,
+        "global_enabled": True,
     }
 
 
@@ -21183,6 +21679,7 @@ def create_embedded_copy_api():
             "ok": True,
             "status": "active",
             "server_time": now_iso(),
+            "global_enabled": is_copy_global_enabled(),
             "account": {
                 "telegram_user_id": telegram_user_id,
                 "plan": record.get("plan") or record.get("mode") or "active",
@@ -21200,27 +21697,28 @@ def create_embedded_copy_api():
         response.headers["Pragma"] = "no-cache"
         session = _mobile_bearer_session(authorization)
         telegram_user_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
+        global_enabled = is_copy_global_enabled()
 
-        visible = []
-        for signal in list(_copy_signal_history)[-int(COPY_SIGNAL_HISTORY_LIMIT):]:
-            if not isinstance(signal, dict):
-                continue
-            target_user_id = normalize_copy_telegram_user_id(signal.get("target_user_id"))
-            # Same routing semantics as the extension: targeted signals only go to
-            # their owner; broadcast signals remain visible to every authenticated client.
-            if target_user_id and target_user_id != telegram_user_id:
-                continue
-            visible.append(dict(signal))
+        source_history = list(_copy_signal_history)[-int(COPY_SIGNAL_HISTORY_LIMIT):] if global_enabled else []
+        visible = _copy_filter_mobile_recent_signals(
+            source_history, global_enabled, telegram_user_id, limit=100
+        )
+        _copy_diag_log_mobile_feed(telegram_user_id, global_enabled, source_history, visible)
 
         return {
             "ok": True,
             "server_time": now_iso(),
             "telegram_user_id": telegram_user_id,
             "session_expires_in": int(COPY_SESSION_TOKEN_TTL_SECONDS),
-            "signals": visible[-100:],
+            "global_enabled": global_enabled,
+            "signals": visible,
         }
 
-    @copy_api.post("/api/mobile/signals/request")
+    @copy_api.post(
+        "/api/mobile/signals/request",
+        responses={501: {"description": "On-demand mobile analysis is not implemented"}},
+        summary="Reserved mobile analysis endpoint (not implemented)",
+    )
     async def mobile_request_signal(request: Request, authorization: str | None = Header(default=None)):
         # Authentication is intentionally checked even though on-demand analysis
         # is not part of the v0.5 execution-link milestone yet.
@@ -21269,7 +21767,18 @@ def create_embedded_copy_api():
             "client_id": client_id,
             "server_time": now_iso(),
             "transport": "mobile_push_v1",
+            "global_enabled": is_copy_global_enabled(),
         })
+        if not is_copy_global_enabled():
+            await _copy_send_json_safe(websocket, {
+                "type": "control",
+                "action": "global_stop",
+                "global_enabled": False,
+                "discard_pending_signals": True,
+                "reason": "copy trading stopped by admin",
+                "server_time": now_iso(),
+                "transport": "mobile_push_v1",
+            })
         try:
             while True:
                 raw = await websocket.receive_text()
@@ -21340,11 +21849,64 @@ def create_embedded_copy_api():
 
         normalized["received_at"] = now_iso()
         normalized["origin"] = "bot"
-        _copy_signal_history.append(normalized)
-        del _copy_signal_history[:-int(COPY_SIGNAL_HISTORY_LIMIT)]
+        global_enabled = is_copy_global_enabled()
+        registration = _copy_store_signal_if_allowed(
+            _copy_signal_history,
+            _copy_signal_id_registry,
+            normalized,
+            global_enabled,
+            COPY_SIGNAL_HISTORY_LIMIT,
+            COPY_SIGNAL_DEDUPE_LIMIT,
+            _copy_signal_store_lock,
+        )
+        if registration["status"] == "global_stop":
+            return {
+                "ok": False, "skipped": True, "reason": "copy trading stopped by admin",
+                "global_enabled": False,
+            }
+        if registration["status"] == "collision":
+            raise HTTPException(status_code=409, detail="signal id collision")
+        if registration["status"] == "duplicate":
+            logger.info(
+                "[TT_COPY_DIAG] SIGNAL_DUPLICATE tag=%s signal=%s",
+                COPY_FEED_DIAG_TAG, json.dumps(_copy_diag_signal_summary(normalized), ensure_ascii=False, default=str),
+            )
+            return {
+                "ok": True, "duplicate": True, "signal": normalized,
+                "global_enabled": True, "delivery": {"delivered": 0, "duplicate": True},
+                "mobile_delivery": {"delivered": 0, "duplicate": True},
+            }
+        logger.info(
+            "[TT_COPY_DIAG] SIGNAL_ACCEPTED tag=%s history_size=%s signal=%s",
+            COPY_FEED_DIAG_TAG, registration.get("history_size"),
+            json.dumps(_copy_diag_signal_summary(normalized), ensure_ascii=False, default=str),
+        )
         delivery = await _copy_broadcast_signal(normalized)
         mobile_delivery = await _copy_broadcast_mobile_signal(normalized)
-        return {"ok": True, "signal": normalized, "delivery": delivery, "mobile_delivery": mobile_delivery}
+        logger.info(
+            "[TT_COPY_DIAG] SIGNAL_DELIVERY tag=%s id=%s extension=%s mobile=%s",
+            COPY_FEED_DIAG_TAG, normalized.get("id"),
+            json.dumps(delivery, ensure_ascii=False, default=str),
+            json.dumps(mobile_delivery, ensure_ascii=False, default=str),
+        )
+        if delivery.get("global_enabled") is False or mobile_delivery.get("global_enabled") is False:
+            # The admin may stop Copy after the synchronous store gate and
+            # before async broadcast. Remove the just-stored signal so REST
+            # replay cannot resurrect it when Copy starts again.
+            with _copy_signal_store_lock:
+                _copy_signal_history[:] = [
+                    row for row in _copy_signal_history if str((row or {}).get("id") or "") != normalized["id"]
+                ]
+            return {
+                "ok": False,
+                "skipped": True,
+                "reason": "copy trading stopped by admin",
+                "signal": normalized,
+                "delivery": delivery,
+                "mobile_delivery": mobile_delivery,
+                "global_enabled": False,
+            }
+        return {"ok": True, "signal": normalized, "delivery": delivery, "mobile_delivery": mobile_delivery, "global_enabled": True}
 
     @copy_api.post("/api/admin/manual-signal")
     async def copy_manual_signal(request: Request, x_ttcopy_secret: str | None = Header(default=None)):
@@ -21362,11 +21924,46 @@ def create_embedded_copy_api():
 
         normalized["received_at"] = now_iso()
         normalized["origin"] = "admin_manual"
-        _copy_signal_history.append(normalized)
-        del _copy_signal_history[:-int(COPY_SIGNAL_HISTORY_LIMIT)]
+        global_enabled = is_copy_global_enabled()
+        registration = _copy_store_signal_if_allowed(
+            _copy_signal_history,
+            _copy_signal_id_registry,
+            normalized,
+            global_enabled,
+            COPY_SIGNAL_HISTORY_LIMIT,
+            COPY_SIGNAL_DEDUPE_LIMIT,
+            _copy_signal_store_lock,
+        )
+        if registration["status"] == "global_stop":
+            return {
+                "ok": False, "skipped": True, "reason": "copy trading stopped by admin",
+                "global_enabled": False,
+            }
+        if registration["status"] == "collision":
+            raise HTTPException(status_code=409, detail="signal id collision")
+        if registration["status"] == "duplicate":
+            return {
+                "ok": True, "duplicate": True, "signal": normalized,
+                "global_enabled": True, "delivery": {"delivered": 0, "duplicate": True},
+                "mobile_delivery": {"delivered": 0, "duplicate": True},
+            }
         delivery = await _copy_broadcast_signal(normalized)
         mobile_delivery = await _copy_broadcast_mobile_signal(normalized)
-        return {"ok": True, "signal": normalized, "delivery": delivery, "mobile_delivery": mobile_delivery}
+        if delivery.get("global_enabled") is False or mobile_delivery.get("global_enabled") is False:
+            with _copy_signal_store_lock:
+                _copy_signal_history[:] = [
+                    row for row in _copy_signal_history if str((row or {}).get("id") or "") != normalized["id"]
+                ]
+            return {
+                "ok": False,
+                "skipped": True,
+                "reason": "copy trading stopped by admin",
+                "signal": normalized,
+                "delivery": delivery,
+                "mobile_delivery": mobile_delivery,
+                "global_enabled": False,
+            }
+        return {"ok": True, "signal": normalized, "delivery": delivery, "mobile_delivery": mobile_delivery, "global_enabled": True}
 
     @copy_api.websocket("/ws/extension")
     async def copy_extension_ws(websocket: WebSocket):
