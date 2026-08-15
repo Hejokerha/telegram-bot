@@ -1016,7 +1016,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.12.0"
+COPY_SERVER_VERSION = "1.12.1"
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.00").strip() or "v1.00"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
@@ -10390,7 +10390,8 @@ def _copy_execution_transport_state_for_user(user_id: int | str | None) -> dict:
         "mobile_push": mobile_push,
         "mobile_poll": mobile_poll,
         "mobile_online": bool(mobile_push or mobile_poll),
-        "total": extension + mobile_push + mobile_poll,
+        # OTC Edge uses this transport state and is extension-only in v1.12.1.
+        "total": extension,
     }
 
 
@@ -11365,9 +11366,9 @@ def start_otc_edge_watcher(chat_id: int, started_by: int, mode: str = "all", pai
             _otc_edge_mark_waiting_for_extension(uid, state, persist=False)
             state["execution_transport"] = transport
             prefix = (
-                f"✅ Monitoring was saved. Keep the TRADING TIME app Auto active or connect your extension within {OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS // 60} minutes, otherwise monitoring will stop automatically."
+                f"✅ Monitoring was saved. Keep your TRADING TIME Chrome extension connected within {OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS // 60} minutes, otherwise monitoring will stop automatically."
                 if lang == "en" else
-                f"✅ تم حفظ المراقبة. خلي Auto شغال بتطبيق TRADING TIME أو وصّل الإضافة خلال {OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS // 60} دقائق، وإلا ستتوقف المراقبة تلقائيًا."
+                f"✅ تم حفظ المراقبة. خلي إضافة TRADING TIME على Chrome متصلة خلال {OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS // 60} دقائق، وإلا ستتوقف المراقبة تلقائيًا."
             )
         save_otc_edge_watcher_state(uid, state)
         if is_admin(uid):
@@ -11565,26 +11566,16 @@ def _otc_edge_copy_delivered_count(copy_result: dict | None) -> int:
     try:
         result = copy_result or {}
         extension_delivery = result.get("delivery") or {}
-        mobile_delivery = result.get("mobile_delivery") or {}
-        return max(0, int(extension_delivery.get("delivered", 0) or 0)) + max(
-            0, int(mobile_delivery.get("delivered", 0) or 0)
-        )
+        return max(0, int(extension_delivery.get("delivered", 0) or 0))
     except Exception:
         return 0
 
 
 def _otc_edge_copy_delivery_succeeded(copy_result: dict | None, owner_user_id=None) -> bool:
-    """Accept a real socket delivery or a stored signal with a fresh authenticated mobile poll."""
+    """OTC Edge succeeds only after the owner's Chrome extension receives it."""
     try:
         result = copy_result or {}
-        if not bool(result.get("ok")):
-            return False
-        if _otc_edge_copy_delivered_count(result) > 0:
-            return True
-        # REST mobile execution is pull-based. /api/bot/signal stores the signal
-        # before returning, so a fresh authenticated poll means the targeted
-        # Android engine will pick the stored signal up on its next ~3s cycle.
-        return _copy_mobile_poll_is_fresh_for_user(owner_user_id)
+        return bool(result.get("ok")) and _otc_edge_copy_delivered_count(result) > 0
     except Exception:
         return False
 
@@ -11873,7 +11864,7 @@ def build_otc_edge_user_status_message(user_id: int, prefix: str | None = None, 
             lines.extend([
                 "⚡ OTC Edge",
                 "━━━━━━━━━━━━━━",
-                f"Status: {'Waiting for your app/extension ⏳' if waiting_extension else ('Running ✅' if enabled else 'Stopped ⏸')}",
+                f"Status: {'Waiting for your extension ⏳' if waiting_extension else ('Running ✅' if enabled else 'Stopped ⏸')}",
                 f"Execution transport: App {'✅' if mobile_online else '—'} • Extension {'✅' if extension_online_count > 0 else '—'}",
                 f"Monitoring mode: {('Specific pair' if mode == 'pairs' else 'Whole OTC market') if enabled else 'Not selected'}",
                 f"Session: {int(state.get('session_trades', 0) or 0)} trades | ✅ {int(state.get('session_wins', 0) or 0)} | ❌ {int(state.get('session_losses', 0) or 0)} | ⚖️ {int(state.get('session_draws', 0) or 0)} | net {_money_signed(state.get('session_net_delta', 0))}",
@@ -11928,11 +11919,11 @@ def build_otc_edge_user_status_message(user_id: int, prefix: str | None = None, 
         if state.get("last_alert_at"):
             lines.append(f"آخر إشارة: {format_dt_ar(state.get('last_alert_at'))}")
         if waiting_extension:
-            lines.append(f"⏳ لا تحليل ولا إشارات إذا التطبيق والإضافة الاثنين أوفلاين، وتتوقف المراقبة تلقائيًا بعد {OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS // 60} دقائق.")
+            lines.append(f"⏳ لا تحليل ولا إشارات إذا الإضافة أوفلاين، وتتوقف المراقبة تلقائيًا بعد {OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS // 60} دقائق.")
         elif state.get("last_delivery_error"):
-            lines.append("⚠️ آخر إشارة لم تصل لوسيلة التنفيذ. خلي Auto بالتطبيق أو الإضافة شغالة.")
+            lines.append("⚠️ آخر إشارة لم تصل لوسيلة التنفيذ. خلي إضافة TRADING TIME على Chrome شغالة.")
         elif state.get("last_error"):
-            lines.append("⚠️ التجهيز أو الإرسال غير جاهز حاليًا. خلي Auto بالتطبيق أو الإضافة شغالة.")
+            lines.append("⚠️ التجهيز أو الإرسال غير جاهز حاليًا. خلي إضافة TRADING TIME على Chrome شغالة.")
         if not enabled:
             lines.extend(["", "اختر مراقبة كل السوق أو مراقبة زوج OTC محدد."])
         return "\n".join(lines)[:3900]
@@ -11951,14 +11942,13 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                 state["last_error"] = "bot_access_inactive"
                 save_otc_edge_watcher_state(owner_uid, state)
                 continue
-            # v1.12 online gate: either the authenticated Chrome extension OR a
-            # fresh authenticated Android signal poll is a valid execution transport.
+            # v1.12 online gate: only the authenticated Chrome extension is a valid OTC Edge execution transport.
             transport = _copy_execution_transport_state_for_user(owner_uid)
             online_count = int(transport.get("total", 0) or 0)
             state["execution_transport"] = transport
             if online_count <= 0:
                 if _otc_edge_mark_waiting_for_extension(owner_uid, state, persist=True):
-                    logger.info("OTC Edge paused; waiting for owner's app/extension | user=%s", owner_uid)
+                    logger.info("OTC Edge paused; waiting for owner's extension | user=%s", owner_uid)
                 waited_seconds = _otc_edge_extension_wait_seconds(state)
                 if waited_seconds >= int(OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS):
                     # Recheck once at the boundary so a just-reconnected transport is never stopped by a race.
@@ -11970,9 +11960,9 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                     _otc_edge_apply_stop_state(owner_uid, state, reason="execution_transport_offline_timeout")
                     minutes = max(1, int(OTC_EDGE_EXTENSION_OFFLINE_AUTO_STOP_SECONDS // 60))
                     notice = (
-                        f"🛑 OTC Edge monitoring stopped automatically because the TRADING TIME app/extension stayed offline for {minutes} minutes.\n\n{summary}"
+                        f"🛑 OTC Edge monitoring stopped automatically because the TRADING TIME Chrome extension stayed offline for {minutes} minutes.\n\n{summary}"
                         if lang == "en" else
-                        f"🛑 تم إيقاف مراقبة OTC Edge تلقائيًا لأن تطبيق TRADING TIME والإضافة بقيا غير متصلين لمدة {minutes} دقائق.\n\n{summary}"
+                        f"🛑 تم إيقاف مراقبة OTC Edge تلقائيًا لأن إضافة TRADING TIME على Chrome بقيت غير متصلة لمدة {minutes} دقائق.\n\n{summary}"
                     )
                     await safe_send_message(context.bot, chat_id=int(state.get("chat_id") or owner_uid), text=notice)
                     logger.info("OTC Edge auto-stopped after execution transport timeout | user=%s | waited=%ss", owner_uid, waited_seconds)
@@ -11982,10 +11972,7 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
 
             state["last_scan_at"] = now_iso()
 
-            # Legacy selected-pair prepare packets are extension-only. Android
-            # v0.19+ prepares asset/amount/expiry directly from the executable
-            # signal over Quotex WebSocket, so never stall a mobile-only watcher
-            # on a prepare_only packet that the REST feed intentionally filters.
+            # OTC Edge is extension-only; selected-pair prepare packets are published only when the owner's extension is online.
             if int(transport.get("extension", 0) or 0) > 0:
                 if await _otc_edge_maybe_publish_selected_pair_prepare(state=state, owner_user_id=owner_uid):
                     continue
@@ -12043,9 +12030,9 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                     # normal case, switch to silent waiting instead of logging repeated warnings.
                     if int(_copy_execution_transport_state_for_user(owner_uid).get("total", 0) or 0) <= 0:
                         _otc_edge_mark_waiting_for_extension(owner_uid, state, persist=False)
-                        logger.info("OTC Edge delivery paused after app/extension disconnected | user=%s", owner_uid)
+                        logger.info("OTC Edge delivery paused after extension disconnected | user=%s", owner_uid)
                     else:
-                        # A same-user execution transport still exists, so this is a real delivery failure.
+                        # A same-user extension transport still exists, so this is a real delivery failure.
                         # Do not consume cooldown or lock the watcher.
                         reason = _otc_edge_delivery_failure_reason(copy_result)
                         state["last_delivery_status"] = "failed"
@@ -12053,7 +12040,7 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                         state["last_delivery_error"] = reason
                         state["last_error"] = f"OTC Edge delivery failed: {reason}"
                         logger.warning(
-                            "OTC Edge signal not delivered despite owner execution transport being online | user=%s | pair=%s | reason=%s | result=%s",
+                            "OTC Edge signal not delivered despite owner extension being online | user=%s | pair=%s | reason=%s | result=%s",
                             owner_uid, item.get("pair"), reason, copy_result,
                         )
                         # Notify at most once per minute only for an actual online delivery error.
@@ -12061,7 +12048,7 @@ async def otc_edge_watcher_job(context: ContextTypes.DEFAULT_TYPE):
                         if now_ts - last_notice >= 60:
                             state["last_delivery_notice_ts"] = now_ts
                             warning_text = (
-                                "⚠️ تطبيق TRADING TIME أو الإضافة متصلان لكن تعذر تسليم فرصة OTC Edge. أعد فتح Quotex وتأكد أن Auto/الإضافة مفعّلان."
+                                "⚠️ إضافة TRADING TIME متصلة لكن تعذر تسليم فرصة OTC Edge. أعد فتح Quotex وتأكد أن الإضافة مفعّلة."
                                 if lang != "en" else
                                 "⚠️ Your extension is connected, but the OTC Edge opportunity could not be delivered. Reopen Quotex and ensure the extension is enabled."
                             )
@@ -20775,6 +20762,11 @@ def _copy_store_signal_if_allowed(
 
 def _copy_is_mobile_executable_signal(signal: dict) -> bool:
     try:
+        # v1.12.1: OTC Edge is Chrome-extension-only again. Keep the signal in
+        # the shared Copy history so extension delivery is unchanged, but never
+        # expose it through Android push or REST replay.
+        if normalize_copy_source((signal or {}).get("source")) == "otc_edge":
+            return False
         return _copy_signal_contract_kind(signal) == "execute" and not bool((signal or {}).get("prepare_only"))
     except ValueError:
         return False
@@ -21108,7 +21100,16 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
     """
     global_enabled = is_copy_global_enabled()
     if not _copy_signal_delivery_allowed(global_enabled, signal, mobile=True):
-        prepare_only = not _copy_is_mobile_executable_signal(signal)
+        source = normalize_copy_source((signal or {}).get("source"))
+        prepare_only = _copy_signal_contract_kind(signal) == "prepare" if global_enabled else False
+        if not global_enabled:
+            reason = "copy trading stopped by admin"
+        elif source == "otc_edge":
+            reason = "otc_edge_extension_only"
+        elif prepare_only:
+            reason = "prepare signals are not executable on mobile"
+        else:
+            reason = "signal_not_executable_on_mobile"
         return {
             "online_mobile_clients": len(_mobile_signal_clients),
             "delivered": 0,
@@ -21117,7 +21118,7 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
             "skipped_scope": 0,
             "global_enabled": bool(global_enabled),
             "skipped": True,
-            "reason": "prepare signals are not executable on mobile" if prepare_only and global_enabled else "copy trading stopped by admin",
+            "reason": reason,
         }
     target_user_id = normalize_copy_telegram_user_id((signal or {}).get("target_user_id"))
     delivered = 0
