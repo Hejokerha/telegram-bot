@@ -1016,7 +1016,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.13.1"
+COPY_SERVER_VERSION = "1.13.2"
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.00").strip() or "v1.00"
@@ -20539,6 +20539,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 _copy_server_started = False
 _copy_clients = {}
 _mobile_signal_clients = {}
+_mobile_notification_history = deque(maxlen=300)
+_mobile_notification_sequence = 0
 _copy_mobile_recent_activity = {}
 _copy_ws_sessions = {}
 _copy_ws_auth_failures = {}
@@ -21091,6 +21093,95 @@ async def _copy_broadcast_signal(signal: dict) -> dict:
         "global_enabled": True,
         "target_user_id": target_user_id or None,
         "scope": "user" if target_user_id else "broadcast",
+    }
+
+
+def _mobile_notification_visible_to_user(notification: dict, telegram_user_id: int | str | None) -> bool:
+    target = normalize_copy_telegram_user_id((notification or {}).get("target_user_id"))
+    user_id = normalize_copy_telegram_user_id(telegram_user_id)
+    return not target or (user_id and target == user_id)
+
+
+def _mobile_recent_notifications_for_user(telegram_user_id: int | str | None, limit: int = 30) -> list[dict]:
+    rows = [
+        dict(item)
+        for item in list(_mobile_notification_history)
+        if isinstance(item, dict) and _mobile_notification_visible_to_user(item, telegram_user_id)
+    ]
+    return rows[-max(1, min(int(limit or 30), 60)):]
+
+
+async def _mobile_emit_notification(
+    title: str,
+    body: str,
+    *,
+    severity: str = "warning",
+    category: str = "backend",
+    code: str = "backend_notice",
+    target_user_id: int | str | None = None,
+    details: dict | None = None,
+) -> dict:
+    """Create one mobile notification and deliver it to connected Android clients.
+
+    The short in-memory history is also returned by /api/mobile/signals/recent,
+    so the existing authenticated polling path can recover notices that were
+    emitted between polls without adding Firebase reads to every 3-second feed.
+    """
+    global _mobile_notification_sequence
+    _mobile_notification_sequence += 1
+    created_at = now_iso()
+    target = normalize_copy_telegram_user_id(target_user_id)
+    notification = {
+        "id": f"srv:{int(time_module.time() * 1000)}:{_mobile_notification_sequence}",
+        "at": created_at,
+        "createdAtEpochMs": int(time_module.time() * 1000),
+        "source": "backend",
+        "severity": str(severity or "warning"),
+        "category": str(category or "backend"),
+        "code": str(code or "backend_notice"),
+        "event": str(code or "backend_notice"),
+        "title": str(title or "TRADING TIME")[:120],
+        "body": str(body or "")[:1200],
+        "target_user_id": target or None,
+    }
+    if details:
+        # Keep transport/history compact and avoid leaking full tracebacks into
+        # ordinary user UI. Detailed server logs remain the forensic source.
+        clean_details = {}
+        for key, value in dict(details).items():
+            if value is None:
+                continue
+            text = str(value)
+            clean_details[str(key)[:60]] = text[:500]
+        notification["details"] = clean_details
+        reason = clean_details.get("reason") or clean_details.get("error")
+        if reason:
+            notification["reason"] = reason[:500]
+
+    _mobile_notification_history.append(notification)
+
+    dead = []
+    delivered = 0
+    for client_id, client in list(_mobile_signal_clients.items()):
+        client_user_id = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
+        if target and client_user_id != target:
+            continue
+        payload = {
+            "type": "notification",
+            "notification": notification,
+            "server_time": created_at,
+            "transport": "mobile_push_v1",
+        }
+        if await _copy_send_json_safe((client or {}).get("ws"), payload):
+            delivered += 1
+        else:
+            dead.append(client_id)
+    for client_id in dead:
+        _mobile_signal_clients.pop(client_id, None)
+    return {
+        "notification": notification,
+        "delivered": delivered,
+        "dead_removed": len(dead),
     }
 
 
@@ -21700,6 +21791,7 @@ def create_embedded_copy_api():
             "status": "active",
             "server_time": now_iso(),
             "global_enabled": is_copy_global_enabled(),
+            "notifications": _mobile_recent_notifications_for_user(telegram_user_id, limit=30),
             "account": {
                 "telegram_user_id": telegram_user_id,
                 "plan": record.get("plan") or record.get("mode") or "active",
@@ -21732,6 +21824,7 @@ def create_embedded_copy_api():
             "session_expires_in": int(COPY_SESSION_TOKEN_TTL_SECONDS),
             "global_enabled": global_enabled,
             "signals": visible,
+            "notifications": _mobile_recent_notifications_for_user(telegram_user_id, limit=30),
         }
 
     # ===== v1.13 Mobile Bot Features + Admin Control Plane =====
@@ -22887,19 +22980,32 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
     )
 
     if should_send_admin_error_alert():
+        msg = (
+            "⚠️ Bot Error Alert\n\n"
+            f"الخطأ: {html.escape(str(context.error))}\n\n"
+            f"تفاصيل مختصرة:\n<code>{html.escape(error_text[-2500:] if error_text else 'no traceback')}</code>"
+        )
         try:
-            msg = (
-                "⚠️ Bot Error Alert\n\n"
-                f"الخطأ: {html.escape(str(context.error))}\n\n"
-                f"تفاصيل مختصرة:\n<code>{html.escape(error_text[-2500:] if error_text else 'no traceback')}</code>"
-            )
-            await safe_send_message(context.bot,
+            await safe_send_message(
+                context.bot,
                 chat_id=ADMIN_TELEGRAM_ID,
                 text=msg[:3900],
-                parse_mode="HTML"
+                parse_mode="HTML",
             )
         except Exception:
-            logger.debug("Suppressed exception at line 18307", exc_info=True)
+            logger.debug("Telegram admin error notification failed", exc_info=True)
+        try:
+            await _mobile_emit_notification(
+                "خطأ في خدمة TRADING TIME",
+                f"صار خطأ غير اعتيادي في البوت: {str(context.error)[:420]}",
+                severity="critical",
+                category="bot",
+                code="BOT_RUNTIME_ERROR",
+                target_user_id=ADMIN_TELEGRAM_ID,
+                details={"error": str(context.error)[:500]},
+            )
+        except Exception:
+            logger.debug("Mobile bot error notification failed", exc_info=True)
 
 def run_telegram_bot_only():
     global TRADING_TIME_TELEGRAM_APP
