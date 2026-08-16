@@ -1016,7 +1016,9 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.12.1"
+COPY_SERVER_VERSION = "1.13.0"
+# v1.13 mobile control plane: runtime reference to the same Telegram Application.
+TRADING_TIME_TELEGRAM_APP = None
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.00").strip() or "v1.00"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
@@ -21732,16 +21734,478 @@ def create_embedded_copy_api():
             "signals": visible,
         }
 
-    @copy_api.post(
-        "/api/mobile/signals/request",
-        responses={501: {"description": "On-demand mobile analysis is not implemented"}},
-        summary="Reserved mobile analysis endpoint (not implemented)",
-    )
+    # ===== v1.13 Mobile Bot Features + Admin Control Plane =====
+    # Flutter is only a UI/client. Signal generation and admin actions stay here,
+    # reusing the exact Telegram-bot functions/state so there is one source of truth.
+
+    def _mobile_session_tid(session: dict) -> str:
+        return normalize_copy_telegram_user_id(session.get("telegram_user_id"))
+
+    def _mobile_require_admin(session: dict) -> str:
+        tid = _mobile_session_tid(session)
+        if tid != str(int(ADMIN_TELEGRAM_ID)):
+            raise HTTPException(status_code=403, detail="admin access required")
+        return tid
+
+    def _mobile_clean_user(uid_raw, data: dict | None = None) -> dict:
+        data = dict(data or {})
+        uid = normalize_copy_telegram_user_id(uid_raw)
+        if not uid:
+            uid = normalize_copy_telegram_user_id(data.get("telegram_id"))
+        expires_at = data.get("expires_at") or data.get("expiry") or ""
+        return {
+            "telegram_id": uid,
+            "name": data.get("name") or data.get("full_name") or "غير معروف",
+            "username": data.get("username") or "",
+            "quotex_id": data.get("quotex_id") or "",
+            "status": data.get("status") or ("approved" if uid and is_approved(int(uid)) else "inactive"),
+            "plan": data.get("plan") or data.get("subscription_type") or "",
+            "expires_at": expires_at,
+            "last_seen": data.get("last_seen") or "",
+            "created_at": data.get("created_at") or "",
+        }
+
+    def _mobile_bot_stats_payload() -> dict:
+        all_users = get_all_users() or {}
+        approved = get_all_approved_users() or {}
+        pending = get_all_pending_users() or {}
+        active_approved = 0
+        expired_or_blocked = 0
+        for uid in list(approved.keys()):
+            try:
+                if is_approved(int(uid)):
+                    active_approved += 1
+                else:
+                    expired_or_blocked += 1
+            except Exception:
+                expired_or_blocked += 1
+        active_15 = len(get_recent_active_approved_users() or [])
+        return {
+            "total_users": len(all_users),
+            "approved_active": active_approved,
+            "pending": len(pending),
+            "expired_or_blocked": expired_or_blocked,
+            "active_15m": active_15,
+            "bot_enabled": bool(get_bot_enabled()),
+            "copy_enabled": bool(is_copy_global_enabled()),
+            "extension_online": len(_copy_clients),
+            "mobile_online": len(_mobile_signal_clients),
+        }
+
+    def _mobile_runtime_app():
+        app_ref = globals().get("TRADING_TIME_TELEGRAM_APP")
+        if app_ref is None:
+            raise HTTPException(status_code=503, detail="Telegram runtime is not ready")
+        return app_ref
+
+    @copy_api.get("/api/mobile/features")
+    async def mobile_features(authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        tid = _mobile_session_tid(session)
+        return {
+            "ok": True,
+            "server_version": COPY_SERVER_VERSION,
+            "telegram_user_id": tid,
+            "is_admin": tid == str(int(ADMIN_TELEGRAM_ID)),
+            "markets": {
+                "otc": {
+                    "pairs": list(OTC_PAIRS),
+                    "trade_counts": list(TRADE_COUNTS),
+                    "timed_interval_minutes": 3,
+                    "direct_trade": True,
+                },
+                "global": {
+                    "pairs": list(REAL_PAIRS),
+                    "timeframes": list(REAL_INTERVALS),
+                    "best_opportunity": True,
+                },
+                "trading_room": {"enabled": not bool(TRADING_ROOM_ADMIN_ONLY) or tid == str(int(ADMIN_TELEGRAM_ID))},
+            },
+        }
+
+    @copy_api.post("/api/mobile/signals/generate")
+    async def mobile_generate_signal(request: Request, authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        tid = _mobile_session_tid(session)
+        try:
+            creator_id = int(tid)
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid Telegram ID")
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid request body")
+        kind = str(body.get("kind") or "").strip().lower()
+
+        if kind == "otc_timed":
+            pair = str(body.get("pair") or "").strip()
+            count = safe_int(body.get("count"), 0)
+            if pair not in OTC_PAIRS:
+                raise HTTPException(status_code=400, detail="اختر زوج OTC صالح")
+            if count not in TRADE_COUNTS:
+                raise HTTPException(status_code=400, detail="عدد الصفقات غير صالح")
+            interval_minutes = 3
+            start_dt = next_full_minute(now_utc())
+            signal_rows = generate_signals(pair, count, interval_minutes, start_dt)
+            publish_result = await publish_copy_timed_list_signals(
+                pair, signal_rows, interval_minutes, start_dt,
+                source="timed_list", creator_user_id=creator_id,
+            )
+            structured = []
+            for i in range(count):
+                entry_dt = start_dt + timedelta(minutes=i * interval_minutes)
+                direction = get_stable_direction(pair, entry_dt)
+                structured.append({
+                    "pair": pair,
+                    "pair_display": pair,
+                    "direction": direction,
+                    "entry_time": entry_dt.isoformat(),
+                    "timeframe": "M1",
+                    "source": "timed_list",
+                    "note": f"الليستة الزمنية {i+1}/{count}",
+                })
+            return {
+                "ok": True, "kind": kind,
+                "message": build_signals_message(pair, count, interval_minutes, signal_rows),
+                "signals": structured,
+                "copy_delivery": publish_result,
+            }
+
+        if kind == "otc_direct":
+            result = analyze_best_live_otc_now()
+            delivery = None
+            if result.get("ok"):
+                delivery = await maybe_publish_copy_signal(
+                    result, source="otc_live", enabled=COPY_SEND_OTC_LIVE_NOW,
+                    creator_user_id=creator_id,
+                )
+            return {"ok": True, "kind": kind, "analysis_ok": bool(result.get("ok")), "signal": result, "message": result.get("message"), "copy_delivery": delivery}
+
+        if kind == "global":
+            pair = str(body.get("pair") or "").strip()
+            timeframe_raw = str(body.get("timeframe") or "best").strip().lower()
+            if pair not in REAL_PAIRS:
+                raise HTTPException(status_code=400, detail="اختر زوج سوق عالمي صالح")
+            if timeframe_raw in {"best", "0", "best_opportunity"}:
+                result = analyze_real_market_best(pair)
+            else:
+                timeframe = safe_int(timeframe_raw, 0)
+                if timeframe not in REAL_INTERVALS:
+                    raise HTTPException(status_code=400, detail="الفريم غير صالح")
+                result = analyze_real_market(pair, timeframe)
+            delivery = None
+            if result.get("ok"):
+                delivery = await maybe_publish_copy_signal(
+                    result, source="real_market", enabled=COPY_SEND_REAL_MARKET,
+                    creator_user_id=creator_id,
+                )
+            return {"ok": True, "kind": kind, "analysis_ok": bool(result.get("ok")), "signal": result, "message": result.get("message"), "copy_delivery": delivery}
+
+        raise HTTPException(status_code=400, detail="نوع توليد الإشارة غير معروف")
+
+    # Backward-compatible endpoint used by older mobile builds.
+    @copy_api.post("/api/mobile/signals/request")
     async def mobile_request_signal(request: Request, authorization: str | None = Header(default=None)):
-        # Authentication is intentionally checked even though on-demand analysis
-        # is not part of the v0.5 execution-link milestone yet.
-        _mobile_bearer_session(authorization)
-        raise HTTPException(status_code=501, detail="طلب تحليل يدوي من الموبايل غير مفعّل بعد")
+        session = _mobile_bearer_session(authorization)
+        try:
+            body = await request.json()
+        except Exception:
+            body = {}
+        market = str(body.get("market") or "GLOBAL").strip().upper()
+        tid = _mobile_session_tid(session)
+        creator_id = int(tid)
+        if market == "OTC":
+            result = analyze_best_live_otc_now()
+            if result.get("ok"):
+                await maybe_publish_copy_signal(result, source="otc_live", enabled=COPY_SEND_OTC_LIVE_NOW, creator_user_id=creator_id)
+            return {"ok": True, "signal": result}
+        pair = REAL_PAIRS[0]
+        result = analyze_real_market_best(pair)
+        if result.get("ok"):
+            await maybe_publish_copy_signal(result, source="real_market", enabled=COPY_SEND_REAL_MARKET, creator_user_id=creator_id)
+        return {"ok": True, "signal": result}
+
+    @copy_api.get("/api/mobile/trading-room/status")
+    async def mobile_trading_room_status(authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        tid = _mobile_session_tid(session)
+        uid = int(tid)
+        state = {}
+        app_ref = globals().get("TRADING_TIME_TELEGRAM_APP")
+        if app_ref is not None:
+            state = dict(get_trading_room_state(app_ref, uid) or {})
+        else:
+            try:
+                state = dict(trading_room_sessions_ref().child(str(uid)).get() or {})
+            except Exception:
+                state = {}
+        safe_state = {k: v for k, v in state.items() if k not in {"trade_ledger"}}
+        return {"ok": True, "active": bool(state.get("active")), "state": safe_state, "server_time": now_iso()}
+
+    @copy_api.post("/api/mobile/trading-room/action")
+    async def mobile_trading_room_action(request: Request, authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        tid = _mobile_session_tid(session)
+        uid = int(tid)
+        app_ref = _mobile_runtime_app()
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid request body")
+        action = str(body.get("action") or "status").strip().lower()
+        if action == "start":
+            balance = float(body.get("balance") or 0)
+            if balance <= 0:
+                raise HTTPException(status_code=400, detail="أدخل رصيد صحيح")
+            plan = build_session_money_plan(balance)
+            state = {
+                "active": True, "pending_ready": True, "ready_confirmed": False,
+                "admin_id": uid, "balance": plan["balance"], "trade_amount": plan["trade_amount"],
+                "recovery_amount": plan["recovery_amount"], "target_profit_amount": plan["target_profit_amount"],
+                "max_loss_amount": plan["max_loss_amount"], "max_trades": plan["max_trades"],
+                "wins": 0, "losses": 0, "net_profit": 0.0, "trade_ledger": [],
+                "pending_loss_units": 0, "pending_loss_amount": 0.0, "pending_loss_payout": 0.0,
+                "unrecovered_loss": False, "session_mode": "normal", "trades_done": 0,
+                "recovery_losses": 0, "extra_recovery_used": 0, "recovery_mode": False,
+                "recovery_notified_at": 0.0, "waiting_result": False,
+                "started_at": time_module.time(), "expires_at": time_module.time() + TRADING_ROOM_SCAN_SECONDS,
+                "brain_mode": "normal", "market_mood": None, "pair_health": None,
+                "pair_health_label": None, "pair_switches": 0, "bad_symbols": [],
+                "last_loss_setup": None, "last_loss_direction": None, "last_trade_setup": None,
+                "last_trade_direction": None, "no_entry_scans": 0, "last_brain_notice_at": 0.0,
+                "pair_selected_at": 0.0, "last_pair_switch_at": 0.0, "pair_bad_scans": 0,
+                "smart_exit_waiting": False, "smart_exit_reason": None, "smart_exit_last_suggested_at": 0.0,
+                "origin": "mobile",
+            }
+            app_ref.bot_data[trading_room_key(uid)] = state
+            save_trading_room_state(app_ref, uid, state)
+            return {"ok": True, "message": build_trading_room_intro(plan, get_user_language(uid)), "state": {k:v for k,v in state.items() if k != "trade_ledger"}}
+        state = get_trading_room_state(app_ref, uid)
+        if action == "ready":
+            if not state or not state.get("active"):
+                raise HTTPException(status_code=409, detail="لا توجد جلسة نشطة")
+            state["pending_ready"] = False
+            state["ready_confirmed"] = True
+            save_trading_room_state(app_ref, uid, state)
+            app_ref.job_queue.run_once(
+                trading_room_begin_market_job, when=1,
+                data={"admin_id": uid},
+                name=f"mobile_trading_room_begin_{uid}_{int(time_module.time())}",
+            )
+            return {"ok": True, "message": "تم بدء البحث عن زوج مناسب.", "state": {k:v for k,v in state.items() if k != "trade_ledger"}}
+        if action == "stop":
+            clear_trading_room_state(app_ref, uid)
+            return {"ok": True, "message": "تم إيقاف غرفة جلسة التداول.", "state": {}}
+        return {"ok": True, "state": {k:v for k,v in (state or {}).items() if k != "trade_ledger"}}
+
+    @copy_api.get("/api/mobile/admin/overview")
+    async def mobile_admin_overview(authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        _mobile_require_admin(session)
+        three_settings = _three_candle_get_settings()
+        public_settings = _three_candle_public_get_settings()
+        return {
+            "ok": True,
+            "stats": _mobile_bot_stats_payload(),
+            "sections": {
+                "copy": {"enabled": bool(is_copy_global_enabled()), "online_clients": len(_copy_clients), "status_text": build_copy_status_message()},
+                "three_candle": {"enabled": bool(_three_candle_is_enabled()), "daily_limit": int(three_settings.get("daily_limit", 0) or 0), "status_text": build_three_candle_channel_status()},
+                "public_three_candle": {"enabled": bool(_three_candle_public_is_enabled()), "session_limit": int(public_settings.get("session_limit", 0) or 0), "status_text": build_three_candle_public_status()},
+                "bot": {"enabled": bool(get_bot_enabled())},
+                "otc_list": {"result_ready": bool((get_ready_otc_list_result(int(ADMIN_TELEGRAM_ID)) or {}).get("result_text"))},
+            },
+            "menu": [
+                "pending_users", "all_users", "active_users", "user_details", "bot_stats", "export_users",
+                "copy_trading", "copy_status", "three_candle", "public_three_candle", "otc_list_check",
+                "otc_list_results", "bot_start", "bot_stop", "broadcast"
+            ],
+        }
+
+    @copy_api.get("/api/mobile/admin/users")
+    async def mobile_admin_users(kind: str = Query(default="all"), authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        _mobile_require_admin(session)
+        kind = str(kind or "all").lower()
+        rows = []
+        if kind == "pending":
+            data = get_all_pending_users() or {}
+            for key, value in data.items(): rows.append(_mobile_clean_user(key, value))
+        elif kind == "active":
+            for key, value in (get_recent_active_approved_users() or []): rows.append(_mobile_clean_user(key, value))
+        else:
+            approved = get_all_approved_users() or {}
+            all_users = get_all_users() or {}
+            for key, value in approved.items():
+                try:
+                    if not is_approved(int(key)): continue
+                except Exception: continue
+                merged = dict(all_users.get(str(key), {}) or {})
+                merged.update(dict(value or {}))
+                rows.append(_mobile_clean_user(key, merged))
+        return {"ok": True, "kind": kind, "users": rows[:200], "count": len(rows)}
+
+    @copy_api.get("/api/mobile/admin/user")
+    async def mobile_admin_user(telegram_id: str = Query(...), authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        _mobile_require_admin(session)
+        tid = normalize_copy_telegram_user_id(telegram_id)
+        if not tid:
+            raise HTTPException(status_code=400, detail="Telegram ID غير صالح")
+        all_users = get_all_users() or {}
+        approved = get_all_approved_users() or {}
+        pending = get_all_pending_users() or {}
+        merged = dict(all_users.get(tid, {}) or {})
+        merged.update(dict(approved.get(tid, {}) or {}))
+        if not merged: merged.update(dict(pending.get(tid, {}) or {}))
+        user_payload = _mobile_clean_user(tid, merged)
+        try:
+            licenses = find_copy_licenses_by_telegram_id(tid, 100)
+        except Exception:
+            licenses = []
+        return {"ok": True, "user": user_payload, "approved": is_approved(int(tid)), "licenses": licenses}
+
+    @copy_api.get("/api/mobile/admin/report")
+    async def mobile_admin_report(section: str = Query(...), limit: int = Query(default=20), authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        _mobile_require_admin(session)
+        section = str(section or "").lower()
+        if section == "stats": text = build_bot_stats_message()
+        elif section == "copy": text = build_copy_status_message()
+        elif section == "three_status": text = build_three_candle_channel_status()
+        elif section == "three_summary": text = build_three_candle_channel_summary(None if limit <= 0 else limit)
+        elif section == "three_memory": text = build_three_candle_strategy_memory_report(None if limit <= 0 else limit)
+        elif section == "public_status": text = build_three_candle_public_status()
+        elif section == "public_summary": text = build_three_candle_public_summary(None if limit <= 0 else limit)
+        elif section == "otc_list_results":
+            saved = get_ready_otc_list_result(int(ADMIN_TELEGRAM_ID)) or {}
+            text = saved.get("result_text") or "لا توجد نتيجة جاهزة بعد."
+        elif section == "export_users": text = build_users_export_csv_bytes().decode("utf-8-sig", errors="replace")
+        else: raise HTTPException(status_code=400, detail="قسم التقرير غير معروف")
+        return {"ok": True, "section": section, "text": text}
+
+    @copy_api.post("/api/mobile/admin/otc-list/check")
+    async def mobile_admin_otc_list_check(request: Request, authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        _mobile_require_admin(session)
+        app_ref = _mobile_runtime_app()
+        try: body = await request.json()
+        except Exception: raise HTTPException(status_code=400, detail="invalid request body")
+        raw_list = str(body.get("text") or "").strip()
+        parsed_trades = parse_otc_list_trades(raw_list)
+        if not parsed_trades:
+            raise HTTPException(status_code=400, detail="لم أستطع قراءة أي صفقة من الليستة")
+        uid = int(ADMIN_TELEGRAM_ID)
+        try: otc_list_results_ref(uid).delete()
+        except Exception: pass
+        list_id = str(int(time_module.time()))
+        save_otc_list_job(uid, list_id, raw_list, parsed_trades)
+        latest_delay = 1.0
+        for idx, trade in enumerate(parsed_trades):
+            entry_dt = otc_list_entry_datetime(int(trade["hour"]), int(trade["minute"]))
+            ready_dt = entry_dt + timedelta(seconds=130)
+            trade_delay = max(1.0, (ready_dt - now_utc()).total_seconds())
+            latest_delay = max(latest_delay, trade_delay)
+            app_ref.job_queue.run_once(
+                evaluate_single_otc_list_trade_job, when=trade_delay,
+                data={"admin_id": uid, "list_id": list_id, "index": idx, "trade": trade},
+                name=f"mobile_otc_list_trade_{uid}_{list_id}_{idx}",
+            )
+        app_ref.job_queue.run_once(
+            finalize_otc_list_results_job, when=latest_delay + 2,
+            data={"admin_id": uid, "list_id": list_id},
+            name=f"mobile_otc_list_finalize_{uid}_{list_id}",
+        )
+        return {"ok": True, "list_id": list_id, "count": len(parsed_trades), "ready_minutes": round((latest_delay+2)/60, 1)}
+
+    @copy_api.post("/api/mobile/admin/action")
+    async def mobile_admin_action(request: Request, authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        _mobile_require_admin(session)
+        app_ref = globals().get("TRADING_TIME_TELEGRAM_APP")
+        try: body = await request.json()
+        except Exception: raise HTTPException(status_code=400, detail="invalid request body")
+        action = str(body.get("action") or "").strip().lower()
+        value = body.get("value")
+        target_tid = normalize_copy_telegram_user_id(body.get("telegram_id"))
+
+        if action == "bot_start": set_bot_enabled(True); message = "تم تشغيل البوت."
+        elif action == "bot_stop": set_bot_enabled(False); message = "تم إيقاف البوت."
+        elif action == "copy_start": set_copy_global_enabled(True, int(ADMIN_TELEGRAM_ID)); message = "تم تشغيل Copy Trading."
+        elif action == "copy_stop": set_copy_global_enabled(False, int(ADMIN_TELEGRAM_ID)); message = "تم إيقاف Copy Trading."
+        elif action == "three_start":
+            if not _three_candle_set_enabled(True): raise HTTPException(status_code=500, detail="تعذر تشغيل قناة 3 شموع")
+            message = "تم تشغيل نشر قناة 3 شموع."
+        elif action == "three_stop":
+            if not _three_candle_set_enabled(False): raise HTTPException(status_code=500, detail="تعذر إيقاف قناة 3 شموع")
+            message = "تم إيقاف نشر قناة 3 شموع."
+        elif action == "three_limit":
+            limit = safe_int(value, -1)
+            if limit < 0 or not _three_candle_set_daily_limit(limit): raise HTTPException(status_code=400, detail="حد الصفقات غير صالح")
+            message = f"تم ضبط حد 3 شموع على {limit if limit else 'مفتوح'}."
+        elif action == "three_memory_reset":
+            ok, message = _three_candle_reset_strategy_memory()
+            if not ok: raise HTTPException(status_code=500, detail=message)
+        elif action == "public_start":
+            ok, message = _three_candle_public_set_enabled(True)
+            if not ok: raise HTTPException(status_code=400, detail=message)
+        elif action == "public_stop":
+            ok, message = _three_candle_public_set_enabled(False)
+            if not ok: raise HTTPException(status_code=400, detail=message)
+        elif action == "public_limit":
+            limit = safe_int(value, -1)
+            if limit < 0: raise HTTPException(status_code=400, detail="عدد الصفقات غير صالح")
+            ok, message = _three_candle_public_set_session_limit(limit)
+            if not ok: raise HTTPException(status_code=400, detail=message)
+        elif action == "public_reset":
+            ok, message = _three_candle_public_reset_results()
+            if not ok: raise HTTPException(status_code=500, detail=message)
+        elif action in {"user_week", "user_month", "user_forever", "user_revoke"}:
+            if not target_tid: raise HTTPException(status_code=400, detail="Telegram ID مطلوب")
+            uid = int(target_tid)
+            if action == "user_week":
+                set_user_expiry(uid, "week"); message = "تم تفعيل المستخدم أسبوع."; user_notice = "✅ تم تفعيل حسابك بنجاح لمدة أسبوع.\nاضغط /start للدخول إلى TRADING TIME."
+            elif action == "user_month":
+                set_user_expiry(uid, "month"); message = "تم تفعيل المستخدم شهر."; user_notice = "✅ تم تفعيل حسابك بنجاح لمدة شهر.\nاضغط /start للدخول إلى TRADING TIME."
+            elif action == "user_forever":
+                set_user_expiry(uid, "forever"); message = "تم تفعيل المستخدم دائم."; user_notice = "✅ تم تفعيل حسابك بشكل دائم.\nاضغط /start للدخول إلى TRADING TIME."
+            else:
+                block_user(uid); message = "تم إلغاء تفعيل المستخدم."; user_notice = "⛔ تم إلغاء تفعيل اشتراك TRADING TIME الخاص بك."
+            if app_ref is not None:
+                try:
+                    await safe_send_message(app_ref.bot, chat_id=uid, text=user_notice)
+                except Exception:
+                    logger.debug("Mobile admin user notification failed", exc_info=True)
+        elif action == "copy_reset_telegram_device":
+            if not target_tid: raise HTTPException(status_code=400, detail="Telegram ID مطلوب")
+            if not copy_reset_telegram_device(target_tid): raise HTTPException(status_code=500, detail="تعذر تصفير الجهاز")
+            message = "تم تصفير جهاز Copy للمستخدم."
+        elif action == "copy_update_notice":
+            notice = str(value or "").strip()
+            if not set_copy_update_notice(notice, int(ADMIN_TELEGRAM_ID)):
+                raise HTTPException(status_code=500, detail="تعذر حفظ رسالة التحديث")
+            message = "تم مسح رسالة التحديث." if not notice else "تم حفظ رسالة التحديث للإضافة."
+        elif action == "direct_message":
+            if not target_tid or app_ref is None: raise HTTPException(status_code=400, detail="المستخدم أو Telegram runtime غير متوفر")
+            msg = str(value or "").strip()
+            if not msg: raise HTTPException(status_code=400, detail="الرسالة فارغة")
+            await safe_send_message(app_ref.bot, chat_id=int(target_tid), text=msg)
+            message = "تم إرسال الرسالة للمستخدم."
+        elif action == "broadcast":
+            if app_ref is None: raise HTTPException(status_code=503, detail="Telegram runtime غير متوفر")
+            msg = str(value or "").strip()
+            if not msg: raise HTTPException(status_code=400, detail="الرسالة فارغة")
+            sent = failed = skipped = 0
+            for uid_raw in list((get_all_approved_users() or {}).keys()):
+                try:
+                    uid = int(uid_raw)
+                    if not is_approved(uid): skipped += 1; continue
+                    await safe_send_message(app_ref.bot, chat_id=uid, text="📢 رسالة من الأدمن\n\n" + msg)
+                    sent += 1
+                except Exception: failed += 1
+            message = f"تم الإرسال: {sent}، تجاهل: {skipped}، فشل: {failed}."
+        else:
+            raise HTTPException(status_code=400, detail="إجراء إداري غير معروف")
+        return {"ok": True, "action": action, "message": message, "overview": _mobile_bot_stats_payload()}
 
     @copy_api.websocket("/ws/mobile-signals")
     async def mobile_signal_ws(websocket: WebSocket):
@@ -22420,12 +22884,14 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
             logger.debug("Suppressed exception at line 18307", exc_info=True)
 
 def run_telegram_bot_only():
+    global TRADING_TIME_TELEGRAM_APP
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN غير موجود داخل ملف .env")
 
     # في نسخة Web Service، FastAPI/Uvicorn هو السيرفر الأساسي، لذلك لا نشغل سيرفر مدمج داخل thread هنا.
 
     app = Application.builder().token(BOT_TOKEN).build()
+    TRADING_TIME_TELEGRAM_APP = app
 
     # تشغيل بث Quotex OTC الحقيقي بالخلفية
     start_quotex_otc_feed()
