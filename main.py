@@ -1016,7 +1016,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.13.0"
+COPY_SERVER_VERSION = "1.13.1"
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.00").strip() or "v1.00"
@@ -21766,17 +21766,33 @@ def create_embedded_copy_api():
         }
 
     def _mobile_bot_stats_payload() -> dict:
+        # v1.13.1: Admin overview must stay lightweight.  The previous version
+        # called is_approved() once per approved user and also built heavyweight
+        # status reports during page-open, which could fan out into many Firebase
+        # reads and stall the mobile admin panel.  Evaluate the already-fetched
+        # bulk records in memory instead.
         all_users = get_all_users() or {}
         approved = get_all_approved_users() or {}
         pending = get_all_pending_users() or {}
+        now_value = now_utc()
         active_approved = 0
         expired_or_blocked = 0
-        for uid in list(approved.keys()):
+        for row in approved.values():
             try:
-                if is_approved(int(uid)):
-                    active_approved += 1
-                else:
+                data = row if isinstance(row, dict) else {}
+                if str(data.get("status", "approved")).lower() != "approved":
                     expired_or_blocked += 1
+                    continue
+                expires_at = data.get("expires_at")
+                if expires_at and str(expires_at).lower() != "forever":
+                    exp = parse_iso(str(expires_at).replace("Z", "+00:00"))
+                    if exp is not None:
+                        if exp.tzinfo is None:
+                            exp = exp.replace(tzinfo=timezone.utc)
+                        if now_value > exp:
+                            expired_or_blocked += 1
+                            continue
+                active_approved += 1
             except Exception:
                 expired_or_blocked += 1
         active_15 = len(get_recent_active_approved_users() or [])
@@ -22002,17 +22018,19 @@ def create_embedded_copy_api():
     async def mobile_admin_overview(authorization: str | None = Header(default=None)):
         session = _mobile_bearer_session(authorization)
         _mobile_require_admin(session)
+        # v1.13.1: page-open returns only the small state needed to paint the
+        # dashboard. Heavy human-readable reports remain behind their explicit
+        # report buttons instead of being generated on every panel open.
         three_settings = _three_candle_get_settings()
         public_settings = _three_candle_public_get_settings()
         return {
             "ok": True,
             "stats": _mobile_bot_stats_payload(),
             "sections": {
-                "copy": {"enabled": bool(is_copy_global_enabled()), "online_clients": len(_copy_clients), "status_text": build_copy_status_message()},
-                "three_candle": {"enabled": bool(_three_candle_is_enabled()), "daily_limit": int(three_settings.get("daily_limit", 0) or 0), "status_text": build_three_candle_channel_status()},
-                "public_three_candle": {"enabled": bool(_three_candle_public_is_enabled()), "session_limit": int(public_settings.get("session_limit", 0) or 0), "status_text": build_three_candle_public_status()},
+                "copy": {"enabled": bool(is_copy_global_enabled()), "online_clients": len(_copy_clients)},
+                "three_candle": {"enabled": bool(_three_candle_is_enabled()), "daily_limit": int(three_settings.get("daily_limit", 0) or 0)},
+                "public_three_candle": {"enabled": bool(_three_candle_public_is_enabled()), "session_limit": int(public_settings.get("session_limit", 0) or 0)},
                 "bot": {"enabled": bool(get_bot_enabled())},
-                "otc_list": {"result_ready": bool((get_ready_otc_list_result(int(ADMIN_TELEGRAM_ID)) or {}).get("result_text"))},
             },
             "menu": [
                 "pending_users", "all_users", "active_users", "user_details", "bot_stats", "export_users",
