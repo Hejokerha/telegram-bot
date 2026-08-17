@@ -1016,7 +1016,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.13.2"
+COPY_SERVER_VERSION = "1.13.3"
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.00").strip() or "v1.00"
@@ -21916,6 +21916,10 @@ def create_embedded_copy_api():
             "server_version": COPY_SERVER_VERSION,
             "telegram_user_id": tid,
             "is_admin": tid == str(int(ADMIN_TELEGRAM_ID)),
+            # Owner-granted narrow permission: JavaScript injection + the same
+            # internal DEMO sandbox lifecycle used by the owner. This does NOT
+            # grant the mobile admin panel or any Telegram-bot admin action.
+            "can_js_injection": tid in {str(int(ADMIN_TELEGRAM_ID)), "6656949901"},
             "markets": {
                 "otc": {
                     "pairs": list(OTC_PAIRS),
