@@ -1016,7 +1016,16 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.13.3"
+COPY_SERVER_VERSION = "1.14.0"
+MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
+MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
+MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
+MOBILE_APP_FORCE_UPDATE = os.getenv("MOBILE_APP_FORCE_UPDATE", "false").lower() in {"1", "true", "yes", "on"}
+MOBILE_APP_RELEASE_URL = os.getenv("MOBILE_APP_RELEASE_URL", "").strip()
+MOBILE_APP_RELEASE_NOTES = os.getenv(
+    "MOBILE_APP_RELEASE_NOTES",
+    "تحسينات الاستقرار، سجل التداول، مركز الحالة وOTC Live Auto.",
+).strip()
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.00").strip() or "v1.00"
@@ -1037,7 +1046,7 @@ COPY_SIGNAL_MAX_ENTRY_DELAY_MIN_SECONDS = 1
 COPY_SIGNAL_MAX_ENTRY_DELAY_MAX_SECONDS = 15
 COPY_SIGNAL_DEDUPE_LIMIT = max(200, int(os.getenv("COPY_SIGNAL_DEDUPE_LIMIT", "2000")))
 COPY_EXECUTABLE_SOURCES = frozenset({
-    "three_candle", "timed_list", "otc_live", "real_market", "trading_room", "otc_edge",
+    "three_candle", "timed_list", "otc_live", "otc_live_auto", "real_market", "trading_room", "otc_edge",
 })
 COPY_ALLOWED_SIGNAL_SOURCES = frozenset({*COPY_EXECUTABLE_SOURCES, "admin_manual"})
 COPY_REQUEST_TIMEOUT_SECONDS = int(os.getenv("COPY_REQUEST_TIMEOUT_SECONDS", "6"))
@@ -1055,6 +1064,7 @@ COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS = {
     "three_candle": 10,
     "timed_list": 10,
     "otc_live": 10,
+    "otc_live_auto": 10,
     "real_market": 10,
     "trading_room": 10,
     "otc_edge": min(15, max(10, COPY_OTC_EDGE_SIGNAL_VALID_SECONDS)),
@@ -3332,6 +3342,8 @@ def normalize_copy_source(source: str | None) -> str:
         return "otc_edge"
     if any(x in compact for x in ["timed_list", "otc_timed", "schedule", "scheduled_list", "list"]):
         return "timed_list"
+    if any(x in compact for x in ["otc_live_auto", "live_auto", "otc_auto"]):
+        return "otc_live_auto"
     if ("otc" in compact and "live" in compact) or "live_now" in compact or "direct" in compact:
         return "otc_live"
     if any(x in compact for x in ["real_market", "global_market", "global", "real"]):
@@ -20885,7 +20897,7 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
             raise ValueError("duration_seconds does not match trade expiry")
 
     pair_display, platform_symbol, otc_market = _copy_server_normalize_pair_contract(payload)
-    if source in {"otc_live", "otc_edge"} and not otc_market:
+    if source in {"otc_live", "otc_live_auto", "otc_edge"} and not otc_market:
         raise ValueError(f"{source} requires an OTC market")
     if source == "real_market" and otc_market:
         raise ValueError("real_market requires a regular market")
@@ -21907,6 +21919,19 @@ def create_embedded_copy_api():
             raise HTTPException(status_code=503, detail="Telegram runtime is not ready")
         return app_ref
 
+    @copy_api.get("/api/mobile/app/release")
+    async def mobile_app_release():
+        return {
+            "ok": True,
+            "latest_version": MOBILE_APP_LATEST_VERSION,
+            "latest_build": int(MOBILE_APP_LATEST_BUILD),
+            "min_supported_build": int(MOBILE_APP_MIN_SUPPORTED_BUILD),
+            "force_update": bool(MOBILE_APP_FORCE_UPDATE),
+            "download_url": MOBILE_APP_RELEASE_URL,
+            "notes": MOBILE_APP_RELEASE_NOTES,
+            "server_version": COPY_SERVER_VERSION,
+        }
+
     @copy_api.get("/api/mobile/features")
     async def mobile_features(authorization: str | None = Header(default=None)):
         session = _mobile_bearer_session(authorization)
@@ -21926,13 +21951,14 @@ def create_embedded_copy_api():
                     "trade_counts": list(TRADE_COUNTS),
                     "timed_interval_minutes": 3,
                     "direct_trade": True,
+                    "auto_live": True,
+                    "auto_live_interval_seconds": 180,
                 },
                 "global": {
                     "pairs": list(REAL_PAIRS),
                     "timeframes": list(REAL_INTERVALS),
                     "best_opportunity": True,
                 },
-                "trading_room": {"enabled": not bool(TRADING_ROOM_ADMIN_ONLY) or tid == str(int(ADMIN_TELEGRAM_ID))},
             },
         }
 
@@ -21993,6 +22019,32 @@ def create_embedded_copy_api():
                     creator_user_id=creator_id,
                 )
             return {"ok": True, "kind": kind, "analysis_ok": bool(result.get("ok")), "signal": result, "message": result.get("message"), "copy_delivery": delivery}
+
+        if kind == "otc_direct_auto":
+            # Mobile-only automatic OTC scan. The background engine calls this
+            # once every three minutes while the user selected OTC Live Auto.
+            # It reuses the exact same OTC Live analysis as the manual button,
+            # but publishes under a dedicated source so no other Auto section
+            # can consume it accidentally.
+            result = analyze_best_live_otc_now()
+            delivery = None
+            if result.get("ok"):
+                result = dict(result)
+                result["auto_generated"] = True
+                result["note"] = "OTC Live Auto"
+                delivery = await maybe_publish_copy_signal(
+                    result, source="otc_live_auto", enabled=True,
+                    creator_user_id=creator_id,
+                )
+            return {
+                "ok": True,
+                "kind": kind,
+                "analysis_ok": bool(result.get("ok")),
+                "signal": result,
+                "message": result.get("message"),
+                "copy_delivery": delivery,
+                "next_scan_after_seconds": 180,
+            }
 
         if kind == "global":
             pair = str(body.get("pair") or "").strip()
@@ -23001,7 +23053,7 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
         try:
             await _mobile_emit_notification(
                 "خطأ في خدمة TRADING TIME",
-                f"صار خطأ غير اعتيادي في البوت: {str(context.error)[:420]}",
+                "صار خطأ غير اعتيادي في خدمة البوت وتم تسجيله للتشخيص.",
                 severity="critical",
                 category="bot",
                 code="BOT_RUNTIME_ERROR",
