@@ -1016,7 +1016,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.14.0"
+COPY_SERVER_VERSION = "1.15.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -4282,6 +4282,162 @@ def copy_telegram_devices_ref():
 def copy_telegram_link_requests_ref():
     return system_ref().child("copy_trading").child("telegram_link_requests")
 
+
+# ===== v1.15.0: Mobile app adoption analytics =====
+# Download counting is privacy-light: the public Firebase download page creates
+# one random browser-local ID and the backend stores only its SHA-256 digest.
+# No IP address, Telegram ID, device proof, or user-agent is stored for download
+# analytics. Activation counting is exact for confirmed Android Telegram links.
+_mobile_app_analytics_lock = threading.RLock()
+
+
+def mobile_app_analytics_ref():
+    return system_ref().child("mobile_app").child("analytics")
+
+
+def _mobile_app_increment_counter(name: str, amount: int = 1) -> int:
+    ref = mobile_app_analytics_ref().child("stats").child(str(name))
+    try:
+        value = ref.transaction(lambda current: int(current or 0) + int(amount))
+        return int(value or 0)
+    except Exception:
+        logger.debug("Mobile app analytics counter update failed | %s", name, exc_info=True)
+        return 0
+
+
+def _mobile_app_record_activation(telegram_user_id, confirmed_at: str | None = None) -> bool:
+    tid = normalize_copy_telegram_user_id(telegram_user_id)
+    if not tid:
+        return False
+    now_value = confirmed_at or now_iso()
+    created = {"value": False}
+    ref = mobile_app_analytics_ref().child("activations").child(tid)
+
+    def _txn(current):
+        row = dict(current or {}) if isinstance(current, dict) else {}
+        if not row:
+            created["value"] = True
+            row["first_confirmed_at"] = now_value
+        row["last_confirmed_at"] = now_value
+        row["telegram_user_id"] = tid
+        return row
+
+    try:
+        ref.transaction(_txn)
+        if created["value"]:
+            _mobile_app_increment_counter("activated_users", 1)
+        mobile_app_analytics_ref().child("stats").update({"last_activation_at": now_value})
+        return True
+    except Exception:
+        logger.debug("Mobile activation analytics write failed | tid=%s", tid, exc_info=True)
+        return False
+
+
+def _mobile_app_ensure_activation_index() -> None:
+    """Backfill pre-v1.15 confirmed mobile links exactly once.
+
+    Older public builds already created `clients/mobile` bindings, but the
+    aggregate analytics counters did not exist yet. The first admin overview on
+    v1.15 scans those bindings once, seeds the compact activation index, and
+    records a marker so later admin opens stay lightweight.
+    """
+    stats_ref = mobile_app_analytics_ref().child("stats")
+    try:
+        if (stats_ref.child("activation_index_ready_at").get() or ""):
+            return
+    except Exception:
+        return
+
+    with _mobile_app_analytics_lock:
+        try:
+            if (stats_ref.child("activation_index_ready_at").get() or ""):
+                return
+            bindings = copy_telegram_devices_ref().get() or {}
+            if not isinstance(bindings, dict):
+                bindings = {}
+            activations = {}
+            for raw_tid, raw_binding in bindings.items():
+                if not isinstance(raw_binding, dict):
+                    continue
+                clients = raw_binding.get("clients") or {}
+                mobile = clients.get("mobile") if isinstance(clients, dict) else None
+                if not isinstance(mobile, dict):
+                    continue
+                confirmed_at = str(mobile.get("confirmed_at") or "").strip()
+                if not confirmed_at:
+                    continue
+                tid = normalize_copy_telegram_user_id(raw_tid)
+                if not tid:
+                    continue
+                activations[tid] = {
+                    "telegram_user_id": tid,
+                    "first_confirmed_at": confirmed_at,
+                    "last_confirmed_at": str(mobile.get("last_seen_at") or confirmed_at),
+                }
+            if activations:
+                mobile_app_analytics_ref().child("activations").update(activations)
+            stats_ref.update({
+                "activated_users": len(activations),
+                "activation_index_ready_at": now_iso(),
+            })
+        except Exception:
+            logger.warning("Mobile activation analytics backfill failed", exc_info=True)
+
+
+def _mobile_app_analytics_summary() -> dict:
+    try:
+        stats = mobile_app_analytics_ref().child("stats").get() or {}
+    except Exception:
+        stats = {}
+    if not isinstance(stats, dict):
+        stats = {}
+    return {
+        "unique_downloaders": int(stats.get("unique_downloaders") or 0),
+        "download_events": int(stats.get("download_events") or 0),
+        "activated_users": int(stats.get("activated_users") or 0),
+        "last_download_at": str(stats.get("last_download_at") or ""),
+        "last_activation_at": str(stats.get("last_activation_at") or ""),
+    }
+
+
+def _mobile_app_record_download(download_id, version="", build=0) -> bool:
+    raw_id = str(download_id or "").strip()
+    if not re.fullmatch(r"[A-Za-z0-9._-]{12,120}", raw_id):
+        return False
+    digest = hashlib.sha256(raw_id.encode("utf-8")).hexdigest()[:40]
+    now_value = now_iso()
+    version_value = str(version or "").strip()[:32]
+    build_value = safe_int(build, 0)
+    created = {"value": False}
+    ref = mobile_app_analytics_ref().child("downloaders").child(digest)
+
+    def _txn(current):
+        row = dict(current or {}) if isinstance(current, dict) else {}
+        if not row:
+            created["value"] = True
+            row["first_download_at"] = now_value
+            row["download_count"] = 0
+        row["last_download_at"] = now_value
+        row["download_count"] = int(row.get("download_count") or 0) + 1
+        if version_value:
+            row["last_version"] = version_value
+        if build_value > 0:
+            row["last_build"] = build_value
+        return row
+
+    try:
+        ref.transaction(_txn)
+        _mobile_app_increment_counter("download_events", 1)
+        if created["value"]:
+            _mobile_app_increment_counter("unique_downloaders", 1)
+        mobile_app_analytics_ref().child("stats").update({"last_download_at": now_value})
+        if build_value > 0:
+            _mobile_app_increment_counter(f"downloads_build_{build_value}", 1)
+        return True
+    except Exception:
+        logger.debug("Mobile download analytics write failed", exc_info=True)
+        return False
+
 def _copy_telegram_device_key(device_id: str) -> str:
     return hashlib.sha256(str(device_id or "").encode("utf-8")).hexdigest()[:32]
 
@@ -4475,6 +4631,8 @@ def copy_confirm_telegram_device(request_id: str, actor_telegram_id) -> tuple[bo
     except Exception as exc:
         logger.warning("Could not confirm Copy Telegram device | tid=%s | error=%s", tid, exc)
         return False, "تعذر حفظ ربط الجهاز.", req
+    if client_kind == "mobile":
+        _mobile_app_record_activation(tid, now_value)
     label = "التطبيق" if client_kind == "mobile" else "الإضافة"
     return True, f"تم ربط {label} باشتراك البوت بنجاح.", subscription
 
@@ -21901,6 +22059,11 @@ def create_embedded_copy_api():
             except Exception:
                 expired_or_blocked += 1
         active_15 = len(get_recent_active_approved_users() or [])
+        _mobile_app_ensure_activation_index()
+        app_analytics = _mobile_app_analytics_summary()
+        unique_downloaders = int(app_analytics.get("unique_downloaders") or 0)
+        activated_users = int(app_analytics.get("activated_users") or 0)
+        activation_rate = round((activated_users / unique_downloaders) * 100.0, 1) if unique_downloaders > 0 else 0.0
         return {
             "total_users": len(all_users),
             "approved_active": active_approved,
@@ -21911,6 +22074,12 @@ def create_embedded_copy_api():
             "copy_enabled": bool(is_copy_global_enabled()),
             "extension_online": len(_copy_clients),
             "mobile_online": len(_mobile_signal_clients),
+            "app_unique_downloaders": unique_downloaders,
+            "app_download_events": int(app_analytics.get("download_events") or 0),
+            "app_activated_users": activated_users,
+            "app_activation_rate_pct": activation_rate,
+            "app_last_download_at": app_analytics.get("last_download_at") or "",
+            "app_last_activation_at": app_analytics.get("last_activation_at") or "",
         }
 
     def _mobile_runtime_app():
@@ -21918,6 +22087,18 @@ def create_embedded_copy_api():
         if app_ref is None:
             raise HTTPException(status_code=503, detail="Telegram runtime is not ready")
         return app_ref
+
+    @copy_api.get("/api/mobile/app/download-track")
+    async def mobile_app_download_track(
+        download_id: str = Query(...),
+        version: str = Query(default=""),
+        build: int = Query(default=0),
+    ):
+        # Used as a cross-origin image/beacon from the Firebase /download page.
+        # 204 avoids response payload/cache overhead and requires no browser CORS
+        # permission because the page does not read the response.
+        _mobile_app_record_download(download_id, version, build)
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
 
     @copy_api.get("/api/mobile/app/release")
     async def mobile_app_release():
