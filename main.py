@@ -451,7 +451,8 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
         ["🔐 Copy Trading", "📡 حالة Copy"],
-        ["📡 قناة 3 شموع", "🌐 Public Three Candle"],
+        ["🧱 Structure Edge", "📡 قناة 3 شموع"],
+        ["🌐 Public Three Candle"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
         ["📢 رسالة جماعية"],
@@ -484,6 +485,18 @@ admin_otc_edge_keyboard = ReplyKeyboardMarkup(
         ["📋 حالة مراقبة Edge", "📊 تقرير الأنماط"],
         ["🔔 نمط رسائل Edge", "🧾 آخر تحليل Edge"],
         ["🧪 فحص زوج محدد"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+# v1.16.0: Admin-only shadow test for the independent Structure Edge engine.
+# It does not alter or replace Three Candle / OTC Edge and does not send Copy Trading commands.
+structure_edge_admin_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🟢 تشغيل Structure Edge", "🔴 إيقاف Structure Edge"],
+        ["📋 حالة Structure Edge", "📊 ملخص Structure Edge"],
+        ["🧹 تصفير نتائج Structure Edge"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -1016,7 +1029,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.15.0"
+COPY_SERVER_VERSION = "1.18.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -1046,7 +1059,7 @@ COPY_SIGNAL_MAX_ENTRY_DELAY_MIN_SECONDS = 1
 COPY_SIGNAL_MAX_ENTRY_DELAY_MAX_SECONDS = 15
 COPY_SIGNAL_DEDUPE_LIMIT = max(200, int(os.getenv("COPY_SIGNAL_DEDUPE_LIMIT", "2000")))
 COPY_EXECUTABLE_SOURCES = frozenset({
-    "three_candle", "timed_list", "otc_live", "otc_live_auto", "real_market", "trading_room", "otc_edge",
+    "three_candle", "timed_list", "otc_live", "otc_live_auto", "real_market", "trading_room", "otc_edge", "structure_edge",
 })
 COPY_ALLOWED_SIGNAL_SOURCES = frozenset({*COPY_EXECUTABLE_SOURCES, "admin_manual"})
 COPY_REQUEST_TIMEOUT_SECONDS = int(os.getenv("COPY_REQUEST_TIMEOUT_SECONDS", "6"))
@@ -1056,6 +1069,7 @@ COPY_SEND_TIMED_LISTS = os.getenv("COPY_SEND_TIMED_LISTS", "true").lower() in {"
 COPY_SEND_THREE_CANDLE = os.getenv("COPY_SEND_THREE_CANDLE", "true").lower() in {"1", "true", "yes", "on"}
 COPY_SEND_TRADING_ROOM = os.getenv("COPY_SEND_TRADING_ROOM", "true").lower() in {"1", "true", "yes", "on"}
 COPY_SEND_OTC_EDGE = os.getenv("COPY_SEND_OTC_EDGE", "true").lower() in {"1", "true", "yes", "on"}
+COPY_SEND_STRUCTURE_EDGE = os.getenv("COPY_SEND_STRUCTURE_EDGE", "true").lower() in {"1", "true", "yes", "on"}
 COPY_OTC_EDGE_SIGNAL_VALID_SECONDS = int(os.getenv("COPY_OTC_EDGE_SIGNAL_VALID_SECONDS", str(max(10, int(os.getenv("OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS", "5")) * 2))))
 # A trade received late is a different trade. Keep every producer inside the
 # same bounded admission window used by the mobile executor; never preserve the
@@ -1068,6 +1082,9 @@ COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS = {
     "real_market": 10,
     "trading_room": 10,
     "otc_edge": min(15, max(10, COPY_OTC_EDGE_SIGNAL_VALID_SECONDS)),
+    # Structure Edge predicts the CURRENT M1 candle immediately after the prior candle closes.
+    # A packet that arrives after this tiny window is intentionally discarded.
+    "structure_edge": 6,
 }
 # v0.67: عند مراقبة زوج واحد نرسل أمر تجهيز مسبق للإضافة قبل السماح بأي إشارة Edge.
 COPY_OTC_EDGE_PREPARE_ENABLED = os.getenv("COPY_OTC_EDGE_PREPARE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -3336,6 +3353,8 @@ def normalize_copy_source(source: str | None) -> str:
 
     if any(x in compact for x in ["three_candle", "3_candle", "threecandle"]) or ("3" in compact and "candle" in compact):
         return "three_candle"
+    if any(x in compact for x in ["structure_edge", "structureedge", "structure_liquidity"]):
+        return "structure_edge"
     if any(x in compact for x in ["trading_room", "session_room", "room_session"]):
         return "trading_room"
     if any(x in compact for x in ["otc_edge", "edge_engine", "edge"]):
@@ -3471,6 +3490,14 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
         "preselected_pair_mode": bool(signal.get("preselected_pair_mode") or False),
         "watch_pair": signal.get("watch_pair"),
         "skip_asset_switch": bool(signal.get("skip_asset_switch") or False),
+        # v1.17 Structure Edge test metadata. Kept non-executable; execution still depends
+        # only on the canonical pair/direction/time/expiry contract above.
+        "structure_setup": signal.get("structure_setup") or signal.get("setup"),
+        "structure_score": signal.get("structure_score") or signal.get("score"),
+        "m5_bias": signal.get("m5_bias"),
+        "m5_strength": signal.get("m5_strength"),
+        "structure_confluences": signal.get("structure_confluences") or signal.get("confluences"),
+        "demo_only": bool(signal.get("demo_only") or False),
     }
 
     base = "|".join([
@@ -3669,6 +3696,79 @@ async def publish_copy_three_candle_signal(trade: dict) -> dict:
     except Exception as e:
         logger.warning("Three-candle Copy signal failed: %s", e)
         return {"ok": False, "error": str(e)}
+
+
+async def publish_copy_structure_edge_signal(trade: dict) -> dict:
+    """Send one confirmed Structure Edge setup to the owner's Chrome extension.
+
+    Test contract:
+    - owner/admin Telegram route only
+    - extension-only (never Android replay)
+    - DEMO-only enforced again by the extension
+    - no martingale / no sequence system
+    - entry is immediate in the first seconds of the current M1 candle
+    - expiry is the current M1 candle close
+    """
+    if not COPY_SEND_STRUCTURE_EDGE:
+        return {"ok": False, "skipped": True, "reason": "COPY_SEND_STRUCTURE_EDGE=false"}
+    try:
+        entry_bucket = int(float((trade or {}).get("entry_bucket") or 0))
+        if entry_bucket <= 0:
+            return {"ok": False, "skipped": True, "reason": "missing entry_bucket"}
+        pair = str((trade or {}).get("pair") or "").strip()
+        direction = str((trade or {}).get("direction") or "").strip().upper()
+        symbol = str((trade or {}).get("symbol") or "").strip()
+        if not pair or direction not in {"CALL", "PUT"}:
+            return {"ok": False, "skipped": True, "reason": "missing pair/direction"}
+        entry_dt = datetime.fromtimestamp(entry_bucket, tz=UTC)
+        expiry_dt = entry_dt + timedelta(seconds=60)
+        payload = {
+            "ok": True,
+            "id": f"structure_{safe_key(pair)}_{entry_bucket}_{direction}_{safe_key((trade or {}).get('setup'))}",
+            "pair": pair,
+            "pair_display": pair,
+            "symbol": symbol or None,
+            "platform_symbol": symbol or pair,
+            "direction": direction,
+            "timeframe": "M1",
+            "duration_seconds": 60,
+            "duration_minutes": 1,
+            "entry_time": entry_dt.isoformat(),
+            "expires_at": (entry_dt + timedelta(seconds=COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["structure_edge"])).isoformat(),
+            "expiry_time": expiry_dt.isoformat(),
+            "expiry_timestamp": int(expiry_dt.timestamp()),
+            "trade_expiry_mode": "absolute_time",
+            "entry_mode": "instant",
+            "copy_entry_mode": "instant",
+            "execution_mode": "instant_demo_test",
+            "immediate_entry": True,
+            "direct_entry": True,
+            "instant_entry": True,
+            "allow_background_entry": True,
+            "max_entry_delay_seconds": COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["structure_edge"],
+            "quality": (trade or {}).get("score"),
+            "confidence": (trade or {}).get("score"),
+            "entry_price": (trade or {}).get("entry_price") or (trade or {}).get("price"),
+            "payout": (trade or {}).get("payout"),
+            "structure_setup": (trade or {}).get("setup"),
+            "structure_score": (trade or {}).get("score"),
+            "m5_bias": (trade or {}).get("m5_bias"),
+            "m5_strength": (trade or {}).get("m5_strength"),
+            "structure_confluences": list((trade or {}).get("confluences") or [])[:8],
+            "demo_only": True,
+            "creator_user_id": int(ADMIN_TELEGRAM_ID),
+            "target_user_id": int(ADMIN_TELEGRAM_ID),
+            "note": f"structure_edge_v1 | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | M5={(trade or {}).get('m5_bias')}:{(trade or {}).get('m5_strength')} | demo_only",
+        }
+        result = await publish_copy_trading_signal(payload, source="structure_edge")
+        logger.info(
+            "Copy Trading Structure Edge sent | pair=%s | setup=%s | score=%s | delivery=%s",
+            pair, (trade or {}).get("setup"), (trade or {}).get("score"), result.get("delivery") if isinstance(result, dict) else result,
+        )
+        return result
+    except Exception as exc:
+        logger.exception("Structure Edge Copy publish failed: %s", exc)
+        return {"ok": False, "error": str(exc)}
 
 
 async def publish_copy_otc_edge_prepare_signal(pair: str, target_user_id: int | None = None, state: dict | None = None) -> dict:
@@ -12304,6 +12404,952 @@ THREE_CANDLE_CHANNEL_ID_RAW = os.getenv("THREE_CANDLE_CHANNEL_ID", "").strip()
 THREE_CANDLE_CHANNEL_ENABLED = os.getenv("THREE_CANDLE_CHANNEL_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 
 # v1.01: Optional public/free mirror channel. Keep the private channel untouched.
+
+# ===== v1.18.0 Structure Edge: owner extension direct DEMO + Telegram audit trail =====
+# Goal: test a genuinely different decision model before considering any replacement of
+# the existing production channels. The engine uses only CLOSED M1 candles for setup
+# confirmation, M5 market structure for context, and the live Quotex price for entry.
+# v1.17 direct test: confirmed setups are routed to the owner Chrome extension and
+# executed DEMO-only. Result accounting comes back from Quotex through the extension.
+STRUCTURE_EDGE_SCAN_SECONDS = max(1, int(os.getenv("STRUCTURE_EDGE_SCAN_SECONDS", "1")))
+STRUCTURE_EDGE_MIN_SCORE = max(70, min(99, int(os.getenv("STRUCTURE_EDGE_MIN_SCORE", "84"))))
+STRUCTURE_EDGE_MIN_PAYOUT = max(0, min(100, int(os.getenv("STRUCTURE_EDGE_MIN_PAYOUT", "85"))))
+STRUCTURE_EDGE_ENTRY_MIN_SECOND = max(0, min(20, int(os.getenv("STRUCTURE_EDGE_ENTRY_MIN_SECOND", "2"))))
+STRUCTURE_EDGE_ENTRY_MAX_SECOND = max(
+    STRUCTURE_EDGE_ENTRY_MIN_SECOND,
+    min(30, int(os.getenv("STRUCTURE_EDGE_ENTRY_MAX_SECOND", "4"))),
+)
+STRUCTURE_EDGE_RESULT_DELAY_SECONDS = max(2, int(os.getenv("STRUCTURE_EDGE_RESULT_DELAY_SECONDS", "4")))
+STRUCTURE_EDGE_EXTENSION_RESULT_TIMEOUT_SECONDS = max(30, int(os.getenv("STRUCTURE_EDGE_EXTENSION_RESULT_TIMEOUT_SECONDS", "90")))
+STRUCTURE_EDGE_PAIR_COOLDOWN_SECONDS = max(60, int(os.getenv("STRUCTURE_EDGE_PAIR_COOLDOWN_SECONDS", "600")))
+STRUCTURE_EDGE_MIN_CLOSED_M1 = max(15, int(os.getenv("STRUCTURE_EDGE_MIN_CLOSED_M1", "20")))
+STRUCTURE_EDGE_RESULT_REPORT_LIMIT = max(10, int(os.getenv("STRUCTURE_EDGE_RESULT_REPORT_LIMIT", "50")))
+STRUCTURE_EDGE_CHANNEL_ID_RAW = str(os.getenv("STRUCTURE_EDGE_CHANNEL_ID", "") or "").strip()
+STRUCTURE_EDGE_DEFAULT_ENABLED = os.getenv("STRUCTURE_EDGE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+_structure_edge_state = {
+    "pending_trade": None,
+    "last_scan_at": None,
+    "last_scan_bucket": 0,
+    "last_signal_at": None,
+    "last_result_at": None,
+    "last_candidate": None,
+    "last_reject_reason": None,
+    "signals_sent": 0,
+    "results_sent": 0,
+    "copy_signals_sent": 0,
+    "copy_signals_failed": 0,
+    "unconfirmed_results": 0,
+    "extension_skips": 0,
+    "last_skip_at": None,
+    "last_skip_reason": None,
+    "execution_reports": 0,
+    "last_execution_at": None,
+    "last_execution": None,
+    "last_copy_result": None,
+    "execution_signal_ids": {},
+    "result_signal_ids": {},
+    "skip_signal_ids": {},
+    "last_error": None,
+    "pair_last_signal_ts": {},
+}
+
+
+def _structure_edge_base_ref():
+    return system_ref().child("structure_edge_test_v1")
+
+
+def _structure_edge_settings_ref():
+    return _structure_edge_base_ref().child("settings")
+
+
+def _structure_edge_results_ref():
+    return _structure_edge_base_ref().child("results")
+
+
+def _structure_edge_executions_ref():
+    return _structure_edge_base_ref().child("executions")
+
+
+def _structure_edge_target_chat_id():
+    raw = str(STRUCTURE_EDGE_CHANNEL_ID_RAW or "").strip()
+    if raw:
+        try:
+            return int(raw) if raw.lstrip("-").isdigit() else raw
+        except Exception:
+            pass
+    # Safe default for the experimental phase: only the owner/admin sees signals.
+    return int(ADMIN_TELEGRAM_ID)
+
+
+def _structure_edge_get_settings() -> dict:
+    default = {"enabled": bool(STRUCTURE_EDGE_DEFAULT_ENABLED)}
+    try:
+        data = _structure_edge_settings_ref().get() or {}
+        if not isinstance(data, dict):
+            data = {}
+        return {"enabled": bool(data.get("enabled", default["enabled"]))}
+    except Exception as exc:
+        logger.debug("Structure Edge settings read failed: %s", exc)
+        return default
+
+
+def _structure_edge_set_enabled(enabled: bool) -> bool:
+    try:
+        _structure_edge_settings_ref().update({"enabled": bool(enabled), "updated_at": now_iso()})
+        return True
+    except Exception as exc:
+        _structure_edge_state["last_error"] = str(exc)
+        logger.exception("Structure Edge enabled update failed: %s", exc)
+        return False
+
+
+def _structure_edge_is_enabled() -> bool:
+    return bool(_structure_edge_get_settings().get("enabled"))
+
+
+def _structure_edge_candle_bucket(candle: dict) -> int:
+    try:
+        return int(float(candle.get("bucket_ts", candle.get("time", 0)) or 0))
+    except Exception:
+        return 0
+
+
+def _structure_edge_complete_m5(closed_m1: list[dict]) -> list[dict]:
+    """Aggregate only COMPLETE 5-minute groups from closed Quotex M1 candles."""
+    groups = {}
+    for candle in closed_m1:
+        bucket = _structure_edge_candle_bucket(candle)
+        if bucket <= 0:
+            continue
+        m5_bucket = int(bucket // 300) * 300
+        groups.setdefault(m5_bucket, []).append(candle)
+
+    out = []
+    for bucket in sorted(groups):
+        rows = sorted(groups[bucket], key=_structure_edge_candle_bucket)
+        expected = [bucket + 60 * i for i in range(5)]
+        got = [_structure_edge_candle_bucket(x) for x in rows]
+        if got != expected:
+            continue
+        try:
+            out.append({
+                "bucket_ts": bucket,
+                "open": float(rows[0]["open"]),
+                "high": max(float(x["high"]) for x in rows),
+                "low": min(float(x["low"]) for x in rows),
+                "close": float(rows[-1]["close"]),
+            })
+        except Exception:
+            continue
+    return out
+
+
+def _structure_edge_m5_bias(m5: list[dict]) -> tuple[str, int, dict]:
+    """Structure-first M5 bias. No RSI/MACD/EMA is used."""
+    if len(m5) < 3:
+        return "NEUTRAL", 0, {"reason": "M5 غير مكتمل"}
+    parts = [_otc_edge_candle_parts(x) for x in m5[-4:]]
+    highs = [x["high"] for x in parts]
+    lows = [x["low"] for x in parts]
+    closes = [x["close"] for x in parts]
+    ranges = [x["range"] for x in parts if x["range"] > 0]
+    avg_range = sum(ranges) / max(1, len(ranges)) if ranges else 0.0
+
+    last3_h = highs[-3:]
+    last3_l = lows[-3:]
+    hh_hl = last3_h[0] < last3_h[1] < last3_h[2] and last3_l[0] < last3_l[1] < last3_l[2]
+    ll_lh = last3_h[0] > last3_h[1] > last3_h[2] and last3_l[0] > last3_l[1] > last3_l[2]
+    close_up = closes[-3] < closes[-2] < closes[-1]
+    close_down = closes[-3] > closes[-2] > closes[-1]
+    displacement = abs(closes[-1] - closes[-3]) / avg_range if avg_range > 0 else 0.0
+
+    if hh_hl or (close_up and displacement >= 0.55 and last3_l[-1] >= last3_l[0]):
+        strength = min(100, int(round(68 + min(1.5, displacement) * 16)))
+        return "CALL", strength, {"reason": "M5 HH/HL أو إغلاق صاعد متدرج", "displacement": round(displacement, 2)}
+    if ll_lh or (close_down and displacement >= 0.55 and last3_h[-1] <= last3_h[0]):
+        strength = min(100, int(round(68 + min(1.5, displacement) * 16)))
+        return "PUT", strength, {"reason": "M5 LL/LH أو إغلاق هابط متدرج", "displacement": round(displacement, 2)}
+    return "NEUTRAL", 50, {"reason": "M5 متوازن/انتقالي", "displacement": round(displacement, 2)}
+
+
+def _structure_edge_recent_swing_low(parts: list[dict]) -> tuple[float | None, int | None]:
+    if len(parts) < 4:
+        return None, None
+    candidates = []
+    for i in range(1, len(parts) - 1):
+        if parts[i]["low"] <= parts[i - 1]["low"] and parts[i]["low"] < parts[i + 1]["low"]:
+            candidates.append((parts[i]["low"], i))
+    if candidates:
+        return candidates[-1]
+    window = parts[-8:]
+    if not window:
+        return None, None
+    local_i = min(range(len(window)), key=lambda j: window[j]["low"])
+    return window[local_i]["low"], len(parts) - len(window) + local_i
+
+
+def _structure_edge_recent_swing_high(parts: list[dict]) -> tuple[float | None, int | None]:
+    if len(parts) < 4:
+        return None, None
+    candidates = []
+    for i in range(1, len(parts) - 1):
+        if parts[i]["high"] >= parts[i - 1]["high"] and parts[i]["high"] > parts[i + 1]["high"]:
+            candidates.append((parts[i]["high"], i))
+    if candidates:
+        return candidates[-1]
+    window = parts[-8:]
+    if not window:
+        return None, None
+    local_i = max(range(len(window)), key=lambda j: window[j]["high"])
+    return window[local_i]["high"], len(parts) - len(window) + local_i
+
+
+def _structure_edge_analyze_closed_candles(pair: str, symbol: str, closed_m1: list[dict], payout: int, current_price: float) -> dict:
+    """Return a confirmed next-candle setup or a rejection reason.
+
+    Every structural decision uses CLOSED candles only. That is intentional: the test
+    channel must not enter because of a wick/pressure pattern that can disappear while
+    the current M1 candle is still forming.
+    """
+    if len(closed_m1) < STRUCTURE_EDGE_MIN_CLOSED_M1:
+        return {"ok": False, "reason": f"warmup M1: {len(closed_m1)}/{STRUCTURE_EDGE_MIN_CLOSED_M1}"}
+
+    recent_raw = closed_m1[-12:]
+    recent_buckets = [_structure_edge_candle_bucket(x) for x in recent_raw]
+    if len(recent_buckets) < 12 or any((b - a) != 60 for a, b in zip(recent_buckets, recent_buckets[1:])):
+        return {"ok": False, "reason": "فجوة في شموع M1 المغلقة"}
+
+    parts = [_otc_edge_candle_parts(x) for x in closed_m1[-24:]]
+    if len(parts) < 12:
+        return {"ok": False, "reason": "شموع M1 المغلقة غير كافية"}
+
+    recent6 = parts[-6:]
+    ranges = [x["range"] for x in recent6 if x["range"] > 0]
+    avg_range = sum(ranges) / max(1, len(ranges)) if ranges else 0.0
+    if avg_range <= 0:
+        return {"ok": False, "reason": "مدى M1 غير صالح"}
+    dojis = sum(1 for x in recent6 if x["body_ratio"] <= 0.16)
+    wick_heavy = sum(1 for x in recent6 if max(x["upper_wick"], x["lower_wick"]) >= 0.68)
+    noisy = dojis >= 3 or wick_heavy >= 4
+
+    m5 = _structure_edge_complete_m5(closed_m1)
+    m5_bias, m5_strength, m5_meta = _structure_edge_m5_bias(m5)
+    m5_parts = [_otc_edge_candle_parts(x) for x in m5[-3:]] if m5 else []
+    m5_low = min((x["low"] for x in m5_parts), default=None)
+    m5_high = max((x["high"] for x in m5_parts), default=None)
+
+    candidates = []
+
+    def add(kind: str, direction: str, score: float, confluences: list[str], level=None, meta=None):
+        score_i = int(round(max(0, min(100, score))))
+        candidates.append({
+            "ok": True,
+            "pair": pair,
+            "symbol": symbol,
+            "direction": direction,
+            "score": score_i,
+            "setup": kind,
+            "payout": int(payout),
+            "price": float(current_price),
+            "m5_bias": m5_bias,
+            "m5_strength": int(m5_strength),
+            "m5_reason": str(m5_meta.get("reason") or ""),
+            "level": level,
+            "confluences": confluences,
+            "meta": meta or {},
+        })
+
+    # --- Setup A: Liquidity Sweep -> closed-candle CHOCH confirmation -> next M1 entry.
+    # Sweep is penultimate closed candle; confirmation is the latest closed candle.
+    sweep = parts[-2]
+    confirm = parts[-1]
+    prior = parts[:-2]
+    prior_low, _ = _structure_edge_recent_swing_low(prior[-12:])
+    prior_high, _ = _structure_edge_recent_swing_high(prior[-12:])
+
+    if prior_low is not None:
+        swept = sweep["low"] < prior_low and sweep["close"] > prior_low and sweep["lower_wick"] >= 0.32
+        choch = confirm["dir"] > 0 and confirm["body_ratio"] >= 0.34 and confirm["close"] > sweep["high"]
+        near_m5_extreme = m5_low is None or sweep["low"] <= (m5_low + avg_range * 0.45)
+        counter_ok = m5_bias != "PUT" or (
+            sweep["lower_wick"] >= 0.52 and confirm["body_ratio"] >= 0.50 and near_m5_extreme
+        )
+        if swept and choch and counter_ok:
+            align = 10 if m5_bias == "CALL" else 6 if m5_bias == "NEUTRAL" else 1
+            score = 68 + align + sweep["lower_wick"] * 11 + confirm["body_ratio"] * 9
+            score += 4 if near_m5_extreme else 0
+            score -= 4 if noisy else 0
+            add(
+                "LIQUIDITY_SWEEP_CHOCH",
+                "CALL",
+                score,
+                ["سحب سيولة تحت Swing Low", "إغلاق رجع فوق المستوى", "CHOCH صاعد مغلق", f"M5 {m5_bias}"],
+                level=prior_low,
+                meta={"sweep_wick": round(sweep["lower_wick"], 2), "confirm_body": round(confirm["body_ratio"], 2), "noisy": noisy},
+            )
+
+    if prior_high is not None:
+        swept = sweep["high"] > prior_high and sweep["close"] < prior_high and sweep["upper_wick"] >= 0.32
+        choch = confirm["dir"] < 0 and confirm["body_ratio"] >= 0.34 and confirm["close"] < sweep["low"]
+        near_m5_extreme = m5_high is None or sweep["high"] >= (m5_high - avg_range * 0.45)
+        counter_ok = m5_bias != "CALL" or (
+            sweep["upper_wick"] >= 0.52 and confirm["body_ratio"] >= 0.50 and near_m5_extreme
+        )
+        if swept and choch and counter_ok:
+            align = 10 if m5_bias == "PUT" else 6 if m5_bias == "NEUTRAL" else 1
+            score = 68 + align + sweep["upper_wick"] * 11 + confirm["body_ratio"] * 9
+            score += 4 if near_m5_extreme else 0
+            score -= 4 if noisy else 0
+            add(
+                "LIQUIDITY_SWEEP_CHOCH",
+                "PUT",
+                score,
+                ["سحب سيولة فوق Swing High", "إغلاق رجع تحت المستوى", "CHOCH هابط مغلق", f"M5 {m5_bias}"],
+                level=prior_high,
+                meta={"sweep_wick": round(sweep["upper_wick"], 2), "confirm_body": round(confirm["body_ratio"], 2), "noisy": noisy},
+            )
+
+    # --- Setup B: confirmed BOS -> retest of broken structure -> follow-through confirmation.
+    # Exact three-candle sequence makes this intentionally selective.
+    bos = parts[-3]
+    retest = parts[-2]
+    confirm = parts[-1]
+    structure_prior = parts[:-3]
+    swing_high, _ = _structure_edge_recent_swing_high(structure_prior[-12:])
+    swing_low, _ = _structure_edge_recent_swing_low(structure_prior[-12:])
+    tolerance = avg_range * 0.28
+
+    if m5_bias == "CALL" and swing_high is not None:
+        bos_ok = bos["dir"] > 0 and bos["body_ratio"] >= 0.42 and bos["close"] > swing_high
+        retest_ok = retest["low"] <= swing_high + tolerance and retest["close"] >= swing_high - tolerance * 0.25
+        confirm_ok = confirm["dir"] > 0 and confirm["body_ratio"] >= 0.30 and confirm["close"] > retest["high"] and confirm["upper_wick"] < 0.48
+        not_chasing = (confirm["close"] - swing_high) <= avg_range * 1.65
+        if bos_ok and retest_ok and confirm_ok and not_chasing:
+            score = 70 + 10 + bos["body_ratio"] * 7 + confirm["body_ratio"] * 8
+            score += 4 if retest["lower_wick"] >= 0.25 else 2
+            score -= 4 if noisy else 0
+            add(
+                "BOS_RETEST_CONFIRMATION",
+                "CALL",
+                score,
+                ["M5 صاعد", "BOS صاعد مغلق", "Retest حافظ على المستوى", "شمعة تأكيد صاعدة"],
+                level=swing_high,
+                meta={"bos_body": round(bos["body_ratio"], 2), "confirm_body": round(confirm["body_ratio"], 2), "noisy": noisy},
+            )
+
+    if m5_bias == "PUT" and swing_low is not None:
+        bos_ok = bos["dir"] < 0 and bos["body_ratio"] >= 0.42 and bos["close"] < swing_low
+        retest_ok = retest["high"] >= swing_low - tolerance and retest["close"] <= swing_low + tolerance * 0.25
+        confirm_ok = confirm["dir"] < 0 and confirm["body_ratio"] >= 0.30 and confirm["close"] < retest["low"] and confirm["lower_wick"] < 0.48
+        not_chasing = (swing_low - confirm["close"]) <= avg_range * 1.65
+        if bos_ok and retest_ok and confirm_ok and not_chasing:
+            score = 70 + 10 + bos["body_ratio"] * 7 + confirm["body_ratio"] * 8
+            score += 4 if retest["upper_wick"] >= 0.25 else 2
+            score -= 4 if noisy else 0
+            add(
+                "BOS_RETEST_CONFIRMATION",
+                "PUT",
+                score,
+                ["M5 هابط", "BOS هابط مغلق", "Retest حافظ على المستوى", "شمعة تأكيد هابطة"],
+                level=swing_low,
+                meta={"bos_body": round(bos["body_ratio"], 2), "confirm_body": round(confirm["body_ratio"], 2), "noisy": noisy},
+            )
+
+    candidates = [x for x in candidates if int(x.get("score", 0)) >= int(STRUCTURE_EDGE_MIN_SCORE)]
+    if not candidates:
+        return {
+            "ok": False,
+            "reason": "لا يوجد Structure confirmation مكتمل",
+            "m5_bias": m5_bias,
+            "m5_strength": m5_strength,
+            "noisy": noisy,
+        }
+    candidates.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("payout", 0))), reverse=True)
+    return candidates[0]
+
+
+def analyze_structure_edge_pair(pair: str, symbol: str | None = None) -> dict:
+    try:
+        normalized = normalize_otc_currency_pair_name(pair, symbol) if symbol else normalize_pair_name_basic(pair)
+        if not normalized or not is_valid_otc_currency_pair_name(normalized):
+            return {"ok": False, "pair": pair, "reason": "زوج OTC غير صالح"}
+        symbol = symbol or get_otc_symbol_for_pair(normalized)
+        if not symbol:
+            return {"ok": False, "pair": normalized, "reason": "لا يوجد symbol مباشر"}
+        rows, last_tick, candles = _get_otc_rows_and_candles(symbol)
+        if not last_tick:
+            return {"ok": False, "pair": normalized, "reason": "لا يوجد tick حي"}
+        try:
+            tick_ts = float(last_tick.get("time") or 0)
+            if tick_ts > 1e12:
+                tick_ts /= 1000.0
+            if not tick_ts or time_module.time() - tick_ts > 20:
+                return {"ok": False, "pair": normalized, "reason": "tick قديم"}
+            current_price = float(last_tick.get("price"))
+        except Exception:
+            return {"ok": False, "pair": normalized, "reason": "tick غير صالح"}
+
+        instrument = quotex_otc_feed.instrument(symbol) if "quotex_otc_feed" in globals() else {}
+        payout = int(float((instrument or {}).get("payout", 0) or 0))
+        if payout < STRUCTURE_EDGE_MIN_PAYOUT:
+            return {"ok": False, "pair": normalized, "reason": f"payout {payout}% أقل من الحد"}
+
+        current_bucket = int(time_module.time() // 60) * 60
+        closed = [dict(c) for c in candles if _structure_edge_candle_bucket(c) < current_bucket]
+        if len(closed) < STRUCTURE_EDGE_MIN_CLOSED_M1:
+            return {"ok": False, "pair": normalized, "reason": f"warmup M1: {len(closed)}/{STRUCTURE_EDGE_MIN_CLOSED_M1}"}
+        result = _structure_edge_analyze_closed_candles(normalized, symbol, closed, payout, current_price)
+        if result.get("ok"):
+            result["entry_bucket"] = current_bucket
+            result["entry_price"] = current_price
+            result["closed_m1_count"] = len(closed)
+        return result
+    except Exception as exc:
+        logger.exception("Structure Edge pair analysis failed | pair=%s | error=%s", pair, exc)
+        return {"ok": False, "pair": pair, "reason": f"analysis error: {exc}"}
+
+
+def _structure_edge_pair_ready(pair: str, now_ts: float) -> bool:
+    try:
+        last = float((_structure_edge_state.get("pair_last_signal_ts") or {}).get(str(pair), 0) or 0)
+        return now_ts - last >= STRUCTURE_EDGE_PAIR_COOLDOWN_SECONDS
+    except Exception:
+        return True
+
+
+def _structure_edge_scan_market() -> list[dict]:
+    candidates = []
+    pair_map = get_otc_analysis_pair_map()
+    for pair, symbol in pair_map.items():
+        try:
+            if not _structure_edge_pair_ready(pair, time_module.time()):
+                continue
+            item = analyze_structure_edge_pair(pair, symbol)
+            if item.get("ok"):
+                candidates.append(item)
+        except Exception:
+            logger.debug("Structure Edge skipped pair %s", pair, exc_info=True)
+    candidates.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("payout", 0))), reverse=True)
+    return candidates
+
+
+def _structure_edge_signal_message(trade: dict) -> str:
+    direction = str(trade.get("direction") or "").upper()
+    icon = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
+    setup = "Liquidity Sweep + CHOCH" if trade.get("setup") == "LIQUIDITY_SWEEP_CHOCH" else "BOS + Retest + Confirmation"
+    entry_dt = datetime.fromtimestamp(int(trade.get("entry_bucket", 0)), tz=UTC).astimezone(UTC_PLUS_3)
+    close_dt = entry_dt + timedelta(seconds=60)
+    conf = " • ".join(str(x) for x in (trade.get("confluences") or []))
+    return (
+        "🧱 STRUCTURE EDGE — TEST\n"
+        "━━━━━━━━━━━━━━\n"
+        f"💱 {trade.get('pair')}\n"
+        f"📌 {icon}\n"
+        f"🧠 {setup}\n"
+        f"🧭 M5: {trade.get('m5_bias')} ({trade.get('m5_strength')}%)\n"
+        f"🎯 Score: {trade.get('score')}% | payout {trade.get('payout')}%\n"
+        f"⏳ الدخول: الآن • {entry_dt.strftime('%H:%M:%S')} UTC+3\n"
+        f"🏁 الإغلاق: {close_dt.strftime('%H:%M:%S')} UTC+3\n"
+        f"🔗 {conf}\n"
+        "🧪 Extension direct test — DEMO فقط"
+    )[:3900]
+
+
+def _structure_edge_result_from_close(direction: str, entry_price, close_price) -> str:
+    try:
+        entry = float(entry_price)
+        close = float(close_price)
+        eps = max(abs(entry) * 1e-10, 1e-12)
+        if abs(close - entry) <= eps:
+            return "draw"
+        if str(direction).upper() == "CALL":
+            return "win" if close > entry else "loss"
+        return "win" if close < entry else "loss"
+    except Exception:
+        return "draw"
+
+
+def _structure_edge_record_result(trade: dict, result: str, close_price=None) -> bool:
+    try:
+        record = {
+            "created_at": trade.get("created_at"),
+            "closed_at": now_iso(),
+            "pair": trade.get("pair"),
+            "symbol": trade.get("symbol"),
+            "direction": trade.get("direction"),
+            "setup": trade.get("setup"),
+            "score": int(trade.get("score", 0) or 0),
+            "payout": int(trade.get("payout", 0) or 0),
+            "m5_bias": trade.get("m5_bias"),
+            "m5_strength": int(trade.get("m5_strength", 0) or 0),
+            "entry_bucket": int(trade.get("entry_bucket", 0) or 0),
+            "entry_price": float(trade.get("entry_price", 0) or 0),
+            "close_price": float(close_price or 0),
+            "result": str(result),
+            "confluences": trade.get("confluences") or [],
+        }
+        _structure_edge_results_ref().push(record)
+        return True
+    except Exception as exc:
+        _structure_edge_state["last_error"] = str(exc)
+        logger.exception("Structure Edge result store failed: %s", exc)
+        return False
+
+
+def _structure_edge_fetch_results(limit: int | None = None) -> list[dict]:
+    try:
+        ref = _structure_edge_results_ref()
+        if limit and int(limit) > 0:
+            data = ref.order_by_key().limit_to_last(int(limit)).get() or {}
+        else:
+            data = ref.get() or {}
+        if not isinstance(data, dict):
+            return []
+        rows = [dict(v, _key=k) for k, v in data.items() if isinstance(v, dict)]
+        rows.sort(key=lambda x: str(x.get("closed_at") or x.get("created_at") or ""))
+        return rows
+    except Exception as exc:
+        logger.exception("Structure Edge results read failed: %s", exc)
+        return []
+
+
+def _structure_edge_max_loss_streak(rows: list[dict]) -> int:
+    best = current = 0
+    for row in rows:
+        result = str(row.get("result") or "")
+        if result == "loss":
+            current += 1
+            best = max(best, current)
+        elif result in {"win", "draw"}:
+            current = 0
+    return best
+
+
+def build_structure_edge_summary(limit: int | None = None) -> str:
+    effective = int(limit or STRUCTURE_EDGE_RESULT_REPORT_LIMIT)
+    rows = _structure_edge_fetch_results(effective)
+    wins = sum(1 for x in rows if x.get("result") == "win")
+    losses = sum(1 for x in rows if x.get("result") == "loss")
+    draws = sum(1 for x in rows if x.get("result") == "draw")
+    decided = wins + losses
+    wr = round(wins / decided * 100, 1) if decided else 0.0
+    setups = {}
+    for row in rows:
+        key = str(row.get("setup") or "UNKNOWN")
+        bucket = setups.setdefault(key, {"w": 0, "l": 0, "d": 0})
+        r = row.get("result")
+        if r == "win": bucket["w"] += 1
+        elif r == "loss": bucket["l"] += 1
+        else: bucket["d"] += 1
+    setup_lines = []
+    for name, s in setups.items():
+        n = s["w"] + s["l"]
+        rate = round(s["w"] / n * 100, 1) if n else 0.0
+        setup_lines.append(f"• {name}: {s['w']}W / {s['l']}L / {s['d']}D — {rate}%")
+    return (
+        f"📊 Structure Edge — آخر {effective} نتيجة\n"
+        "━━━━━━━━━━━━━━\n"
+        f"✅ Win: {wins}\n"
+        f"❌ Loss: {losses}\n"
+        f"⚖️ Draw: {draws}\n"
+        f"📈 Win rate: {wr}%\n"
+        f"🧨 Max loss streak: {_structure_edge_max_loss_streak(rows)}\n\n"
+        "حسب الـSetup:\n" + ("\n".join(setup_lines) if setup_lines else "لا توجد نتائج بعد")
+    )[:3900]
+
+
+def build_structure_edge_status() -> str:
+    settings = _structure_edge_get_settings()
+    pending = _structure_edge_state.get("pending_trade")
+    last = _structure_edge_state.get("last_candidate") or {}
+    pending_text = "لا يوجد"
+    if isinstance(pending, dict):
+        pending_text = f"{pending.get('pair')} {pending.get('direction')} | {pending.get('setup')}"
+    last_text = "لا يوجد بعد"
+    if isinstance(last, dict) and last:
+        last_text = f"{last.get('pair')} {last.get('direction')} | {last.get('setup')} | {last.get('score')}%"
+    return (
+        "📋 حالة Structure Edge — TEST\n"
+        "━━━━━━━━━━━━━━\n"
+        f"الحالة: {'شغال ✅' if settings.get('enabled') else 'متوقف ⏸'}\n"
+        f"الهدف: {_structure_edge_target_chat_id()}\n"
+        f"M1 warmup المطلوب: {STRUCTURE_EDGE_MIN_CLOSED_M1} شمعة\n"
+        f"Score الأدنى: {STRUCTURE_EDGE_MIN_SCORE}%\n"
+        f"Payout الأدنى: {STRUCTURE_EDGE_MIN_PAYOUT}%\n"
+        f"نافذة الدخول: الثانية {STRUCTURE_EDGE_ENTRY_MIN_SECOND}–{STRUCTURE_EDGE_ENTRY_MAX_SECOND}\n"
+        f"Cooldown الزوج: {round(STRUCTURE_EDGE_PAIR_COOLDOWN_SECONDS/60, 1)} دقيقة\n"
+        f"صفقة قيد المتابعة: {pending_text}\n"
+        f"آخر Candidate: {last_text}\n"
+        f"آخر Scan: {_structure_edge_state.get('last_scan_at') or '-'}\n"
+        f"آخر خطأ: {_structure_edge_state.get('last_error') or '-'}\n\n"
+        "المنطق: M5 Structure → Liquidity Sweep/BOS → CHOCH/Retest → Closed-candle confirmation → M1 entry.\n"
+        f"Extension online: {_copy_online_clients_for_user(ADMIN_TELEGRAM_ID)} | Copy sent: {_structure_edge_state.get('copy_signals_sent', 0)} | order reports: {_structure_edge_state.get('execution_reports', 0)} | failed: {_structure_edge_state.get('copy_signals_failed', 0)} | skipped: {_structure_edge_state.get('extension_skips', 0)}\n"
+        f"آخر Skip: {_structure_edge_state.get('last_skip_reason') or '-'}\n"
+        "🧪 التنفيذ: Chrome Extension — DEMO فقط — بدون مضاعفات."
+    )[:3900]
+
+
+def _structure_edge_reset_results() -> tuple[bool, str]:
+    try:
+        _structure_edge_results_ref().delete()
+        _structure_edge_state.update({"results_sent": 0, "last_result_at": None})
+        return True, "✅ تم تصفير نتائج Structure Edge فقط. إعداد التشغيل بقي كما هو."
+    except Exception as exc:
+        logger.exception("Structure Edge results reset failed: %s", exc)
+        return False, f"❌ تعذر تصفير النتائج: {exc}"
+
+
+async def _structure_edge_process_pending(context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Hold one Structure Edge trade until the extension returns a confirmed Quotex result.
+
+    We intentionally do NOT score the server-side shadow candle as the official test
+    result anymore. The whole point of v1.17 is to measure the actual extension entry.
+    """
+    trade = _structure_edge_state.get("pending_trade")
+    if not isinstance(trade, dict):
+        return False
+    try:
+        bucket = int(trade.get("entry_bucket", 0) or 0)
+        deadline = bucket + 60 + STRUCTURE_EDGE_EXTENSION_RESULT_TIMEOUT_SECONDS
+        if time_module.time() < deadline:
+            return True
+        _structure_edge_state["pending_trade"] = None
+        _structure_edge_state["unconfirmed_results"] = int(_structure_edge_state.get("unconfirmed_results", 0) or 0) + 1
+        _structure_edge_state["last_reject_reason"] = "Extension result timeout"
+        await safe_send_message(
+            context.bot,
+            chat_id=_structure_edge_target_chat_id(),
+            text=f"⚠️ Structure Edge: لم تصل نتيجة Quotex مؤكدة للإشارة {trade.get('pair')} {trade.get('direction')} ضمن المهلة. لم تُحسب Win/Loss.",
+        )
+        return False
+    except Exception as exc:
+        _structure_edge_state["last_error"] = str(exc)
+        logger.exception("Structure Edge pending result timeout failed: %s", exc)
+        return True
+
+
+def _structure_edge_local_hms(value) -> str:
+    try:
+        raw = str(value or "").strip()
+        if not raw:
+            return "-"
+        dt = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return dt.astimezone(UTC_PLUS_3).strftime("%H:%M:%S")
+    except Exception:
+        return str(value or "-")[:19]
+
+
+def _structure_edge_direction_label(direction: str) -> str:
+    return "🟢 CALL" if str(direction or "").upper() == "CALL" else "🔴 PUT"
+
+
+async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: dict | None = None) -> bool:
+    """Record/send the extension's successful orders/open delivery audit event.
+
+    This confirms that the secure extension bridge accepted and sent the open command.
+    It is intentionally NOT treated as the authoritative Quotex result; W/L is recorded
+    only by _copy_record_structure_edge_trade_result after closed-deal evidence arrives.
+    """
+    try:
+        client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
+        if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
+            logger.warning("Ignored non-owner Structure Edge opened event | user=%s", client_uid)
+            return False
+        if str((payload_event or {}).get("source") or "") != "structure_edge":
+            return False
+        signal_id = str((payload_event or {}).get("signal_id") or "").strip()
+        if not signal_id:
+            return False
+
+        pending = _structure_edge_state.get("pending_trade") if isinstance(_structure_edge_state.get("pending_trade"), dict) else {}
+        record = {
+            "reported_at": now_iso(),
+            "signal_id": signal_id,
+            "pair": (payload_event or {}).get("pair") or (pending or {}).get("pair"),
+            "direction": (payload_event or {}).get("direction") or (pending or {}).get("direction"),
+            "asset": (payload_event or {}).get("asset"),
+            "amount": float((payload_event or {}).get("amount") or 0),
+            "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
+            "setup": (payload_event or {}).get("setup") or (pending or {}).get("setup") or "UNKNOWN",
+            "score": int((payload_event or {}).get("score") or (pending or {}).get("score") or 0),
+            "m5_bias": (payload_event or {}).get("m5_bias") or (pending or {}).get("m5_bias"),
+            "m5_strength": int((payload_event or {}).get("m5_strength") or (pending or {}).get("m5_strength") or 0),
+            "signal_created_at": (payload_event or {}).get("signal_created_at") or (pending or {}).get("created_at"),
+            "executed_at": (payload_event or {}).get("executed_at") or now_iso(),
+            "execution_latency_ms": (payload_event or {}).get("execution_latency_ms"),
+            "expires_at": (payload_event or {}).get("expires_at"),
+            "pair_prepare_mode": (payload_event or {}).get("pair_prepare_mode"),
+            "account_mode": "demo",
+            "audit_status": "order_sent_to_quotex_bridge",
+        }
+        _structure_edge_executions_ref().child(safe_key(signal_id)).set(record)
+
+        seen = _structure_edge_state.setdefault("execution_signal_ids", {})
+        already_seen = signal_id in seen
+        seen[signal_id] = now_iso()
+        if len(seen) > 500:
+            for old_key in list(seen.keys())[:-500]:
+                seen.pop(old_key, None)
+        if not already_seen:
+            _structure_edge_state["execution_reports"] = int(_structure_edge_state.get("execution_reports", 0) or 0) + 1
+        _structure_edge_state["last_execution_at"] = now_iso()
+        _structure_edge_state["last_execution"] = dict(record)
+
+        if isinstance(pending, dict) and str(pending.get("copy_signal_id") or "") == signal_id:
+            pending["execution_report"] = dict(record)
+            _structure_edge_state["pending_trade"] = pending
+
+        if not already_seen and TRADING_TIME_TELEGRAM_APP is not None:
+            latency = record.get("execution_latency_ms")
+            latency_text = f"{int(latency)} ms" if isinstance(latency, (int, float)) else "-"
+            amount = float(record.get("amount") or 0)
+            await safe_send_message(
+                TRADING_TIME_TELEGRAM_APP.bot,
+                chat_id=_structure_edge_target_chat_id(),
+                text=(
+                    "⚡ STRUCTURE EDGE — ORDER SENT\n"
+                    "━━━━━━━━━━━━━━\n"
+                    f"💱 {record.get('pair')}\n"
+                    f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
+                    f"🧠 {record.get('setup')} • Score {record.get('score')}%\n"
+                    f"💵 DEMO • ${amount:g}\n"
+                    f"🕐 إرسال أمر الدخول: {_structure_edge_local_hms(record.get('executed_at'))} UTC+3\n"
+                    f"🏁 انتهاء الصفقة: {_structure_edge_local_hms(record.get('expires_at'))} UTC+3\n"
+                    f"⚡ Latency: {latency_text}\n"
+                    "✅ الإضافة أرسلت أمر orders/open عبر قناة Quotex الآمنة.\n"
+                    "ℹ️ Win/Loss لا يُحسب إلا بعد وصول نتيجة Quotex المؤكدة."
+                )[:3900],
+            )
+        return True
+    except Exception as exc:
+        _structure_edge_state["last_error"] = str(exc)
+        logger.exception("Structure Edge opened audit record failed: %s", exc)
+        return False
+
+
+async def _copy_record_structure_edge_trade_result(payload_event: dict, client: dict | None = None) -> bool:
+    """Persist a confirmed Structure Edge result reported by the owner's extension."""
+    try:
+        client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
+        if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
+            logger.warning("Ignored non-owner Structure Edge result event | user=%s", client_uid)
+            return False
+        if str((payload_event or {}).get("source") or "") != "structure_edge":
+            return False
+        outcome = str((payload_event or {}).get("outcome") or "").lower().strip()
+        if outcome not in {"win", "loss", "draw"}:
+            return False
+        signal_id = str((payload_event or {}).get("signal_id") or "").strip()
+        if not signal_id:
+            return False
+
+        pending = _structure_edge_state.get("pending_trade") if isinstance(_structure_edge_state.get("pending_trade"), dict) else {}
+        pending_id = str((pending or {}).get("copy_signal_id") or "")
+        execution_record = {}
+        try:
+            execution_record = _structure_edge_executions_ref().child(safe_key(signal_id)).get() or {}
+            if not isinstance(execution_record, dict):
+                execution_record = {}
+        except Exception:
+            execution_record = {}
+
+        record = {
+            "created_at": (payload_event or {}).get("signal_created_at") or (pending or {}).get("created_at") or now_iso(),
+            "closed_at": now_iso(),
+            "signal_id": signal_id,
+            "pair": (payload_event or {}).get("pair") or (pending or {}).get("pair"),
+            "symbol": (pending or {}).get("symbol"),
+            "direction": (payload_event or {}).get("direction") or (pending or {}).get("direction"),
+            "setup": (payload_event or {}).get("setup") or (pending or {}).get("setup") or "UNKNOWN",
+            "score": int((payload_event or {}).get("score") or (pending or {}).get("score") or 0),
+            "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
+            "m5_bias": (payload_event or {}).get("m5_bias") or (pending or {}).get("m5_bias"),
+            "m5_strength": int((payload_event or {}).get("m5_strength") or (pending or {}).get("m5_strength") or 0),
+            "entry_bucket": int((pending or {}).get("entry_bucket") or 0),
+            "entry_price": float((pending or {}).get("entry_price") or 0),
+            "close_price": 0.0,
+            "result": outcome,
+            "confluences": (payload_event or {}).get("confluences") or (pending or {}).get("confluences") or [],
+            "result_source": "extension_quotex_confirmed",
+            "account_mode": "demo",
+            "executed_at": (payload_event or {}).get("executed_at") or execution_record.get("executed_at"),
+            "execution_latency_ms": (payload_event or {}).get("execution_latency_ms") if (payload_event or {}).get("execution_latency_ms") is not None else execution_record.get("execution_latency_ms"),
+            "net_delta": (payload_event or {}).get("net_delta"),
+            "amount": (payload_event or {}).get("amount") or execution_record.get("amount"),
+            "platform_deal_id": (payload_event or {}).get("platform_deal_id"),
+            "result_evidence": (payload_event or {}).get("result_source"),
+        }
+        # Deterministic child key makes retrying the same outbox event idempotent.
+        _structure_edge_results_ref().child(safe_key(signal_id)).set(record)
+        seen = _structure_edge_state.setdefault("result_signal_ids", {})
+        already_seen = signal_id in seen
+        seen[signal_id] = now_iso()
+        if len(seen) > 500:
+            for old_key in list(seen.keys())[:-500]:
+                seen.pop(old_key, None)
+        if not already_seen:
+            _structure_edge_state["results_sent"] = int(_structure_edge_state.get("results_sent", 0) or 0) + 1
+        _structure_edge_state["last_result_at"] = now_iso()
+        _structure_edge_state["last_copy_result"] = dict(record)
+        if pending_id == signal_id or not pending_id:
+            _structure_edge_state["pending_trade"] = None
+        result_text = "WIN ✅" if outcome == "win" else "LOSS ❌" if outcome == "loss" else "DRAW ⚖️"
+        if TRADING_TIME_TELEGRAM_APP is not None:
+            rows = _structure_edge_fetch_results(limit=STRUCTURE_EDGE_RESULT_REPORT_LIMIT)
+            wins = sum(1 for x in rows if str(x.get("result") or "") == "win")
+            losses = sum(1 for x in rows if str(x.get("result") or "") == "loss")
+            draws = sum(1 for x in rows if str(x.get("result") or "") == "draw")
+            decided = wins + losses
+            wr = round((wins / decided * 100.0), 1) if decided else 0.0
+            max_loss_streak = _structure_edge_max_loss_streak(rows)
+            latency = record.get("execution_latency_ms")
+            latency_text = f"{int(latency)} ms" if isinstance(latency, (int, float)) else "-"
+            net = record.get("net_delta")
+            try:
+                net_text = f"{float(net):+.2f}" if net is not None else "-"
+            except Exception:
+                net_text = str(net or "-")
+            await safe_send_message(
+                TRADING_TIME_TELEGRAM_APP.bot,
+                chat_id=_structure_edge_target_chat_id(),
+                text=(
+                    f"🧱 STRUCTURE EDGE — {result_text}\n"
+                    "━━━━━━━━━━━━━━\n"
+                    f"💱 {record.get('pair')}\n"
+                    f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
+                    f"🧠 {record.get('setup')} • Score {record.get('score')}%\n"
+                    f"💵 Net: {net_text} | DEMO\n"
+                    f"⚡ Latency: {latency_text}\n"
+                    "━━━━━━━━━━━━━━\n"
+                    f"📊 آخر {len(rows)} نتيجة: ✅ {wins} | ❌ {losses} | ⚖️ {draws}\n"
+                    f"📈 Win Rate: {wr}% | أقصى سلسلة خسائر: {max_loss_streak}"
+                )[:3900],
+            )
+        return True
+    except Exception as exc:
+        _structure_edge_state["last_error"] = str(exc)
+        logger.exception("Structure Edge extension result record failed: %s", exc)
+        return False
+
+
+async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: dict | None = None) -> bool:
+    """Record a Structure Edge signal that the owner extension intentionally skipped.
+
+    A skip is diagnostic only: it clears a matching pending trade and never creates a
+    Win/Loss row. Idempotency prevents outbox retries from inflating the skip counter.
+    """
+    try:
+        client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
+        if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
+            logger.warning("Ignored non-owner Structure Edge skip event | user=%s", client_uid)
+            return False
+        if str((payload_event or {}).get("source") or "") != "structure_edge":
+            return False
+        signal_id = str((payload_event or {}).get("signal_id") or "").strip()
+        if not signal_id:
+            return False
+        reason = str((payload_event or {}).get("reason") or "extension_skip").strip()[:240]
+
+        seen = _structure_edge_state.setdefault("skip_signal_ids", {})
+        already_seen = signal_id in seen
+        seen[signal_id] = now_iso()
+        if len(seen) > 500:
+            for old_key in list(seen.keys())[:-500]:
+                seen.pop(old_key, None)
+
+        if not already_seen:
+            _structure_edge_state["extension_skips"] = int(_structure_edge_state.get("extension_skips", 0) or 0) + 1
+        _structure_edge_state["last_skip_at"] = now_iso()
+        _structure_edge_state["last_skip_reason"] = reason
+        _structure_edge_state["last_reject_reason"] = f"Extension skip: {reason}"
+
+        pending = _structure_edge_state.get("pending_trade")
+        if isinstance(pending, dict) and str(pending.get("copy_signal_id") or "") == signal_id:
+            _structure_edge_state["pending_trade"] = None
+
+        logger.info(
+            "Structure Edge extension skip | signal=%s | pair=%s | direction=%s | reason=%s",
+            signal_id,
+            (payload_event or {}).get("pair"),
+            (payload_event or {}).get("direction"),
+            reason,
+        )
+        if not already_seen and TRADING_TIME_TELEGRAM_APP is not None:
+            await safe_send_message(
+                TRADING_TIME_TELEGRAM_APP.bot,
+                chat_id=_structure_edge_target_chat_id(),
+                text=(
+                    "⏭️ STRUCTURE EDGE — SKIPPED\n"
+                    "━━━━━━━━━━━━━━\n"
+                    f"💱 {(payload_event or {}).get('pair') or (pending or {}).get('pair')}\n"
+                    f"📌 {_structure_edge_direction_label((payload_event or {}).get('direction') or (pending or {}).get('direction'))}\n"
+                    f"🚫 السبب: {reason}\n"
+                    "📊 لم تُحسب Win/Loss لأن الصفقة لم تدخل ضمن شروط التنفيذ."
+                )[:3900],
+            )
+        return True
+    except Exception as exc:
+        _structure_edge_state["last_error"] = str(exc)
+        logger.exception("Structure Edge extension skip record failed: %s", exc)
+        return False
+
+
+async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not _structure_edge_is_enabled():
+            return
+        _structure_edge_state["last_scan_at"] = now_iso()
+        if await _structure_edge_process_pending(context):
+            return
+
+        now_ts = time_module.time()
+        current_bucket = int(now_ts // 60) * 60
+        sec = int(now_ts - current_bucket)
+        if sec < STRUCTURE_EDGE_ENTRY_MIN_SECOND or sec > STRUCTURE_EDGE_ENTRY_MAX_SECOND:
+            return
+        if int(_structure_edge_state.get("last_scan_bucket", 0) or 0) == current_bucket:
+            return
+
+        # Direct-test mode is extension-only. Do not consume this minute's one scan
+        # before the owner's authenticated Chrome extension is actually online.
+        if _copy_online_clients_for_user(ADMIN_TELEGRAM_ID) <= 0:
+            _structure_edge_state["last_reject_reason"] = "Waiting for owner extension"
+            return
+
+        # The setup is based on fully closed candles, so one market scan per M1 bucket is enough.
+        _structure_edge_state["last_scan_bucket"] = current_bucket
+        candidates = _structure_edge_scan_market()
+        if not candidates:
+            _structure_edge_state["last_reject_reason"] = "No confirmed setup this minute"
+            return
+        item = dict(candidates[0])
+        item.update({"created_at": now_iso(), "entry_bucket": current_bucket})
+        _structure_edge_state["last_candidate"] = dict(item)
+
+        copy_result = await publish_copy_structure_edge_signal(item)
+        _structure_edge_state["last_copy_result"] = copy_result
+        if not isinstance(copy_result, dict) or not copy_result.get("ok"):
+            _structure_edge_state["copy_signals_failed"] = int(_structure_edge_state.get("copy_signals_failed", 0) or 0) + 1
+            _structure_edge_state["last_reject_reason"] = f"Copy publish failed: {copy_result}"
+            return
+        normalized_signal = copy_result.get("signal") if isinstance(copy_result.get("signal"), dict) else {}
+        item["copy_signal_id"] = normalized_signal.get("id") or f"structure_{safe_key(item.get('pair'))}_{current_bucket}_{item.get('direction')}"
+        _structure_edge_state["pending_trade"] = item
+        _structure_edge_state["copy_signals_sent"] = int(_structure_edge_state.get("copy_signals_sent", 0) or 0) + 1
+        _structure_edge_state.setdefault("pair_last_signal_ts", {})[str(item.get("pair"))] = now_ts
+
+        sent = await safe_send_message(context.bot, chat_id=_structure_edge_target_chat_id(), text=_structure_edge_signal_message(item))
+        if sent:
+            _structure_edge_state["signals_sent"] = int(_structure_edge_state.get("signals_sent", 0) or 0) + 1
+            _structure_edge_state["last_signal_at"] = now_iso()
+    except Exception as exc:
+        _structure_edge_state["last_error"] = str(exc)
+        logger.exception("Structure Edge job error: %s", exc)
+
+
 # v1.02: Three Candle timing/filter tuning only; Public remains a mirror of accepted private signals.
 # Set this to a public @username or numeric -100... Telegram channel ID.
 THREE_CANDLE_PUBLIC_CHANNEL_ID_RAW = os.getenv("THREE_CANDLE_PUBLIC_CHANNEL_ID", "").strip()
@@ -20106,6 +21152,46 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
 
+        if text == "🧱 Structure Edge":
+            reset_signal_state(context)
+            await update.message.reply_text(
+                "🧱 Structure Edge — قناة اختبار مستقلة\n"
+                "M5 Structure + Liquidity + BOS/CHOCH + Retest/Confirmation.\n"
+                "لا تغيّر قناة الثغرة. الاختبار ينفذ عبر إضافة Chrome على DEMO فقط.\n"
+                "سجل القناة: Signal → Order Sent/Skip → Quotex Result.",
+                reply_markup=structure_edge_admin_keyboard,
+            )
+            return
+
+        if text == "🟢 تشغيل Structure Edge":
+            ok = _structure_edge_set_enabled(True)
+            await update.message.reply_text(
+                "✅ تم تشغيل Structure Edge — Extension Direct DEMO Test." if ok else "❌ تعذر تشغيل Structure Edge. راجع اللوج.",
+                reply_markup=structure_edge_admin_keyboard,
+            )
+            return
+
+        if text == "🔴 إيقاف Structure Edge":
+            ok = _structure_edge_set_enabled(False)
+            await update.message.reply_text(
+                "⛔ تم إيقاف Structure Edge." if ok else "❌ تعذر إيقاف Structure Edge. راجع اللوج.",
+                reply_markup=structure_edge_admin_keyboard,
+            )
+            return
+
+        if text == "📋 حالة Structure Edge":
+            await update.message.reply_text(build_structure_edge_status(), reply_markup=structure_edge_admin_keyboard)
+            return
+
+        if text == "📊 ملخص Structure Edge":
+            await update.message.reply_text(build_structure_edge_summary(), reply_markup=structure_edge_admin_keyboard)
+            return
+
+        if text == "🧹 تصفير نتائج Structure Edge":
+            ok, msg = _structure_edge_reset_results()
+            await update.message.reply_text(msg, reply_markup=structure_edge_admin_keyboard)
+            return
+
         if text == "📡 قناة 3 شموع":
             reset_signal_state(context)
             await update.message.reply_text(
@@ -20939,7 +22025,7 @@ def _copy_is_mobile_executable_signal(signal: dict) -> bool:
         # v1.12.1: OTC Edge is Chrome-extension-only again. Keep the signal in
         # the shared Copy history so extension delivery is unchanged, but never
         # expose it through Android push or REST replay.
-        if normalize_copy_source((signal or {}).get("source")) == "otc_edge":
+        if normalize_copy_source((signal or {}).get("source")) in {"otc_edge", "structure_edge"}:
             return False
         return _copy_signal_contract_kind(signal) == "execute" and not bool((signal or {}).get("prepare_only"))
     except ValueError:
@@ -21055,7 +22141,7 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
             raise ValueError("duration_seconds does not match trade expiry")
 
     pair_display, platform_symbol, otc_market = _copy_server_normalize_pair_contract(payload)
-    if source in {"otc_live", "otc_live_auto", "otc_edge"} and not otc_market:
+    if source in {"otc_live", "otc_live_auto", "otc_edge", "structure_edge"} and not otc_market:
         raise ValueError(f"{source} requires an OTC market")
     if source == "real_market" and otc_market:
         raise ValueError("real_market requires a regular market")
@@ -21115,6 +22201,13 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         "preselected_pair_mode": bool(payload.get("preselected_pair_mode") or False),
         "watch_pair": payload.get("watch_pair"),
         "skip_asset_switch": bool(payload.get("skip_asset_switch") or False),
+        # v1.17: Structure Edge diagnostics/results metadata.
+        "structure_setup": str(payload.get("structure_setup") or "")[:80] or None,
+        "structure_score": int(payload.get("structure_score")) if str(payload.get("structure_score") or "").strip().isdigit() else payload.get("confidence"),
+        "m5_bias": str(payload.get("m5_bias") or "")[:16] or None,
+        "m5_strength": int(payload.get("m5_strength")) if str(payload.get("m5_strength") or "").strip().isdigit() else None,
+        "structure_confluences": [str(x)[:120] for x in (payload.get("structure_confluences") or [])[:8]] if isinstance(payload.get("structure_confluences"), list) else [],
+        "demo_only": bool(payload.get("demo_only") or False),
     }
     supplied_id = str(payload.get("id") or "").strip()
     if supplied_id and not re.fullmatch(r"[A-Za-z0-9_.:-]{1,160}", supplied_id):
@@ -22952,13 +24045,25 @@ def create_embedded_copy_api():
                             "copy_settings": copy_public_settings_payload(),
                         })
                     elif event.get("type") == "ack":
+                        if str(event.get("source_key") or "") == "structure_edge" and str(event.get("status") or "") in {"source_disabled", "risk_stopped", "expired"}:
+                            pending = _structure_edge_state.get("pending_trade")
+                            if isinstance(pending, dict) and str(pending.get("copy_signal_id") or "") == str(event.get("signal_id") or ""):
+                                _structure_edge_state["pending_trade"] = None
+                                _structure_edge_state["last_reject_reason"] = f"Extension ack: {event.get('status')}"
                         await _copy_send_json_safe(websocket, {"type": "ack_saved", "signal_id": event.get("signal_id")})
                     elif event.get("type") == "extension_event":
                         payload_event = event.get("event") if isinstance(event.get("event"), dict) else {}
                         payload_event["telegram_user_id"] = payload_event.get("telegram_user_id") or telegram_user_id
                         sent = False
                         if payload_event.get("type") == "extension_alert":
-                            if str(payload_event.get("kind") or "") == "otc_edge_trade_result" and not OTC_EDGE_INDIVIDUAL_RESULT_MESSAGES:
+                            event_kind = str(payload_event.get("kind") or "")
+                            if event_kind == "structure_edge_trade_opened":
+                                sent = await _copy_record_structure_edge_trade_opened(payload_event, _copy_clients.get(client_id) or {})
+                            elif event_kind == "structure_edge_trade_result":
+                                sent = await _copy_record_structure_edge_trade_result(payload_event, _copy_clients.get(client_id) or {})
+                            elif event_kind == "structure_edge_trade_skipped":
+                                sent = await _copy_record_structure_edge_trade_skip(payload_event, _copy_clients.get(client_id) or {})
+                            elif event_kind == "otc_edge_trade_result" and not OTC_EDGE_INDIVIDUAL_RESULT_MESSAGES:
                                 # v0.97: accept and aggregate silently; send one session summary on stop.
                                 sent = _copy_record_otc_edge_trade_result(payload_event, _copy_clients.get(client_id) or {})
                             else:
@@ -23275,6 +24380,14 @@ def run_telegram_bot_only():
         interval=OTC_EDGE_WATCHER_SCAN_SECONDS,
         first=OTC_EDGE_WATCHER_SCAN_SECONDS,
         name="multi_user_otc_edge_watcher",
+    )
+
+    # v1.16.0: independent Structure Edge shadow strategy; disabled by default and admin-only.
+    job_queue.run_repeating(
+        structure_edge_job,
+        interval=STRUCTURE_EDGE_SCAN_SECONDS,
+        first=STRUCTURE_EDGE_SCAN_SECONDS,
+        name="structure_edge_shadow_strategy",
     )
 
     # قناة اختبار استراتيجية 3 شموع + ذاكرة تحليل v0.59. تعمل فقط عند ضبط THREE_CANDLE_CHANNEL_ID وتفعيلها من env.
