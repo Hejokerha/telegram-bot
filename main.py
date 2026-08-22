@@ -451,7 +451,7 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
         ["🔐 Copy Trading", "📡 حالة Copy"],
-        ["📐 Trendline Edge", "📡 قناة 3 شموع"],
+        ["📐 Price Action Edge", "📡 قناة 3 شموع"],
         ["🌐 Public Three Candle"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
@@ -494,9 +494,9 @@ admin_otc_edge_keyboard = ReplyKeyboardMarkup(
 # It does not alter or replace Three Candle / OTC Edge and does not send Copy Trading commands.
 structure_edge_admin_keyboard = ReplyKeyboardMarkup(
     [
-        ["🟢 تشغيل Trendline Edge", "🔴 إيقاف Trendline Edge"],
-        ["📋 حالة Trendline Edge", "📊 ملخص Trendline Edge"],
-        ["📚 كل نتائج Trendline Edge", "🧹 تصفير نتائج Trendline Edge"],
+        ["🟢 تشغيل Price Action Edge", "🔴 إيقاف Price Action Edge"],
+        ["📋 حالة Price Action Edge", "📊 ملخص Price Action Edge"],
+        ["📚 كل نتائج Price Action Edge", "🧹 تصفير نتائج Price Action Edge"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -1029,7 +1029,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.20.3"
+COPY_SERVER_VERSION = "1.21.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -3538,7 +3538,13 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
         "m5_bias": signal.get("m5_bias"),
         "m5_strength": signal.get("m5_strength"),
         "structure_confluences": signal.get("structure_confluences") or signal.get("confluences"),
-        # v1.20.2 Trendline pre-arm/open synchronization metadata.
+        # v1.21 Price Action test metadata.
+        "price_action_families": signal.get("price_action_families") or [],
+        "price_action_components": signal.get("price_action_components") or [],
+        "primary_family": signal.get("primary_family"),
+        "level_type": signal.get("level_type"),
+        "level_value": signal.get("level_value"),
+        # v1.20.2 PRE-ARM/open synchronization metadata retained.
         "trendline_prearm": bool(signal.get("trendline_prearm") or False),
         "trendline_target_bucket": signal.get("trendline_target_bucket"),
         "trendline_candle_open": signal.get("trendline_candle_open"),
@@ -3794,19 +3800,24 @@ async def publish_copy_structure_edge_prepare_signal(trade: dict, target_entry_b
             "m5_bias": (trade or {}).get("m5_bias"),
             "m5_strength": (trade or {}).get("m5_strength"),
             "structure_confluences": list((trade or {}).get("confluences") or [])[:8],
+            "price_action_families": list((trade or {}).get("price_action_families") or [])[:4],
+            "price_action_components": list((trade or {}).get("price_action_components") or [])[:8],
+            "primary_family": (trade or {}).get("primary_family"),
+            "level_type": (trade or {}).get("level_type") or (trade or {}).get("line_type"),
+            "level_value": (trade or {}).get("level_value") if (trade or {}).get("level_value") is not None else (trade or {}).get("line_value"),
             "trendline_prearm": True,
             "trendline_target_bucket": target_entry_bucket,
             "trendline_prearmed_at": now_iso(),
             "demo_only": True,
             "creator_user_id": int(ADMIN_TELEGRAM_ID),
             "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"trendline_edge_v2_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | pair_prepare_only",
+            "note": f"price_action_edge_v1_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | pair_prepare_only",
         }
         result = await publish_copy_trading_signal(payload, source="structure_edge")
-        logger.info("Trendline Edge pre-arm sent | pair=%s | target=%s | delivery=%s", pair, target_entry_bucket, result.get("delivery") if isinstance(result, dict) else result)
+        logger.info("Price Action Edge pre-arm sent | pair=%s | target=%s | delivery=%s", pair, target_entry_bucket, result.get("delivery") if isinstance(result, dict) else result)
         return result
     except Exception as exc:
-        logger.exception("Trendline Edge pre-arm publish failed: %s", exc)
+        logger.exception("Price Action Edge pre-arm publish failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -3863,6 +3874,11 @@ async def publish_copy_structure_edge_signal(trade: dict) -> dict:
             "m5_bias": (trade or {}).get("m5_bias"),
             "m5_strength": (trade or {}).get("m5_strength"),
             "structure_confluences": list((trade or {}).get("confluences") or [])[:8],
+            "price_action_families": list((trade or {}).get("price_action_families") or [])[:4],
+            "price_action_components": list((trade or {}).get("price_action_components") or [])[:8],
+            "primary_family": (trade or {}).get("primary_family"),
+            "level_type": (trade or {}).get("level_type") or (trade or {}).get("line_type"),
+            "level_value": (trade or {}).get("level_value") if (trade or {}).get("level_value") is not None else (trade or {}).get("line_value"),
             "trendline_prearm": True,
             "trendline_target_bucket": entry_bucket,
             "trendline_candle_open": (trade or {}).get("trendline_candle_open"),
@@ -3877,13 +3893,13 @@ async def publish_copy_structure_edge_signal(trade: dict) -> dict:
             "demo_only": True,
             "creator_user_id": int(ADMIN_TELEGRAM_ID),
             "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"trendline_edge_v2_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | line={(trade or {}).get('line_type')} | touches={(trade or {}).get('line_touches')} | demo_only",
+            "note": f"price_action_edge_v1_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | line={(trade or {}).get('line_type')} | touches={(trade or {}).get('line_touches')} | demo_only",
         }
         result = await publish_copy_trading_signal(payload, source="structure_edge")
-        logger.info("Copy Trading Trendline Edge FINAL sent | pair=%s | setup=%s | score=%s | delivery=%s", pair, (trade or {}).get("setup"), (trade or {}).get("score"), result.get("delivery") if isinstance(result, dict) else result)
+        logger.info("Copy Trading Price Action Edge FINAL sent | pair=%s | setup=%s | score=%s | delivery=%s", pair, (trade or {}).get("setup"), (trade or {}).get("score"), result.get("delivery") if isinstance(result, dict) else result)
         return result
     except Exception as exc:
-        logger.exception("Trendline Edge final Copy publish failed: %s", exc)
+        logger.exception("Price Action Edge final Copy publish failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -12521,37 +12537,27 @@ THREE_CANDLE_CHANNEL_ENABLED = os.getenv("THREE_CANDLE_CHANNEL_ENABLED", "false"
 
 # v1.01: Optional public/free mirror channel. Keep the private channel untouched.
 
-# ===== v1.20.0 Trendline Edge: same owner test slot, classical technical-analysis school =====
-# This deliberately REUSES the existing source key `structure_edge`, the same extension radio,
+# ===== v1.21.0 Price Action Edge: same owner test slot, 3 classical schools =====
+# This REUSES the existing source key `structure_edge`, the same extension radio,
 # the same Telegram channel env (`STRUCTURE_EDGE_CHANNEL_ID`) and the same enable/settings node.
-# No extra section is created. Statistical Edge is retired from the active test slot.
-#
-# Classical setup rules (closed M1 candles only):
-#   1) BREAKOUT: a candle breaks a valid trendline and CLOSES clearly outside it -> next M1 follows break.
-#   2) BOUNCE: price touches/approaches a valid trendline, does not close through it, and the closed
-#      candle itself moves away from the line -> next M1 follows the bounce candle.
-#
-# Lines are drawn programmatically like classical technical analysis:
-#   rising support = two+ higher swing lows; falling resistance = two+ lower swing highs.
-# Candidate lines are validated for slope, freshness, touches and absence of repeated prior closes
-# through the line. Execution/audit contract stays owner Chrome extension only, physical DEMO,
-# fixed $1, no martingale/sequence, strict late-entry cancellation, authoritative Quotex result.
-# v1.20.2 PRE-ARM: lightweight scheduler ticks twice per second, but the expensive
-# market scan still runs at most twice in the final seconds of each M1 candle.
+# No extra section is created. The active test engine evaluates three independent price-action families:
+#   1) TRENDLINE: rising support / falling resistance, BREAKOUT + BOUNCE.
+#   2) SUPPORT/RESISTANCE: clustered horizontal swing levels, BREAKOUT + BOUNCE.
+#   3) ROUND NUMBER: major/half psychological levels, BREAKOUT + BOUNCE.
+# If 2+ families agree on the same pair/direction around the same price zone, one trade is sent and
+# the agreement is stored as confluence instead of opening duplicate trades.
+# Execution contract remains PRE-ARM -> final close validation -> immediate next-M1 open, owner Chrome
+# extension only, physical DEMO, fixed $1, no martingale/sequence, strict stale/open-displacement guards.
 STRUCTURE_EDGE_SCAN_SECONDS = max(0.25, float(os.getenv("STRUCTURE_EDGE_SCAN_SECONDS", "0.5")))
-# Kept under the old env name for deployment compatibility. Here it is line/setup quality score.
+# Kept under the old env name for deployment compatibility. Here it is generic setup-quality score.
 STRUCTURE_EDGE_MIN_SCORE = max(50, min(95, int(os.getenv("STRUCTURE_EDGE_MIN_SCORE", "70"))))
 STRUCTURE_EDGE_MIN_PAYOUT = max(0, min(100, int(os.getenv("STRUCTURE_EDGE_MIN_PAYOUT", "85"))))
-# Pre-arm the pair BEFORE candle close, then perform one pair-local final validation just
-# after the minute boundary. The execute packet itself is valid for only ~2 seconds.
 TRENDLINE_PREARM_MIN_SECOND = max(50.0, min(59.0, float(os.getenv("TRENDLINE_PREARM_MIN_SECOND", "56.5"))))
 TRENDLINE_PREARM_LAST_SECOND = max(TRENDLINE_PREARM_MIN_SECOND, min(59.7, float(os.getenv("TRENDLINE_PREARM_LAST_SECOND", "59.0"))))
 TRENDLINE_PREARM_MAX_ATTEMPTS = max(1, min(3, int(os.getenv("TRENDLINE_PREARM_MAX_ATTEMPTS", "2"))))
 TRENDLINE_PREARM_RETRY_SECONDS = max(0.5, min(3.0, float(os.getenv("TRENDLINE_PREARM_RETRY_SECONDS", "1.5"))))
 TRENDLINE_FINAL_MAX_SECOND = max(0.4, min(3.0, float(os.getenv("TRENDLINE_FINAL_MAX_SECOND", "1.5"))))
 TRENDLINE_EXECUTION_MAX_DELAY_SECONDS = max(1, min(3, int(os.getenv("TRENDLINE_EXECUTION_MAX_DELAY_SECONDS", "2"))))
-# Do not chase the new candle. At final validation, the live price must remain close to
-# the new M1 open (or previous close fallback) by a fraction of the pair's recent M1 ATR/range.
 TRENDLINE_ENTRY_MAX_DISPLACEMENT_ATR = max(0.01, min(0.25, float(os.getenv("TRENDLINE_ENTRY_MAX_DISPLACEMENT_ATR", "0.06"))))
 STRUCTURE_EDGE_RESULT_DELAY_SECONDS = max(2, int(os.getenv("STRUCTURE_EDGE_RESULT_DELAY_SECONDS", "4")))
 STRUCTURE_EDGE_EXTENSION_RESULT_TIMEOUT_SECONDS = max(30, int(os.getenv("STRUCTURE_EDGE_EXTENSION_RESULT_TIMEOUT_SECONDS", "90")))
@@ -12561,6 +12567,7 @@ STRUCTURE_EDGE_RESULT_REPORT_LIMIT = max(200, int(os.getenv("STRUCTURE_EDGE_RESU
 STRUCTURE_EDGE_CHANNEL_ID_RAW = str(os.getenv("STRUCTURE_EDGE_CHANNEL_ID", "") or "").strip()
 STRUCTURE_EDGE_DEFAULT_ENABLED = os.getenv("STRUCTURE_EDGE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 
+# Classical trendline geometry.
 TRENDLINE_LOOKBACK = max(24, min(100, int(os.getenv("TRENDLINE_LOOKBACK", "55"))))
 TRENDLINE_SWING_SPAN = max(1, min(4, int(os.getenv("TRENDLINE_SWING_SPAN", "2"))))
 TRENDLINE_TOUCH_TOL_ATR = max(0.05, min(0.60, float(os.getenv("TRENDLINE_TOUCH_TOL_ATR", "0.18"))))
@@ -12571,6 +12578,24 @@ TRENDLINE_MAX_SLOPE_ATR = max(TRENDLINE_MIN_SLOPE_ATR, min(2.00, float(os.getenv
 TRENDLINE_MAX_SECOND_ANCHOR_AGE = max(5, min(45, int(os.getenv("TRENDLINE_MAX_SECOND_ANCHOR_AGE", "24"))))
 TRENDLINE_MIN_BOUNCE_BODY_RATIO = max(0.0, min(0.80, float(os.getenv("TRENDLINE_MIN_BOUNCE_BODY_RATIO", "0.18"))))
 TRENDLINE_MIN_BREAK_BODY_RATIO = max(0.0, min(0.80, float(os.getenv("TRENDLINE_MIN_BREAK_BODY_RATIO", "0.22"))))
+
+# Horizontal support/resistance from repeated swing clusters.
+PRICE_ACTION_SR_CLUSTER_TOL_ATR = max(0.05, min(0.60, float(os.getenv("PRICE_ACTION_SR_CLUSTER_TOL_ATR", "0.22"))))
+PRICE_ACTION_SR_TOUCH_TOL_ATR = max(0.05, min(0.60, float(os.getenv("PRICE_ACTION_SR_TOUCH_TOL_ATR", "0.20"))))
+PRICE_ACTION_SR_BREAK_MARGIN_ATR = max(0.02, min(0.40, float(os.getenv("PRICE_ACTION_SR_BREAK_MARGIN_ATR", "0.08"))))
+PRICE_ACTION_SR_CLOSE_TOL_ATR = max(0.02, min(0.40, float(os.getenv("PRICE_ACTION_SR_CLOSE_TOL_ATR", "0.08"))))
+PRICE_ACTION_SR_MIN_TOUCHES = max(2, min(5, int(os.getenv("PRICE_ACTION_SR_MIN_TOUCHES", "2"))))
+PRICE_ACTION_SR_MAX_TOUCH_AGE = max(8, min(50, int(os.getenv("PRICE_ACTION_SR_MAX_TOUCH_AGE", "32"))))
+
+# Psychological round numbers: major 00 and half-round 50 style levels, scaled by quote price.
+PRICE_ACTION_ROUND_TOUCH_TOL_ATR = max(0.04, min(0.50, float(os.getenv("PRICE_ACTION_ROUND_TOUCH_TOL_ATR", "0.18"))))
+PRICE_ACTION_ROUND_BREAK_MARGIN_ATR = max(0.02, min(0.40, float(os.getenv("PRICE_ACTION_ROUND_BREAK_MARGIN_ATR", "0.08"))))
+PRICE_ACTION_ROUND_CLOSE_TOL_ATR = max(0.02, min(0.40, float(os.getenv("PRICE_ACTION_ROUND_CLOSE_TOL_ATR", "0.08"))))
+
+# Cross-family agreement. Nearby agreeing levels become ONE trade with a confluence bonus.
+PRICE_ACTION_CONFLUENCE_DISTANCE_ATR = max(0.05, min(1.0, float(os.getenv("PRICE_ACTION_CONFLUENCE_DISTANCE_ATR", "0.35"))))
+PRICE_ACTION_CONFLUENCE_BONUS = max(0, min(12, int(os.getenv("PRICE_ACTION_CONFLUENCE_BONUS", "5"))))
+PRICE_ACTION_OPPOSITE_CONFLICT_MARGIN = max(0, min(12, int(os.getenv("PRICE_ACTION_OPPOSITE_CONFLICT_MARGIN", "4"))))
 
 _structure_edge_state = {
     "pending_trade": None,
@@ -12609,6 +12634,9 @@ _structure_edge_state = {
     "setups_found": 0,
     "pairs_ready": 0,
     "last_line": None,
+    "sr_levels_found": 0,
+    "round_levels_found": 0,
+    "family_setups_found": {},
 }
 
 # Reuse old settings node so the currently-enabled test slot remains enabled after deployment.
@@ -12646,17 +12674,17 @@ def _structure_edge_get_settings() -> dict:
             data = {}
         return {"enabled": bool(data.get("enabled", default["enabled"]))}
     except Exception as exc:
-        logger.debug("Trendline Edge settings read failed: %s", exc)
+        logger.debug("Price Action Edge settings read failed: %s", exc)
         return default
 
 
 def _structure_edge_set_enabled(enabled: bool) -> bool:
     try:
-        _structure_edge_settings_ref().update({"enabled": bool(enabled), "updated_at": now_iso(), "engine": "trendline_edge_v1"})
+        _structure_edge_settings_ref().update({"enabled": bool(enabled), "updated_at": now_iso(), "engine": "price_action_edge_v1"})
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Trendline Edge enabled update failed: %s", exc)
+        logger.exception("Price Action Edge enabled update failed: %s", exc)
         return False
 
 
@@ -12877,6 +12905,12 @@ def _trendline_eval_setup(parts: list[dict], line: dict, atr: float) -> dict | N
             "line_touches": int(line.get("touches", 0) or 0),
             "line_slope_atr": float(line.get("slope_atr", 0) or 0),
             "line_value": float(line_now),
+            "family": "TRENDLINE",
+            "primary_family": "TRENDLINE",
+            "level_type": line.get("kind"),
+            "level_value": float(line_now),
+            "level_quality": base_quality,
+            "level_touches": int(line.get("touches", 0) or 0),
             "anchor1_index": int(a1[0]),
             "anchor1_price": float(a1[1]),
             "anchor2_index": int(a2[0]),
@@ -12894,8 +12928,259 @@ def _trendline_eval_setup(parts: list[dict], line: dict, atr: float) -> dict | N
         return None
 
 
+
+def _price_action_sr_levels(parts: list[dict], atr: float) -> list[dict]:
+    """Build classical horizontal support/resistance from repeated swing-price clusters."""
+    if len(parts) < 10 or atr <= 0:
+        return []
+    highs, lows = _trendline_swings(parts)
+    last_idx = len(parts) - 1
+    cluster_tol = atr * PRICE_ACTION_SR_CLUSTER_TOL_ATR
+    close_tol = atr * PRICE_ACTION_SR_CLOSE_TOL_ATR
+    levels = []
+    for points, kind in ((lows[-18:], "HORIZONTAL_SUPPORT"), (highs[-18:], "HORIZONTAL_RESISTANCE")):
+        clusters = []
+        for pidx, price in points:
+            best = None
+            best_dist = None
+            for cluster in clusters:
+                dist = abs(float(price) - float(cluster["level"]))
+                if dist <= cluster_tol and (best_dist is None or dist < best_dist):
+                    best, best_dist = cluster, dist
+            if best is None:
+                clusters.append({"points": [(int(pidx), float(price))], "level": float(price)})
+            else:
+                best["points"].append((int(pidx), float(price)))
+                best["level"] = sum(x[1] for x in best["points"]) / len(best["points"])
+        for cluster in clusters:
+            pts = cluster["points"]
+            touches = len(pts)
+            if touches < PRICE_ACTION_SR_MIN_TOUCHES:
+                continue
+            last_touch_idx = max(x[0] for x in pts)
+            age = last_idx - last_touch_idx
+            if age > PRICE_ACTION_SR_MAX_TOUCH_AGE:
+                continue
+            level = float(cluster["level"])
+            violations = 0
+            deep = 0
+            first_idx = min(x[0] for x in pts)
+            for i in range(first_idx, last_idx):
+                close = float(parts[i]["close"])
+                if kind == "HORIZONTAL_SUPPORT":
+                    if close < level - close_tol:
+                        violations += 1
+                    if close < level - close_tol * 2.0:
+                        deep += 1
+                else:
+                    if close > level + close_tol:
+                        violations += 1
+                    if close > level + close_tol * 2.0:
+                        deep += 1
+            if deep > 0 or violations > 1:
+                continue
+            distance_atr = abs(float(parts[-1]["close"]) - level) / atr
+            if distance_atr > 2.0:
+                continue
+            freshness = max(0.0, 1.0 - age / max(1.0, float(PRICE_ACTION_SR_MAX_TOUCH_AGE)))
+            quality = int(round(min(94.0, 52.0 + min(5, touches) * 6.0 + freshness * 12.0 + (8.0 if violations == 0 else 4.0))))
+            levels.append({
+                "kind": kind,
+                "level_value": level,
+                "level_quality": quality,
+                "level_touches": touches,
+                "distance_atr": round(distance_atr, 3),
+                "violations": violations,
+                "last_touch_age": age,
+            })
+    levels.sort(key=lambda x: (int(x.get("level_quality", 0)), int(x.get("level_touches", 0)), -float(x.get("distance_atr", 99))), reverse=True)
+    return levels[:12]
+
+
+def _price_action_eval_sr(parts: list[dict], level: dict, atr: float) -> dict | None:
+    if len(parts) < 3 or atr <= 0:
+        return None
+    cur, prev = parts[-1], parts[-2]
+    value = float(level.get("level_value"))
+    touch_tol = atr * PRICE_ACTION_SR_TOUCH_TOL_ATR
+    close_tol = atr * PRICE_ACTION_SR_CLOSE_TOL_ATR
+    break_margin = atr * PRICE_ACTION_SR_BREAK_MARGIN_ATR
+    body_ratio = float(cur.get("body_ratio", 0) or 0)
+    setup = direction = None
+    strength = 0.0
+    kind = str(level.get("kind") or "")
+    if kind == "HORIZONTAL_SUPPORT":
+        if float(prev["close"]) >= value - close_tol and float(cur["close"]) < value - break_margin and int(cur.get("dir", 0) or 0) < 0 and body_ratio >= TRENDLINE_MIN_BREAK_BODY_RATIO:
+            setup, direction = "SR_BREAKOUT", "PUT"
+            strength = max(0.0, (value - float(cur["close"])) / atr)
+        else:
+            touched = float(cur["low"]) <= value + touch_tol and float(cur["low"]) >= value - touch_tol * 1.5
+            held = float(cur["close"]) >= value - close_tol
+            if touched and held and int(cur.get("dir", 0) or 0) > 0 and body_ratio >= TRENDLINE_MIN_BOUNCE_BODY_RATIO:
+                setup, direction = "SR_BOUNCE", "CALL"
+                strength = max(0.0, (float(cur["close"]) - value) / atr)
+    elif kind == "HORIZONTAL_RESISTANCE":
+        if float(prev["close"]) <= value + close_tol and float(cur["close"]) > value + break_margin and int(cur.get("dir", 0) or 0) > 0 and body_ratio >= TRENDLINE_MIN_BREAK_BODY_RATIO:
+            setup, direction = "SR_BREAKOUT", "CALL"
+            strength = max(0.0, (float(cur["close"]) - value) / atr)
+        else:
+            touched = float(cur["high"]) >= value - touch_tol and float(cur["high"]) <= value + touch_tol * 1.5
+            held = float(cur["close"]) <= value + close_tol
+            if touched and held and int(cur.get("dir", 0) or 0) < 0 and body_ratio >= TRENDLINE_MIN_BOUNCE_BODY_RATIO:
+                setup, direction = "SR_BOUNCE", "PUT"
+                strength = max(0.0, (value - float(cur["close"])) / atr)
+    if not setup:
+        return None
+    base_quality = int(level.get("level_quality", 0) or 0)
+    score = int(round(min(99.0, base_quality + min(8.0, strength * 10.0) + min(5.0, max(0.0, body_ratio - 0.20) * 10.0))))
+    if score < STRUCTURE_EDGE_MIN_SCORE:
+        return None
+    return {
+        "ok": True, "family": "SR", "primary_family": "SR", "setup": setup, "direction": direction, "score": score,
+        "line_type": kind, "line_quality": base_quality, "line_touches": int(level.get("level_touches", 0) or 0), "line_slope_atr": 0.0,
+        "line_value": value, "level_type": kind, "level_value": value, "level_quality": base_quality, "level_touches": int(level.get("level_touches", 0) or 0),
+        "signal_body_ratio": round(body_ratio, 3), "setup_strength_atr": round(strength, 3),
+        "confluences": [f"{kind} • {int(level.get('level_touches', 0) or 0)} touches", f"level quality {base_quality}%", f"signal candle body {body_ratio:.2f}"],
+    }
+
+
+def _price_action_round_major_step(price: float) -> float:
+    p = abs(float(price))
+    if p >= 1000: return 10.0
+    if p >= 100: return 1.0
+    if p >= 10: return 0.10
+    if p >= 1: return 0.01
+    if p >= 0.10: return 0.001
+    if p >= 0.01: return 0.0001
+    return max(p * 0.001, 0.00001)
+
+
+def _price_action_round_levels(parts: list[dict], atr: float) -> list[dict]:
+    if len(parts) < 5 or atr <= 0:
+        return []
+    price = float(parts[-1]["close"])
+    major = _price_action_round_major_step(price)
+    definitions = [(major, "ROUND_MAJOR", 70), (major / 2.0, "ROUND_HALF", 64)]
+    touch_tol = atr * PRICE_ACTION_ROUND_TOUCH_TOL_ATR
+    seen = {}
+    for step, kind, base_quality in definitions:
+        if step <= 0:
+            continue
+        nearest_n = int(round(price / step))
+        for n in range(nearest_n - 2, nearest_n + 3):
+            value = float(n * step)
+            if abs(price - value) > max(atr * 2.0, step * 0.65):
+                continue
+            key = round(value / max(step, 1e-12), 8), round(value, 12)
+            touches = sum(1 for row in parts[-32:-1] if float(row["low"]) - touch_tol <= value <= float(row["high"]) + touch_tol)
+            quality = int(min(92, base_quality + min(15, touches * 3)))
+            candidate = {
+                "kind": kind, "level_value": value, "level_quality": quality, "level_touches": touches,
+                "distance_atr": round(abs(price - value) / atr, 3), "round_step": step,
+            }
+            old = seen.get(round(value, 12))
+            if old is None or int(candidate["level_quality"]) > int(old["level_quality"]):
+                seen[round(value, 12)] = candidate
+    levels = list(seen.values())
+    levels.sort(key=lambda x: (int(x.get("level_quality", 0)), -float(x.get("distance_atr", 99))), reverse=True)
+    return levels[:8]
+
+
+def _price_action_eval_round(parts: list[dict], level: dict, atr: float) -> dict | None:
+    if len(parts) < 3 or atr <= 0:
+        return None
+    cur, prev = parts[-1], parts[-2]
+    value = float(level.get("level_value"))
+    touch_tol = atr * PRICE_ACTION_ROUND_TOUCH_TOL_ATR
+    close_tol = atr * PRICE_ACTION_ROUND_CLOSE_TOL_ATR
+    break_margin = atr * PRICE_ACTION_ROUND_BREAK_MARGIN_ATR
+    body_ratio = float(cur.get("body_ratio", 0) or 0)
+    setup = direction = None
+    strength = 0.0
+    # Break through the psychological level with a confirming close.
+    if float(prev["close"]) <= value + close_tol and float(cur["close"]) > value + break_margin and int(cur.get("dir", 0) or 0) > 0 and body_ratio >= TRENDLINE_MIN_BREAK_BODY_RATIO:
+        setup, direction = "ROUND_BREAKOUT", "CALL"
+        strength = max(0.0, (float(cur["close"]) - value) / atr)
+    elif float(prev["close"]) >= value - close_tol and float(cur["close"]) < value - break_margin and int(cur.get("dir", 0) or 0) < 0 and body_ratio >= TRENDLINE_MIN_BREAK_BODY_RATIO:
+        setup, direction = "ROUND_BREAKOUT", "PUT"
+        strength = max(0.0, (value - float(cur["close"])) / atr)
+    else:
+        # Bounce from above/below; no special wick-rejection shape is required.
+        from_above = float(prev["close"]) >= value - close_tol and float(cur["low"]) <= value + touch_tol and float(cur["close"]) > value and int(cur.get("dir", 0) or 0) > 0
+        from_below = float(prev["close"]) <= value + close_tol and float(cur["high"]) >= value - touch_tol and float(cur["close"]) < value and int(cur.get("dir", 0) or 0) < 0
+        if from_above and body_ratio >= TRENDLINE_MIN_BOUNCE_BODY_RATIO:
+            setup, direction = "ROUND_BOUNCE", "CALL"
+            strength = max(0.0, (float(cur["close"]) - value) / atr)
+        elif from_below and body_ratio >= TRENDLINE_MIN_BOUNCE_BODY_RATIO:
+            setup, direction = "ROUND_BOUNCE", "PUT"
+            strength = max(0.0, (value - float(cur["close"])) / atr)
+    if not setup:
+        return None
+    base_quality = int(level.get("level_quality", 0) or 0)
+    score = int(round(min(99.0, base_quality + min(8.0, strength * 10.0) + min(5.0, max(0.0, body_ratio - 0.20) * 10.0))))
+    if score < STRUCTURE_EDGE_MIN_SCORE:
+        return None
+    kind = str(level.get("kind") or "ROUND_NUMBER")
+    return {
+        "ok": True, "family": "ROUND", "primary_family": "ROUND", "setup": setup, "direction": direction, "score": score,
+        "line_type": kind, "line_quality": base_quality, "line_touches": int(level.get("level_touches", 0) or 0), "line_slope_atr": 0.0,
+        "line_value": value, "level_type": kind, "level_value": value, "level_quality": base_quality, "level_touches": int(level.get("level_touches", 0) or 0),
+        "signal_body_ratio": round(body_ratio, 3), "setup_strength_atr": round(strength, 3),
+        "confluences": [f"{kind} @ {value:g}", f"historical touches {int(level.get('level_touches', 0) or 0)}", f"signal candle body {body_ratio:.2f}"],
+    }
+
+
+def _price_action_add_confluence(candidates: list[dict], atr: float) -> list[dict]:
+    """Attach nearby same-direction family agreement without creating duplicate trades."""
+    enriched = []
+    for base in candidates:
+        item = dict(base)
+        base_level = float(item.get("level_value", item.get("line_value", 0)) or 0)
+        direction = str(item.get("direction") or "")
+        nearby = []
+        for other in candidates:
+            if str(other.get("direction") or "") != direction:
+                continue
+            other_level = float(other.get("level_value", other.get("line_value", 0)) or 0)
+            if base_level and other_level and abs(other_level - base_level) <= atr * PRICE_ACTION_CONFLUENCE_DISTANCE_ATR:
+                nearby.append(other)
+        families = []
+        components = []
+        extra_conf = list(item.get("confluences") or [])
+        for row in sorted(nearby, key=lambda x: int(x.get("score", 0)), reverse=True):
+            family = str(row.get("family") or row.get("primary_family") or "")
+            setup = str(row.get("setup") or "")
+            if family and family not in families:
+                families.append(family)
+            if setup and setup not in components:
+                components.append(setup)
+        if not families:
+            families = [str(item.get("family") or "UNKNOWN")]
+        if not components:
+            components = [str(item.get("setup") or "UNKNOWN")]
+        bonus = max(0, len(families) - 1) * PRICE_ACTION_CONFLUENCE_BONUS
+        item["score"] = min(99, int(item.get("score", 0) or 0) + bonus)
+        item["primary_family"] = str(item.get("family") or item.get("primary_family") or families[0])
+        item["price_action_families"] = families
+        item["price_action_components"] = components
+        item["confluence_count"] = len(families)
+        if len(families) >= 2:
+            extra_conf.append("CONFLUENCE: " + " + ".join(families))
+        item["confluences"] = extra_conf[:10]
+        enriched.append(item)
+    return enriched
+
+
+def _price_action_family_from_setup(setup: str) -> str:
+    text = str(setup or "").upper()
+    if text.startswith("TRENDLINE_"): return "TRENDLINE"
+    if text.startswith("SR_"): return "SR"
+    if text.startswith("ROUND_"): return "ROUND"
+    return "UNKNOWN"
+
+
 def analyze_structure_edge_pair(pair: str, symbol: str | None = None, closed_override: list[dict] | None = None) -> dict:
-    """Compatibility name; active implementation is Trendline Edge v1."""
+    """Compatibility name; active implementation is Price Action Edge v1.21."""
     try:
         normalized = normalize_otc_currency_pair_name(pair, symbol) if symbol else normalize_pair_name_basic(pair)
         if not normalized or not is_valid_otc_currency_pair_name(normalized):
@@ -12934,37 +13219,53 @@ def analyze_structure_edge_pair(pair: str, symbol: str | None = None, closed_ove
         atr = _trendline_avg_range(parts, 14)
         if atr <= 0:
             return {"ok": False, "pair": normalized, "reason": "ATR/range غير صالح"}
-        lines = _trendline_find_lines(parts, atr)
-        if not lines:
-            return {"ok": False, "pair": normalized, "reason": "لا يوجد Trendline كلاسيكي صالح"}
 
-        setups = []
+        candidates = []
+        lines = _trendline_find_lines(parts, atr)
         for line in lines:
             item = _trendline_eval_setup(parts, line, atr)
             if item:
-                setups.append(item)
-        if not setups:
-            return {"ok": False, "pair": normalized, "reason": f"{len(lines)} خطوط صالحة لكن لا Breakout/Bounce مؤكد"}
-        # Prefer quality; when equal prefer breakout because a confirmed close through the line is explicit.
-        setups.sort(key=lambda x: (int(x.get("score", 0)), 1 if x.get("setup") == "TRENDLINE_BREAKOUT" else 0), reverse=True)
-        decision = dict(setups[0])
+                candidates.append(item)
+
+        sr_levels = _price_action_sr_levels(parts, atr)
+        for level in sr_levels:
+            item = _price_action_eval_sr(parts, level, atr)
+            if item:
+                candidates.append(item)
+
+        round_levels = _price_action_round_levels(parts, atr)
+        for level in round_levels:
+            item = _price_action_eval_round(parts, level, atr)
+            if item:
+                candidates.append(item)
+
+        if not candidates:
+            return {
+                "ok": False, "pair": normalized,
+                "reason": f"لا Setup مؤكد | TL {len(lines)} | SR {len(sr_levels)} | ROUND {len(round_levels)}",
+                "lines_considered": len(lines), "sr_levels_considered": len(sr_levels), "round_levels_considered": len(round_levels),
+            }
+
+        candidates = _price_action_add_confluence(candidates, atr)
+        candidates.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("confluence_count", 1)), int(x.get("line_touches", 0))), reverse=True)
+        best = candidates[0]
+        # If the same closed candle creates nearly equal high-quality opposite directions,
+        # skip instead of arbitrarily choosing one side.
+        opposite = next((x for x in candidates[1:] if str(x.get("direction")) != str(best.get("direction"))), None)
+        if opposite and abs(int(best.get("score", 0)) - int(opposite.get("score", 0))) <= PRICE_ACTION_OPPOSITE_CONFLICT_MARGIN:
+            return {"ok": False, "pair": normalized, "reason": f"تعارض Price Action: {best.get('direction')} {best.get('score')} vs {opposite.get('direction')} {opposite.get('score')}"}
+
+        decision = dict(best)
         decision.update({
-            "pair": normalized,
-            "symbol": symbol,
-            "payout": payout,
-            "price": current_price,
-            "entry_price": current_price,
-            "entry_bucket": current_bucket,
-            "closed_m1_count": len(closed),
-            "atr": atr,
-            # Reuse legacy metadata slots for extension audit compatibility.
-            "m5_bias": str(decision.get("line_type") or "TRENDLINE"),
-            "m5_strength": int(decision.get("line_quality", 0) or 0),
-            "lines_considered": len(lines),
+            "pair": normalized, "symbol": symbol, "payout": payout, "price": current_price, "entry_price": current_price,
+            "entry_bucket": current_bucket, "closed_m1_count": len(closed), "atr": atr,
+            "m5_bias": str(decision.get("line_type") or decision.get("level_type") or decision.get("primary_family") or "PRICE_ACTION"),
+            "m5_strength": int(decision.get("line_quality") or decision.get("level_quality") or decision.get("score") or 0),
+            "lines_considered": len(lines), "sr_levels_considered": len(sr_levels), "round_levels_considered": len(round_levels),
         })
         return decision
     except Exception as exc:
-        logger.exception("Trendline Edge pair analysis failed | pair=%s | error=%s", pair, exc)
+        logger.exception("Price Action Edge pair analysis failed | pair=%s | error=%s", pair, exc)
         return {"ok": False, "pair": pair, "reason": f"analysis error: {exc}"}
 
 
@@ -12977,16 +13278,12 @@ def _structure_edge_pair_ready(pair: str, now_ts: float) -> bool:
 
 
 def _structure_edge_scan_market(provisional_current: bool = False) -> list[dict]:
-    """Scan all OTC currency pairs.
-
-    provisional_current=True appends the still-forming current M1 candle so the pair can
-    be PRE-ARMED before close. The final trade is never authorized by this provisional scan.
-    """
+    """Scan all OTC currency pairs for Trendline + S/R + Round Number setups."""
     pair_map = get_otc_analysis_pair_map()
     current_bucket = int(time_module.time() // 60) * 60
     candidates = []
-    lines_found = 0
-    ready_pairs = 0
+    lines_found = sr_found = round_found = ready_pairs = 0
+    family_counts = {"TRENDLINE": 0, "SR": 0, "ROUND": 0}
     last_line = None
     for pair, symbol in pair_map.items():
         try:
@@ -13003,31 +13300,31 @@ def _structure_edge_scan_market(provisional_current: bool = False) -> list[dict]
                     current_rows.sort(key=_structure_edge_candle_bucket)
                     eval_rows.append(current_rows[-1])
                 else:
-                    # No reliable live candle -> do not guess a pre-arm candidate.
                     continue
             item = analyze_structure_edge_pair(pair, symbol, closed_override=eval_rows)
+            lines_found += int(item.get("lines_considered", 0) or 0)
+            sr_found += int(item.get("sr_levels_considered", 0) or 0)
+            round_found += int(item.get("round_levels_considered", 0) or 0)
             if item.get("ok"):
                 candidates.append(item)
-                lines_found += int(item.get("lines_considered", 0) or 0)
+                fam = str(item.get("primary_family") or _price_action_family_from_setup(item.get("setup")))
+                family_counts[fam] = family_counts.get(fam, 0) + 1
                 last_line = {
-                    "pair": item.get("pair"), "type": item.get("line_type"),
-                    "touches": item.get("line_touches"), "quality": item.get("line_quality"),
+                    "pair": item.get("pair"), "type": item.get("line_type") or item.get("level_type"),
+                    "touches": item.get("line_touches") or item.get("level_touches"),
+                    "quality": item.get("line_quality") or item.get("level_quality"), "family": fam,
                 }
-            else:
-                reason = str(item.get("reason") or "")
-                if "خطوط صالحة" in reason:
-                    try:
-                        lines_found += int(reason.split(" ", 1)[0])
-                    except Exception:
-                        pass
         except Exception:
-            logger.debug("Trendline Edge skipped pair %s", pair, exc_info=True)
+            logger.debug("Price Action Edge skipped pair %s", pair, exc_info=True)
     _structure_edge_state["pairs_ready"] = ready_pairs
     _structure_edge_state["lines_found"] = lines_found
+    _structure_edge_state["sr_levels_found"] = sr_found
+    _structure_edge_state["round_levels_found"] = round_found
     _structure_edge_state["setups_found"] = len(candidates)
+    _structure_edge_state["family_setups_found"] = family_counts
     if last_line:
         _structure_edge_state["last_line"] = last_line
-    candidates.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("line_touches", 0)), int(x.get("payout", 0))), reverse=True)
+    candidates.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("confluence_count", 1)), int(x.get("line_touches", 0)), int(x.get("payout", 0))), reverse=True)
     return candidates
 
 
@@ -13064,18 +13361,29 @@ def _trendline_final_open_snapshot(symbol: str, current_bucket: int, decision: d
 def _structure_edge_signal_message(trade: dict) -> str:
     direction = str(trade.get("direction") or "").upper()
     icon = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
-    setup = "Break + Close → مع الكسر" if trade.get("setup") == "TRENDLINE_BREAKOUT" else "Bounce candle → مع الارتداد"
-    line_ar = "ترند صاعد / دعم" if trade.get("line_type") == "RISING_SUPPORT" else "ترند هابط / مقاومة"
+    setup_labels = {
+        "TRENDLINE_BREAKOUT": "Trendline • Break + Close → مع الكسر",
+        "TRENDLINE_BOUNCE": "Trendline • Bounce → مع الارتداد",
+        "SR_BREAKOUT": "Support/Resistance • Break + Close → مع الكسر",
+        "SR_BOUNCE": "Support/Resistance • Bounce → مع الارتداد",
+        "ROUND_BREAKOUT": "Round Number • Break + Close → مع الكسر",
+        "ROUND_BOUNCE": "Round Number • Bounce → مع الارتداد",
+    }
+    setup = setup_labels.get(str(trade.get("setup") or ""), str(trade.get("setup") or "-"))
+    level_type = str(trade.get("line_type") or trade.get("level_type") or "-")
+    families = list(trade.get("price_action_families") or [trade.get("primary_family") or _price_action_family_from_setup(trade.get("setup"))])
+    components = list(trade.get("price_action_components") or [trade.get("setup")])
     entry_dt = datetime.fromtimestamp(int(trade.get("entry_bucket", 0)), tz=UTC).astimezone(UTC_PLUS_3)
     close_dt = entry_dt + timedelta(seconds=60)
     return (
-        "📐 TRENDLINE EDGE — TEST\n"
+        "📐 PRICE ACTION EDGE — TEST\n"
         "━━━━━━━━━━━━━━\n"
         f"💱 {trade.get('pair')}\n"
         f"📌 {icon}\n"
         f"🧠 {setup}\n"
-        f"📏 الخط: {line_ar} • touches {trade.get('line_touches')} • quality {trade.get('line_quality')}%\n"
-        f"📐 Slope: {trade.get('line_slope_atr')} ATR/candle\n"
+        f"📍 المستوى: {level_type} @ {trade.get('level_value') if trade.get('level_value') is not None else trade.get('line_value')}\n"
+        f"⭐ Quality {trade.get('level_quality') or trade.get('line_quality') or '-'}% • touches {trade.get('level_touches') if trade.get('level_touches') is not None else trade.get('line_touches') or '-'}\n"
+        f"🤝 Families: {' + '.join(str(x) for x in families)} | Components: {', '.join(str(x) for x in components)}\n"
         f"🎯 Setup score: {trade.get('score')}% | payout {trade.get('payout')}%\n"
         f"⚙️ Pre-arm: {'جاهز ✅' if trade.get('prearmed_at') else '-'}\n"
         f"🎬 Open المرجعي: {trade.get('trendline_candle_open') if trade.get('trendline_candle_open') is not None else '-'}\n"
@@ -13110,12 +13418,15 @@ def _structure_edge_record_result(trade: dict, result: str, close_price=None) ->
             "line_touches": int(trade.get("line_touches", 0) or 0), "line_slope_atr": float(trade.get("line_slope_atr", 0) or 0),
             "entry_bucket": int(trade.get("entry_bucket", 0) or 0), "entry_price": float(trade.get("entry_price", 0) or 0),
             "close_price": float(close_price or 0), "result": str(result), "confluences": trade.get("confluences") or [],
+            "primary_family": trade.get("primary_family") or _price_action_family_from_setup(trade.get("setup")),
+            "price_action_families": trade.get("price_action_families") or [], "price_action_components": trade.get("price_action_components") or [],
+            "level_type": trade.get("level_type") or trade.get("line_type"), "level_value": trade.get("level_value") if trade.get("level_value") is not None else trade.get("line_value"),
         }
         _structure_edge_results_ref().push(record)
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Trendline Edge result store failed: %s", exc)
+        logger.exception("Price Action Edge result store failed: %s", exc)
         return False
 
 
@@ -13130,7 +13441,7 @@ def _structure_edge_fetch_results(limit: int | None = None) -> list[dict]:
         rows.sort(key=lambda x: str(x.get("closed_at") or x.get("created_at") or ""))
         return rows
     except Exception as exc:
-        logger.exception("Trendline Edge results read failed: %s", exc)
+        logger.exception("Price Action Edge results read failed: %s", exc)
         return []
 
 
@@ -13147,44 +13458,77 @@ def _structure_edge_max_loss_streak(rows: list[dict]) -> int:
 
 
 def build_structure_edge_summary(limit: int | None = None) -> str:
-    # v1.20.3: default report covers the latest 200 confirmed trades. Passing 0
-    # intentionally means ALL stored Trendline Edge results, so long unattended
-    # DEMO runs can be audited without silently truncating the scorecard at 50.
     if limit is None:
-        effective_limit = STRUCTURE_EDGE_RESULT_REPORT_LIMIT
-        rows = _structure_edge_fetch_results(effective_limit)
+        rows = _structure_edge_fetch_results(STRUCTURE_EDGE_RESULT_REPORT_LIMIT)
         scope_label = f"آخر {len(rows)} نتيجة"
     elif int(limit) <= 0:
         rows = _structure_edge_fetch_results(None)
         scope_label = f"كل النتائج ({len(rows)})"
     else:
-        effective_limit = max(1, int(limit))
-        rows = _structure_edge_fetch_results(effective_limit)
+        rows = _structure_edge_fetch_results(max(1, int(limit)))
         scope_label = f"آخر {len(rows)} نتيجة"
 
-    wins = sum(1 for x in rows if x.get("result") == "win")
-    losses = sum(1 for x in rows if x.get("result") == "loss")
-    draws = sum(1 for x in rows if x.get("result") == "draw")
-    decided = wins + losses
-    wr = round(wins / decided * 100, 1) if decided else 0.0
+    def stats(subset):
+        w = sum(1 for x in subset if x.get("result") == "win")
+        l = sum(1 for x in subset if x.get("result") == "loss")
+        d = sum(1 for x in subset if x.get("result") == "draw")
+        rate = round(w / (w + l) * 100, 1) if (w + l) else 0.0
+        return w, l, d, rate
+
+    wins, losses, draws, wr = stats(rows)
+    family_lines = []
+    for fam, label in (("TRENDLINE", "Trendline"), ("SR", "Support/Resistance"), ("ROUND", "Round Number")):
+        subset = []
+        for row in rows:
+            families = row.get("price_action_families") if isinstance(row.get("price_action_families"), list) else []
+            if not families:
+                families = [row.get("primary_family") or _price_action_family_from_setup(row.get("setup"))]
+            if fam in [str(x) for x in families]:
+                subset.append(row)
+        w, l, d, rate = stats(subset)
+        family_lines.append(f"• {label}: {w}W / {l}L / {d}D — {rate}% ({len(subset)})")
+
     setup_lines = []
-    for setup in ("TRENDLINE_BREAKOUT", "TRENDLINE_BOUNCE"):
-        subset = [x for x in rows if str(x.get("setup") or "") == setup]
-        sw = sum(1 for x in subset if x.get("result") == "win")
-        sl = sum(1 for x in subset if x.get("result") == "loss")
-        sd = sum(1 for x in subset if x.get("result") == "draw")
-        sr = round(sw / max(1, sw + sl) * 100, 1) if (sw + sl) else 0.0
-        label = "BREAKOUT" if setup == "TRENDLINE_BREAKOUT" else "BOUNCE"
-        setup_lines.append(f"• {label}: {sw}W / {sl}L / {sd}D — {sr}%")
+    setup_labels = (
+        ("TRENDLINE_BREAKOUT", "TL BREAKOUT"), ("TRENDLINE_BOUNCE", "TL BOUNCE"),
+        ("SR_BREAKOUT", "S/R BREAKOUT"), ("SR_BOUNCE", "S/R BOUNCE"),
+        ("ROUND_BREAKOUT", "ROUND BREAKOUT"), ("ROUND_BOUNCE", "ROUND BOUNCE"),
+    )
+    for setup, label in setup_labels:
+        subset = []
+        for row in rows:
+            components = row.get("price_action_components") if isinstance(row.get("price_action_components"), list) else []
+            if not components:
+                components = [row.get("setup")]
+            if setup in [str(x) for x in components]:
+                subset.append(row)
+        w, l, d, rate = stats(subset)
+        if subset:
+            setup_lines.append(f"• {label}: {w}W / {l}L / {d}D — {rate}%")
+
+    single = []
+    confluence = []
+    for row in rows:
+        families = row.get("price_action_families") if isinstance(row.get("price_action_families"), list) else []
+        if len(set(str(x) for x in families if x)) >= 2:
+            confluence.append(row)
+        else:
+            single.append(row)
+    sw, sl, sd, sr = stats(single)
+    cw, cl, cd, cr = stats(confluence)
     avg_latency_rows = [float(x.get("execution_latency_ms")) for x in rows if isinstance(x.get("execution_latency_ms"), (int, float))]
     avg_latency = round(sum(avg_latency_rows) / len(avg_latency_rows)) if avg_latency_rows else None
+    extra = ""
+    if confluence:
+        extra = f"\n\n🤝 Confluence 2+ families: {cw}W / {cl}L / {cd}D — {cr}% ({len(confluence)})\n• Single-family: {sw}W / {sl}L / {sd}D — {sr}% ({len(single)})"
     return (
-        f"📊 Trendline Edge — {scope_label}\n"
+        f"📊 Price Action Edge — {scope_label}\n"
         "━━━━━━━━━━━━━━\n"
         f"✅ Win: {wins}\n❌ Loss: {losses}\n⚖️ Draw: {draws}\n"
         f"📈 Win rate: {wr}%\n🧨 Max loss streak: {_structure_edge_max_loss_streak(rows)}\n"
         f"⚡ Avg execution latency: {str(avg_latency) + ' ms' if avg_latency is not None else '-'}\n\n"
-        "حسب الـSetup:\n" + "\n".join(setup_lines)
+        "حسب المدرسة (الصفقة المتوافقة قد تُحسب بأكثر من مدرسة):\n" + "\n".join(family_lines) +
+        ("\n\nحسب الـSetup:\n" + "\n".join(setup_lines) if setup_lines else "") + extra
     )[:3900]
 
 
@@ -13201,16 +13545,18 @@ def build_structure_edge_status() -> str:
     last_line = _structure_edge_state.get("last_line") or {}
     line_text = "-"
     if isinstance(last_line, dict) and last_line:
-        line_text = f"{last_line.get('pair')} | {last_line.get('type')} | touches {last_line.get('touches')} | q {last_line.get('quality')}%"
+        line_text = f"{last_line.get('pair')} | {last_line.get('family')} | {last_line.get('type')} | touches {last_line.get('touches')} | q {last_line.get('quality')}%"
+    family_counts = _structure_edge_state.get("family_setups_found") or {}
     return (
-        "📋 حالة Trendline Edge — TEST\n"
+        "📋 حالة Price Action Edge — TEST\n"
         "━━━━━━━━━━━━━━\n"
         f"الحالة: {'شغال ✅' if settings.get('enabled') else 'متوقف ⏸'}\n"
         f"الهدف: {_structure_edge_target_chat_id()}\n"
         f"M1 warmup المطلوب: {STRUCTURE_EDGE_MIN_CLOSED_M1} شمعة لكل زوج\n"
-        f"Pairs ready: {_structure_edge_state.get('pairs_ready', 0)} | valid lines last scan: {_structure_edge_state.get('lines_found', 0)}\n"
-        f"Setups last scan: {_structure_edge_state.get('setups_found', 0)}\n"
-        f"آخر خط معتبر: {line_text}\n"
+        f"Pairs ready: {_structure_edge_state.get('pairs_ready', 0)}\n"
+        f"Levels last scan: TL {_structure_edge_state.get('lines_found', 0)} | S/R {_structure_edge_state.get('sr_levels_found', 0)} | Round {_structure_edge_state.get('round_levels_found', 0)}\n"
+        f"Setups last scan: {_structure_edge_state.get('setups_found', 0)} | TL {family_counts.get('TRENDLINE', 0)} | S/R {family_counts.get('SR', 0)} | Round {family_counts.get('ROUND', 0)}\n"
+        f"آخر مستوى معتبر: {line_text}\n"
         f"Setup score الأدنى: {STRUCTURE_EDGE_MIN_SCORE}% | Payout الأدنى: {STRUCTURE_EDGE_MIN_PAYOUT}%\n"
         f"Pre-arm: الثانية {TRENDLINE_PREARM_MIN_SECOND:g}–{TRENDLINE_PREARM_LAST_SECOND:g} قبل الإغلاق | Final ≤ {TRENDLINE_FINAL_MAX_SECOND:g}s\n"
         f"صلاحية أمر التنفيذ: {TRENDLINE_EXECUTION_MAX_DELAY_SECONDS}s | Max Open displacement: {round(TRENDLINE_ENTRY_MAX_DISPLACEMENT_ATR*100, 1)}% ATR\n"
@@ -13219,7 +13565,7 @@ def build_structure_edge_status() -> str:
         f"صفقة قيد المتابعة: {pending_text}\nآخر Candidate: {last_text}\n"
         f"آخر رفض: {_structure_edge_state.get('last_reject_reason') or '-'}\n"
         f"آخر Scan: {_structure_edge_state.get('last_scan_at') or '-'}\nآخر خطأ: {_structure_edge_state.get('last_error') or '-'}\n\n"
-        "المنطق: Trendline setup يتشكل قرب الإغلاق → Pre-arm للزوج → Final check بعد الإغلاق → دخول فوري قرب Open الشمعة التالية.\n"
+        "المنطق: Trendline + S/R + Round Number → Breakout/Bounce → دمج Confluence → Pre-arm → Final check → دخول قرب Open الشمعة التالية.\n"
         f"Extension online: {_copy_online_clients_for_user(ADMIN_TELEGRAM_ID)} | Copy sent: {_structure_edge_state.get('copy_signals_sent', 0)} | order reports: {_structure_edge_state.get('execution_reports', 0)} | skipped: {_structure_edge_state.get('extension_skips', 0)}\n"
         "🧪 التنفيذ: Chrome Extension — DEMO فقط — $1 — بدون مضاعفات."
     )[:3900]
@@ -13230,9 +13576,9 @@ def _structure_edge_reset_results() -> tuple[bool, str]:
         _structure_edge_results_ref().delete()
         _structure_edge_executions_ref().delete()
         _structure_edge_state.update({"results_sent": 0, "last_result_at": None, "execution_reports": 0})
-        return True, "✅ تم تصفير نتائج Trendline Edge فقط. نتائج Structure/Statistical السابقة بقيت بأرشيفها."
+        return True, "✅ تم تصفير نتائج Price Action Edge فقط. نتائج Structure/Statistical السابقة بقيت بأرشيفها."
     except Exception as exc:
-        logger.exception("Trendline Edge results reset failed: %s", exc)
+        logger.exception("Price Action Edge results reset failed: %s", exc)
         return False, f"❌ تعذر تصفير النتائج: {exc}"
 
 async def _structure_edge_process_pending(context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -13255,12 +13601,12 @@ async def _structure_edge_process_pending(context: ContextTypes.DEFAULT_TYPE) ->
         await safe_send_message(
             context.bot,
             chat_id=_structure_edge_target_chat_id(),
-            text=f"⚠️ Trendline Edge: لم تصل نتيجة Quotex مؤكدة للإشارة {trade.get('pair')} {trade.get('direction')} ضمن المهلة. لم تُحسب Win/Loss.",
+            text=f"⚠️ Price Action Edge: لم تصل نتيجة Quotex مؤكدة للإشارة {trade.get('pair')} {trade.get('direction')} ضمن المهلة. لم تُحسب Win/Loss.",
         )
         return False
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Trendline Edge pending result timeout failed: %s", exc)
+        logger.exception("Price Action Edge pending result timeout failed: %s", exc)
         return True
 
 
@@ -13291,7 +13637,7 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
     try:
         client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
         if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Trendline Edge opened event | user=%s", client_uid)
+            logger.warning("Ignored non-owner Price Action Edge opened event | user=%s", client_uid)
             return False
         if str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
@@ -13316,6 +13662,11 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
             "line_quality": int((pending or {}).get("line_quality") or (payload_event or {}).get("m5_strength") or 0),
             "line_touches": int((pending or {}).get("line_touches") or 0),
             "line_slope_atr": float((pending or {}).get("line_slope_atr") or 0),
+            "primary_family": (payload_event or {}).get("primary_family") or (pending or {}).get("primary_family") or _price_action_family_from_setup((payload_event or {}).get("setup") or (pending or {}).get("setup")),
+            "price_action_families": (payload_event or {}).get("price_action_families") or (pending or {}).get("price_action_families") or [],
+            "price_action_components": (payload_event or {}).get("price_action_components") or (pending or {}).get("price_action_components") or [],
+            "level_type": (payload_event or {}).get("level_type") or (pending or {}).get("level_type") or (pending or {}).get("line_type"),
+            "level_value": (payload_event or {}).get("level_value") if (payload_event or {}).get("level_value") is not None else (pending or {}).get("level_value", (pending or {}).get("line_value")),
             "signal_created_at": (payload_event or {}).get("signal_created_at") or (pending or {}).get("created_at"),
             "executed_at": (payload_event or {}).get("executed_at") or now_iso(),
             "execution_latency_ms": (payload_event or {}).get("execution_latency_ms"),
@@ -13353,12 +13704,13 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
                 TRADING_TIME_TELEGRAM_APP.bot,
                 chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    "⚡ TRENDLINE EDGE — ORDER SENT\n"
+                    "⚡ PRICE ACTION EDGE — ORDER SENT\n"
                     "━━━━━━━━━━━━━━\n"
                     f"💱 {record.get('pair')}\n"
                     f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
-                    f"🧠 {record.get('setup')} • {record.get('line_type')}\n"
-                    f"📏 touches {record.get('line_touches') or '-'} • line quality {record.get('line_quality') or '-'}%\n"
+                    f"🧠 {record.get('setup')} • {record.get('primary_family') or '-'}\n"
+                    f"📍 {record.get('level_type') or record.get('line_type')} @ {record.get('level_value') if record.get('level_value') is not None else '-'}\n"
+                    f"🤝 {' + '.join(str(x) for x in (record.get('price_action_families') or [record.get('primary_family') or '-']))}\n"
                     f"💵 DEMO • ${amount:g}\n"
                     f"🕐 إرسال أمر الدخول: {_structure_edge_local_hms(record.get('executed_at'))} UTC+3\n"
                     f"🏁 انتهاء الصفقة: {_structure_edge_local_hms(record.get('expires_at'))} UTC+3\n"
@@ -13372,16 +13724,16 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Trendline Edge opened audit record failed: %s", exc)
+        logger.exception("Price Action Edge opened audit record failed: %s", exc)
         return False
 
 
 async def _copy_record_structure_edge_trade_result(payload_event: dict, client: dict | None = None) -> bool:
-    """Persist a confirmed Trendline Edge result reported by the owner's extension."""
+    """Persist a confirmed Price Action Edge result reported by the owner's extension."""
     try:
         client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
         if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Trendline Edge result event | user=%s", client_uid)
+            logger.warning("Ignored non-owner Price Action Edge result event | user=%s", client_uid)
             return False
         if str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
@@ -13418,6 +13770,11 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
             "line_quality": int((pending or {}).get("line_quality") or (payload_event or {}).get("m5_strength") or 0),
             "line_touches": int((pending or {}).get("line_touches") or 0),
             "line_slope_atr": float((pending or {}).get("line_slope_atr") or 0),
+            "primary_family": (payload_event or {}).get("primary_family") or (pending or {}).get("primary_family") or _price_action_family_from_setup((payload_event or {}).get("setup") or (pending or {}).get("setup")),
+            "price_action_families": (payload_event or {}).get("price_action_families") or (pending or {}).get("price_action_families") or [],
+            "price_action_components": (payload_event or {}).get("price_action_components") or (pending or {}).get("price_action_components") or [],
+            "level_type": (payload_event or {}).get("level_type") or (pending or {}).get("level_type") or (pending or {}).get("line_type"),
+            "level_value": (payload_event or {}).get("level_value") if (payload_event or {}).get("level_value") is not None else (pending or {}).get("level_value", (pending or {}).get("line_value")),
             "entry_bucket": int((pending or {}).get("entry_bucket") or 0),
             "entry_price": float((pending or {}).get("entry_price") or 0),
             "close_price": 0.0,
@@ -13466,12 +13823,13 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
                 TRADING_TIME_TELEGRAM_APP.bot,
                 chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    f"📐 TRENDLINE EDGE — {result_text}\n"
+                    f"📐 PRICE ACTION EDGE — {result_text}\n"
                     "━━━━━━━━━━━━━━\n"
                     f"💱 {record.get('pair')}\n"
                     f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
-                    f"🧠 {record.get('setup')} • {record.get('line_type')}\n"
-                    f"📏 touches {record.get('line_touches') or '-'} • line quality {record.get('line_quality') or '-'}%\n"
+                    f"🧠 {record.get('setup')} • {record.get('primary_family') or '-'}\n"
+                    f"📍 {record.get('level_type') or record.get('line_type')} @ {record.get('level_value') if record.get('level_value') is not None else '-'}\n"
+                    f"🤝 {' + '.join(str(x) for x in (record.get('price_action_families') or [record.get('primary_family') or '-']))}\n"
                     f"💵 Net: {net_text} | DEMO\n"
                     f"⚡ Latency: {latency_text}\n"
                     "━━━━━━━━━━━━━━\n"
@@ -13482,12 +13840,12 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Trendline Edge extension result record failed: %s", exc)
+        logger.exception("Price Action Edge extension result record failed: %s", exc)
         return False
 
 
 async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: dict | None = None) -> bool:
-    """Record a Trendline Edge signal that the owner extension intentionally skipped.
+    """Record a Price Action Edge signal that the owner extension intentionally skipped.
 
     A skip is diagnostic only: it clears a matching pending trade and never creates a
     Win/Loss row. Idempotency prevents outbox retries from inflating the skip counter.
@@ -13495,7 +13853,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
     try:
         client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
         if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Trendline Edge skip event | user=%s", client_uid)
+            logger.warning("Ignored non-owner Price Action Edge skip event | user=%s", client_uid)
             return False
         if str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
@@ -13522,7 +13880,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
             _structure_edge_state["pending_trade"] = None
 
         logger.info(
-            "Trendline Edge extension skip | signal=%s | pair=%s | direction=%s | reason=%s",
+            "Price Action Edge extension skip | signal=%s | pair=%s | direction=%s | reason=%s",
             signal_id,
             (payload_event or {}).get("pair"),
             (payload_event or {}).get("direction"),
@@ -13533,7 +13891,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
                 TRADING_TIME_TELEGRAM_APP.bot,
                 chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    "⏭️ TRENDLINE EDGE — SKIPPED\n"
+                    "⏭️ PRICE ACTION EDGE — SKIPPED\n"
                     "━━━━━━━━━━━━━━\n"
                     f"💱 {(payload_event or {}).get('pair') or (pending or {}).get('pair')}\n"
                     f"📌 {_structure_edge_direction_label((payload_event or {}).get('direction') or (pending or {}).get('direction'))}\n"
@@ -13544,12 +13902,12 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Trendline Edge extension skip record failed: %s", exc)
+        logger.exception("Price Action Edge extension skip record failed: %s", exc)
         return False
 
 
 async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
-    """Trendline Edge v1.20.2 PRE-ARM state machine.
+    """Price Action Edge v1.21 PRE-ARM state machine.
 
     Phase A (56.5-59s): analyze the still-forming signal candle and PREPARE only the best pair.
     Phase B (0-1.5s next minute): re-analyze that same pair using the now CLOSED candle. Only if
@@ -13588,12 +13946,13 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
                 pair = str(prearmed.get("pair") or "")
                 symbol = str(prearmed.get("symbol") or "") or get_otc_symbol_for_pair(pair)
                 final = analyze_structure_edge_pair(pair, symbol)
-                same_setup = bool(final.get("ok")) and str(final.get("setup")) == str(prearmed.get("setup"))
                 same_direction = bool(final.get("ok")) and str(final.get("direction")) == str(prearmed.get("direction"))
-                same_line = bool(final.get("ok")) and str(final.get("line_type")) == str(prearmed.get("line_type"))
-                if not (same_setup and same_direction and same_line):
+                pre_components = set(str(x) for x in (prearmed.get("price_action_components") or [prearmed.get("setup")]) if x)
+                final_components = set(str(x) for x in (final.get("price_action_components") or [final.get("setup")]) if x) if final.get("ok") else set()
+                setup_overlap = bool(pre_components & final_components)
+                if not (same_direction and setup_overlap):
                     _structure_edge_state["prearm_cancelled"] = int(_structure_edge_state.get("prearm_cancelled", 0) or 0) + 1
-                    _structure_edge_state["last_reject_reason"] = f"Pre-arm invalidated at close: {final.get('reason') or 'setup changed'}"
+                    _structure_edge_state["last_reject_reason"] = f"Pre-arm invalidated at close: {final.get('reason') or 'direction/setup changed'}"
                     _structure_edge_state["prearmed_candidate"] = None
                     return
 
@@ -13664,7 +14023,7 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
         _structure_edge_state["last_prearm_attempt_ts"] = now_ts
         candidates = _structure_edge_scan_market(provisional_current=True)
         if not candidates:
-            _structure_edge_state["last_reject_reason"] = "No provisional Trendline setup near close"
+            _structure_edge_state["last_reject_reason"] = "No provisional Price Action setup near close"
             return
 
         item = dict(candidates[0])
@@ -13686,7 +14045,7 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
         _structure_edge_state["last_reject_reason"] = "Pair pre-armed; waiting for candle close final check"
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Trendline Edge pre-arm job error: %s", exc)
+        logger.exception("Price Action Edge pre-arm job error: %s", exc)
 
 
 # v1.02: Three Candle timing/filter tuning only; Public remains a mirror of accepted private signals.
@@ -21491,47 +21850,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
 
-        if text == "📐 Trendline Edge":
+        if text == "📐 Price Action Edge":
             reset_signal_state(context)
             await update.message.reply_text(
-                "📐 Trendline Edge — نفس خانة الاختبار السابقة\n"
-                "رسم Trendline كلاسيكي من Swing High/Low.\n"
-                "Break + Close خارج الخط → مع الكسر، أو Bounce candle من الخط → مع الارتداد بالشمعة التالية.\n"
-                "الجديد: Pre-arm قبل إغلاق الشمعة ثم Final check عند الفتح، حتى يكون أمر الدخول قريب جدًا من Open الشمعة التالية.\n"
+                "📐 Price Action Edge — نفس خانة الاختبار السابقة\n"
+                "3 مدارس بنفس المحرك: Trendline + Support/Resistance + Round Numbers.\n"
+                "كل مدرسة تختبر Break + Close مع الكسر، وBounce candle مع الارتداد بالشمعة التالية.\n"
+                "إذا اتفقت مدرستان أو أكثر بنفس الاتجاه والمنطقة تُرسل صفقة واحدة وتُسجل Confluence.\n"
+                "Pre-arm قبل الإغلاق + Final check عند الفتح للحفاظ على دخول قريب من Open الشمعة.\n"
                 "لا تغيّر قناة الثغرة. Chrome DEMO فقط، وسجل القناة Signal → Order Sent/Skip → Result.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
 
-        if text == "🟢 تشغيل Trendline Edge":
+        if text == "🟢 تشغيل Price Action Edge":
             ok = _structure_edge_set_enabled(True)
             await update.message.reply_text(
-                "✅ تم تشغيل Trendline Edge — DEMO Test." if ok else "❌ تعذر تشغيل Trendline Edge. راجع اللوج.",
+                "✅ تم تشغيل Price Action Edge — DEMO Test." if ok else "❌ تعذر تشغيل Price Action Edge. راجع اللوج.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
 
-        if text == "🔴 إيقاف Trendline Edge":
+        if text == "🔴 إيقاف Price Action Edge":
             ok = _structure_edge_set_enabled(False)
             await update.message.reply_text(
-                "⛔ تم إيقاف Trendline Edge." if ok else "❌ تعذر إيقاف Trendline Edge. راجع اللوج.",
+                "⛔ تم إيقاف Price Action Edge." if ok else "❌ تعذر إيقاف Price Action Edge. راجع اللوج.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
 
-        if text == "📋 حالة Trendline Edge":
+        if text == "📋 حالة Price Action Edge":
             await update.message.reply_text(build_structure_edge_status(), reply_markup=structure_edge_admin_keyboard)
             return
 
-        if text == "📊 ملخص Trendline Edge":
+        if text == "📊 ملخص Price Action Edge":
             await update.message.reply_text(build_structure_edge_summary(), reply_markup=structure_edge_admin_keyboard)
             return
 
-        if text == "📚 كل نتائج Trendline Edge":
+        if text == "📚 كل نتائج Price Action Edge":
             await update.message.reply_text(build_structure_edge_summary(limit=0), reply_markup=structure_edge_admin_keyboard)
             return
 
-        if text == "🧹 تصفير نتائج Trendline Edge":
+        if text == "🧹 تصفير نتائج Price Action Edge":
             ok, msg = _structure_edge_reset_results()
             await update.message.reply_text(msg, reply_markup=structure_edge_admin_keyboard)
             return
@@ -22551,6 +22911,12 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         "m5_bias": str(payload.get("m5_bias") or "")[:16] or None,
         "m5_strength": int(payload.get("m5_strength")) if str(payload.get("m5_strength") or "").strip().isdigit() else None,
         "structure_confluences": [str(x)[:120] for x in (payload.get("structure_confluences") or [])[:8]] if isinstance(payload.get("structure_confluences"), list) else [],
+        # v1.21 Price Action Edge metadata.
+        "price_action_families": [str(x)[:24] for x in (payload.get("price_action_families") or [])[:4]] if isinstance(payload.get("price_action_families"), list) else [],
+        "price_action_components": [str(x)[:80] for x in (payload.get("price_action_components") or [])[:8]] if isinstance(payload.get("price_action_components"), list) else [],
+        "primary_family": str(payload.get("primary_family") or "")[:24] or None,
+        "level_type": str(payload.get("level_type") or "")[:40] or None,
+        "level_value": float(payload.get("level_value")) if str(payload.get("level_value") or "").strip().replace(".", "", 1).replace("-", "", 1).isdigit() else None,
         "stat_model_confidence": float(payload.get("stat_model_confidence")) if str(payload.get("stat_model_confidence") or "").strip().replace(".", "", 1).isdigit() else None,
         "stat_model_support": int(payload.get("stat_model_support")) if str(payload.get("stat_model_support") or "").strip().isdigit() else None,
         "stat_model_pairs": int(payload.get("stat_model_pairs")) if str(payload.get("stat_model_pairs") or "").strip().isdigit() else None,
@@ -24745,7 +25111,7 @@ def run_telegram_bot_only():
         name="multi_user_otc_edge_watcher",
     )
 
-    # v1.20.3: Trendline Edge PRE-ARM/open-sync retained; 200/all summary + extension TEST result accounting. v1.20.1 Telegram polling-loop hotfix retained.
+    # v1.21.0: Price Action Edge = Trendline + S/R + Round Numbers with confluence; PRE-ARM/open-sync + 200/all summary retained; v1.20.1 Telegram polling-loop hotfix retained.
     job_queue.run_repeating(
         structure_edge_job,
         interval=STRUCTURE_EDGE_SCAN_SECONDS,
