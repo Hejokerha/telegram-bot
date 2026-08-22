@@ -496,7 +496,7 @@ structure_edge_admin_keyboard = ReplyKeyboardMarkup(
     [
         ["🟢 تشغيل Trendline Edge", "🔴 إيقاف Trendline Edge"],
         ["📋 حالة Trendline Edge", "📊 ملخص Trendline Edge"],
-        ["🧹 تصفير نتائج Trendline Edge"],
+        ["📚 كل نتائج Trendline Edge", "🧹 تصفير نتائج Trendline Edge"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -1029,7 +1029,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.20.2"
+COPY_SERVER_VERSION = "1.20.3"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -12557,7 +12557,7 @@ STRUCTURE_EDGE_RESULT_DELAY_SECONDS = max(2, int(os.getenv("STRUCTURE_EDGE_RESUL
 STRUCTURE_EDGE_EXTENSION_RESULT_TIMEOUT_SECONDS = max(30, int(os.getenv("STRUCTURE_EDGE_EXTENSION_RESULT_TIMEOUT_SECONDS", "90")))
 STRUCTURE_EDGE_PAIR_COOLDOWN_SECONDS = max(60, int(os.getenv("STRUCTURE_EDGE_PAIR_COOLDOWN_SECONDS", "300")))
 STRUCTURE_EDGE_MIN_CLOSED_M1 = max(20, int(os.getenv("STRUCTURE_EDGE_MIN_CLOSED_M1", "25")))
-STRUCTURE_EDGE_RESULT_REPORT_LIMIT = max(10, int(os.getenv("STRUCTURE_EDGE_RESULT_REPORT_LIMIT", "50")))
+STRUCTURE_EDGE_RESULT_REPORT_LIMIT = max(200, int(os.getenv("STRUCTURE_EDGE_RESULT_REPORT_LIMIT", "200")))
 STRUCTURE_EDGE_CHANNEL_ID_RAW = str(os.getenv("STRUCTURE_EDGE_CHANNEL_ID", "") or "").strip()
 STRUCTURE_EDGE_DEFAULT_ENABLED = os.getenv("STRUCTURE_EDGE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 
@@ -13147,8 +13147,21 @@ def _structure_edge_max_loss_streak(rows: list[dict]) -> int:
 
 
 def build_structure_edge_summary(limit: int | None = None) -> str:
-    effective = int(limit or STRUCTURE_EDGE_RESULT_REPORT_LIMIT)
-    rows = _structure_edge_fetch_results(effective)
+    # v1.20.3: default report covers the latest 200 confirmed trades. Passing 0
+    # intentionally means ALL stored Trendline Edge results, so long unattended
+    # DEMO runs can be audited without silently truncating the scorecard at 50.
+    if limit is None:
+        effective_limit = STRUCTURE_EDGE_RESULT_REPORT_LIMIT
+        rows = _structure_edge_fetch_results(effective_limit)
+        scope_label = f"آخر {len(rows)} نتيجة"
+    elif int(limit) <= 0:
+        rows = _structure_edge_fetch_results(None)
+        scope_label = f"كل النتائج ({len(rows)})"
+    else:
+        effective_limit = max(1, int(limit))
+        rows = _structure_edge_fetch_results(effective_limit)
+        scope_label = f"آخر {len(rows)} نتيجة"
+
     wins = sum(1 for x in rows if x.get("result") == "win")
     losses = sum(1 for x in rows if x.get("result") == "loss")
     draws = sum(1 for x in rows if x.get("result") == "draw")
@@ -13166,7 +13179,7 @@ def build_structure_edge_summary(limit: int | None = None) -> str:
     avg_latency_rows = [float(x.get("execution_latency_ms")) for x in rows if isinstance(x.get("execution_latency_ms"), (int, float))]
     avg_latency = round(sum(avg_latency_rows) / len(avg_latency_rows)) if avg_latency_rows else None
     return (
-        f"📊 Trendline Edge — آخر {effective} نتيجة\n"
+        f"📊 Trendline Edge — {scope_label}\n"
         "━━━━━━━━━━━━━━\n"
         f"✅ Win: {wins}\n❌ Loss: {losses}\n⚖️ Draw: {draws}\n"
         f"📈 Win rate: {wr}%\n🧨 Max loss streak: {_structure_edge_max_loss_streak(rows)}\n"
@@ -21514,6 +21527,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(build_structure_edge_summary(), reply_markup=structure_edge_admin_keyboard)
             return
 
+        if text == "📚 كل نتائج Trendline Edge":
+            await update.message.reply_text(build_structure_edge_summary(limit=0), reply_markup=structure_edge_admin_keyboard)
+            return
+
         if text == "🧹 تصفير نتائج Trendline Edge":
             ok, msg = _structure_edge_reset_results()
             await update.message.reply_text(msg, reply_markup=structure_edge_admin_keyboard)
@@ -24728,7 +24745,7 @@ def run_telegram_bot_only():
         name="multi_user_otc_edge_watcher",
     )
 
-    # v1.20.2: Trendline Edge PRE-ARM/open-sync execution; v1.20.1 Telegram polling-loop hotfix retained.
+    # v1.20.3: Trendline Edge PRE-ARM/open-sync retained; 200/all summary + extension TEST result accounting. v1.20.1 Telegram polling-loop hotfix retained.
     job_queue.run_repeating(
         structure_edge_job,
         interval=STRUCTURE_EDGE_SCAN_SECONDS,
