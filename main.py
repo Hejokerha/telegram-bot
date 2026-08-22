@@ -1029,7 +1029,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.20.0"
+COPY_SERVER_VERSION = "1.20.2"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -1041,6 +1041,7 @@ MOBILE_APP_RELEASE_NOTES = os.getenv(
 ).strip()
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
+TRADING_TIME_TELEGRAM_LOOP = None
 COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.00").strip() or "v1.00"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
@@ -3231,11 +3232,8 @@ def request_json_with_retries(url: str, *, params=None, headers=None, timeout: i
     return None, last_error or "تعذر جلب البيانات"
 
 
-async def safe_send_message(bot, *, chat_id, text: str, parse_mode: str | None = None, reply_markup=None):
-    """Send Telegram message safely.
-    Telegram can occasionally timeout without the bot being broken.
-    We retry once, then log a warning without crashing job callbacks.
-    """
+async def _safe_send_message_on_telegram_loop(bot, *, chat_id, text: str, parse_mode: str | None = None, reply_markup=None):
+    """Actual Telegram HTTP send. Must run on the polling application's owner event loop."""
     last_error = None
     for attempt in range(2):
         try:
@@ -3259,7 +3257,7 @@ async def safe_send_message(bot, *, chat_id, text: str, parse_mode: str | None =
                     try:
                         await asyncio.sleep(1.5)
                     except Exception:
-                        logger.debug("Suppressed exception at line 2460", exc_info=True)
+                        logger.debug("Telegram timeout retry sleep failed", exc_info=True)
                     continue
                 return None
 
@@ -3269,6 +3267,49 @@ async def safe_send_message(bot, *, chat_id, text: str, parse_mode: str | None =
     if last_error:
         logger.warning("Telegram send_message skipped after retries | chat_id=%s | error=%s", chat_id, last_error)
     return None
+
+
+async def safe_send_message(bot, *, chat_id, text: str, parse_mode: str | None = None, reply_markup=None):
+    """Thread/event-loop safe Telegram send.
+
+    The Telegram Application runs in its own polling thread while FastAPI/Uvicorn runs on
+    another asyncio loop. python-telegram-bot's HTTP client must never be awaited from the
+    Uvicorn loop. Cross-loop callers are marshalled back to the polling loop with
+    run_coroutine_threadsafe, preventing ``Event ... is bound to a different event loop``.
+    """
+    target_loop = globals().get("TRADING_TIME_TELEGRAM_LOOP")
+    try:
+        current_loop = asyncio.get_running_loop()
+    except RuntimeError:
+        current_loop = None
+
+    if target_loop is not None and current_loop is not target_loop:
+        if not target_loop.is_running():
+            logger.warning("Telegram send skipped because polling event loop is not running | chat_id=%s", chat_id)
+            return None
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                _safe_send_message_on_telegram_loop(
+                    bot,
+                    chat_id=chat_id,
+                    text=text,
+                    parse_mode=parse_mode,
+                    reply_markup=reply_markup,
+                ),
+                target_loop,
+            )
+            return await asyncio.wrap_future(future)
+        except Exception as e:
+            logger.exception("Telegram cross-loop marshal failed | chat_id=%s | error=%s", chat_id, e)
+            return None
+
+    return await _safe_send_message_on_telegram_loop(
+        bot,
+        chat_id=chat_id,
+        text=text,
+        parse_mode=parse_mode,
+        reply_markup=reply_markup,
+    )
 
 # ===== TRADING TIME COPY helpers =====
 def _copy_parse_iso(value: str | None):
@@ -3497,6 +3538,13 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
         "m5_bias": signal.get("m5_bias"),
         "m5_strength": signal.get("m5_strength"),
         "structure_confluences": signal.get("structure_confluences") or signal.get("confluences"),
+        # v1.20.2 Trendline pre-arm/open synchronization metadata.
+        "trendline_prearm": bool(signal.get("trendline_prearm") or False),
+        "trendline_target_bucket": signal.get("trendline_target_bucket"),
+        "trendline_candle_open": signal.get("trendline_candle_open"),
+        "trendline_signal_price": signal.get("trendline_signal_price"),
+        "trendline_entry_displacement_atr": signal.get("trendline_entry_displacement_atr"),
+        "trendline_prearmed_at": signal.get("trendline_prearmed_at"),
         "demo_only": bool(signal.get("demo_only") or False),
     }
 
@@ -3698,16 +3746,75 @@ async def publish_copy_three_candle_signal(trade: dict) -> dict:
         return {"ok": False, "error": str(e)}
 
 
-async def publish_copy_structure_edge_signal(trade: dict) -> dict:
-    """Send one Trendline Edge signal through the existing owner test slot.
+async def publish_copy_structure_edge_prepare_signal(trade: dict, target_entry_bucket: int) -> dict:
+    """Pre-select the Trendline Edge pair before the current M1 candle closes.
 
-    Test contract:
-    - owner/admin Telegram route only
-    - extension-only (never Android replay)
-    - DEMO-only enforced again by the extension
-    - no martingale / no sequence system
-    - entry is immediate in the first seconds of the current M1 candle
-    - expiry is the current M1 candle close
+    This packet NEVER opens a trade. It only moves the owner's extension to the pair and
+    refreshes the $1 / expiry settings so the final execute packet can use the fast path.
+    """
+    if not COPY_SEND_STRUCTURE_EDGE:
+        return {"ok": False, "skipped": True, "reason": "COPY_SEND_STRUCTURE_EDGE=false"}
+    try:
+        target_entry_bucket = int(target_entry_bucket or 0)
+        pair = str((trade or {}).get("pair") or "").strip()
+        symbol = str((trade or {}).get("symbol") or "").strip()
+        direction = str((trade or {}).get("direction") or "").strip().upper()
+        if target_entry_bucket <= 0 or not pair or direction not in {"CALL", "PUT"}:
+            return {"ok": False, "skipped": True, "reason": "missing prearm target/pair/direction"}
+        entry_dt = datetime.fromtimestamp(target_entry_bucket, tz=UTC)
+        expiry_dt = entry_dt + timedelta(seconds=60)
+        payload = {
+            "ok": True,
+            "id": f"trendline_prepare_{safe_key(pair)}_{target_entry_bucket}_{direction}",
+            "pair": pair,
+            "pair_display": pair,
+            "symbol": symbol or None,
+            "platform_symbol": symbol or pair,
+            "direction": direction,
+            "timeframe": "M1",
+            "duration_seconds": 60,
+            "duration_minutes": 1,
+            "entry_time": entry_dt.isoformat(),
+            "expires_at": (entry_dt + timedelta(seconds=10)).isoformat(),
+            "expiry_time": expiry_dt.isoformat(),
+            "expiry_timestamp": int(expiry_dt.timestamp()),
+            "trade_expiry_mode": "absolute_time",
+            "entry_mode": "prepare",
+            "copy_entry_mode": "prepare",
+            "execution_mode": "prepare_pair",
+            "signal_kind": "prepare",
+            "prepare_only": True,
+            "preselected_pair_mode": True,
+            "watch_pair": pair,
+            "quality": (trade or {}).get("score"),
+            "confidence": (trade or {}).get("score"),
+            "payout": (trade or {}).get("payout"),
+            "structure_setup": (trade or {}).get("setup"),
+            "structure_score": (trade or {}).get("score"),
+            "m5_bias": (trade or {}).get("m5_bias"),
+            "m5_strength": (trade or {}).get("m5_strength"),
+            "structure_confluences": list((trade or {}).get("confluences") or [])[:8],
+            "trendline_prearm": True,
+            "trendline_target_bucket": target_entry_bucket,
+            "trendline_prearmed_at": now_iso(),
+            "demo_only": True,
+            "creator_user_id": int(ADMIN_TELEGRAM_ID),
+            "target_user_id": int(ADMIN_TELEGRAM_ID),
+            "note": f"trendline_edge_v2_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | pair_prepare_only",
+        }
+        result = await publish_copy_trading_signal(payload, source="structure_edge")
+        logger.info("Trendline Edge pre-arm sent | pair=%s | target=%s | delivery=%s", pair, target_entry_bucket, result.get("delivery") if isinstance(result, dict) else result)
+        return result
+    except Exception as exc:
+        logger.exception("Trendline Edge pre-arm publish failed: %s", exc)
+        return {"ok": False, "error": str(exc)}
+
+
+async def publish_copy_structure_edge_signal(trade: dict) -> dict:
+    """Send the FINAL Trendline Edge execution after the prior M1 candle has closed.
+
+    The pair was already pre-armed before the boundary. This execute packet has a strict
+    two-second validity window and carries the new-candle open/displacement audit fields.
     """
     if not COPY_SEND_STRUCTURE_EDGE:
         return {"ok": False, "skipped": True, "reason": "COPY_SEND_STRUCTURE_EDGE=false"}
@@ -3722,6 +3829,7 @@ async def publish_copy_structure_edge_signal(trade: dict) -> dict:
             return {"ok": False, "skipped": True, "reason": "missing pair/direction"}
         entry_dt = datetime.fromtimestamp(entry_bucket, tz=UTC)
         expiry_dt = entry_dt + timedelta(seconds=60)
+        max_delay = int(TRENDLINE_EXECUTION_MAX_DELAY_SECONDS)
         payload = {
             "ok": True,
             "id": f"structure_{safe_key(pair)}_{entry_bucket}_{direction}_{safe_key((trade or {}).get('setup'))}",
@@ -3734,7 +3842,7 @@ async def publish_copy_structure_edge_signal(trade: dict) -> dict:
             "duration_seconds": 60,
             "duration_minutes": 1,
             "entry_time": entry_dt.isoformat(),
-            "expires_at": (entry_dt + timedelta(seconds=COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["structure_edge"])).isoformat(),
+            "expires_at": (entry_dt + timedelta(seconds=max_delay)).isoformat(),
             "expiry_time": expiry_dt.isoformat(),
             "expiry_timestamp": int(expiry_dt.timestamp()),
             "trade_expiry_mode": "absolute_time",
@@ -3745,7 +3853,7 @@ async def publish_copy_structure_edge_signal(trade: dict) -> dict:
             "direct_entry": True,
             "instant_entry": True,
             "allow_background_entry": True,
-            "max_entry_delay_seconds": COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["structure_edge"],
+            "max_entry_delay_seconds": max_delay,
             "quality": (trade or {}).get("score"),
             "confidence": (trade or {}).get("score"),
             "entry_price": (trade or {}).get("entry_price") or (trade or {}).get("price"),
@@ -3755,8 +3863,12 @@ async def publish_copy_structure_edge_signal(trade: dict) -> dict:
             "m5_bias": (trade or {}).get("m5_bias"),
             "m5_strength": (trade or {}).get("m5_strength"),
             "structure_confluences": list((trade or {}).get("confluences") or [])[:8],
-            # Keep protocol shape backward-compatible; Trendline metadata rides in the
-            # existing structure fields/confluences so v1.04 can reuse the secure path.
+            "trendline_prearm": True,
+            "trendline_target_bucket": entry_bucket,
+            "trendline_candle_open": (trade or {}).get("trendline_candle_open"),
+            "trendline_signal_price": (trade or {}).get("trendline_signal_price") or (trade or {}).get("entry_price") or (trade or {}).get("price"),
+            "trendline_entry_displacement_atr": (trade or {}).get("trendline_entry_displacement_atr"),
+            "trendline_prearmed_at": (trade or {}).get("prearmed_at"),
             "stat_model_confidence": None,
             "stat_model_support": None,
             "stat_model_pairs": None,
@@ -3765,16 +3877,13 @@ async def publish_copy_structure_edge_signal(trade: dict) -> dict:
             "demo_only": True,
             "creator_user_id": int(ADMIN_TELEGRAM_ID),
             "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"trendline_edge_v1 | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | line={(trade or {}).get('line_type')} | touches={(trade or {}).get('line_touches')} | demo_only",
+            "note": f"trendline_edge_v2_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | line={(trade or {}).get('line_type')} | touches={(trade or {}).get('line_touches')} | demo_only",
         }
         result = await publish_copy_trading_signal(payload, source="structure_edge")
-        logger.info(
-            "Copy Trading Trendline Edge sent | pair=%s | setup=%s | score=%s | delivery=%s",
-            pair, (trade or {}).get("setup"), (trade or {}).get("score"), result.get("delivery") if isinstance(result, dict) else result,
-        )
+        logger.info("Copy Trading Trendline Edge FINAL sent | pair=%s | setup=%s | score=%s | delivery=%s", pair, (trade or {}).get("setup"), (trade or {}).get("score"), result.get("delivery") if isinstance(result, dict) else result)
         return result
     except Exception as exc:
-        logger.exception("Trendline Edge Copy publish failed: %s", exc)
+        logger.exception("Trendline Edge final Copy publish failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -12427,15 +12536,23 @@ THREE_CANDLE_CHANNEL_ENABLED = os.getenv("THREE_CANDLE_CHANNEL_ENABLED", "false"
 # Candidate lines are validated for slope, freshness, touches and absence of repeated prior closes
 # through the line. Execution/audit contract stays owner Chrome extension only, physical DEMO,
 # fixed $1, no martingale/sequence, strict late-entry cancellation, authoritative Quotex result.
-STRUCTURE_EDGE_SCAN_SECONDS = max(1, int(os.getenv("STRUCTURE_EDGE_SCAN_SECONDS", "1")))
+# v1.20.2 PRE-ARM: lightweight scheduler ticks twice per second, but the expensive
+# market scan still runs at most twice in the final seconds of each M1 candle.
+STRUCTURE_EDGE_SCAN_SECONDS = max(0.25, float(os.getenv("STRUCTURE_EDGE_SCAN_SECONDS", "0.5")))
 # Kept under the old env name for deployment compatibility. Here it is line/setup quality score.
 STRUCTURE_EDGE_MIN_SCORE = max(50, min(95, int(os.getenv("STRUCTURE_EDGE_MIN_SCORE", "70"))))
 STRUCTURE_EDGE_MIN_PAYOUT = max(0, min(100, int(os.getenv("STRUCTURE_EDGE_MIN_PAYOUT", "85"))))
-STRUCTURE_EDGE_ENTRY_MIN_SECOND = max(0, min(20, int(os.getenv("STRUCTURE_EDGE_ENTRY_MIN_SECOND", "2"))))
-STRUCTURE_EDGE_ENTRY_MAX_SECOND = max(
-    STRUCTURE_EDGE_ENTRY_MIN_SECOND,
-    min(30, int(os.getenv("STRUCTURE_EDGE_ENTRY_MAX_SECOND", "4"))),
-)
+# Pre-arm the pair BEFORE candle close, then perform one pair-local final validation just
+# after the minute boundary. The execute packet itself is valid for only ~2 seconds.
+TRENDLINE_PREARM_MIN_SECOND = max(50.0, min(59.0, float(os.getenv("TRENDLINE_PREARM_MIN_SECOND", "56.5"))))
+TRENDLINE_PREARM_LAST_SECOND = max(TRENDLINE_PREARM_MIN_SECOND, min(59.7, float(os.getenv("TRENDLINE_PREARM_LAST_SECOND", "59.0"))))
+TRENDLINE_PREARM_MAX_ATTEMPTS = max(1, min(3, int(os.getenv("TRENDLINE_PREARM_MAX_ATTEMPTS", "2"))))
+TRENDLINE_PREARM_RETRY_SECONDS = max(0.5, min(3.0, float(os.getenv("TRENDLINE_PREARM_RETRY_SECONDS", "1.5"))))
+TRENDLINE_FINAL_MAX_SECOND = max(0.4, min(3.0, float(os.getenv("TRENDLINE_FINAL_MAX_SECOND", "1.5"))))
+TRENDLINE_EXECUTION_MAX_DELAY_SECONDS = max(1, min(3, int(os.getenv("TRENDLINE_EXECUTION_MAX_DELAY_SECONDS", "2"))))
+# Do not chase the new candle. At final validation, the live price must remain close to
+# the new M1 open (or previous close fallback) by a fraction of the pair's recent M1 ATR/range.
+TRENDLINE_ENTRY_MAX_DISPLACEMENT_ATR = max(0.01, min(0.25, float(os.getenv("TRENDLINE_ENTRY_MAX_DISPLACEMENT_ATR", "0.06"))))
 STRUCTURE_EDGE_RESULT_DELAY_SECONDS = max(2, int(os.getenv("STRUCTURE_EDGE_RESULT_DELAY_SECONDS", "4")))
 STRUCTURE_EDGE_EXTENSION_RESULT_TIMEOUT_SECONDS = max(30, int(os.getenv("STRUCTURE_EDGE_EXTENSION_RESULT_TIMEOUT_SECONDS", "90")))
 STRUCTURE_EDGE_PAIR_COOLDOWN_SECONDS = max(60, int(os.getenv("STRUCTURE_EDGE_PAIR_COOLDOWN_SECONDS", "300")))
@@ -12459,6 +12576,14 @@ _structure_edge_state = {
     "pending_trade": None,
     "last_scan_at": None,
     "last_scan_bucket": 0,
+    "prearmed_candidate": None,
+    "prearm_bucket": 0,
+    "prearm_target_bucket": 0,
+    "prearm_attempts": 0,
+    "last_prearm_attempt_ts": 0.0,
+    "last_prearm_at": None,
+    "prearm_sent": 0,
+    "prearm_cancelled": 0,
     "last_signal_at": None,
     "last_result_at": None,
     "last_candidate": None,
@@ -12851,7 +12976,12 @@ def _structure_edge_pair_ready(pair: str, now_ts: float) -> bool:
         return True
 
 
-def _structure_edge_scan_market() -> list[dict]:
+def _structure_edge_scan_market(provisional_current: bool = False) -> list[dict]:
+    """Scan all OTC currency pairs.
+
+    provisional_current=True appends the still-forming current M1 candle so the pair can
+    be PRE-ARMED before close. The final trade is never authorized by this provisional scan.
+    """
     pair_map = get_otc_analysis_pair_map()
     current_bucket = int(time_module.time() // 60) * 60
     candidates = []
@@ -12866,7 +12996,16 @@ def _structure_edge_scan_market() -> list[dict]:
             closed = sorted([dict(c) for c in candles if _structure_edge_candle_bucket(c) < current_bucket], key=_structure_edge_candle_bucket)
             if len(closed) >= STRUCTURE_EDGE_MIN_CLOSED_M1:
                 ready_pairs += 1
-            item = analyze_structure_edge_pair(pair, symbol, closed_override=closed)
+            eval_rows = list(closed)
+            if provisional_current:
+                current_rows = [dict(c) for c in candles if _structure_edge_candle_bucket(c) == current_bucket]
+                if current_rows:
+                    current_rows.sort(key=_structure_edge_candle_bucket)
+                    eval_rows.append(current_rows[-1])
+                else:
+                    # No reliable live candle -> do not guess a pre-arm candidate.
+                    continue
+            item = analyze_structure_edge_pair(pair, symbol, closed_override=eval_rows)
             if item.get("ok"):
                 candidates.append(item)
                 lines_found += int(item.get("lines_considered", 0) or 0)
@@ -12875,7 +13014,6 @@ def _structure_edge_scan_market() -> list[dict]:
                     "touches": item.get("line_touches"), "quality": item.get("line_quality"),
                 }
             else:
-                # Count available valid lines when the pair was warm but had no setup.
                 reason = str(item.get("reason") or "")
                 if "خطوط صالحة" in reason:
                     try:
@@ -12891,6 +13029,36 @@ def _structure_edge_scan_market() -> list[dict]:
         _structure_edge_state["last_line"] = last_line
     candidates.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("line_touches", 0)), int(x.get("payout", 0))), reverse=True)
     return candidates
+
+
+def _trendline_final_open_snapshot(symbol: str, current_bucket: int, decision: dict) -> tuple[float | None, float | None, float | None]:
+    """Return (new_candle_open, live_price, displacement_as_ATR).
+
+    Prefer the feed's actual current-M1 open. If the new candle object has not appeared yet,
+    use the just-closed candle close as the opening reference; this is intentionally strict and
+    prevents chasing an already-displaced first tick.
+    """
+    try:
+        _, last_tick, candles = _get_otc_rows_and_candles(symbol)
+        live_price = float((last_tick or {}).get("price"))
+        current_rows = [dict(c) for c in candles if _structure_edge_candle_bucket(c) == int(current_bucket)]
+        open_price = None
+        if current_rows:
+            try:
+                open_price = float(current_rows[-1].get("open"))
+            except Exception:
+                open_price = None
+        if open_price is None:
+            prior = sorted([dict(c) for c in candles if _structure_edge_candle_bucket(c) < int(current_bucket)], key=_structure_edge_candle_bucket)
+            if prior:
+                open_price = float(prior[-1].get("close"))
+        atr = float((decision or {}).get("atr") or 0)
+        if open_price is None or not atr or atr <= 0:
+            return open_price, live_price, None
+        displacement = abs(live_price - open_price) / atr
+        return open_price, live_price, float(displacement)
+    except Exception:
+        return None, None, None
 
 
 def _structure_edge_signal_message(trade: dict) -> str:
@@ -12909,9 +13077,12 @@ def _structure_edge_signal_message(trade: dict) -> str:
         f"📏 الخط: {line_ar} • touches {trade.get('line_touches')} • quality {trade.get('line_quality')}%\n"
         f"📐 Slope: {trade.get('line_slope_atr')} ATR/candle\n"
         f"🎯 Setup score: {trade.get('score')}% | payout {trade.get('payout')}%\n"
-        f"⏳ الدخول: الآن • {entry_dt.strftime('%H:%M:%S')} UTC+3\n"
+        f"⚙️ Pre-arm: {'جاهز ✅' if trade.get('prearmed_at') else '-'}\n"
+        f"🎬 Open المرجعي: {trade.get('trendline_candle_open') if trade.get('trendline_candle_open') is not None else '-'}\n"
+        f"📍 سعر لحظة التأكيد: {trade.get('trendline_signal_price') if trade.get('trendline_signal_price') is not None else '-'} | ΔATR {round(float(trade.get('trendline_entry_displacement_atr') or 0), 4)}\n"
+        f"⏳ الدخول المستهدف: {entry_dt.strftime('%H:%M:%S')} UTC+3 — أول لحظة من الشمعة\n"
         f"🏁 الإغلاق: {close_dt.strftime('%H:%M:%S')} UTC+3\n"
-        "🧪 Extension direct test — DEMO فقط"
+        "🧪 Extension PRE-ARM direct test — DEMO فقط"
     )[:3900]
 
 
@@ -13028,12 +13199,14 @@ def build_structure_edge_status() -> str:
         f"Setups last scan: {_structure_edge_state.get('setups_found', 0)}\n"
         f"آخر خط معتبر: {line_text}\n"
         f"Setup score الأدنى: {STRUCTURE_EDGE_MIN_SCORE}% | Payout الأدنى: {STRUCTURE_EDGE_MIN_PAYOUT}%\n"
-        f"نافذة الدخول: الثانية {STRUCTURE_EDGE_ENTRY_MIN_SECOND}–{STRUCTURE_EDGE_ENTRY_MAX_SECOND}\n"
+        f"Pre-arm: الثانية {TRENDLINE_PREARM_MIN_SECOND:g}–{TRENDLINE_PREARM_LAST_SECOND:g} قبل الإغلاق | Final ≤ {TRENDLINE_FINAL_MAX_SECOND:g}s\n"
+        f"صلاحية أمر التنفيذ: {TRENDLINE_EXECUTION_MAX_DELAY_SECONDS}s | Max Open displacement: {round(TRENDLINE_ENTRY_MAX_DISPLACEMENT_ATR*100, 1)}% ATR\n"
         f"Cooldown الزوج: {round(STRUCTURE_EDGE_PAIR_COOLDOWN_SECONDS/60, 1)} دقيقة\n"
+        f"Pre-armed الآن: {((_structure_edge_state.get('prearmed_candidate') or {}).get('pair') if isinstance(_structure_edge_state.get('prearmed_candidate'), dict) else '-') or '-'}\n"
         f"صفقة قيد المتابعة: {pending_text}\nآخر Candidate: {last_text}\n"
         f"آخر رفض: {_structure_edge_state.get('last_reject_reason') or '-'}\n"
         f"آخر Scan: {_structure_edge_state.get('last_scan_at') or '-'}\nآخر خطأ: {_structure_edge_state.get('last_error') or '-'}\n\n"
-        "المنطق: Swing High/Low → Rising Support / Falling Resistance → Break+Close أو Bounce candle → الشمعة التالية.\n"
+        "المنطق: Trendline setup يتشكل قرب الإغلاق → Pre-arm للزوج → Final check بعد الإغلاق → دخول فوري قرب Open الشمعة التالية.\n"
         f"Extension online: {_copy_online_clients_for_user(ADMIN_TELEGRAM_ID)} | Copy sent: {_structure_edge_state.get('copy_signals_sent', 0)} | order reports: {_structure_edge_state.get('execution_reports', 0)} | skipped: {_structure_edge_state.get('extension_skips', 0)}\n"
         "🧪 التنفيذ: Chrome Extension — DEMO فقط — $1 — بدون مضاعفات."
     )[:3900]
@@ -13135,6 +13308,10 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
             "execution_latency_ms": (payload_event or {}).get("execution_latency_ms"),
             "expires_at": (payload_event or {}).get("expires_at"),
             "pair_prepare_mode": (payload_event or {}).get("pair_prepare_mode"),
+            "entry_offset_from_candle_open_ms": (payload_event or {}).get("entry_offset_from_candle_open_ms"),
+            "trendline_candle_open": (payload_event or {}).get("trendline_candle_open") or (pending or {}).get("trendline_candle_open"),
+            "trendline_signal_price": (payload_event or {}).get("trendline_signal_price") or (pending or {}).get("trendline_signal_price"),
+            "trendline_entry_displacement_atr": (payload_event or {}).get("trendline_entry_displacement_atr") if (payload_event or {}).get("trendline_entry_displacement_atr") is not None else (pending or {}).get("trendline_entry_displacement_atr"),
             "account_mode": "demo",
             "audit_status": "order_sent_to_quotex_bridge",
         }
@@ -13172,7 +13349,9 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
                     f"💵 DEMO • ${amount:g}\n"
                     f"🕐 إرسال أمر الدخول: {_structure_edge_local_hms(record.get('executed_at'))} UTC+3\n"
                     f"🏁 انتهاء الصفقة: {_structure_edge_local_hms(record.get('expires_at'))} UTC+3\n"
-                    f"⚡ Latency: {latency_text}\n"
+                    f"⚡ Latency من Final signal: {latency_text}\n"
+                    f"🎬 Δ عن Open الشمعة: {record.get('entry_offset_from_candle_open_ms') if record.get('entry_offset_from_candle_open_ms') is not None else '-'} ms\n"
+                    f"📍 Open ref: {record.get('trendline_candle_open') if record.get('trendline_candle_open') is not None else '-'} | signal price: {record.get('trendline_signal_price') if record.get('trendline_signal_price') is not None else '-'}\n"
                     "✅ الإضافة أرسلت أمر orders/open عبر قناة Quotex الآمنة.\n"
                     "ℹ️ Win/Loss لا يُحسب إلا بعد وصول نتيجة Quotex المؤكدة."
                 )[:3900],
@@ -13357,56 +13536,144 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
 
 
 async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
+    """Trendline Edge v1.20.2 PRE-ARM state machine.
+
+    Phase A (56.5-59s): analyze the still-forming signal candle and PREPARE only the best pair.
+    Phase B (0-1.5s next minute): re-analyze that same pair using the now CLOSED candle. Only if
+    setup/direction/line type still agree and live price is close to the new candle open do we send
+    the executable packet. This removes the old 2-4 second decision delay and avoids chasing price.
+    """
     try:
         if not _structure_edge_is_enabled():
             return
+        now_ts = time_module.time()
         _structure_edge_state["last_scan_at"] = now_iso()
+
         if await _structure_edge_process_pending(context):
             return
 
-        now_ts = time_module.time()
         current_bucket = int(now_ts // 60) * 60
-        sec = int(now_ts - current_bucket)
-        if sec < STRUCTURE_EDGE_ENTRY_MIN_SECOND or sec > STRUCTURE_EDGE_ENTRY_MAX_SECOND:
-            return
-        if int(_structure_edge_state.get("last_scan_bucket", 0) or 0) == current_bucket:
-            return
+        sec = float(now_ts - current_bucket)
 
-        # Direct-test mode is extension-only. Do not consume this minute's one scan
-        # before the owner's authenticated Chrome extension is actually online.
+        # Extension must be online before either pre-arm or final execution.
         if _copy_online_clients_for_user(ADMIN_TELEGRAM_ID) <= 0:
             _structure_edge_state["last_reject_reason"] = "Waiting for owner extension"
             return
 
-        # Trendline setup uses fully closed candles; one scan in the first seconds of each M1 bucket is enough.
-        _structure_edge_state["last_scan_bucket"] = current_bucket
-        candidates = _structure_edge_scan_market()
+        prearmed = _structure_edge_state.get("prearmed_candidate")
+        if isinstance(prearmed, dict):
+            target_bucket = int(_structure_edge_state.get("prearm_target_bucket") or prearmed.get("target_entry_bucket") or 0)
+
+            # FINAL check immediately after the target minute opens.
+            if target_bucket == current_bucket:
+                if sec > TRENDLINE_FINAL_MAX_SECOND:
+                    _structure_edge_state["prearm_cancelled"] = int(_structure_edge_state.get("prearm_cancelled", 0) or 0) + 1
+                    _structure_edge_state["last_reject_reason"] = f"Pre-arm missed final window ({sec:.2f}s)"
+                    _structure_edge_state["prearmed_candidate"] = None
+                    return
+
+                pair = str(prearmed.get("pair") or "")
+                symbol = str(prearmed.get("symbol") or "") or get_otc_symbol_for_pair(pair)
+                final = analyze_structure_edge_pair(pair, symbol)
+                same_setup = bool(final.get("ok")) and str(final.get("setup")) == str(prearmed.get("setup"))
+                same_direction = bool(final.get("ok")) and str(final.get("direction")) == str(prearmed.get("direction"))
+                same_line = bool(final.get("ok")) and str(final.get("line_type")) == str(prearmed.get("line_type"))
+                if not (same_setup and same_direction and same_line):
+                    _structure_edge_state["prearm_cancelled"] = int(_structure_edge_state.get("prearm_cancelled", 0) or 0) + 1
+                    _structure_edge_state["last_reject_reason"] = f"Pre-arm invalidated at close: {final.get('reason') or 'setup changed'}"
+                    _structure_edge_state["prearmed_candidate"] = None
+                    return
+
+                open_price, live_price, displacement_atr = _trendline_final_open_snapshot(symbol, current_bucket, final)
+                if open_price is None or live_price is None or displacement_atr is None:
+                    _structure_edge_state["prearm_cancelled"] = int(_structure_edge_state.get("prearm_cancelled", 0) or 0) + 1
+                    _structure_edge_state["last_reject_reason"] = "Final open/price snapshot unavailable"
+                    _structure_edge_state["prearmed_candidate"] = None
+                    return
+                if displacement_atr > TRENDLINE_ENTRY_MAX_DISPLACEMENT_ATR:
+                    _structure_edge_state["prearm_cancelled"] = int(_structure_edge_state.get("prearm_cancelled", 0) or 0) + 1
+                    _structure_edge_state["last_reject_reason"] = f"Open displacement too large: {displacement_atr:.3f} ATR"
+                    _structure_edge_state["prearmed_candidate"] = None
+                    return
+
+                item = dict(final)
+                item.update({
+                    "created_at": now_iso(),
+                    "entry_bucket": current_bucket,
+                    "entry_price": live_price,
+                    "trendline_candle_open": open_price,
+                    "trendline_signal_price": live_price,
+                    "trendline_entry_displacement_atr": round(float(displacement_atr), 6),
+                    "prearmed_at": prearmed.get("prearmed_at") or _structure_edge_state.get("last_prearm_at"),
+                })
+                _structure_edge_state["last_candidate"] = dict(item)
+
+                copy_result = await publish_copy_structure_edge_signal(item)
+                _structure_edge_state["last_copy_result"] = copy_result
+                _structure_edge_state["prearmed_candidate"] = None
+                if not isinstance(copy_result, dict) or not copy_result.get("ok"):
+                    _structure_edge_state["copy_signals_failed"] = int(_structure_edge_state.get("copy_signals_failed", 0) or 0) + 1
+                    _structure_edge_state["last_reject_reason"] = f"Final Copy publish failed: {copy_result}"
+                    return
+                normalized_signal = copy_result.get("signal") if isinstance(copy_result.get("signal"), dict) else {}
+                item["copy_signal_id"] = normalized_signal.get("id") or f"structure_{safe_key(item.get('pair'))}_{current_bucket}_{item.get('direction')}"
+                _structure_edge_state["pending_trade"] = item
+                _structure_edge_state["copy_signals_sent"] = int(_structure_edge_state.get("copy_signals_sent", 0) or 0) + 1
+                _structure_edge_state.setdefault("pair_last_signal_ts", {})[str(item.get("pair"))] = now_ts
+                _structure_edge_state["last_reject_reason"] = None
+
+                sent = await safe_send_message(context.bot, chat_id=_structure_edge_target_chat_id(), text=_structure_edge_signal_message(item))
+                if sent:
+                    _structure_edge_state["signals_sent"] = int(_structure_edge_state.get("signals_sent", 0) or 0) + 1
+                    _structure_edge_state["last_signal_at"] = now_iso()
+                return
+
+            # A stale pre-arm from an older minute must never execute later.
+            if target_bucket and current_bucket > target_bucket:
+                _structure_edge_state["prearm_cancelled"] = int(_structure_edge_state.get("prearm_cancelled", 0) or 0) + 1
+                _structure_edge_state["last_reject_reason"] = "Stale pre-arm cleared"
+                _structure_edge_state["prearmed_candidate"] = None
+
+        # PRE-ARM phase. Two attempts max so a setup that forms in the final 1-2 seconds
+        # can still be discovered, without scanning the whole market every scheduler tick.
+        if sec < TRENDLINE_PREARM_MIN_SECOND or sec > TRENDLINE_PREARM_LAST_SECOND:
+            return
+        if int(_structure_edge_state.get("prearm_bucket", 0) or 0) != current_bucket:
+            _structure_edge_state["prearm_bucket"] = current_bucket
+            _structure_edge_state["prearm_attempts"] = 0
+            _structure_edge_state["last_prearm_attempt_ts"] = 0.0
+        attempts = int(_structure_edge_state.get("prearm_attempts", 0) or 0)
+        last_attempt = float(_structure_edge_state.get("last_prearm_attempt_ts", 0) or 0)
+        if attempts >= TRENDLINE_PREARM_MAX_ATTEMPTS or (last_attempt and now_ts - last_attempt < TRENDLINE_PREARM_RETRY_SECONDS):
+            return
+
+        _structure_edge_state["prearm_attempts"] = attempts + 1
+        _structure_edge_state["last_prearm_attempt_ts"] = now_ts
+        candidates = _structure_edge_scan_market(provisional_current=True)
         if not candidates:
-            _structure_edge_state["last_reject_reason"] = "No confirmed setup this minute"
+            _structure_edge_state["last_reject_reason"] = "No provisional Trendline setup near close"
             return
+
         item = dict(candidates[0])
-        item.update({"created_at": now_iso(), "entry_bucket": current_bucket})
-        _structure_edge_state["last_candidate"] = dict(item)
-
-        copy_result = await publish_copy_structure_edge_signal(item)
-        _structure_edge_state["last_copy_result"] = copy_result
-        if not isinstance(copy_result, dict) or not copy_result.get("ok"):
-            _structure_edge_state["copy_signals_failed"] = int(_structure_edge_state.get("copy_signals_failed", 0) or 0) + 1
-            _structure_edge_state["last_reject_reason"] = f"Copy publish failed: {copy_result}"
+        target_bucket = current_bucket + 60
+        item.update({
+            "prearmed_at": now_iso(),
+            "target_entry_bucket": target_bucket,
+        })
+        prepare_result = await publish_copy_structure_edge_prepare_signal(item, target_bucket)
+        _structure_edge_state["last_copy_result"] = prepare_result
+        if not isinstance(prepare_result, dict) or not prepare_result.get("ok"):
+            _structure_edge_state["last_reject_reason"] = f"Pre-arm publish failed: {prepare_result}"
             return
-        normalized_signal = copy_result.get("signal") if isinstance(copy_result.get("signal"), dict) else {}
-        item["copy_signal_id"] = normalized_signal.get("id") or f"structure_{safe_key(item.get('pair'))}_{current_bucket}_{item.get('direction')}"
-        _structure_edge_state["pending_trade"] = item
-        _structure_edge_state["copy_signals_sent"] = int(_structure_edge_state.get("copy_signals_sent", 0) or 0) + 1
-        _structure_edge_state.setdefault("pair_last_signal_ts", {})[str(item.get("pair"))] = now_ts
 
-        sent = await safe_send_message(context.bot, chat_id=_structure_edge_target_chat_id(), text=_structure_edge_signal_message(item))
-        if sent:
-            _structure_edge_state["signals_sent"] = int(_structure_edge_state.get("signals_sent", 0) or 0) + 1
-            _structure_edge_state["last_signal_at"] = now_iso()
+        _structure_edge_state["prearmed_candidate"] = item
+        _structure_edge_state["prearm_target_bucket"] = target_bucket
+        _structure_edge_state["last_prearm_at"] = item["prearmed_at"]
+        _structure_edge_state["prearm_sent"] = int(_structure_edge_state.get("prearm_sent", 0) or 0) + 1
+        _structure_edge_state["last_reject_reason"] = "Pair pre-armed; waiting for candle close final check"
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Trendline Edge job error: %s", exc)
+        logger.exception("Trendline Edge pre-arm job error: %s", exc)
 
 
 # v1.02: Three Candle timing/filter tuning only; Public remains a mirror of accepted private signals.
@@ -21217,6 +21484,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "📐 Trendline Edge — نفس خانة الاختبار السابقة\n"
                 "رسم Trendline كلاسيكي من Swing High/Low.\n"
                 "Break + Close خارج الخط → مع الكسر، أو Bounce candle من الخط → مع الارتداد بالشمعة التالية.\n"
+                "الجديد: Pre-arm قبل إغلاق الشمعة ثم Final check عند الفتح، حتى يكون أمر الدخول قريب جدًا من Open الشمعة التالية.\n"
                 "لا تغيّر قناة الثغرة. Chrome DEMO فقط، وسجل القناة Signal → Order Sent/Skip → Result.",
                 reply_markup=structure_edge_admin_keyboard,
             )
@@ -21918,8 +22186,8 @@ def _copy_signal_contract_kind(payload: dict) -> str:
     }:
         raise ValueError("signal_kind must be execute or prepare")
     kind = "prepare" if prepare_marked else "execute"
-    if kind == "prepare" and source != "otc_edge":
-        raise ValueError("prepare signals are supported only for otc_edge")
+    if kind == "prepare" and source not in {"otc_edge", "structure_edge"}:
+        raise ValueError("prepare signals are supported only for otc_edge/structure_edge")
     return kind
 
 
@@ -22271,6 +22539,13 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         "stat_model_pairs": int(payload.get("stat_model_pairs")) if str(payload.get("stat_model_pairs") or "").strip().isdigit() else None,
         "stat_local_probability": float(payload.get("stat_local_probability")) if str(payload.get("stat_local_probability") or "").strip().replace(".", "", 1).isdigit() else None,
         "stat_local_support": int(payload.get("stat_local_support")) if str(payload.get("stat_local_support") or "").strip().isdigit() else None,
+        # v1.20.2 Trendline pre-arm/open synchronization metadata.
+        "trendline_prearm": bool(payload.get("trendline_prearm") or False),
+        "trendline_target_bucket": int(payload.get("trendline_target_bucket")) if str(payload.get("trendline_target_bucket") or "").strip().isdigit() else None,
+        "trendline_candle_open": float(payload.get("trendline_candle_open")) if str(payload.get("trendline_candle_open") or "").strip().replace(".", "", 1).replace("-", "", 1).isdigit() else None,
+        "trendline_signal_price": float(payload.get("trendline_signal_price")) if str(payload.get("trendline_signal_price") or "").strip().replace(".", "", 1).replace("-", "", 1).isdigit() else None,
+        "trendline_entry_displacement_atr": float(payload.get("trendline_entry_displacement_atr")) if str(payload.get("trendline_entry_displacement_atr") or "").strip().replace(".", "", 1).replace("-", "", 1).isdigit() else None,
+        "trendline_prearmed_at": str(payload.get("trendline_prearmed_at") or "")[:40] or None,
         "demo_only": bool(payload.get("demo_only") or False),
     }
     supplied_id = str(payload.get("id") or "").strip()
@@ -24414,9 +24689,16 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
             logger.debug("Mobile bot error notification failed", exc_info=True)
 
 def run_telegram_bot_only():
-    global TRADING_TIME_TELEGRAM_APP
+    global TRADING_TIME_TELEGRAM_APP, TRADING_TIME_TELEGRAM_LOOP
     if not BOT_TOKEN:
         raise ValueError("BOT_TOKEN غير موجود داخل ملف .env")
+
+    # v1.20.1: create/set the polling loop BEFORE constructing python-telegram-bot.
+    # The Bot/HTTPX client is then owned by one loop for its entire lifetime. FastAPI
+    # callbacks use safe_send_message(), which marshals sends back to this loop.
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    TRADING_TIME_TELEGRAM_LOOP = loop
 
     # في نسخة Web Service، FastAPI/Uvicorn هو السيرفر الأساسي، لذلك لا نشغل سيرفر مدمج داخل thread هنا.
 
@@ -24446,7 +24728,7 @@ def run_telegram_bot_only():
         name="multi_user_otc_edge_watcher",
     )
 
-    # v1.20.0: Trendline Edge strategy in the reused owner test slot; disabled/default state preserved.
+    # v1.20.2: Trendline Edge PRE-ARM/open-sync execution; v1.20.1 Telegram polling-loop hotfix retained.
     job_queue.run_repeating(
         structure_edge_job,
         interval=STRUCTURE_EDGE_SCAN_SECONDS,
@@ -24496,9 +24778,6 @@ def run_telegram_bot_only():
     app.add_error_handler(telegram_error_handler)
 
     logger.info("Bot is running...")
-
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
 
     app.run_polling(drop_pending_updates=True, close_loop=False, stop_signals=None)
 
