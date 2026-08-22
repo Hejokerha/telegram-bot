@@ -451,7 +451,7 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
         ["🔐 Copy Trading", "📡 حالة Copy"],
-        ["🧱 Structure Edge", "📡 قناة 3 شموع"],
+        ["📊 Statistical Edge", "📡 قناة 3 شموع"],
         ["🌐 Public Three Candle"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
@@ -494,9 +494,9 @@ admin_otc_edge_keyboard = ReplyKeyboardMarkup(
 # It does not alter or replace Three Candle / OTC Edge and does not send Copy Trading commands.
 structure_edge_admin_keyboard = ReplyKeyboardMarkup(
     [
-        ["🟢 تشغيل Structure Edge", "🔴 إيقاف Structure Edge"],
-        ["📋 حالة Structure Edge", "📊 ملخص Structure Edge"],
-        ["🧹 تصفير نتائج Structure Edge"],
+        ["🟢 تشغيل Statistical Edge", "🔴 إيقاف Statistical Edge"],
+        ["📋 حالة Statistical Edge", "📊 ملخص Statistical Edge"],
+        ["🧹 تصفير نتائج Statistical Edge"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -1029,7 +1029,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.18.0"
+COPY_SERVER_VERSION = "1.19.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -3699,7 +3699,7 @@ async def publish_copy_three_candle_signal(trade: dict) -> dict:
 
 
 async def publish_copy_structure_edge_signal(trade: dict) -> dict:
-    """Send one confirmed Structure Edge setup to the owner's Chrome extension.
+    """Send one Statistical Edge consensus signal through the existing owner test slot.
 
     Test contract:
     - owner/admin Telegram route only
@@ -3755,19 +3755,24 @@ async def publish_copy_structure_edge_signal(trade: dict) -> dict:
             "m5_bias": (trade or {}).get("m5_bias"),
             "m5_strength": (trade or {}).get("m5_strength"),
             "structure_confluences": list((trade or {}).get("confluences") or [])[:8],
+            "stat_model_confidence": (trade or {}).get("model_confidence"),
+            "stat_model_support": (trade or {}).get("model_support"),
+            "stat_model_pairs": (trade or {}).get("model_pairs"),
+            "stat_local_probability": (trade or {}).get("local_probability"),
+            "stat_local_support": (trade or {}).get("local_support"),
             "demo_only": True,
             "creator_user_id": int(ADMIN_TELEGRAM_ID),
             "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"structure_edge_v1 | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | M5={(trade or {}).get('m5_bias')}:{(trade or {}).get('m5_strength')} | demo_only",
+            "note": f"statistical_edge_v1 | setup={(trade or {}).get('setup')} | historical_score={(trade or {}).get('score')} | support={(trade or {}).get('model_support')} | demo_only",
         }
         result = await publish_copy_trading_signal(payload, source="structure_edge")
         logger.info(
-            "Copy Trading Structure Edge sent | pair=%s | setup=%s | score=%s | delivery=%s",
+            "Copy Trading Statistical Edge sent | pair=%s | setup=%s | score=%s | delivery=%s",
             pair, (trade or {}).get("setup"), (trade or {}).get("score"), result.get("delivery") if isinstance(result, dict) else result,
         )
         return result
     except Exception as exc:
-        logger.exception("Structure Edge Copy publish failed: %s", exc)
+        logger.exception("Statistical Edge Copy publish failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -12405,14 +12410,17 @@ THREE_CANDLE_CHANNEL_ENABLED = os.getenv("THREE_CANDLE_CHANNEL_ENABLED", "false"
 
 # v1.01: Optional public/free mirror channel. Keep the private channel untouched.
 
-# ===== v1.18.0 Structure Edge: owner extension direct DEMO + Telegram audit trail =====
-# Goal: test a genuinely different decision model before considering any replacement of
-# the existing production channels. The engine uses only CLOSED M1 candles for setup
-# confirmation, M5 market structure for context, and the live Quotex price for entry.
-# v1.17 direct test: confirmed setups are routed to the owner Chrome extension and
-# executed DEMO-only. Result accounting comes back from Quotex through the extension.
+# ===== v1.19.0 Statistical Edge: same owner test slot, new decision school =====
+# This deliberately REUSES the existing source key `structure_edge` and its extension slot so
+# no extra section is added. The old Structure/Liquidity decision engine is retired for this
+# test. Decisions are now empirical: several independent candle-state tables are learned from
+# the live closed-M1 history across OTC currency pairs, then must agree on the NEXT M1 candle.
+# Execution/audit contract is unchanged: owner Chrome extension only, physical DEMO, fixed $1,
+# no martingale/sequence, hard late-entry cancellation, authoritative result from Quotex.
 STRUCTURE_EDGE_SCAN_SECONDS = max(1, int(os.getenv("STRUCTURE_EDGE_SCAN_SECONDS", "1")))
-STRUCTURE_EDGE_MIN_SCORE = max(70, min(99, int(os.getenv("STRUCTURE_EDGE_MIN_SCORE", "84"))))
+# Kept under the old env name for deployment compatibility. Here it means minimum historical
+# consensus score, not structure score.
+STRUCTURE_EDGE_MIN_SCORE = max(60, min(95, int(os.getenv("STRUCTURE_EDGE_MIN_SCORE", "74"))))
 STRUCTURE_EDGE_MIN_PAYOUT = max(0, min(100, int(os.getenv("STRUCTURE_EDGE_MIN_PAYOUT", "85"))))
 STRUCTURE_EDGE_ENTRY_MIN_SECOND = max(0, min(20, int(os.getenv("STRUCTURE_EDGE_ENTRY_MIN_SECOND", "2"))))
 STRUCTURE_EDGE_ENTRY_MAX_SECOND = max(
@@ -12422,10 +12430,21 @@ STRUCTURE_EDGE_ENTRY_MAX_SECOND = max(
 STRUCTURE_EDGE_RESULT_DELAY_SECONDS = max(2, int(os.getenv("STRUCTURE_EDGE_RESULT_DELAY_SECONDS", "4")))
 STRUCTURE_EDGE_EXTENSION_RESULT_TIMEOUT_SECONDS = max(30, int(os.getenv("STRUCTURE_EDGE_EXTENSION_RESULT_TIMEOUT_SECONDS", "90")))
 STRUCTURE_EDGE_PAIR_COOLDOWN_SECONDS = max(60, int(os.getenv("STRUCTURE_EDGE_PAIR_COOLDOWN_SECONDS", "600")))
-STRUCTURE_EDGE_MIN_CLOSED_M1 = max(15, int(os.getenv("STRUCTURE_EDGE_MIN_CLOSED_M1", "20")))
+# 45 minutes per live pair is enough to create a cross-pair training pool; the feed retains ~200 M1 candles.
+STRUCTURE_EDGE_MIN_CLOSED_M1 = max(30, int(os.getenv("STRUCTURE_EDGE_MIN_CLOSED_M1", "45")))
 STRUCTURE_EDGE_RESULT_REPORT_LIMIT = max(10, int(os.getenv("STRUCTURE_EDGE_RESULT_REPORT_LIMIT", "50")))
 STRUCTURE_EDGE_CHANNEL_ID_RAW = str(os.getenv("STRUCTURE_EDGE_CHANNEL_ID", "") or "").strip()
 STRUCTURE_EDGE_DEFAULT_ENABLED = os.getenv("STRUCTURE_EDGE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+STAT_EDGE_TRAINING_WINDOW = max(40, min(190, int(os.getenv("STAT_EDGE_TRAINING_WINDOW", "180"))))
+STAT_EDGE_MIN_TRAINING_SAMPLES = max(120, int(os.getenv("STAT_EDGE_MIN_TRAINING_SAMPLES", "350")))
+STAT_EDGE_MIN_TRAINING_PAIRS = max(4, int(os.getenv("STAT_EDGE_MIN_TRAINING_PAIRS", "8")))
+STAT_EDGE_OPEN_DISPLACEMENT_MAX = max(0.10, min(1.50, float(os.getenv("STAT_EDGE_OPEN_DISPLACEMENT_MAX", "0.55"))))
+STAT_EDGE_MODEL_MIN_SUPPORT = {
+    "A": max(8, int(os.getenv("STAT_EDGE_MODEL_A_MIN_SUPPORT", "20"))),
+    "B": max(8, int(os.getenv("STAT_EDGE_MODEL_B_MIN_SUPPORT", "15"))),
+    "C": max(8, int(os.getenv("STAT_EDGE_MODEL_C_MIN_SUPPORT", "25"))),
+    "D": max(8, int(os.getenv("STAT_EDGE_MODEL_D_MIN_SUPPORT", "15"))),
+}
 
 _structure_edge_state = {
     "pending_trade": None,
@@ -12452,15 +12471,19 @@ _structure_edge_state = {
     "skip_signal_ids": {},
     "last_error": None,
     "pair_last_signal_ts": {},
+    "model_samples": 0,
+    "model_pairs": 0,
+    "model_generated_at": None,
+    "model_qualified": 0,
 }
 
-
-def _structure_edge_base_ref():
-    return system_ref().child("structure_edge_test_v1")
-
-
+# Keep the old settings node so an already-enabled test slot stays enabled after this deployment.
 def _structure_edge_settings_ref():
-    return _structure_edge_base_ref().child("settings")
+    return system_ref().child("structure_edge_test_v1").child("settings")
+
+# Results are intentionally isolated from the failed Structure Edge sample (12W/18L).
+def _structure_edge_base_ref():
+    return system_ref().child("statistical_edge_test_v1")
 
 
 def _structure_edge_results_ref():
@@ -12478,7 +12501,6 @@ def _structure_edge_target_chat_id():
             return int(raw) if raw.lstrip("-").isdigit() else raw
         except Exception:
             pass
-    # Safe default for the experimental phase: only the owner/admin sees signals.
     return int(ADMIN_TELEGRAM_ID)
 
 
@@ -12490,17 +12512,17 @@ def _structure_edge_get_settings() -> dict:
             data = {}
         return {"enabled": bool(data.get("enabled", default["enabled"]))}
     except Exception as exc:
-        logger.debug("Structure Edge settings read failed: %s", exc)
+        logger.debug("Statistical Edge settings read failed: %s", exc)
         return default
 
 
 def _structure_edge_set_enabled(enabled: bool) -> bool:
     try:
-        _structure_edge_settings_ref().update({"enabled": bool(enabled), "updated_at": now_iso()})
+        _structure_edge_settings_ref().update({"enabled": bool(enabled), "updated_at": now_iso(), "engine": "statistical_edge_v1"})
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Structure Edge enabled update failed: %s", exc)
+        logger.exception("Statistical Edge enabled update failed: %s", exc)
         return False
 
 
@@ -12515,261 +12537,236 @@ def _structure_edge_candle_bucket(candle: dict) -> int:
         return 0
 
 
-def _structure_edge_complete_m5(closed_m1: list[dict]) -> list[dict]:
-    """Aggregate only COMPLETE 5-minute groups from closed Quotex M1 candles."""
-    groups = {}
-    for candle in closed_m1:
-        bucket = _structure_edge_candle_bucket(candle)
-        if bucket <= 0:
+def _stat_edge_consecutive(rows: list[dict]) -> bool:
+    buckets = [_structure_edge_candle_bucket(x) for x in rows]
+    return bool(buckets) and all((b - a) == 60 for a, b in zip(buckets, buckets[1:]))
+
+
+def _stat_edge_signature(context: list[dict]) -> dict | None:
+    """Coarse, interpretable candle-state signature from the LAST 8 closed M1 candles."""
+    if len(context) < 8:
+        return None
+    rows = context[-8:]
+    if not _stat_edge_consecutive(rows):
+        return None
+    try:
+        parts = [_otc_edge_candle_parts(x) for x in rows]
+        ranges = [float(x.get("range", 0) or 0) for x in parts]
+        valid_ranges = [x for x in ranges if x > 0]
+        if len(valid_ranges) < 6:
+            return None
+        avg_range = sum(valid_ranges) / len(valid_ranges)
+        if avg_range <= 0:
+            return None
+
+        def dchar(p):
+            d = int(p.get("dir", 0) or 0)
+            return "U" if d > 0 else "D" if d < 0 else "N"
+
+        d3 = "".join(dchar(x) for x in parts[-3:])
+        d2 = "".join(dchar(x) for x in parts[-2:])
+        net5 = (float(parts[-1]["close"]) - float(parts[-5]["open"])) / avg_range
+        trend = "U" if net5 >= 0.55 else "D" if net5 <= -0.55 else "F"
+
+        last = parts[-1]
+        body = float(last.get("body_ratio", 0) or 0)
+        body_bin = "S" if body >= 0.55 else "M" if body >= 0.28 else "W"
+        wick_delta = float(last.get("lower_wick", 0) or 0) - float(last.get("upper_wick", 0) or 0)
+        wick_bin = "B" if wick_delta >= 0.18 else "S" if wick_delta <= -0.18 else "N"
+        rng = max(float(last.get("range", 0) or 0), 1e-12)
+        close_pos = (float(last["close"]) - float(last["low"])) / rng
+        close_bin = "H" if close_pos >= 0.67 else "L" if close_pos <= 0.33 else "M"
+
+        dirs5 = [int(x.get("dir", 0) or 0) for x in parts[-5:]]
+        directional = [x for x in dirs5 if x != 0]
+        switches = sum(1 for a, b in zip(directional, directional[1:]) if a != b)
+        denom = max(1, len(directional) - 1)
+        switch_ratio = switches / denom
+        chop = "C" if switch_ratio >= 0.75 else "T" if switch_ratio <= 0.25 else "M"
+
+        recent3 = sum(ranges[-3:]) / 3.0
+        prior5 = sum(ranges[:5]) / 5.0
+        vol_ratio = recent3 / max(prior5, 1e-12)
+        vol = "H" if vol_ratio >= 1.35 else "L" if vol_ratio <= 0.75 else "N"
+
+        return {
+            "A": f"d3={d3}|t={trend}",
+            "B": f"d2={d2}|b={body_bin}|w={wick_bin}|p={close_bin}",
+            "C": f"t={trend}|c={chop}|v={vol}",
+            "D": f"d3={d3}|b={body_bin}|v={vol}",
+            "meta": {
+                "d3": d3,
+                "trend": trend,
+                "body": body_bin,
+                "wick": wick_bin,
+                "close": close_bin,
+                "chop": chop,
+                "vol": vol,
+                "avg_range": avg_range,
+                "net5": round(net5, 3),
+            },
+        }
+    except Exception:
+        return None
+
+
+def _stat_edge_new_counter():
+    return {"CALL": 0, "PUT": 0, "pairs": set()}
+
+
+def _stat_edge_build_model(closed_map: dict[str, list[dict]]) -> dict:
+    tables = {name: {} for name in ("A", "B", "C", "D")}
+    local_a = {}
+    samples = 0
+    used_pairs = set()
+    for pair, raw_rows in (closed_map or {}).items():
+        rows = sorted([dict(x) for x in (raw_rows or [])], key=_structure_edge_candle_bucket)
+        if len(rows) < 12:
             continue
-        m5_bucket = int(bucket // 300) * 300
-        groups.setdefault(m5_bucket, []).append(candle)
+        first_target = max(8, len(rows) - int(STAT_EDGE_TRAINING_WINDOW))
+        pair_samples = 0
+        for i in range(first_target, len(rows)):
+            window = rows[i - 8:i + 1]
+            if len(window) != 9 or not _stat_edge_consecutive(window):
+                continue
+            target = _otc_edge_candle_parts(rows[i])
+            d = int(target.get("dir", 0) or 0)
+            if d == 0:
+                continue
+            label = "CALL" if d > 0 else "PUT"
+            sig = _stat_edge_signature(rows[i - 8:i])
+            if not sig:
+                continue
+            for name in ("A", "B", "C", "D"):
+                key = sig[name]
+                bucket = tables[name].setdefault(key, _stat_edge_new_counter())
+                bucket[label] += 1
+                bucket["pairs"].add(str(pair))
+            lk = (str(pair), sig["A"])
+            lb = local_a.setdefault(lk, {"CALL": 0, "PUT": 0})
+            lb[label] += 1
+            samples += 1
+            pair_samples += 1
+        if pair_samples:
+            used_pairs.add(str(pair))
+    return {"tables": tables, "local_a": local_a, "samples": samples, "pairs": len(used_pairs)}
 
-    out = []
-    for bucket in sorted(groups):
-        rows = sorted(groups[bucket], key=_structure_edge_candle_bucket)
-        expected = [bucket + 60 * i for i in range(5)]
-        got = [_structure_edge_candle_bucket(x) for x in rows]
-        if got != expected:
+
+def _stat_edge_wilson_lower(successes: int, total: int, z: float = 1.645) -> float:
+    if total <= 0:
+        return 0.0
+    p = successes / total
+    zz = z * z
+    denom = 1.0 + zz / total
+    center = p + zz / (2.0 * total)
+    spread = z * ((p * (1.0 - p) / total + zz / (4.0 * total * total)) ** 0.5)
+    return max(0.0, (center - spread) / denom)
+
+
+def _stat_edge_model_decision(pair: str, closed: list[dict], model: dict) -> dict:
+    sig = _stat_edge_signature(closed[-8:])
+    if not sig:
+        return {"ok": False, "reason": "النمط الإحصائي الحالي غير مكتمل"}
+    if int(model.get("samples", 0) or 0) < STAT_EDGE_MIN_TRAINING_SAMPLES:
+        return {"ok": False, "reason": f"warmup model: {int(model.get('samples', 0) or 0)}/{STAT_EDGE_MIN_TRAINING_SAMPLES}"}
+    if int(model.get("pairs", 0) or 0) < STAT_EDGE_MIN_TRAINING_PAIRS:
+        return {"ok": False, "reason": f"أزواج التدريب: {int(model.get('pairs', 0) or 0)}/{STAT_EDGE_MIN_TRAINING_PAIRS}"}
+
+    components = []
+    for name in ("A", "B", "C", "D"):
+        bucket = ((model.get("tables") or {}).get(name) or {}).get(sig[name]) or {}
+        call_n = int(bucket.get("CALL", 0) or 0)
+        put_n = int(bucket.get("PUT", 0) or 0)
+        support = call_n + put_n
+        pair_count = len(bucket.get("pairs") or set())
+        if support < int(STAT_EDGE_MODEL_MIN_SUPPORT[name]) or pair_count < 4:
             continue
-        try:
-            out.append({
-                "bucket_ts": bucket,
-                "open": float(rows[0]["open"]),
-                "high": max(float(x["high"]) for x in rows),
-                "low": min(float(x["low"]) for x in rows),
-                "close": float(rows[-1]["close"]),
-            })
-        except Exception:
-            continue
-    return out
-
-
-def _structure_edge_m5_bias(m5: list[dict]) -> tuple[str, int, dict]:
-    """Structure-first M5 bias. No RSI/MACD/EMA is used."""
-    if len(m5) < 3:
-        return "NEUTRAL", 0, {"reason": "M5 غير مكتمل"}
-    parts = [_otc_edge_candle_parts(x) for x in m5[-4:]]
-    highs = [x["high"] for x in parts]
-    lows = [x["low"] for x in parts]
-    closes = [x["close"] for x in parts]
-    ranges = [x["range"] for x in parts if x["range"] > 0]
-    avg_range = sum(ranges) / max(1, len(ranges)) if ranges else 0.0
-
-    last3_h = highs[-3:]
-    last3_l = lows[-3:]
-    hh_hl = last3_h[0] < last3_h[1] < last3_h[2] and last3_l[0] < last3_l[1] < last3_l[2]
-    ll_lh = last3_h[0] > last3_h[1] > last3_h[2] and last3_l[0] > last3_l[1] > last3_l[2]
-    close_up = closes[-3] < closes[-2] < closes[-1]
-    close_down = closes[-3] > closes[-2] > closes[-1]
-    displacement = abs(closes[-1] - closes[-3]) / avg_range if avg_range > 0 else 0.0
-
-    if hh_hl or (close_up and displacement >= 0.55 and last3_l[-1] >= last3_l[0]):
-        strength = min(100, int(round(68 + min(1.5, displacement) * 16)))
-        return "CALL", strength, {"reason": "M5 HH/HL أو إغلاق صاعد متدرج", "displacement": round(displacement, 2)}
-    if ll_lh or (close_down and displacement >= 0.55 and last3_h[-1] <= last3_h[0]):
-        strength = min(100, int(round(68 + min(1.5, displacement) * 16)))
-        return "PUT", strength, {"reason": "M5 LL/LH أو إغلاق هابط متدرج", "displacement": round(displacement, 2)}
-    return "NEUTRAL", 50, {"reason": "M5 متوازن/انتقالي", "displacement": round(displacement, 2)}
-
-
-def _structure_edge_recent_swing_low(parts: list[dict]) -> tuple[float | None, int | None]:
-    if len(parts) < 4:
-        return None, None
-    candidates = []
-    for i in range(1, len(parts) - 1):
-        if parts[i]["low"] <= parts[i - 1]["low"] and parts[i]["low"] < parts[i + 1]["low"]:
-            candidates.append((parts[i]["low"], i))
-    if candidates:
-        return candidates[-1]
-    window = parts[-8:]
-    if not window:
-        return None, None
-    local_i = min(range(len(window)), key=lambda j: window[j]["low"])
-    return window[local_i]["low"], len(parts) - len(window) + local_i
-
-
-def _structure_edge_recent_swing_high(parts: list[dict]) -> tuple[float | None, int | None]:
-    if len(parts) < 4:
-        return None, None
-    candidates = []
-    for i in range(1, len(parts) - 1):
-        if parts[i]["high"] >= parts[i - 1]["high"] and parts[i]["high"] > parts[i + 1]["high"]:
-            candidates.append((parts[i]["high"], i))
-    if candidates:
-        return candidates[-1]
-    window = parts[-8:]
-    if not window:
-        return None, None
-    local_i = max(range(len(window)), key=lambda j: window[j]["high"])
-    return window[local_i]["high"], len(parts) - len(window) + local_i
-
-
-def _structure_edge_analyze_closed_candles(pair: str, symbol: str, closed_m1: list[dict], payout: int, current_price: float) -> dict:
-    """Return a confirmed next-candle setup or a rejection reason.
-
-    Every structural decision uses CLOSED candles only. That is intentional: the test
-    channel must not enter because of a wick/pressure pattern that can disappear while
-    the current M1 candle is still forming.
-    """
-    if len(closed_m1) < STRUCTURE_EDGE_MIN_CLOSED_M1:
-        return {"ok": False, "reason": f"warmup M1: {len(closed_m1)}/{STRUCTURE_EDGE_MIN_CLOSED_M1}"}
-
-    recent_raw = closed_m1[-12:]
-    recent_buckets = [_structure_edge_candle_bucket(x) for x in recent_raw]
-    if len(recent_buckets) < 12 or any((b - a) != 60 for a, b in zip(recent_buckets, recent_buckets[1:])):
-        return {"ok": False, "reason": "فجوة في شموع M1 المغلقة"}
-
-    parts = [_otc_edge_candle_parts(x) for x in closed_m1[-24:]]
-    if len(parts) < 12:
-        return {"ok": False, "reason": "شموع M1 المغلقة غير كافية"}
-
-    recent6 = parts[-6:]
-    ranges = [x["range"] for x in recent6 if x["range"] > 0]
-    avg_range = sum(ranges) / max(1, len(ranges)) if ranges else 0.0
-    if avg_range <= 0:
-        return {"ok": False, "reason": "مدى M1 غير صالح"}
-    dojis = sum(1 for x in recent6 if x["body_ratio"] <= 0.16)
-    wick_heavy = sum(1 for x in recent6 if max(x["upper_wick"], x["lower_wick"]) >= 0.68)
-    noisy = dojis >= 3 or wick_heavy >= 4
-
-    m5 = _structure_edge_complete_m5(closed_m1)
-    m5_bias, m5_strength, m5_meta = _structure_edge_m5_bias(m5)
-    m5_parts = [_otc_edge_candle_parts(x) for x in m5[-3:]] if m5 else []
-    m5_low = min((x["low"] for x in m5_parts), default=None)
-    m5_high = max((x["high"] for x in m5_parts), default=None)
-
-    candidates = []
-
-    def add(kind: str, direction: str, score: float, confluences: list[str], level=None, meta=None):
-        score_i = int(round(max(0, min(100, score))))
-        candidates.append({
-            "ok": True,
-            "pair": pair,
-            "symbol": symbol,
+        # Beta(2,2) smoothing prevents tiny buckets from becoming 100% confidence.
+        p_call = (call_n + 2.0) / (support + 4.0)
+        direction = "CALL" if p_call >= 0.5 else "PUT"
+        chosen_n = call_n if direction == "CALL" else put_n
+        prob = p_call if direction == "CALL" else (1.0 - p_call)
+        lower = _stat_edge_wilson_lower(chosen_n, support)
+        components.append({
+            "name": name,
             "direction": direction,
-            "score": score_i,
-            "setup": kind,
-            "payout": int(payout),
-            "price": float(current_price),
-            "m5_bias": m5_bias,
-            "m5_strength": int(m5_strength),
-            "m5_reason": str(m5_meta.get("reason") or ""),
-            "level": level,
-            "confluences": confluences,
-            "meta": meta or {},
+            "prob": prob,
+            "support": support,
+            "pair_count": pair_count,
+            "lower": lower,
+            "call": call_n,
+            "put": put_n,
         })
 
-    # --- Setup A: Liquidity Sweep -> closed-candle CHOCH confirmation -> next M1 entry.
-    # Sweep is penultimate closed candle; confirmation is the latest closed candle.
-    sweep = parts[-2]
-    confirm = parts[-1]
-    prior = parts[:-2]
-    prior_low, _ = _structure_edge_recent_swing_low(prior[-12:])
-    prior_high, _ = _structure_edge_recent_swing_high(prior[-12:])
+    if len(components) < 3:
+        return {"ok": False, "reason": f"دعم إحصائي غير كافٍ: {len(components)}/4 نماذج"}
 
-    if prior_low is not None:
-        swept = sweep["low"] < prior_low and sweep["close"] > prior_low and sweep["lower_wick"] >= 0.32
-        choch = confirm["dir"] > 0 and confirm["body_ratio"] >= 0.34 and confirm["close"] > sweep["high"]
-        near_m5_extreme = m5_low is None or sweep["low"] <= (m5_low + avg_range * 0.45)
-        counter_ok = m5_bias != "PUT" or (
-            sweep["lower_wick"] >= 0.52 and confirm["body_ratio"] >= 0.50 and near_m5_extreme
-        )
-        if swept and choch and counter_ok:
-            align = 10 if m5_bias == "CALL" else 6 if m5_bias == "NEUTRAL" else 1
-            score = 68 + align + sweep["lower_wick"] * 11 + confirm["body_ratio"] * 9
-            score += 4 if near_m5_extreme else 0
-            score -= 4 if noisy else 0
-            add(
-                "LIQUIDITY_SWEEP_CHOCH",
-                "CALL",
-                score,
-                ["سحب سيولة تحت Swing Low", "إغلاق رجع فوق المستوى", "CHOCH صاعد مغلق", f"M5 {m5_bias}"],
-                level=prior_low,
-                meta={"sweep_wick": round(sweep["lower_wick"], 2), "confirm_body": round(confirm["body_ratio"], 2), "noisy": noisy},
-            )
+    # Weighted aggregate chooses direction; sqrt(support) avoids one coarse table dominating.
+    total_w = sum(max(1.0, float(x["support"]) ** 0.5) for x in components)
+    p_call = sum(
+        ((x["prob"] if x["direction"] == "CALL" else 1.0 - x["prob"]) * max(1.0, float(x["support"]) ** 0.5))
+        for x in components
+    ) / max(total_w, 1e-9)
+    direction = "CALL" if p_call >= 0.5 else "PUT"
 
-    if prior_high is not None:
-        swept = sweep["high"] > prior_high and sweep["close"] < prior_high and sweep["upper_wick"] >= 0.32
-        choch = confirm["dir"] < 0 and confirm["body_ratio"] >= 0.34 and confirm["close"] < sweep["low"]
-        near_m5_extreme = m5_high is None or sweep["high"] >= (m5_high - avg_range * 0.45)
-        counter_ok = m5_bias != "CALL" or (
-            sweep["upper_wick"] >= 0.52 and confirm["body_ratio"] >= 0.50 and near_m5_extreme
-        )
-        if swept and choch and counter_ok:
-            align = 10 if m5_bias == "PUT" else 6 if m5_bias == "NEUTRAL" else 1
-            score = 68 + align + sweep["upper_wick"] * 11 + confirm["body_ratio"] * 9
-            score += 4 if near_m5_extreme else 0
-            score -= 4 if noisy else 0
-            add(
-                "LIQUIDITY_SWEEP_CHOCH",
-                "PUT",
-                score,
-                ["سحب سيولة فوق Swing High", "إغلاق رجع تحت المستوى", "CHOCH هابط مغلق", f"M5 {m5_bias}"],
-                level=prior_high,
-                meta={"sweep_wick": round(sweep["upper_wick"], 2), "confirm_body": round(confirm["body_ratio"], 2), "noisy": noisy},
-            )
+    agreeing = []
+    contradict = []
+    for x in components:
+        p_dir = x["prob"] if x["direction"] == direction else (1.0 - x["prob"])
+        if x["direction"] == direction and p_dir >= 0.60:
+            agreeing.append(x)
+        elif x["direction"] != direction and x["prob"] >= 0.62:
+            contradict.append(x)
+    if len(agreeing) < 3 or contradict:
+        return {"ok": False, "reason": f"لا يوجد إجماع تاريخي نظيف: agree={len(agreeing)} contradict={len(contradict)}"}
 
-    # --- Setup B: confirmed BOS -> retest of broken structure -> follow-through confirmation.
-    # Exact three-candle sequence makes this intentionally selective.
-    bos = parts[-3]
-    retest = parts[-2]
-    confirm = parts[-1]
-    structure_prior = parts[:-3]
-    swing_high, _ = _structure_edge_recent_swing_high(structure_prior[-12:])
-    swing_low, _ = _structure_edge_recent_swing_low(structure_prior[-12:])
-    tolerance = avg_range * 0.28
+    agree_probs = sorted(float(x["prob"]) for x in agreeing)
+    # Median agreeing probability is intentionally more conservative than the raw weighted aggregate.
+    mid = len(agree_probs) // 2
+    consensus = agree_probs[mid] if len(agree_probs) % 2 else (agree_probs[mid - 1] + agree_probs[mid]) / 2.0
+    score = int(round(consensus * 100.0))
+    if score < int(STRUCTURE_EDGE_MIN_SCORE):
+        return {"ok": False, "reason": f"Historical score {score}% أقل من {STRUCTURE_EDGE_MIN_SCORE}%"}
 
-    if m5_bias == "CALL" and swing_high is not None:
-        bos_ok = bos["dir"] > 0 and bos["body_ratio"] >= 0.42 and bos["close"] > swing_high
-        retest_ok = retest["low"] <= swing_high + tolerance and retest["close"] >= swing_high - tolerance * 0.25
-        confirm_ok = confirm["dir"] > 0 and confirm["body_ratio"] >= 0.30 and confirm["close"] > retest["high"] and confirm["upper_wick"] < 0.48
-        not_chasing = (confirm["close"] - swing_high) <= avg_range * 1.65
-        if bos_ok and retest_ok and confirm_ok and not_chasing:
-            score = 70 + 10 + bos["body_ratio"] * 7 + confirm["body_ratio"] * 8
-            score += 4 if retest["lower_wick"] >= 0.25 else 2
-            score -= 4 if noisy else 0
-            add(
-                "BOS_RETEST_CONFIRMATION",
-                "CALL",
-                score,
-                ["M5 صاعد", "BOS صاعد مغلق", "Retest حافظ على المستوى", "شمعة تأكيد صاعدة"],
-                level=swing_high,
-                meta={"bos_body": round(bos["body_ratio"], 2), "confirm_body": round(confirm["body_ratio"], 2), "noisy": noisy},
-            )
+    strong_lowers = sum(1 for x in agreeing if float(x.get("lower", 0)) >= 0.55)
+    if strong_lowers < 2:
+        return {"ok": False, "reason": f"الهامش المحافظ ضعيف: {strong_lowers}/2"}
 
-    if m5_bias == "PUT" and swing_low is not None:
-        bos_ok = bos["dir"] < 0 and bos["body_ratio"] >= 0.42 and bos["close"] < swing_low
-        retest_ok = retest["high"] >= swing_low - tolerance and retest["close"] <= swing_low + tolerance * 0.25
-        confirm_ok = confirm["dir"] < 0 and confirm["body_ratio"] >= 0.30 and confirm["close"] < retest["low"] and confirm["lower_wick"] < 0.48
-        not_chasing = (swing_low - confirm["close"]) <= avg_range * 1.65
-        if bos_ok and retest_ok and confirm_ok and not_chasing:
-            score = 70 + 10 + bos["body_ratio"] * 7 + confirm["body_ratio"] * 8
-            score += 4 if retest["upper_wick"] >= 0.25 else 2
-            score -= 4 if noisy else 0
-            add(
-                "BOS_RETEST_CONFIRMATION",
-                "PUT",
-                score,
-                ["M5 هابط", "BOS هابط مغلق", "Retest حافظ على المستوى", "شمعة تأكيد هابطة"],
-                level=swing_low,
-                meta={"bos_body": round(bos["body_ratio"], 2), "confirm_body": round(confirm["body_ratio"], 2), "noisy": noisy},
-            )
+    # Pair-local same-state history is a veto only when it has meaningful support.
+    local = (model.get("local_a") or {}).get((str(pair), sig["A"])) or {}
+    local_call = int(local.get("CALL", 0) or 0)
+    local_put = int(local.get("PUT", 0) or 0)
+    local_support = local_call + local_put
+    local_chosen = local_call if direction == "CALL" else local_put
+    local_prob = ((local_chosen + 1.0) / (local_support + 2.0)) if local_support else None
+    if local_support >= 6 and local_prob is not None and local_prob < 0.55:
+        return {"ok": False, "reason": f"تاريخ الزوج نفسه يعارض الإشارة: {round(local_prob*100,1)}% / {local_support}"}
 
-    candidates = [x for x in candidates if int(x.get("score", 0)) >= int(STRUCTURE_EDGE_MIN_SCORE)]
-    if not candidates:
-        return {
-            "ok": False,
-            "reason": "لا يوجد Structure confirmation مكتمل",
-            "m5_bias": m5_bias,
-            "m5_strength": m5_strength,
-            "noisy": noisy,
-        }
-    candidates.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("payout", 0))), reverse=True)
-    return candidates[0]
+    support = sum(int(x["support"]) for x in agreeing)
+    reference_pairs = max(int(x["pair_count"]) for x in agreeing)
+    return {
+        "ok": True,
+        "direction": direction,
+        "score": score,
+        "setup": "STATISTICAL_PATTERN_CONSENSUS",
+        "model_confidence": round(consensus * 100.0, 1),
+        "model_support": support,
+        "model_pairs": reference_pairs,
+        "model_components": components,
+        "local_support": local_support,
+        "local_probability": round(local_prob * 100.0, 1) if local_prob is not None else None,
+        "signature": sig.get("meta") or {},
+        "confluences": [
+            f"{len(agreeing)}/{len(components)} نماذج تاريخية متفقة",
+            f"Historical match {round(consensus*100,1)}%",
+            f"Support {support} observations",
+            f"Reference pairs {reference_pairs}",
+        ],
+    }
 
 
-def analyze_structure_edge_pair(pair: str, symbol: str | None = None) -> dict:
+def analyze_structure_edge_pair(pair: str, symbol: str | None = None, model: dict | None = None, closed_override: list[dict] | None = None) -> dict:
+    """Compatibility name; implementation is Statistical Pattern Consensus v1."""
     try:
         normalized = normalize_otc_currency_pair_name(pair, symbol) if symbol else normalize_pair_name_basic(pair)
         if not normalized or not is_valid_otc_currency_pair_name(normalized):
@@ -12796,17 +12793,40 @@ def analyze_structure_edge_pair(pair: str, symbol: str | None = None) -> dict:
             return {"ok": False, "pair": normalized, "reason": f"payout {payout}% أقل من الحد"}
 
         current_bucket = int(time_module.time() // 60) * 60
-        closed = [dict(c) for c in candles if _structure_edge_candle_bucket(c) < current_bucket]
+        closed = list(closed_override or [dict(c) for c in candles if _structure_edge_candle_bucket(c) < current_bucket])
+        closed = sorted(closed, key=_structure_edge_candle_bucket)
         if len(closed) < STRUCTURE_EDGE_MIN_CLOSED_M1:
             return {"ok": False, "pair": normalized, "reason": f"warmup M1: {len(closed)}/{STRUCTURE_EDGE_MIN_CLOSED_M1}"}
-        result = _structure_edge_analyze_closed_candles(normalized, symbol, closed, payout, current_price)
-        if result.get("ok"):
-            result["entry_bucket"] = current_bucket
-            result["entry_price"] = current_price
-            result["closed_m1_count"] = len(closed)
-        return result
+        if not _stat_edge_consecutive(closed[-9:]):
+            return {"ok": False, "pair": normalized, "reason": "فجوة في آخر شموع M1"}
+
+        decision = _stat_edge_model_decision(normalized, closed, model or {})
+        if not decision.get("ok"):
+            return {"ok": False, "pair": normalized, **decision}
+
+        sig = _stat_edge_signature(closed[-8:]) or {}
+        avg_range = float((sig.get("meta") or {}).get("avg_range") or 0)
+        last_close = float(_otc_edge_candle_parts(closed[-1]).get("close") or 0)
+        opening_displacement = abs(current_price - last_close) / max(avg_range, 1e-12)
+        if opening_displacement > STAT_EDGE_OPEN_DISPLACEMENT_MAX:
+            return {"ok": False, "pair": normalized, "reason": f"افتتاح اندفاعي متأخر: {opening_displacement:.2f}x"}
+
+        decision.update({
+            "pair": normalized,
+            "symbol": symbol,
+            "payout": payout,
+            "price": current_price,
+            "entry_price": current_price,
+            "entry_bucket": current_bucket,
+            "closed_m1_count": len(closed),
+            "opening_displacement": round(opening_displacement, 3),
+            # Legacy fields are retained only so v1.02/v1.03 extension metadata remains compatible.
+            "m5_bias": "STAT",
+            "m5_strength": int(decision.get("score", 0) or 0),
+        })
+        return decision
     except Exception as exc:
-        logger.exception("Structure Edge pair analysis failed | pair=%s | error=%s", pair, exc)
+        logger.exception("Statistical Edge pair analysis failed | pair=%s | error=%s", pair, exc)
         return {"ok": False, "pair": pair, "reason": f"analysis error: {exc}"}
 
 
@@ -12819,39 +12839,58 @@ def _structure_edge_pair_ready(pair: str, now_ts: float) -> bool:
 
 
 def _structure_edge_scan_market() -> list[dict]:
-    candidates = []
     pair_map = get_otc_analysis_pair_map()
+    current_bucket = int(time_module.time() // 60) * 60
+    closed_map = {}
+    for pair, symbol in pair_map.items():
+        try:
+            _, _, candles = _get_otc_rows_and_candles(symbol)
+            closed = sorted([dict(c) for c in candles if _structure_edge_candle_bucket(c) < current_bucket], key=_structure_edge_candle_bucket)
+            if len(closed) >= 12:
+                closed_map[str(pair)] = closed
+        except Exception:
+            continue
+
+    model = _stat_edge_build_model(closed_map)
+    _structure_edge_state["model_samples"] = int(model.get("samples", 0) or 0)
+    _structure_edge_state["model_pairs"] = int(model.get("pairs", 0) or 0)
+    _structure_edge_state["model_generated_at"] = now_iso()
+
+    candidates = []
     for pair, symbol in pair_map.items():
         try:
             if not _structure_edge_pair_ready(pair, time_module.time()):
                 continue
-            item = analyze_structure_edge_pair(pair, symbol)
+            item = analyze_structure_edge_pair(pair, symbol, model=model, closed_override=closed_map.get(str(pair)) or [])
             if item.get("ok"):
                 candidates.append(item)
         except Exception:
-            logger.debug("Structure Edge skipped pair %s", pair, exc_info=True)
-    candidates.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("payout", 0))), reverse=True)
+            logger.debug("Statistical Edge skipped pair %s", pair, exc_info=True)
+    _structure_edge_state["model_qualified"] = len(candidates)
+    candidates.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("model_support", 0)), int(x.get("payout", 0))), reverse=True)
     return candidates
 
 
 def _structure_edge_signal_message(trade: dict) -> str:
     direction = str(trade.get("direction") or "").upper()
     icon = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
-    setup = "Liquidity Sweep + CHOCH" if trade.get("setup") == "LIQUIDITY_SWEEP_CHOCH" else "BOS + Retest + Confirmation"
     entry_dt = datetime.fromtimestamp(int(trade.get("entry_bucket", 0)), tz=UTC).astimezone(UTC_PLUS_3)
     close_dt = entry_dt + timedelta(seconds=60)
-    conf = " • ".join(str(x) for x in (trade.get("confluences") or []))
+    local_text = "-"
+    if trade.get("local_probability") is not None:
+        local_text = f"{trade.get('local_probability')}% / n={trade.get('local_support')}"
     return (
-        "🧱 STRUCTURE EDGE — TEST\n"
+        "📊 STATISTICAL EDGE — TEST\n"
         "━━━━━━━━━━━━━━\n"
         f"💱 {trade.get('pair')}\n"
         f"📌 {icon}\n"
-        f"🧠 {setup}\n"
-        f"🧭 M5: {trade.get('m5_bias')} ({trade.get('m5_strength')}%)\n"
-        f"🎯 Score: {trade.get('score')}% | payout {trade.get('payout')}%\n"
+        f"🧠 Pattern Consensus — توقع الشمعة التالية\n"
+        f"📈 Historical match: {trade.get('model_confidence')}%\n"
+        f"🧮 Support: {trade.get('model_support')} | reference pairs: {trade.get('model_pairs')}\n"
+        f"💱 Pair-local: {local_text}\n"
+        f"🎯 Gate score: {trade.get('score')}% | payout {trade.get('payout')}%\n"
         f"⏳ الدخول: الآن • {entry_dt.strftime('%H:%M:%S')} UTC+3\n"
         f"🏁 الإغلاق: {close_dt.strftime('%H:%M:%S')} UTC+3\n"
-        f"🔗 {conf}\n"
         "🧪 Extension direct test — DEMO فقط"
     )[:3900]
 
@@ -12873,44 +12912,34 @@ def _structure_edge_result_from_close(direction: str, entry_price, close_price) 
 def _structure_edge_record_result(trade: dict, result: str, close_price=None) -> bool:
     try:
         record = {
-            "created_at": trade.get("created_at"),
-            "closed_at": now_iso(),
-            "pair": trade.get("pair"),
-            "symbol": trade.get("symbol"),
-            "direction": trade.get("direction"),
-            "setup": trade.get("setup"),
-            "score": int(trade.get("score", 0) or 0),
-            "payout": int(trade.get("payout", 0) or 0),
-            "m5_bias": trade.get("m5_bias"),
-            "m5_strength": int(trade.get("m5_strength", 0) or 0),
-            "entry_bucket": int(trade.get("entry_bucket", 0) or 0),
-            "entry_price": float(trade.get("entry_price", 0) or 0),
-            "close_price": float(close_price or 0),
-            "result": str(result),
-            "confluences": trade.get("confluences") or [],
+            "created_at": trade.get("created_at"), "closed_at": now_iso(), "pair": trade.get("pair"),
+            "symbol": trade.get("symbol"), "direction": trade.get("direction"), "setup": trade.get("setup"),
+            "score": int(trade.get("score", 0) or 0), "payout": int(trade.get("payout", 0) or 0),
+            "model_confidence": float(trade.get("model_confidence", 0) or 0),
+            "model_support": int(trade.get("model_support", 0) or 0), "model_pairs": int(trade.get("model_pairs", 0) or 0),
+            "entry_bucket": int(trade.get("entry_bucket", 0) or 0), "entry_price": float(trade.get("entry_price", 0) or 0),
+            "close_price": float(close_price or 0), "result": str(result), "confluences": trade.get("confluences") or [],
         }
         _structure_edge_results_ref().push(record)
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Structure Edge result store failed: %s", exc)
+        logger.exception("Statistical Edge result store failed: %s", exc)
         return False
 
 
 def _structure_edge_fetch_results(limit: int | None = None) -> list[dict]:
     try:
         ref = _structure_edge_results_ref()
-        if limit and int(limit) > 0:
-            data = ref.order_by_key().limit_to_last(int(limit)).get() or {}
-        else:
-            data = ref.get() or {}
+        data = ref.order_by_key().limit_to_last(int(limit)).get() if limit and int(limit) > 0 else ref.get()
+        data = data or {}
         if not isinstance(data, dict):
             return []
         rows = [dict(v, _key=k) for k, v in data.items() if isinstance(v, dict)]
         rows.sort(key=lambda x: str(x.get("closed_at") or x.get("created_at") or ""))
         return rows
     except Exception as exc:
-        logger.exception("Structure Edge results read failed: %s", exc)
+        logger.exception("Statistical Edge results read failed: %s", exc)
         return []
 
 
@@ -12934,28 +12963,21 @@ def build_structure_edge_summary(limit: int | None = None) -> str:
     draws = sum(1 for x in rows if x.get("result") == "draw")
     decided = wins + losses
     wr = round(wins / decided * 100, 1) if decided else 0.0
-    setups = {}
-    for row in rows:
-        key = str(row.get("setup") or "UNKNOWN")
-        bucket = setups.setdefault(key, {"w": 0, "l": 0, "d": 0})
-        r = row.get("result")
-        if r == "win": bucket["w"] += 1
-        elif r == "loss": bucket["l"] += 1
-        else: bucket["d"] += 1
-    setup_lines = []
-    for name, s in setups.items():
-        n = s["w"] + s["l"]
-        rate = round(s["w"] / n * 100, 1) if n else 0.0
-        setup_lines.append(f"• {name}: {s['w']}W / {s['l']}L / {s['d']}D — {rate}%")
+    if rows:
+        avg_score = round(sum(float(x.get("score", 0) or 0) for x in rows) / len(rows), 1)
+        avg_latency_rows = [float(x.get("execution_latency_ms")) for x in rows if isinstance(x.get("execution_latency_ms"), (int, float))]
+        avg_latency = round(sum(avg_latency_rows) / len(avg_latency_rows)) if avg_latency_rows else None
+    else:
+        avg_score = 0.0
+        avg_latency = None
     return (
-        f"📊 Structure Edge — آخر {effective} نتيجة\n"
+        f"📊 Statistical Edge — آخر {effective} نتيجة\n"
         "━━━━━━━━━━━━━━\n"
-        f"✅ Win: {wins}\n"
-        f"❌ Loss: {losses}\n"
-        f"⚖️ Draw: {draws}\n"
-        f"📈 Win rate: {wr}%\n"
-        f"🧨 Max loss streak: {_structure_edge_max_loss_streak(rows)}\n\n"
-        "حسب الـSetup:\n" + ("\n".join(setup_lines) if setup_lines else "لا توجد نتائج بعد")
+        f"✅ Win: {wins}\n❌ Loss: {losses}\n⚖️ Draw: {draws}\n"
+        f"📈 Win rate: {wr}%\n🧨 Max loss streak: {_structure_edge_max_loss_streak(rows)}\n"
+        f"🧠 Avg historical score: {avg_score}%\n"
+        f"⚡ Avg execution latency: {str(avg_latency) + ' ms' if avg_latency is not None else '-'}\n\n"
+        "المدرسة: Statistical Pattern Consensus — بدون Structure/Liquidity rules."
     )[:3900]
 
 
@@ -12965,43 +12987,43 @@ def build_structure_edge_status() -> str:
     last = _structure_edge_state.get("last_candidate") or {}
     pending_text = "لا يوجد"
     if isinstance(pending, dict):
-        pending_text = f"{pending.get('pair')} {pending.get('direction')} | {pending.get('setup')}"
+        pending_text = f"{pending.get('pair')} {pending.get('direction')} | {pending.get('score')}%"
     last_text = "لا يوجد بعد"
     if isinstance(last, dict) and last:
-        last_text = f"{last.get('pair')} {last.get('direction')} | {last.get('setup')} | {last.get('score')}%"
+        last_text = f"{last.get('pair')} {last.get('direction')} | {last.get('score')}% | support {last.get('model_support', '-')}"
     return (
-        "📋 حالة Structure Edge — TEST\n"
+        "📋 حالة Statistical Edge — TEST\n"
         "━━━━━━━━━━━━━━\n"
         f"الحالة: {'شغال ✅' if settings.get('enabled') else 'متوقف ⏸'}\n"
         f"الهدف: {_structure_edge_target_chat_id()}\n"
-        f"M1 warmup المطلوب: {STRUCTURE_EDGE_MIN_CLOSED_M1} شمعة\n"
-        f"Score الأدنى: {STRUCTURE_EDGE_MIN_SCORE}%\n"
+        f"M1 warmup المطلوب: {STRUCTURE_EDGE_MIN_CLOSED_M1} شمعة لكل زوج مرشح\n"
+        f"Training pool: {_structure_edge_state.get('model_samples', 0)} sample / {_structure_edge_state.get('model_pairs', 0)} pairs\n"
+        f"الحد الأدنى للموديل: {STAT_EDGE_MIN_TRAINING_SAMPLES} sample / {STAT_EDGE_MIN_TRAINING_PAIRS} pairs\n"
+        f"Historical score الأدنى: {STRUCTURE_EDGE_MIN_SCORE}%\n"
         f"Payout الأدنى: {STRUCTURE_EDGE_MIN_PAYOUT}%\n"
         f"نافذة الدخول: الثانية {STRUCTURE_EDGE_ENTRY_MIN_SECOND}–{STRUCTURE_EDGE_ENTRY_MAX_SECOND}\n"
         f"Cooldown الزوج: {round(STRUCTURE_EDGE_PAIR_COOLDOWN_SECONDS/60, 1)} دقيقة\n"
-        f"صفقة قيد المتابعة: {pending_text}\n"
-        f"آخر Candidate: {last_text}\n"
-        f"آخر Scan: {_structure_edge_state.get('last_scan_at') or '-'}\n"
-        f"آخر خطأ: {_structure_edge_state.get('last_error') or '-'}\n\n"
-        "المنطق: M5 Structure → Liquidity Sweep/BOS → CHOCH/Retest → Closed-candle confirmation → M1 entry.\n"
-        f"Extension online: {_copy_online_clients_for_user(ADMIN_TELEGRAM_ID)} | Copy sent: {_structure_edge_state.get('copy_signals_sent', 0)} | order reports: {_structure_edge_state.get('execution_reports', 0)} | failed: {_structure_edge_state.get('copy_signals_failed', 0)} | skipped: {_structure_edge_state.get('extension_skips', 0)}\n"
-        f"آخر Skip: {_structure_edge_state.get('last_skip_reason') or '-'}\n"
-        "🧪 التنفيذ: Chrome Extension — DEMO فقط — بدون مضاعفات."
+        f"صفقة قيد المتابعة: {pending_text}\nآخر Candidate: {last_text}\n"
+        f"آخر رفض: {_structure_edge_state.get('last_reject_reason') or '-'}\n"
+        f"آخر Scan: {_structure_edge_state.get('last_scan_at') or '-'}\nآخر خطأ: {_structure_edge_state.get('last_error') or '-'}\n\n"
+        "المنطق: 4 جداول Pattern تاريخية مستقلة → إجماع ≥3 → Wilson guard → pair-local veto → M1 next candle.\n"
+        f"Extension online: {_copy_online_clients_for_user(ADMIN_TELEGRAM_ID)} | Copy sent: {_structure_edge_state.get('copy_signals_sent', 0)} | order reports: {_structure_edge_state.get('execution_reports', 0)} | skipped: {_structure_edge_state.get('extension_skips', 0)}\n"
+        "🧪 التنفيذ: Chrome Extension — DEMO فقط — $1 — بدون مضاعفات."
     )[:3900]
 
 
 def _structure_edge_reset_results() -> tuple[bool, str]:
     try:
         _structure_edge_results_ref().delete()
-        _structure_edge_state.update({"results_sent": 0, "last_result_at": None})
-        return True, "✅ تم تصفير نتائج Structure Edge فقط. إعداد التشغيل بقي كما هو."
+        _structure_edge_executions_ref().delete()
+        _structure_edge_state.update({"results_sent": 0, "last_result_at": None, "execution_reports": 0})
+        return True, "✅ تم تصفير نتائج Statistical Edge الجديدة فقط. نتائج Structure Edge القديمة بقيت محفوظة بأرشيفها القديم."
     except Exception as exc:
-        logger.exception("Structure Edge results reset failed: %s", exc)
+        logger.exception("Statistical Edge results reset failed: %s", exc)
         return False, f"❌ تعذر تصفير النتائج: {exc}"
 
-
 async def _structure_edge_process_pending(context: ContextTypes.DEFAULT_TYPE) -> bool:
-    """Hold one Structure Edge trade until the extension returns a confirmed Quotex result.
+    """Hold one Statistical Edge trade until the extension returns a confirmed Quotex result.
 
     We intentionally do NOT score the server-side shadow candle as the official test
     result anymore. The whole point of v1.17 is to measure the actual extension entry.
@@ -13020,12 +13042,12 @@ async def _structure_edge_process_pending(context: ContextTypes.DEFAULT_TYPE) ->
         await safe_send_message(
             context.bot,
             chat_id=_structure_edge_target_chat_id(),
-            text=f"⚠️ Structure Edge: لم تصل نتيجة Quotex مؤكدة للإشارة {trade.get('pair')} {trade.get('direction')} ضمن المهلة. لم تُحسب Win/Loss.",
+            text=f"⚠️ Statistical Edge: لم تصل نتيجة Quotex مؤكدة للإشارة {trade.get('pair')} {trade.get('direction')} ضمن المهلة. لم تُحسب Win/Loss.",
         )
         return False
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Structure Edge pending result timeout failed: %s", exc)
+        logger.exception("Statistical Edge pending result timeout failed: %s", exc)
         return True
 
 
@@ -13056,7 +13078,7 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
     try:
         client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
         if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Structure Edge opened event | user=%s", client_uid)
+            logger.warning("Ignored non-owner Statistical Edge opened event | user=%s", client_uid)
             return False
         if str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
@@ -13077,6 +13099,9 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
             "score": int((payload_event or {}).get("score") or (pending or {}).get("score") or 0),
             "m5_bias": (payload_event or {}).get("m5_bias") or (pending or {}).get("m5_bias"),
             "m5_strength": int((payload_event or {}).get("m5_strength") or (pending or {}).get("m5_strength") or 0),
+            "model_confidence": float((payload_event or {}).get("stat_model_confidence") or (pending or {}).get("model_confidence") or (pending or {}).get("score") or 0),
+            "model_support": int((payload_event or {}).get("stat_model_support") or (pending or {}).get("model_support") or 0),
+            "model_pairs": int((payload_event or {}).get("stat_model_pairs") or (pending or {}).get("model_pairs") or 0),
             "signal_created_at": (payload_event or {}).get("signal_created_at") or (pending or {}).get("created_at"),
             "executed_at": (payload_event or {}).get("executed_at") or now_iso(),
             "execution_latency_ms": (payload_event or {}).get("execution_latency_ms"),
@@ -13110,11 +13135,12 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
                 TRADING_TIME_TELEGRAM_APP.bot,
                 chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    "⚡ STRUCTURE EDGE — ORDER SENT\n"
+                    "⚡ STATISTICAL EDGE — ORDER SENT\n"
                     "━━━━━━━━━━━━━━\n"
                     f"💱 {record.get('pair')}\n"
                     f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
-                    f"🧠 {record.get('setup')} • Score {record.get('score')}%\n"
+                    f"🧠 Pattern Consensus • Historical score {record.get('model_confidence') or record.get('score')}%\n"
+                    f"🧮 Support {record.get('model_support') or '-'} • pairs {record.get('model_pairs') or '-'}\n"
                     f"💵 DEMO • ${amount:g}\n"
                     f"🕐 إرسال أمر الدخول: {_structure_edge_local_hms(record.get('executed_at'))} UTC+3\n"
                     f"🏁 انتهاء الصفقة: {_structure_edge_local_hms(record.get('expires_at'))} UTC+3\n"
@@ -13126,16 +13152,16 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Structure Edge opened audit record failed: %s", exc)
+        logger.exception("Statistical Edge opened audit record failed: %s", exc)
         return False
 
 
 async def _copy_record_structure_edge_trade_result(payload_event: dict, client: dict | None = None) -> bool:
-    """Persist a confirmed Structure Edge result reported by the owner's extension."""
+    """Persist a confirmed Statistical Edge result reported by the owner's extension."""
     try:
         client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
         if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Structure Edge result event | user=%s", client_uid)
+            logger.warning("Ignored non-owner Statistical Edge result event | user=%s", client_uid)
             return False
         if str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
@@ -13168,6 +13194,9 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
             "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
             "m5_bias": (payload_event or {}).get("m5_bias") or (pending or {}).get("m5_bias"),
             "m5_strength": int((payload_event or {}).get("m5_strength") or (pending or {}).get("m5_strength") or 0),
+            "model_confidence": float((payload_event or {}).get("stat_model_confidence") or (pending or {}).get("model_confidence") or (pending or {}).get("score") or 0),
+            "model_support": int((payload_event or {}).get("stat_model_support") or (pending or {}).get("model_support") or 0),
+            "model_pairs": int((payload_event or {}).get("stat_model_pairs") or (pending or {}).get("model_pairs") or 0),
             "entry_bucket": int((pending or {}).get("entry_bucket") or 0),
             "entry_price": float((pending or {}).get("entry_price") or 0),
             "close_price": 0.0,
@@ -13216,11 +13245,12 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
                 TRADING_TIME_TELEGRAM_APP.bot,
                 chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    f"🧱 STRUCTURE EDGE — {result_text}\n"
+                    f"📊 STATISTICAL EDGE — {result_text}\n"
                     "━━━━━━━━━━━━━━\n"
                     f"💱 {record.get('pair')}\n"
                     f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
-                    f"🧠 {record.get('setup')} • Score {record.get('score')}%\n"
+                    f"🧠 Pattern Consensus • Historical score {record.get('model_confidence') or record.get('score')}%\n"
+                    f"🧮 Support {record.get('model_support') or '-'} • pairs {record.get('model_pairs') or '-'}\n"
                     f"💵 Net: {net_text} | DEMO\n"
                     f"⚡ Latency: {latency_text}\n"
                     "━━━━━━━━━━━━━━\n"
@@ -13231,12 +13261,12 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Structure Edge extension result record failed: %s", exc)
+        logger.exception("Statistical Edge extension result record failed: %s", exc)
         return False
 
 
 async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: dict | None = None) -> bool:
-    """Record a Structure Edge signal that the owner extension intentionally skipped.
+    """Record a Statistical Edge signal that the owner extension intentionally skipped.
 
     A skip is diagnostic only: it clears a matching pending trade and never creates a
     Win/Loss row. Idempotency prevents outbox retries from inflating the skip counter.
@@ -13244,7 +13274,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
     try:
         client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
         if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Structure Edge skip event | user=%s", client_uid)
+            logger.warning("Ignored non-owner Statistical Edge skip event | user=%s", client_uid)
             return False
         if str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
@@ -13271,7 +13301,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
             _structure_edge_state["pending_trade"] = None
 
         logger.info(
-            "Structure Edge extension skip | signal=%s | pair=%s | direction=%s | reason=%s",
+            "Statistical Edge extension skip | signal=%s | pair=%s | direction=%s | reason=%s",
             signal_id,
             (payload_event or {}).get("pair"),
             (payload_event or {}).get("direction"),
@@ -13282,7 +13312,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
                 TRADING_TIME_TELEGRAM_APP.bot,
                 chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    "⏭️ STRUCTURE EDGE — SKIPPED\n"
+                    "⏭️ STATISTICAL EDGE — SKIPPED\n"
                     "━━━━━━━━━━━━━━\n"
                     f"💱 {(payload_event or {}).get('pair') or (pending or {}).get('pair')}\n"
                     f"📌 {_structure_edge_direction_label((payload_event or {}).get('direction') or (pending or {}).get('direction'))}\n"
@@ -13293,7 +13323,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Structure Edge extension skip record failed: %s", exc)
+        logger.exception("Statistical Edge extension skip record failed: %s", exc)
         return False
 
 
@@ -13347,7 +13377,7 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
             _structure_edge_state["last_signal_at"] = now_iso()
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Structure Edge job error: %s", exc)
+        logger.exception("Statistical Edge job error: %s", exc)
 
 
 # v1.02: Three Candle timing/filter tuning only; Public remains a mirror of accepted private signals.
@@ -21152,42 +21182,42 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
 
-        if text == "🧱 Structure Edge":
+        if text == "📊 Statistical Edge":
             reset_signal_state(context)
             await update.message.reply_text(
-                "🧱 Structure Edge — قناة اختبار مستقلة\n"
-                "M5 Structure + Liquidity + BOS/CHOCH + Retest/Confirmation.\n"
+                "📊 Statistical Edge — نفس خانة الاختبار السابقة\n"
+                "تحليل احتمالي للشمعة M1 التالية من Pattern Consensus تاريخي.\n"
                 "لا تغيّر قناة الثغرة. الاختبار ينفذ عبر إضافة Chrome على DEMO فقط.\n"
                 "سجل القناة: Signal → Order Sent/Skip → Quotex Result.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
 
-        if text == "🟢 تشغيل Structure Edge":
+        if text == "🟢 تشغيل Statistical Edge":
             ok = _structure_edge_set_enabled(True)
             await update.message.reply_text(
-                "✅ تم تشغيل Structure Edge — Extension Direct DEMO Test." if ok else "❌ تعذر تشغيل Structure Edge. راجع اللوج.",
+                "✅ تم تشغيل Statistical Edge — Pattern Consensus DEMO Test." if ok else "❌ تعذر تشغيل Statistical Edge. راجع اللوج.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
 
-        if text == "🔴 إيقاف Structure Edge":
+        if text == "🔴 إيقاف Statistical Edge":
             ok = _structure_edge_set_enabled(False)
             await update.message.reply_text(
-                "⛔ تم إيقاف Structure Edge." if ok else "❌ تعذر إيقاف Structure Edge. راجع اللوج.",
+                "⛔ تم إيقاف Statistical Edge." if ok else "❌ تعذر إيقاف Statistical Edge. راجع اللوج.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
 
-        if text == "📋 حالة Structure Edge":
+        if text == "📋 حالة Statistical Edge":
             await update.message.reply_text(build_structure_edge_status(), reply_markup=structure_edge_admin_keyboard)
             return
 
-        if text == "📊 ملخص Structure Edge":
+        if text == "📊 ملخص Statistical Edge":
             await update.message.reply_text(build_structure_edge_summary(), reply_markup=structure_edge_admin_keyboard)
             return
 
-        if text == "🧹 تصفير نتائج Structure Edge":
+        if text == "🧹 تصفير نتائج Statistical Edge":
             ok, msg = _structure_edge_reset_results()
             await update.message.reply_text(msg, reply_markup=structure_edge_admin_keyboard)
             return
@@ -22207,6 +22237,11 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         "m5_bias": str(payload.get("m5_bias") or "")[:16] or None,
         "m5_strength": int(payload.get("m5_strength")) if str(payload.get("m5_strength") or "").strip().isdigit() else None,
         "structure_confluences": [str(x)[:120] for x in (payload.get("structure_confluences") or [])[:8]] if isinstance(payload.get("structure_confluences"), list) else [],
+        "stat_model_confidence": float(payload.get("stat_model_confidence")) if str(payload.get("stat_model_confidence") or "").strip().replace(".", "", 1).isdigit() else None,
+        "stat_model_support": int(payload.get("stat_model_support")) if str(payload.get("stat_model_support") or "").strip().isdigit() else None,
+        "stat_model_pairs": int(payload.get("stat_model_pairs")) if str(payload.get("stat_model_pairs") or "").strip().isdigit() else None,
+        "stat_local_probability": float(payload.get("stat_local_probability")) if str(payload.get("stat_local_probability") or "").strip().replace(".", "", 1).isdigit() else None,
+        "stat_local_support": int(payload.get("stat_local_support")) if str(payload.get("stat_local_support") or "").strip().isdigit() else None,
         "demo_only": bool(payload.get("demo_only") or False),
     }
     supplied_id = str(payload.get("id") or "").strip()
@@ -24382,12 +24417,12 @@ def run_telegram_bot_only():
         name="multi_user_otc_edge_watcher",
     )
 
-    # v1.16.0: independent Structure Edge shadow strategy; disabled by default and admin-only.
+    # v1.16.0: Statistical Edge strategy in the reused test slot; disabled by default and admin-only.
     job_queue.run_repeating(
         structure_edge_job,
         interval=STRUCTURE_EDGE_SCAN_SECONDS,
         first=STRUCTURE_EDGE_SCAN_SECONDS,
-        name="structure_edge_shadow_strategy",
+        name="statistical_edge_consensus_strategy",
     )
 
     # قناة اختبار استراتيجية 3 شموع + ذاكرة تحليل v0.59. تعمل فقط عند ضبط THREE_CANDLE_CHANNEL_ID وتفعيلها من env.
