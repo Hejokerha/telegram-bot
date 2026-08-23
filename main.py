@@ -451,7 +451,7 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
         ["🔐 Copy Trading", "📡 حالة Copy"],
-        ["📐 Reverse Price Action", "📡 قناة 3 شموع"],
+        ["🎯 Round Number Edge", "📡 قناة 3 شموع"],
         ["🌐 Public Three Candle"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
@@ -494,9 +494,9 @@ admin_otc_edge_keyboard = ReplyKeyboardMarkup(
 # It does not alter or replace Three Candle / OTC Edge and does not send Copy Trading commands.
 structure_edge_admin_keyboard = ReplyKeyboardMarkup(
     [
-        ["🟢 تشغيل Reverse Price Action", "🔴 إيقاف Reverse Price Action"],
-        ["📋 حالة Reverse Price Action", "📊 ملخص Reverse Price Action"],
-        ["📚 كل نتائج Reverse Price Action", "🧹 تصفير نتائج Reverse Price Action"],
+        ["🟢 تشغيل Round Number Edge", "🔴 إيقاف Round Number Edge"],
+        ["📋 حالة Round Number Edge", "📊 ملخص Round Number Edge"],
+        ["📚 كل نتائج Round Number Edge", "🧹 تصفير نتائج Round Number Edge"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -1029,7 +1029,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.22.0"
+COPY_SERVER_VERSION = "1.23.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -3540,7 +3540,7 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
         "m5_bias": signal.get("m5_bias"),
         "m5_strength": signal.get("m5_strength"),
         "structure_confluences": signal.get("structure_confluences") or signal.get("confluences"),
-        # v1.21 Price Action test metadata.
+        # v1.21 Round Number test metadata.
         "price_action_families": signal.get("price_action_families") or [],
         "price_action_components": signal.get("price_action_components") or [],
         "primary_family": signal.get("primary_family"),
@@ -3817,13 +3817,13 @@ async def publish_copy_structure_edge_prepare_signal(trade: dict, target_entry_b
             "demo_only": True,
             "creator_user_id": int(ADMIN_TELEGRAM_ID),
             "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"reverse_price_action_v1_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | pair_prepare_only",
+            "note": f"round_number_edge_v1_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | pair_prepare_only",
         }
         result = await publish_copy_trading_signal(payload, source="structure_edge")
-        logger.info("Reverse Price Action pre-arm sent | pair=%s | target=%s | delivery=%s", pair, target_entry_bucket, result.get("delivery") if isinstance(result, dict) else result)
+        logger.info("Round Number Edge pre-arm sent | pair=%s | target=%s | delivery=%s", pair, target_entry_bucket, result.get("delivery") if isinstance(result, dict) else result)
         return result
     except Exception as exc:
-        logger.exception("Reverse Price Action pre-arm publish failed: %s", exc)
+        logger.exception("Round Number Edge pre-arm publish failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -3899,13 +3899,13 @@ async def publish_copy_structure_edge_signal(trade: dict) -> dict:
             "demo_only": True,
             "creator_user_id": int(ADMIN_TELEGRAM_ID),
             "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"reverse_price_action_v1_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | line={(trade or {}).get('line_type')} | touches={(trade or {}).get('line_touches')} | demo_only",
+            "note": f"round_number_edge_v1_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | line={(trade or {}).get('line_type')} | touches={(trade or {}).get('line_touches')} | demo_only",
         }
         result = await publish_copy_trading_signal(payload, source="structure_edge")
-        logger.info("Copy Trading Reverse Price Action FINAL sent | pair=%s | setup=%s | score=%s | delivery=%s", pair, (trade or {}).get("setup"), (trade or {}).get("score"), result.get("delivery") if isinstance(result, dict) else result)
+        logger.info("Copy Trading Round Number Edge FINAL sent | pair=%s | setup=%s | score=%s | delivery=%s", pair, (trade or {}).get("setup"), (trade or {}).get("score"), result.get("delivery") if isinstance(result, dict) else result)
         return result
     except Exception as exc:
-        logger.exception("Reverse Price Action final Copy publish failed: %s", exc)
+        logger.exception("Round Number Edge final Copy publish failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -12543,17 +12543,15 @@ THREE_CANDLE_CHANNEL_ENABLED = os.getenv("THREE_CANDLE_CHANNEL_ENABLED", "false"
 
 # v1.01: Optional public/free mirror channel. Keep the private channel untouched.
 
-# ===== v1.22.0 Reverse Price Action: same owner test slot, 3 classical schools =====
-# This REUSES the existing source key `structure_edge`, the same extension radio,
-# the same Telegram channel env (`STRUCTURE_EDGE_CHANNEL_ID`) and the same enable/settings node.
-# No extra section is created. The active test engine evaluates three independent price-action families:
-#   1) TRENDLINE: rising support / falling resistance, BREAKOUT + BOUNCE.
-#   2) SUPPORT/RESISTANCE: clustered horizontal swing levels, BREAKOUT + BOUNCE.
-#   3) ROUND NUMBER: major/half psychological levels, BREAKOUT + BOUNCE.
-# If 2+ families agree on the same pair/direction around the same price zone, one trade is sent and
-# the agreement is stored as confluence instead of opening duplicate trades.
+# ===== v1.23.0 Round Number Edge: original-direction round-number test =====
+# Reuses the existing owner-only test source key `structure_edge`, extension radio, Telegram channel env
+# (`STRUCTURE_EDGE_CHANNEL_ID`) and enable/settings node. No extra section is created.
+# Active decision family ONLY: psychological major/half ROUND NUMBER levels on M1.
+# Two setups are measured separately: ROUND_BREAKOUT and ROUND_BOUNCE.
+# The execution side is the ORIGINAL analysis direction (no inversion).
 # Execution contract remains PRE-ARM -> final close validation -> immediate next-M1 open, owner Chrome
 # extension only, physical DEMO, fixed $1, no martingale/sequence, strict stale/open-displacement guards.
+# v1.23 also fixes Firebase read waste by caching the enabled flag in RAM and refreshing it periodically.
 STRUCTURE_EDGE_SCAN_SECONDS = max(0.25, float(os.getenv("STRUCTURE_EDGE_SCAN_SECONDS", "0.5")))
 # Kept under the old env name for deployment compatibility. Here it is generic setup-quality score.
 STRUCTURE_EDGE_MIN_SCORE = max(50, min(95, int(os.getenv("STRUCTURE_EDGE_MIN_SCORE", "70"))))
@@ -12572,6 +12570,7 @@ STRUCTURE_EDGE_MIN_CLOSED_M1 = max(20, int(os.getenv("STRUCTURE_EDGE_MIN_CLOSED_
 STRUCTURE_EDGE_RESULT_REPORT_LIMIT = max(200, int(os.getenv("STRUCTURE_EDGE_RESULT_REPORT_LIMIT", "200")))
 STRUCTURE_EDGE_CHANNEL_ID_RAW = str(os.getenv("STRUCTURE_EDGE_CHANNEL_ID", "") or "").strip()
 STRUCTURE_EDGE_DEFAULT_ENABLED = os.getenv("STRUCTURE_EDGE_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+STRUCTURE_EDGE_SETTINGS_CACHE_SECONDS = max(15, int(os.getenv("STRUCTURE_EDGE_SETTINGS_CACHE_SECONDS", "60")))
 
 # Classical trendline geometry.
 TRENDLINE_LOOKBACK = max(24, min(100, int(os.getenv("TRENDLINE_LOOKBACK", "55"))))
@@ -12643,6 +12642,10 @@ _structure_edge_state = {
     "sr_levels_found": 0,
     "round_levels_found": 0,
     "family_setups_found": {},
+    "enabled_cache": bool(STRUCTURE_EDGE_DEFAULT_ENABLED),
+    "enabled_cache_loaded": False,
+    "enabled_cache_last_refresh_ts": 0.0,
+    "settings_reads": 0,
 }
 
 # Reuse old settings node so the currently-enabled test slot remains enabled after deployment.
@@ -12651,7 +12654,7 @@ def _structure_edge_settings_ref():
 
 # Fresh result namespace. Structure Edge and Statistical Edge samples remain archived separately.
 def _structure_edge_base_ref():
-    return system_ref().child("reverse_price_action_test_v1")
+    return system_ref().child("round_number_edge_test_v1")
 
 
 def _structure_edge_results_ref():
@@ -12672,30 +12675,49 @@ def _structure_edge_target_chat_id():
     return int(ADMIN_TELEGRAM_ID)
 
 
-def _structure_edge_get_settings() -> dict:
-    default = {"enabled": bool(STRUCTURE_EDGE_DEFAULT_ENABLED)}
-    try:
-        data = _structure_edge_settings_ref().get() or {}
-        if not isinstance(data, dict):
-            data = {}
-        return {"enabled": bool(data.get("enabled", default["enabled"]))}
-    except Exception as exc:
-        logger.debug("Reverse Price Action settings read failed: %s", exc)
-        return default
+def _structure_edge_get_settings(force_refresh: bool = False) -> dict:
+    """Return enabled state from RAM; Firebase is only a periodic fallback refresh."""
+    default_enabled = bool(STRUCTURE_EDGE_DEFAULT_ENABLED)
+    now_ts = time_module.time()
+    loaded = bool(_structure_edge_state.get("enabled_cache_loaded"))
+    last_refresh = float(_structure_edge_state.get("enabled_cache_last_refresh_ts", 0.0) or 0.0)
+    should_refresh = force_refresh or (not loaded) or (now_ts - last_refresh >= STRUCTURE_EDGE_SETTINGS_CACHE_SECONDS)
+    if should_refresh:
+        try:
+            data = _structure_edge_settings_ref().get() or {}
+            if not isinstance(data, dict):
+                data = {}
+            enabled = bool(data.get("enabled", default_enabled))
+            _structure_edge_state["enabled_cache"] = enabled
+            _structure_edge_state["enabled_cache_loaded"] = True
+            _structure_edge_state["enabled_cache_last_refresh_ts"] = now_ts
+            _structure_edge_state["settings_reads"] = int(_structure_edge_state.get("settings_reads", 0) or 0) + 1
+        except Exception as exc:
+            logger.debug("Round Number Edge settings refresh failed: %s", exc)
+            if not loaded:
+                _structure_edge_state["enabled_cache"] = default_enabled
+                _structure_edge_state["enabled_cache_loaded"] = True
+                _structure_edge_state["enabled_cache_last_refresh_ts"] = now_ts
+    return {"enabled": bool(_structure_edge_state.get("enabled_cache", default_enabled))}
 
 
 def _structure_edge_set_enabled(enabled: bool) -> bool:
     try:
-        _structure_edge_settings_ref().update({"enabled": bool(enabled), "updated_at": now_iso(), "engine": "reverse_price_action_v1"})
+        value = bool(enabled)
+        _structure_edge_settings_ref().update({"enabled": value, "updated_at": now_iso(), "engine": "round_number_edge_v1"})
+        # Immediate in-RAM update: the 0.5s scheduler never needs a Firebase read to notice the toggle.
+        _structure_edge_state["enabled_cache"] = value
+        _structure_edge_state["enabled_cache_loaded"] = True
+        _structure_edge_state["enabled_cache_last_refresh_ts"] = time_module.time()
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Reverse Price Action enabled update failed: %s", exc)
+        logger.exception("Round Number Edge enabled update failed: %s", exc)
         return False
 
 
 def _structure_edge_is_enabled() -> bool:
-    return bool(_structure_edge_get_settings().get("enabled"))
+    return bool(_structure_edge_get_settings(force_refresh=False).get("enabled"))
 
 
 def _structure_edge_candle_bucket(candle: dict) -> int:
@@ -13196,7 +13218,7 @@ def _reverse_price_action_direction(direction: str) -> str | None:
 
 
 def analyze_structure_edge_pair(pair: str, symbol: str | None = None, closed_override: list[dict] | None = None) -> dict:
-    """Compatibility name; active implementation is Reverse Price Action v1.21."""
+    """Round Number Edge v1.23: original-direction ROUND_BREAKOUT / ROUND_BOUNCE only."""
     try:
         normalized = normalize_otc_currency_pair_name(pair, symbol) if symbol else normalize_pair_name_basic(pair)
         if not normalized or not is_valid_otc_currency_pair_name(normalized):
@@ -13236,52 +13258,42 @@ def analyze_structure_edge_pair(pair: str, symbol: str | None = None, closed_ove
         if atr <= 0:
             return {"ok": False, "pair": normalized, "reason": "ATR/range غير صالح"}
 
-        candidates = []
-        lines = _trendline_find_lines(parts, atr)
-        for line in lines:
-            item = _trendline_eval_setup(parts, line, atr)
-            if item:
-                candidates.append(item)
-
-        sr_levels = _price_action_sr_levels(parts, atr)
-        for level in sr_levels:
-            item = _price_action_eval_sr(parts, level, atr)
-            if item:
-                candidates.append(item)
-
         round_levels = _price_action_round_levels(parts, atr)
+        candidates = []
         for level in round_levels:
             item = _price_action_eval_round(parts, level, atr)
             if item:
+                # Keep generic payload metadata compatible with the existing extension/audit path.
+                item["price_action_families"] = ["ROUND"]
+                item["price_action_components"] = [str(item.get("setup") or "ROUND")]
+                item["confluence_count"] = 1
                 candidates.append(item)
 
         if not candidates:
             return {
                 "ok": False, "pair": normalized,
-                "reason": f"لا Setup مؤكد | TL {len(lines)} | SR {len(sr_levels)} | ROUND {len(round_levels)}",
-                "lines_considered": len(lines), "sr_levels_considered": len(sr_levels), "round_levels_considered": len(round_levels),
+                "reason": f"لا Round Number setup مؤكد | ROUND {len(round_levels)}",
+                "lines_considered": 0, "sr_levels_considered": 0, "round_levels_considered": len(round_levels),
             }
 
-        candidates = _price_action_add_confluence(candidates, atr)
-        candidates.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("confluence_count", 1)), int(x.get("line_touches", 0))), reverse=True)
-        best = candidates[0]
-        # If the same closed candle creates nearly equal high-quality opposite directions,
-        # skip instead of arbitrarily choosing one side.
+        candidates.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("level_quality", 0)), int(x.get("level_touches", 0))), reverse=True)
+        best = dict(candidates[0])
         opposite = next((x for x in candidates[1:] if str(x.get("direction")) != str(best.get("direction"))), None)
         if opposite and abs(int(best.get("score", 0)) - int(opposite.get("score", 0))) <= PRICE_ACTION_OPPOSITE_CONFLICT_MARGIN:
-            return {"ok": False, "pair": normalized, "reason": f"تعارض Price Action: {best.get('direction')} {best.get('score')} vs {opposite.get('direction')} {opposite.get('score')}"}
+            return {"ok": False, "pair": normalized, "reason": f"تعارض Round Number: {best.get('direction')} {best.get('score')} vs {opposite.get('direction')} {opposite.get('score')}"}
 
-        decision = dict(best)
-        decision.update({
+        best.update({
             "pair": normalized, "symbol": symbol, "payout": payout, "price": current_price, "entry_price": current_price,
             "entry_bucket": current_bucket, "closed_m1_count": len(closed), "atr": atr,
-            "m5_bias": str(decision.get("line_type") or decision.get("level_type") or decision.get("primary_family") or "PRICE_ACTION"),
-            "m5_strength": int(decision.get("line_quality") or decision.get("level_quality") or decision.get("score") or 0),
-            "lines_considered": len(lines), "sr_levels_considered": len(sr_levels), "round_levels_considered": len(round_levels),
+            "m5_bias": str(best.get("level_type") or "ROUND"),
+            "m5_strength": int(best.get("level_quality") or best.get("score") or 0),
+            "lines_considered": 0, "sr_levels_considered": 0, "round_levels_considered": len(round_levels),
+            "primary_family": "ROUND", "price_action_families": ["ROUND"],
+            "price_action_components": [str(best.get("setup") or "ROUND")],
         })
-        return decision
+        return best
     except Exception as exc:
-        logger.exception("Reverse Price Action pair analysis failed | pair=%s | error=%s", pair, exc)
+        logger.exception("Round Number Edge pair analysis failed | pair=%s | error=%s", pair, exc)
         return {"ok": False, "pair": pair, "reason": f"analysis error: {exc}"}
 
 
@@ -13294,13 +13306,12 @@ def _structure_edge_pair_ready(pair: str, now_ts: float) -> bool:
 
 
 def _structure_edge_scan_market(provisional_current: bool = False) -> list[dict]:
-    """Scan all OTC currency pairs for Trendline + S/R + Round Number setups."""
+    """Scan OTC currency pairs for Round Number BREAKOUT/BOUNCE only."""
     pair_map = get_otc_analysis_pair_map()
     current_bucket = int(time_module.time() // 60) * 60
     candidates = []
-    lines_found = sr_found = round_found = ready_pairs = 0
-    family_counts = {"TRENDLINE": 0, "SR": 0, "ROUND": 0}
-    last_line = None
+    round_found = ready_pairs = 0
+    last_level = None
     for pair, symbol in pair_map.items():
         try:
             if not _structure_edge_pair_ready(pair, time_module.time()):
@@ -13318,29 +13329,24 @@ def _structure_edge_scan_market(provisional_current: bool = False) -> list[dict]
                 else:
                     continue
             item = analyze_structure_edge_pair(pair, symbol, closed_override=eval_rows)
-            lines_found += int(item.get("lines_considered", 0) or 0)
-            sr_found += int(item.get("sr_levels_considered", 0) or 0)
             round_found += int(item.get("round_levels_considered", 0) or 0)
             if item.get("ok"):
                 candidates.append(item)
-                fam = str(item.get("primary_family") or _price_action_family_from_setup(item.get("setup")))
-                family_counts[fam] = family_counts.get(fam, 0) + 1
-                last_line = {
-                    "pair": item.get("pair"), "type": item.get("line_type") or item.get("level_type"),
-                    "touches": item.get("line_touches") or item.get("level_touches"),
-                    "quality": item.get("line_quality") or item.get("level_quality"), "family": fam,
+                last_level = {
+                    "pair": item.get("pair"), "type": item.get("level_type"),
+                    "touches": item.get("level_touches"), "quality": item.get("level_quality"), "family": "ROUND",
                 }
         except Exception:
-            logger.debug("Reverse Price Action skipped pair %s", pair, exc_info=True)
+            logger.debug("Round Number Edge skipped pair %s", pair, exc_info=True)
     _structure_edge_state["pairs_ready"] = ready_pairs
-    _structure_edge_state["lines_found"] = lines_found
-    _structure_edge_state["sr_levels_found"] = sr_found
+    _structure_edge_state["lines_found"] = 0
+    _structure_edge_state["sr_levels_found"] = 0
     _structure_edge_state["round_levels_found"] = round_found
     _structure_edge_state["setups_found"] = len(candidates)
-    _structure_edge_state["family_setups_found"] = family_counts
-    if last_line:
-        _structure_edge_state["last_line"] = last_line
-    candidates.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("confluence_count", 1)), int(x.get("line_touches", 0)), int(x.get("payout", 0))), reverse=True)
+    _structure_edge_state["family_setups_found"] = {"ROUND": len(candidates)}
+    if last_level:
+        _structure_edge_state["last_line"] = last_level
+    candidates.sort(key=lambda x: (int(x.get("score", 0)), int(x.get("level_quality", 0)), int(x.get("level_touches", 0)), int(x.get("payout", 0))), reverse=True)
     return candidates
 
 
@@ -13376,9 +13382,7 @@ def _trendline_final_open_snapshot(symbol: str, current_bucket: int, decision: d
 
 def _structure_edge_signal_message(trade: dict) -> str:
     direction = str(trade.get("direction") or "").upper()
-    original_direction = str(trade.get("original_direction") or "").upper()
     icon = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
-    original_icon = "🟢 CALL" if original_direction == "CALL" else "🔴 PUT" if original_direction == "PUT" else "-"
     setup_labels = {
         "TRENDLINE_BREAKOUT": "Trendline • Break + Close → مع الكسر",
         "TRENDLINE_BOUNCE": "Trendline • Bounce → مع الارتداد",
@@ -13394,11 +13398,10 @@ def _structure_edge_signal_message(trade: dict) -> str:
     entry_dt = datetime.fromtimestamp(int(trade.get("entry_bucket", 0)), tz=UTC).astimezone(UTC_PLUS_3)
     close_dt = entry_dt + timedelta(seconds=60)
     return (
-        "📐 REVERSE PRICE ACTION — TEST\n"
+        "🎯 ROUND NUMBER EDGE — TEST\n"
         "━━━━━━━━━━━━━━\n"
         f"💱 {trade.get('pair')}\n"
-        f"🧠 التحليل الأصلي: {original_icon}\n"
-        f"🔁 التنفيذ المعكوس: {icon}\n"
+        f"📌 الاتجاه: {icon}\n"
         f"🧠 {setup}\n"
         f"📍 المستوى: {level_type} @ {trade.get('level_value') if trade.get('level_value') is not None else trade.get('line_value')}\n"
         f"⭐ Quality {trade.get('level_quality') or trade.get('line_quality') or '-'}% • touches {trade.get('level_touches') if trade.get('level_touches') is not None else trade.get('line_touches') or '-'}\n"
@@ -13445,7 +13448,7 @@ def _structure_edge_record_result(trade: dict, result: str, close_price=None) ->
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Reverse Price Action result store failed: %s", exc)
+        logger.exception("Round Number Edge result store failed: %s", exc)
         return False
 
 
@@ -13460,7 +13463,7 @@ def _structure_edge_fetch_results(limit: int | None = None) -> list[dict]:
         rows.sort(key=lambda x: str(x.get("closed_at") or x.get("created_at") or ""))
         return rows
     except Exception as exc:
-        logger.exception("Reverse Price Action results read failed: %s", exc)
+        logger.exception("Round Number Edge results read failed: %s", exc)
         return []
 
 
@@ -13495,59 +13498,21 @@ def build_structure_edge_summary(limit: int | None = None) -> str:
         return w, l, d, rate
 
     wins, losses, draws, wr = stats(rows)
-    family_lines = []
-    for fam, label in (("TRENDLINE", "Trendline"), ("SR", "Support/Resistance"), ("ROUND", "Round Number")):
-        subset = []
-        for row in rows:
-            families = row.get("price_action_families") if isinstance(row.get("price_action_families"), list) else []
-            if not families:
-                families = [row.get("primary_family") or _price_action_family_from_setup(row.get("setup"))]
-            if fam in [str(x) for x in families]:
-                subset.append(row)
-        w, l, d, rate = stats(subset)
-        family_lines.append(f"• {label}: {w}W / {l}L / {d}D — {rate}% ({len(subset)})")
-
-    setup_lines = []
-    setup_labels = (
-        ("TRENDLINE_BREAKOUT", "TL BREAKOUT"), ("TRENDLINE_BOUNCE", "TL BOUNCE"),
-        ("SR_BREAKOUT", "S/R BREAKOUT"), ("SR_BOUNCE", "S/R BOUNCE"),
-        ("ROUND_BREAKOUT", "ROUND BREAKOUT"), ("ROUND_BOUNCE", "ROUND BOUNCE"),
-    )
-    for setup, label in setup_labels:
-        subset = []
-        for row in rows:
-            components = row.get("price_action_components") if isinstance(row.get("price_action_components"), list) else []
-            if not components:
-                components = [row.get("setup")]
-            if setup in [str(x) for x in components]:
-                subset.append(row)
-        w, l, d, rate = stats(subset)
-        if subset:
-            setup_lines.append(f"• {label}: {w}W / {l}L / {d}D — {rate}%")
-
-    single = []
-    confluence = []
-    for row in rows:
-        families = row.get("price_action_families") if isinstance(row.get("price_action_families"), list) else []
-        if len(set(str(x) for x in families if x)) >= 2:
-            confluence.append(row)
-        else:
-            single.append(row)
-    sw, sl, sd, sr = stats(single)
-    cw, cl, cd, cr = stats(confluence)
+    breakout = [x for x in rows if str(x.get("setup") or "") == "ROUND_BREAKOUT"]
+    bounce = [x for x in rows if str(x.get("setup") or "") == "ROUND_BOUNCE"]
+    bw, bl, bd, br = stats(breakout)
+    rw, rl, rd, rr = stats(bounce)
     avg_latency_rows = [float(x.get("execution_latency_ms")) for x in rows if isinstance(x.get("execution_latency_ms"), (int, float))]
     avg_latency = round(sum(avg_latency_rows) / len(avg_latency_rows)) if avg_latency_rows else None
-    extra = ""
-    if confluence:
-        extra = f"\n\n🤝 Confluence 2+ families: {cw}W / {cl}L / {cd}D — {cr}% ({len(confluence)})\n• Single-family: {sw}W / {sl}L / {sd}D — {sr}% ({len(single)})"
     return (
-        f"📊 Reverse Price Action — {scope_label}\n"
+        f"📊 Round Number Edge — {scope_label}\n"
         "━━━━━━━━━━━━━━\n"
         f"✅ Win: {wins}\n❌ Loss: {losses}\n⚖️ Draw: {draws}\n"
         f"📈 Win rate: {wr}%\n🧨 Max loss streak: {_structure_edge_max_loss_streak(rows)}\n"
         f"⚡ Avg execution latency: {str(avg_latency) + ' ms' if avg_latency is not None else '-'}\n\n"
-        "حسب المدرسة (الصفقة المتوافقة قد تُحسب بأكثر من مدرسة):\n" + "\n".join(family_lines) +
-        ("\n\nحسب الـSetup:\n" + "\n".join(setup_lines) if setup_lines else "") + extra
+        "حسب الـSetup:\n"
+        f"• ROUND BREAKOUT: {bw}W / {bl}L / {bd}D — {br}% ({len(breakout)})\n"
+        f"• ROUND BOUNCE: {rw}W / {rl}L / {rd}D — {rr}% ({len(bounce)})"
     )[:3900]
 
 
@@ -13561,30 +13526,29 @@ def build_structure_edge_status() -> str:
     last_text = "لا يوجد بعد"
     if isinstance(last, dict) and last:
         last_text = f"{last.get('pair')} {last.get('direction')} | {last.get('setup')} | score {last.get('score')}%"
-    last_line = _structure_edge_state.get("last_line") or {}
-    line_text = "-"
-    if isinstance(last_line, dict) and last_line:
-        line_text = f"{last_line.get('pair')} | {last_line.get('family')} | {last_line.get('type')} | touches {last_line.get('touches')} | q {last_line.get('quality')}%"
-    family_counts = _structure_edge_state.get("family_setups_found") or {}
+    last_level = _structure_edge_state.get("last_line") or {}
+    level_text = "-"
+    if isinstance(last_level, dict) and last_level:
+        level_text = f"{last_level.get('pair')} | {last_level.get('type')} | touches {last_level.get('touches')} | q {last_level.get('quality')}%"
     return (
-        "📋 حالة Reverse Price Action — TEST\n"
+        "📋 حالة Round Number Edge — TEST\n"
         "━━━━━━━━━━━━━━\n"
         f"الحالة: {'شغال ✅' if settings.get('enabled') else 'متوقف ⏸'}\n"
         f"الهدف: {_structure_edge_target_chat_id()}\n"
         f"M1 warmup المطلوب: {STRUCTURE_EDGE_MIN_CLOSED_M1} شمعة لكل زوج\n"
         f"Pairs ready: {_structure_edge_state.get('pairs_ready', 0)}\n"
-        f"Levels last scan: TL {_structure_edge_state.get('lines_found', 0)} | S/R {_structure_edge_state.get('sr_levels_found', 0)} | Round {_structure_edge_state.get('round_levels_found', 0)}\n"
-        f"Setups last scan: {_structure_edge_state.get('setups_found', 0)} | TL {family_counts.get('TRENDLINE', 0)} | S/R {family_counts.get('SR', 0)} | Round {family_counts.get('ROUND', 0)}\n"
-        f"آخر مستوى معتبر: {line_text}\n"
+        f"Round levels last scan: {_structure_edge_state.get('round_levels_found', 0)} | setups: {_structure_edge_state.get('setups_found', 0)}\n"
+        f"آخر Round level معتبر: {level_text}\n"
         f"Setup score الأدنى: {STRUCTURE_EDGE_MIN_SCORE}% | Payout الأدنى: {STRUCTURE_EDGE_MIN_PAYOUT}%\n"
         f"Pre-arm: الثانية {TRENDLINE_PREARM_MIN_SECOND:g}–{TRENDLINE_PREARM_LAST_SECOND:g} قبل الإغلاق | Final ≤ {TRENDLINE_FINAL_MAX_SECOND:g}s\n"
         f"صلاحية أمر التنفيذ: {TRENDLINE_EXECUTION_MAX_DELAY_SECONDS}s | Max Open displacement: {round(TRENDLINE_ENTRY_MAX_DISPLACEMENT_ATR*100, 1)}% ATR\n"
         f"Cooldown الزوج: {round(STRUCTURE_EDGE_PAIR_COOLDOWN_SECONDS/60, 1)} دقيقة\n"
+        f"Firebase settings cache: {STRUCTURE_EDGE_SETTINGS_CACHE_SECONDS}s | reads this process: {_structure_edge_state.get('settings_reads', 0)}\n"
         f"Pre-armed الآن: {((_structure_edge_state.get('prearmed_candidate') or {}).get('pair') if isinstance(_structure_edge_state.get('prearmed_candidate'), dict) else '-') or '-'}\n"
         f"صفقة قيد المتابعة: {pending_text}\nآخر Candidate: {last_text}\n"
         f"آخر رفض: {_structure_edge_state.get('last_reject_reason') or '-'}\n"
         f"آخر Scan: {_structure_edge_state.get('last_scan_at') or '-'}\nآخر خطأ: {_structure_edge_state.get('last_error') or '-'}\n\n"
-        "المنطق: نفس Price Action تمامًا → Pre-arm/Final check كما هو → في آخر خطوة فقط CALL↔PUT → دخول معكوس قرب Open الشمعة التالية.\n"
+        "المنطق: Round Number فقط → BREAKOUT أو BOUNCE بالاتجاه الأصلي → Pre-arm/Final check → دخول قرب Open الشمعة التالية.\n"
         f"Extension online: {_copy_online_clients_for_user(ADMIN_TELEGRAM_ID)} | Copy sent: {_structure_edge_state.get('copy_signals_sent', 0)} | order reports: {_structure_edge_state.get('execution_reports', 0)} | skipped: {_structure_edge_state.get('extension_skips', 0)}\n"
         "🧪 التنفيذ: Chrome Extension — DEMO فقط — $1 — بدون مضاعفات."
     )[:3900]
@@ -13595,9 +13559,9 @@ def _structure_edge_reset_results() -> tuple[bool, str]:
         _structure_edge_results_ref().delete()
         _structure_edge_executions_ref().delete()
         _structure_edge_state.update({"results_sent": 0, "last_result_at": None, "execution_reports": 0})
-        return True, "✅ تم تصفير نتائج Reverse Price Action فقط. نتائج Price Action الأصلية والمدارس السابقة بقيت بأرشيفها."
+        return True, "✅ تم تصفير نتائج Round Number Edge فقط. نتائج Price Action وReverse السابقة بقيت بأرشيفها."
     except Exception as exc:
-        logger.exception("Reverse Price Action results reset failed: %s", exc)
+        logger.exception("Round Number Edge results reset failed: %s", exc)
         return False, f"❌ تعذر تصفير النتائج: {exc}"
 
 async def _structure_edge_process_pending(context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -13620,12 +13584,12 @@ async def _structure_edge_process_pending(context: ContextTypes.DEFAULT_TYPE) ->
         await safe_send_message(
             context.bot,
             chat_id=_structure_edge_target_chat_id(),
-            text=f"⚠️ Reverse Price Action: لم تصل نتيجة Quotex مؤكدة للإشارة {trade.get('pair')} {trade.get('direction')} ضمن المهلة. لم تُحسب Win/Loss.",
+            text=f"⚠️ Round Number Edge: لم تصل نتيجة Quotex مؤكدة للإشارة {trade.get('pair')} {trade.get('direction')} ضمن المهلة. لم تُحسب Win/Loss.",
         )
         return False
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Reverse Price Action pending result timeout failed: %s", exc)
+        logger.exception("Round Number Edge pending result timeout failed: %s", exc)
         return True
 
 
@@ -13656,7 +13620,7 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
     try:
         client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
         if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Reverse Price Action opened event | user=%s", client_uid)
+            logger.warning("Ignored non-owner Round Number Edge opened event | user=%s", client_uid)
             return False
         if str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
@@ -13725,11 +13689,10 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
                 TRADING_TIME_TELEGRAM_APP.bot,
                 chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    "⚡ REVERSE PRICE ACTION — ORDER SENT\n"
+                    "⚡ ROUND NUMBER EDGE — ORDER SENT\n"
                     "━━━━━━━━━━━━━━\n"
                     f"💱 {record.get('pair')}\n"
-                    f"🧠 Original: {_structure_edge_direction_label(record.get('original_direction'))}\n"
-                    f"🔁 Executed: {_structure_edge_direction_label(record.get('direction'))}\n"
+                    f"📌 الاتجاه: {_structure_edge_direction_label(record.get('direction'))}\n"
                     f"🧠 {record.get('setup')} • {record.get('primary_family') or '-'}\n"
                     f"📍 {record.get('level_type') or record.get('line_type')} @ {record.get('level_value') if record.get('level_value') is not None else '-'}\n"
                     f"🤝 {' + '.join(str(x) for x in (record.get('price_action_families') or [record.get('primary_family') or '-']))}\n"
@@ -13746,16 +13709,16 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Reverse Price Action opened audit record failed: %s", exc)
+        logger.exception("Round Number Edge opened audit record failed: %s", exc)
         return False
 
 
 async def _copy_record_structure_edge_trade_result(payload_event: dict, client: dict | None = None) -> bool:
-    """Persist a confirmed Reverse Price Action result reported by the owner's extension."""
+    """Persist a confirmed Round Number Edge result reported by the owner's extension."""
     try:
         client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
         if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Reverse Price Action result event | user=%s", client_uid)
+            logger.warning("Ignored non-owner Round Number Edge result event | user=%s", client_uid)
             return False
         if str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
@@ -13847,7 +13810,7 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
                 TRADING_TIME_TELEGRAM_APP.bot,
                 chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    f"📐 REVERSE PRICE ACTION — {result_text}\n"
+                    f"🎯 ROUND NUMBER EDGE — {result_text}\n"
                     "━━━━━━━━━━━━━━\n"
                     f"💱 {record.get('pair')}\n"
                     f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
@@ -13864,12 +13827,12 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Reverse Price Action extension result record failed: %s", exc)
+        logger.exception("Round Number Edge extension result record failed: %s", exc)
         return False
 
 
 async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: dict | None = None) -> bool:
-    """Record a Reverse Price Action signal that the owner extension intentionally skipped.
+    """Record a Round Number Edge signal that the owner extension intentionally skipped.
 
     A skip is diagnostic only: it clears a matching pending trade and never creates a
     Win/Loss row. Idempotency prevents outbox retries from inflating the skip counter.
@@ -13877,7 +13840,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
     try:
         client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
         if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Reverse Price Action skip event | user=%s", client_uid)
+            logger.warning("Ignored non-owner Round Number Edge skip event | user=%s", client_uid)
             return False
         if str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
@@ -13904,7 +13867,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
             _structure_edge_state["pending_trade"] = None
 
         logger.info(
-            "Reverse Price Action extension skip | signal=%s | pair=%s | direction=%s | reason=%s",
+            "Round Number Edge extension skip | signal=%s | pair=%s | direction=%s | reason=%s",
             signal_id,
             (payload_event or {}).get("pair"),
             (payload_event or {}).get("direction"),
@@ -13915,11 +13878,10 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
                 TRADING_TIME_TELEGRAM_APP.bot,
                 chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    "⏭️ REVERSE PRICE ACTION — SKIPPED\n"
+                    "⏭️ ROUND NUMBER EDGE — SKIPPED\n"
                     "━━━━━━━━━━━━━━\n"
                     f"💱 {(payload_event or {}).get('pair') or (pending or {}).get('pair')}\n"
-                    f"🧠 Original: {_structure_edge_direction_label((payload_event or {}).get('original_direction') or (pending or {}).get('original_direction'))}\n"
-                    f"🔁 Executed: {_structure_edge_direction_label((payload_event or {}).get('direction') or (pending or {}).get('direction'))}\n"
+                    f"📌 الاتجاه: {_structure_edge_direction_label((payload_event or {}).get('direction') or (pending or {}).get('direction'))}\n"
                     f"🚫 السبب: {reason}\n"
                     "📊 لم تُحسب Win/Loss لأن الصفقة لم تدخل ضمن شروط التنفيذ."
                 )[:3900],
@@ -13927,12 +13889,12 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Reverse Price Action extension skip record failed: %s", exc)
+        logger.exception("Round Number Edge extension skip record failed: %s", exc)
         return False
 
 
 async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
-    """Reverse Price Action v1.21 PRE-ARM state machine.
+    """Round Number Edge v1.23 PRE-ARM state machine.
 
     Phase A (56.5-59s): analyze the still-forming signal candle and PREPARE only the best pair.
     Phase B (0-1.5s next minute): re-analyze that same pair using the now CLOSED candle. Only if
@@ -13993,21 +13955,19 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
                     _structure_edge_state["prearmed_candidate"] = None
                     return
 
-                # Clean reverse experiment: preserve the exact Price Action analysis side,
-                # then invert ONLY the executable direction at the last step.
+                # Round Number Edge uses the ORIGINAL analysis side; no direction inversion.
                 original_direction = str(final.get("direction") or "").strip().upper()
-                reversed_direction = _reverse_price_action_direction(original_direction)
-                if reversed_direction not in {"CALL", "PUT"}:
+                if original_direction not in {"CALL", "PUT"}:
                     _structure_edge_state["prearm_cancelled"] = int(_structure_edge_state.get("prearm_cancelled", 0) or 0) + 1
-                    _structure_edge_state["last_reject_reason"] = "Reverse direction unavailable"
+                    _structure_edge_state["last_reject_reason"] = "Round Number direction unavailable"
                     _structure_edge_state["prearmed_candidate"] = None
                     return
 
                 item = dict(final)
                 item.update({
                     "original_direction": original_direction,
-                    "direction": reversed_direction,
-                    "reverse_mode": True,
+                    "direction": original_direction,
+                    "reverse_mode": False,
                     "created_at": now_iso(),
                     "entry_bucket": current_bucket,
                     "entry_price": live_price,
@@ -14061,7 +14021,7 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
         _structure_edge_state["last_prearm_attempt_ts"] = now_ts
         candidates = _structure_edge_scan_market(provisional_current=True)
         if not candidates:
-            _structure_edge_state["last_reject_reason"] = "No provisional Price Action setup near close"
+            _structure_edge_state["last_reject_reason"] = "No provisional Round Number setup near close"
             return
 
         item = dict(candidates[0])
@@ -14083,7 +14043,7 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
         _structure_edge_state["last_reject_reason"] = "Pair pre-armed; waiting for candle close final check"
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Reverse Price Action pre-arm job error: %s", exc)
+        logger.exception("Round Number Edge pre-arm job error: %s", exc)
 
 
 # v1.02: Three Candle timing/filter tuning only; Public remains a mirror of accepted private signals.
@@ -21888,48 +21848,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
 
-        if text == "📐 Reverse Price Action":
+        if text == "🎯 Round Number Edge":
             reset_signal_state(context)
             await update.message.reply_text(
-                "📐 Reverse Price Action — نفس خانة الاختبار السابقة\n"
-                "3 مدارس بنفس المحرك: Trendline + Support/Resistance + Round Numbers.\n"
-                "كل مدرسة تختبر Break + Close مع الكسر، وBounce candle مع الارتداد بالشمعة التالية.\n"
-                "إذا اتفقت مدرستان أو أكثر بنفس الاتجاه والمنطقة تُرسل صفقة واحدة وتُسجل Confluence.\n"
-                "Pre-arm قبل الإغلاق + Final check عند الفتح للحفاظ على دخول قريب من Open الشمعة.\n"
-                "لا تغيّر قناة الثغرة. Chrome DEMO فقط، وسجل القناة Signal → Order Sent/Skip → Result.",
+                "🎯 Round Number Edge — نفس خانة الاختبار\n"
+                "المدرسة الوحيدة النشطة: Round Numbers النفسية (Major + Half).\n"
+                "ROUND BREAKOUT: كسر + إغلاق واضح → دخول مع الكسر.\n"
+                "ROUND BOUNCE: لمس/اقتراب + شمعة ترتد → دخول مع الارتداد.\n"
+                "الاتجاه أصلي بدون عكس. Pre-arm قبل الإغلاق + Final check عند Open الشمعة التالية.\n"
+                "Chrome DEMO فقط — $1 — بدون مضاعفات — Signal → Order Sent/Skip → Result.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
 
-        if text == "🟢 تشغيل Reverse Price Action":
+        if text == "🟢 تشغيل Round Number Edge":
             ok = _structure_edge_set_enabled(True)
             await update.message.reply_text(
-                "✅ تم تشغيل Reverse Price Action — DEMO Test." if ok else "❌ تعذر تشغيل Reverse Price Action. راجع اللوج.",
+                "✅ تم تشغيل Round Number Edge — DEMO Test." if ok else "❌ تعذر تشغيل Round Number Edge. راجع اللوج.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
 
-        if text == "🔴 إيقاف Reverse Price Action":
+        if text == "🔴 إيقاف Round Number Edge":
             ok = _structure_edge_set_enabled(False)
             await update.message.reply_text(
-                "⛔ تم إيقاف Reverse Price Action." if ok else "❌ تعذر إيقاف Reverse Price Action. راجع اللوج.",
+                "⛔ تم إيقاف Round Number Edge." if ok else "❌ تعذر إيقاف Round Number Edge. راجع اللوج.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
 
-        if text == "📋 حالة Reverse Price Action":
+        if text == "📋 حالة Round Number Edge":
             await update.message.reply_text(build_structure_edge_status(), reply_markup=structure_edge_admin_keyboard)
             return
 
-        if text == "📊 ملخص Reverse Price Action":
+        if text == "📊 ملخص Round Number Edge":
             await update.message.reply_text(build_structure_edge_summary(), reply_markup=structure_edge_admin_keyboard)
             return
 
-        if text == "📚 كل نتائج Reverse Price Action":
+        if text == "📚 كل نتائج Round Number Edge":
             await update.message.reply_text(build_structure_edge_summary(limit=0), reply_markup=structure_edge_admin_keyboard)
             return
 
-        if text == "🧹 تصفير نتائج Reverse Price Action":
+        if text == "🧹 تصفير نتائج Round Number Edge":
             ok, msg = _structure_edge_reset_results()
             await update.message.reply_text(msg, reply_markup=structure_edge_admin_keyboard)
             return
@@ -22949,7 +22909,7 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         "m5_bias": str(payload.get("m5_bias") or "")[:16] or None,
         "m5_strength": int(payload.get("m5_strength")) if str(payload.get("m5_strength") or "").strip().isdigit() else None,
         "structure_confluences": [str(x)[:120] for x in (payload.get("structure_confluences") or [])[:8]] if isinstance(payload.get("structure_confluences"), list) else [],
-        # v1.21 Reverse Price Action metadata.
+        # v1.23 Round Number Edge metadata.
         "price_action_families": [str(x)[:24] for x in (payload.get("price_action_families") or [])[:4]] if isinstance(payload.get("price_action_families"), list) else [],
         "price_action_components": [str(x)[:80] for x in (payload.get("price_action_components") or [])[:8]] if isinstance(payload.get("price_action_components"), list) else [],
         "primary_family": str(payload.get("primary_family") or "")[:24] or None,
@@ -25149,7 +25109,7 @@ def run_telegram_bot_only():
         name="multi_user_otc_edge_watcher",
     )
 
-    # v1.22.0: Reverse Price Action = Trendline + S/R + Round Numbers with confluence; PRE-ARM/open-sync + 200/all summary retained; v1.20.1 Telegram polling-loop hotfix retained.
+    # v1.23.0: Round Number Edge only (ROUND_BREAKOUT + ROUND_BOUNCE), original direction; PRE-ARM/open-sync + 200/all summary retained; enabled-state Firebase reads cached in RAM; v1.20.1 Telegram loop hotfix retained.
     job_queue.run_repeating(
         structure_edge_job,
         interval=STRUCTURE_EDGE_SCAN_SECONDS,
