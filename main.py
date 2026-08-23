@@ -451,7 +451,7 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
         ["🔐 Copy Trading", "📡 حالة Copy"],
-        ["📐 Price Action Edge", "📡 قناة 3 شموع"],
+        ["📐 Reverse Price Action", "📡 قناة 3 شموع"],
         ["🌐 Public Three Candle"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
@@ -494,9 +494,9 @@ admin_otc_edge_keyboard = ReplyKeyboardMarkup(
 # It does not alter or replace Three Candle / OTC Edge and does not send Copy Trading commands.
 structure_edge_admin_keyboard = ReplyKeyboardMarkup(
     [
-        ["🟢 تشغيل Price Action Edge", "🔴 إيقاف Price Action Edge"],
-        ["📋 حالة Price Action Edge", "📊 ملخص Price Action Edge"],
-        ["📚 كل نتائج Price Action Edge", "🧹 تصفير نتائج Price Action Edge"],
+        ["🟢 تشغيل Reverse Price Action", "🔴 إيقاف Reverse Price Action"],
+        ["📋 حالة Reverse Price Action", "📊 ملخص Reverse Price Action"],
+        ["📚 كل نتائج Reverse Price Action", "🧹 تصفير نتائج Reverse Price Action"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
@@ -1029,7 +1029,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.21.0"
+COPY_SERVER_VERSION = "1.22.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -3496,6 +3496,8 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
         "pair_display": pair_display,
         "platform_symbol": platform_symbol,
         "direction": direction,
+        "original_direction": str(signal.get("original_direction") or "").strip().upper() or None,
+        "reverse_mode": bool(signal.get("reverse_mode") or False),
         "timeframe": _copy_timeframe(signal),
         "duration_seconds": duration_seconds,
         "entry_time": entry_dt.isoformat(),
@@ -3732,6 +3734,8 @@ async def publish_copy_three_candle_signal(trade: dict) -> dict:
             "symbol": (trade or {}).get("symbol"),
             "platform_symbol": (trade or {}).get("symbol"),
             "direction": direction,
+            "original_direction": str((trade or {}).get("original_direction") or (trade or {}).get("direction") or "").strip().upper() or None,
+            "reverse_mode": bool((trade or {}).get("reverse_mode") or False),
             "timeframe": "M1",
             "duration_seconds": 60,
             "duration_minutes": 1,
@@ -3777,6 +3781,8 @@ async def publish_copy_structure_edge_prepare_signal(trade: dict, target_entry_b
             "symbol": symbol or None,
             "platform_symbol": symbol or pair,
             "direction": direction,
+            "original_direction": str((trade or {}).get("original_direction") or (trade or {}).get("direction") or "").strip().upper() or None,
+            "reverse_mode": bool((trade or {}).get("reverse_mode") or False),
             "timeframe": "M1",
             "duration_seconds": 60,
             "duration_minutes": 1,
@@ -3811,13 +3817,13 @@ async def publish_copy_structure_edge_prepare_signal(trade: dict, target_entry_b
             "demo_only": True,
             "creator_user_id": int(ADMIN_TELEGRAM_ID),
             "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"price_action_edge_v1_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | pair_prepare_only",
+            "note": f"reverse_price_action_v1_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | pair_prepare_only",
         }
         result = await publish_copy_trading_signal(payload, source="structure_edge")
-        logger.info("Price Action Edge pre-arm sent | pair=%s | target=%s | delivery=%s", pair, target_entry_bucket, result.get("delivery") if isinstance(result, dict) else result)
+        logger.info("Reverse Price Action pre-arm sent | pair=%s | target=%s | delivery=%s", pair, target_entry_bucket, result.get("delivery") if isinstance(result, dict) else result)
         return result
     except Exception as exc:
-        logger.exception("Price Action Edge pre-arm publish failed: %s", exc)
+        logger.exception("Reverse Price Action pre-arm publish failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -3893,13 +3899,13 @@ async def publish_copy_structure_edge_signal(trade: dict) -> dict:
             "demo_only": True,
             "creator_user_id": int(ADMIN_TELEGRAM_ID),
             "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"price_action_edge_v1_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | line={(trade or {}).get('line_type')} | touches={(trade or {}).get('line_touches')} | demo_only",
+            "note": f"reverse_price_action_v1_prearm | setup={(trade or {}).get('setup')} | score={(trade or {}).get('score')} | line={(trade or {}).get('line_type')} | touches={(trade or {}).get('line_touches')} | demo_only",
         }
         result = await publish_copy_trading_signal(payload, source="structure_edge")
-        logger.info("Copy Trading Price Action Edge FINAL sent | pair=%s | setup=%s | score=%s | delivery=%s", pair, (trade or {}).get("setup"), (trade or {}).get("score"), result.get("delivery") if isinstance(result, dict) else result)
+        logger.info("Copy Trading Reverse Price Action FINAL sent | pair=%s | setup=%s | score=%s | delivery=%s", pair, (trade or {}).get("setup"), (trade or {}).get("score"), result.get("delivery") if isinstance(result, dict) else result)
         return result
     except Exception as exc:
-        logger.exception("Price Action Edge final Copy publish failed: %s", exc)
+        logger.exception("Reverse Price Action final Copy publish failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -12537,7 +12543,7 @@ THREE_CANDLE_CHANNEL_ENABLED = os.getenv("THREE_CANDLE_CHANNEL_ENABLED", "false"
 
 # v1.01: Optional public/free mirror channel. Keep the private channel untouched.
 
-# ===== v1.21.0 Price Action Edge: same owner test slot, 3 classical schools =====
+# ===== v1.22.0 Reverse Price Action: same owner test slot, 3 classical schools =====
 # This REUSES the existing source key `structure_edge`, the same extension radio,
 # the same Telegram channel env (`STRUCTURE_EDGE_CHANNEL_ID`) and the same enable/settings node.
 # No extra section is created. The active test engine evaluates three independent price-action families:
@@ -12645,7 +12651,7 @@ def _structure_edge_settings_ref():
 
 # Fresh result namespace. Structure Edge and Statistical Edge samples remain archived separately.
 def _structure_edge_base_ref():
-    return system_ref().child("trendline_edge_test_v1")
+    return system_ref().child("reverse_price_action_test_v1")
 
 
 def _structure_edge_results_ref():
@@ -12674,17 +12680,17 @@ def _structure_edge_get_settings() -> dict:
             data = {}
         return {"enabled": bool(data.get("enabled", default["enabled"]))}
     except Exception as exc:
-        logger.debug("Price Action Edge settings read failed: %s", exc)
+        logger.debug("Reverse Price Action settings read failed: %s", exc)
         return default
 
 
 def _structure_edge_set_enabled(enabled: bool) -> bool:
     try:
-        _structure_edge_settings_ref().update({"enabled": bool(enabled), "updated_at": now_iso(), "engine": "price_action_edge_v1"})
+        _structure_edge_settings_ref().update({"enabled": bool(enabled), "updated_at": now_iso(), "engine": "reverse_price_action_v1"})
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Price Action Edge enabled update failed: %s", exc)
+        logger.exception("Reverse Price Action enabled update failed: %s", exc)
         return False
 
 
@@ -13179,8 +13185,18 @@ def _price_action_family_from_setup(setup: str) -> str:
     return "UNKNOWN"
 
 
+def _reverse_price_action_direction(direction: str) -> str | None:
+    """Invert only the final execution side; analysis itself remains unchanged."""
+    side = str(direction or "").strip().upper()
+    if side == "CALL":
+        return "PUT"
+    if side == "PUT":
+        return "CALL"
+    return None
+
+
 def analyze_structure_edge_pair(pair: str, symbol: str | None = None, closed_override: list[dict] | None = None) -> dict:
-    """Compatibility name; active implementation is Price Action Edge v1.21."""
+    """Compatibility name; active implementation is Reverse Price Action v1.21."""
     try:
         normalized = normalize_otc_currency_pair_name(pair, symbol) if symbol else normalize_pair_name_basic(pair)
         if not normalized or not is_valid_otc_currency_pair_name(normalized):
@@ -13265,7 +13281,7 @@ def analyze_structure_edge_pair(pair: str, symbol: str | None = None, closed_ove
         })
         return decision
     except Exception as exc:
-        logger.exception("Price Action Edge pair analysis failed | pair=%s | error=%s", pair, exc)
+        logger.exception("Reverse Price Action pair analysis failed | pair=%s | error=%s", pair, exc)
         return {"ok": False, "pair": pair, "reason": f"analysis error: {exc}"}
 
 
@@ -13315,7 +13331,7 @@ def _structure_edge_scan_market(provisional_current: bool = False) -> list[dict]
                     "quality": item.get("line_quality") or item.get("level_quality"), "family": fam,
                 }
         except Exception:
-            logger.debug("Price Action Edge skipped pair %s", pair, exc_info=True)
+            logger.debug("Reverse Price Action skipped pair %s", pair, exc_info=True)
     _structure_edge_state["pairs_ready"] = ready_pairs
     _structure_edge_state["lines_found"] = lines_found
     _structure_edge_state["sr_levels_found"] = sr_found
@@ -13360,7 +13376,9 @@ def _trendline_final_open_snapshot(symbol: str, current_bucket: int, decision: d
 
 def _structure_edge_signal_message(trade: dict) -> str:
     direction = str(trade.get("direction") or "").upper()
+    original_direction = str(trade.get("original_direction") or "").upper()
     icon = "🟢 CALL" if direction == "CALL" else "🔴 PUT"
+    original_icon = "🟢 CALL" if original_direction == "CALL" else "🔴 PUT" if original_direction == "PUT" else "-"
     setup_labels = {
         "TRENDLINE_BREAKOUT": "Trendline • Break + Close → مع الكسر",
         "TRENDLINE_BOUNCE": "Trendline • Bounce → مع الارتداد",
@@ -13376,10 +13394,11 @@ def _structure_edge_signal_message(trade: dict) -> str:
     entry_dt = datetime.fromtimestamp(int(trade.get("entry_bucket", 0)), tz=UTC).astimezone(UTC_PLUS_3)
     close_dt = entry_dt + timedelta(seconds=60)
     return (
-        "📐 PRICE ACTION EDGE — TEST\n"
+        "📐 REVERSE PRICE ACTION — TEST\n"
         "━━━━━━━━━━━━━━\n"
         f"💱 {trade.get('pair')}\n"
-        f"📌 {icon}\n"
+        f"🧠 التحليل الأصلي: {original_icon}\n"
+        f"🔁 التنفيذ المعكوس: {icon}\n"
         f"🧠 {setup}\n"
         f"📍 المستوى: {level_type} @ {trade.get('level_value') if trade.get('level_value') is not None else trade.get('line_value')}\n"
         f"⭐ Quality {trade.get('level_quality') or trade.get('line_quality') or '-'}% • touches {trade.get('level_touches') if trade.get('level_touches') is not None else trade.get('line_touches') or '-'}\n"
@@ -13412,7 +13431,7 @@ def _structure_edge_record_result(trade: dict, result: str, close_price=None) ->
     try:
         record = {
             "created_at": trade.get("created_at"), "closed_at": now_iso(), "pair": trade.get("pair"),
-            "symbol": trade.get("symbol"), "direction": trade.get("direction"), "setup": trade.get("setup"),
+            "symbol": trade.get("symbol"), "direction": trade.get("direction"), "original_direction": trade.get("original_direction"), "reverse_mode": bool(trade.get("reverse_mode")), "setup": trade.get("setup"),
             "score": int(trade.get("score", 0) or 0), "payout": int(trade.get("payout", 0) or 0),
             "line_type": trade.get("line_type"), "line_quality": int(trade.get("line_quality", 0) or 0),
             "line_touches": int(trade.get("line_touches", 0) or 0), "line_slope_atr": float(trade.get("line_slope_atr", 0) or 0),
@@ -13426,7 +13445,7 @@ def _structure_edge_record_result(trade: dict, result: str, close_price=None) ->
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Price Action Edge result store failed: %s", exc)
+        logger.exception("Reverse Price Action result store failed: %s", exc)
         return False
 
 
@@ -13441,7 +13460,7 @@ def _structure_edge_fetch_results(limit: int | None = None) -> list[dict]:
         rows.sort(key=lambda x: str(x.get("closed_at") or x.get("created_at") or ""))
         return rows
     except Exception as exc:
-        logger.exception("Price Action Edge results read failed: %s", exc)
+        logger.exception("Reverse Price Action results read failed: %s", exc)
         return []
 
 
@@ -13522,7 +13541,7 @@ def build_structure_edge_summary(limit: int | None = None) -> str:
     if confluence:
         extra = f"\n\n🤝 Confluence 2+ families: {cw}W / {cl}L / {cd}D — {cr}% ({len(confluence)})\n• Single-family: {sw}W / {sl}L / {sd}D — {sr}% ({len(single)})"
     return (
-        f"📊 Price Action Edge — {scope_label}\n"
+        f"📊 Reverse Price Action — {scope_label}\n"
         "━━━━━━━━━━━━━━\n"
         f"✅ Win: {wins}\n❌ Loss: {losses}\n⚖️ Draw: {draws}\n"
         f"📈 Win rate: {wr}%\n🧨 Max loss streak: {_structure_edge_max_loss_streak(rows)}\n"
@@ -13548,7 +13567,7 @@ def build_structure_edge_status() -> str:
         line_text = f"{last_line.get('pair')} | {last_line.get('family')} | {last_line.get('type')} | touches {last_line.get('touches')} | q {last_line.get('quality')}%"
     family_counts = _structure_edge_state.get("family_setups_found") or {}
     return (
-        "📋 حالة Price Action Edge — TEST\n"
+        "📋 حالة Reverse Price Action — TEST\n"
         "━━━━━━━━━━━━━━\n"
         f"الحالة: {'شغال ✅' if settings.get('enabled') else 'متوقف ⏸'}\n"
         f"الهدف: {_structure_edge_target_chat_id()}\n"
@@ -13565,7 +13584,7 @@ def build_structure_edge_status() -> str:
         f"صفقة قيد المتابعة: {pending_text}\nآخر Candidate: {last_text}\n"
         f"آخر رفض: {_structure_edge_state.get('last_reject_reason') or '-'}\n"
         f"آخر Scan: {_structure_edge_state.get('last_scan_at') or '-'}\nآخر خطأ: {_structure_edge_state.get('last_error') or '-'}\n\n"
-        "المنطق: Trendline + S/R + Round Number → Breakout/Bounce → دمج Confluence → Pre-arm → Final check → دخول قرب Open الشمعة التالية.\n"
+        "المنطق: نفس Price Action تمامًا → Pre-arm/Final check كما هو → في آخر خطوة فقط CALL↔PUT → دخول معكوس قرب Open الشمعة التالية.\n"
         f"Extension online: {_copy_online_clients_for_user(ADMIN_TELEGRAM_ID)} | Copy sent: {_structure_edge_state.get('copy_signals_sent', 0)} | order reports: {_structure_edge_state.get('execution_reports', 0)} | skipped: {_structure_edge_state.get('extension_skips', 0)}\n"
         "🧪 التنفيذ: Chrome Extension — DEMO فقط — $1 — بدون مضاعفات."
     )[:3900]
@@ -13576,9 +13595,9 @@ def _structure_edge_reset_results() -> tuple[bool, str]:
         _structure_edge_results_ref().delete()
         _structure_edge_executions_ref().delete()
         _structure_edge_state.update({"results_sent": 0, "last_result_at": None, "execution_reports": 0})
-        return True, "✅ تم تصفير نتائج Price Action Edge فقط. نتائج Structure/Statistical السابقة بقيت بأرشيفها."
+        return True, "✅ تم تصفير نتائج Reverse Price Action فقط. نتائج Price Action الأصلية والمدارس السابقة بقيت بأرشيفها."
     except Exception as exc:
-        logger.exception("Price Action Edge results reset failed: %s", exc)
+        logger.exception("Reverse Price Action results reset failed: %s", exc)
         return False, f"❌ تعذر تصفير النتائج: {exc}"
 
 async def _structure_edge_process_pending(context: ContextTypes.DEFAULT_TYPE) -> bool:
@@ -13601,12 +13620,12 @@ async def _structure_edge_process_pending(context: ContextTypes.DEFAULT_TYPE) ->
         await safe_send_message(
             context.bot,
             chat_id=_structure_edge_target_chat_id(),
-            text=f"⚠️ Price Action Edge: لم تصل نتيجة Quotex مؤكدة للإشارة {trade.get('pair')} {trade.get('direction')} ضمن المهلة. لم تُحسب Win/Loss.",
+            text=f"⚠️ Reverse Price Action: لم تصل نتيجة Quotex مؤكدة للإشارة {trade.get('pair')} {trade.get('direction')} ضمن المهلة. لم تُحسب Win/Loss.",
         )
         return False
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Price Action Edge pending result timeout failed: %s", exc)
+        logger.exception("Reverse Price Action pending result timeout failed: %s", exc)
         return True
 
 
@@ -13637,7 +13656,7 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
     try:
         client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
         if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Price Action Edge opened event | user=%s", client_uid)
+            logger.warning("Ignored non-owner Reverse Price Action opened event | user=%s", client_uid)
             return False
         if str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
@@ -13651,6 +13670,8 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
             "signal_id": signal_id,
             "pair": (payload_event or {}).get("pair") or (pending or {}).get("pair"),
             "direction": (payload_event or {}).get("direction") or (pending or {}).get("direction"),
+            "original_direction": (payload_event or {}).get("original_direction") or (pending or {}).get("original_direction"),
+            "reverse_mode": bool((payload_event or {}).get("reverse_mode") or (pending or {}).get("reverse_mode")),
             "asset": (payload_event or {}).get("asset"),
             "amount": float((payload_event or {}).get("amount") or 0),
             "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
@@ -13704,10 +13725,11 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
                 TRADING_TIME_TELEGRAM_APP.bot,
                 chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    "⚡ PRICE ACTION EDGE — ORDER SENT\n"
+                    "⚡ REVERSE PRICE ACTION — ORDER SENT\n"
                     "━━━━━━━━━━━━━━\n"
                     f"💱 {record.get('pair')}\n"
-                    f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
+                    f"🧠 Original: {_structure_edge_direction_label(record.get('original_direction'))}\n"
+                    f"🔁 Executed: {_structure_edge_direction_label(record.get('direction'))}\n"
                     f"🧠 {record.get('setup')} • {record.get('primary_family') or '-'}\n"
                     f"📍 {record.get('level_type') or record.get('line_type')} @ {record.get('level_value') if record.get('level_value') is not None else '-'}\n"
                     f"🤝 {' + '.join(str(x) for x in (record.get('price_action_families') or [record.get('primary_family') or '-']))}\n"
@@ -13724,16 +13746,16 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Price Action Edge opened audit record failed: %s", exc)
+        logger.exception("Reverse Price Action opened audit record failed: %s", exc)
         return False
 
 
 async def _copy_record_structure_edge_trade_result(payload_event: dict, client: dict | None = None) -> bool:
-    """Persist a confirmed Price Action Edge result reported by the owner's extension."""
+    """Persist a confirmed Reverse Price Action result reported by the owner's extension."""
     try:
         client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
         if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Price Action Edge result event | user=%s", client_uid)
+            logger.warning("Ignored non-owner Reverse Price Action result event | user=%s", client_uid)
             return False
         if str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
@@ -13761,6 +13783,8 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
             "pair": (payload_event or {}).get("pair") or (pending or {}).get("pair"),
             "symbol": (pending or {}).get("symbol"),
             "direction": (payload_event or {}).get("direction") or (pending or {}).get("direction"),
+            "original_direction": (payload_event or {}).get("original_direction") or (pending or {}).get("original_direction"),
+            "reverse_mode": bool((payload_event or {}).get("reverse_mode") or (pending or {}).get("reverse_mode")),
             "setup": (payload_event or {}).get("setup") or (pending or {}).get("setup") or "UNKNOWN",
             "score": int((payload_event or {}).get("score") or (pending or {}).get("score") or 0),
             "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
@@ -13823,7 +13847,7 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
                 TRADING_TIME_TELEGRAM_APP.bot,
                 chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    f"📐 PRICE ACTION EDGE — {result_text}\n"
+                    f"📐 REVERSE PRICE ACTION — {result_text}\n"
                     "━━━━━━━━━━━━━━\n"
                     f"💱 {record.get('pair')}\n"
                     f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
@@ -13840,12 +13864,12 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Price Action Edge extension result record failed: %s", exc)
+        logger.exception("Reverse Price Action extension result record failed: %s", exc)
         return False
 
 
 async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: dict | None = None) -> bool:
-    """Record a Price Action Edge signal that the owner extension intentionally skipped.
+    """Record a Reverse Price Action signal that the owner extension intentionally skipped.
 
     A skip is diagnostic only: it clears a matching pending trade and never creates a
     Win/Loss row. Idempotency prevents outbox retries from inflating the skip counter.
@@ -13853,7 +13877,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
     try:
         client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
         if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Price Action Edge skip event | user=%s", client_uid)
+            logger.warning("Ignored non-owner Reverse Price Action skip event | user=%s", client_uid)
             return False
         if str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
@@ -13880,7 +13904,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
             _structure_edge_state["pending_trade"] = None
 
         logger.info(
-            "Price Action Edge extension skip | signal=%s | pair=%s | direction=%s | reason=%s",
+            "Reverse Price Action extension skip | signal=%s | pair=%s | direction=%s | reason=%s",
             signal_id,
             (payload_event or {}).get("pair"),
             (payload_event or {}).get("direction"),
@@ -13891,10 +13915,11 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
                 TRADING_TIME_TELEGRAM_APP.bot,
                 chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    "⏭️ PRICE ACTION EDGE — SKIPPED\n"
+                    "⏭️ REVERSE PRICE ACTION — SKIPPED\n"
                     "━━━━━━━━━━━━━━\n"
                     f"💱 {(payload_event or {}).get('pair') or (pending or {}).get('pair')}\n"
-                    f"📌 {_structure_edge_direction_label((payload_event or {}).get('direction') or (pending or {}).get('direction'))}\n"
+                    f"🧠 Original: {_structure_edge_direction_label((payload_event or {}).get('original_direction') or (pending or {}).get('original_direction'))}\n"
+                    f"🔁 Executed: {_structure_edge_direction_label((payload_event or {}).get('direction') or (pending or {}).get('direction'))}\n"
                     f"🚫 السبب: {reason}\n"
                     "📊 لم تُحسب Win/Loss لأن الصفقة لم تدخل ضمن شروط التنفيذ."
                 )[:3900],
@@ -13902,12 +13927,12 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Price Action Edge extension skip record failed: %s", exc)
+        logger.exception("Reverse Price Action extension skip record failed: %s", exc)
         return False
 
 
 async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
-    """Price Action Edge v1.21 PRE-ARM state machine.
+    """Reverse Price Action v1.21 PRE-ARM state machine.
 
     Phase A (56.5-59s): analyze the still-forming signal candle and PREPARE only the best pair.
     Phase B (0-1.5s next minute): re-analyze that same pair using the now CLOSED candle. Only if
@@ -13968,8 +13993,21 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
                     _structure_edge_state["prearmed_candidate"] = None
                     return
 
+                # Clean reverse experiment: preserve the exact Price Action analysis side,
+                # then invert ONLY the executable direction at the last step.
+                original_direction = str(final.get("direction") or "").strip().upper()
+                reversed_direction = _reverse_price_action_direction(original_direction)
+                if reversed_direction not in {"CALL", "PUT"}:
+                    _structure_edge_state["prearm_cancelled"] = int(_structure_edge_state.get("prearm_cancelled", 0) or 0) + 1
+                    _structure_edge_state["last_reject_reason"] = "Reverse direction unavailable"
+                    _structure_edge_state["prearmed_candidate"] = None
+                    return
+
                 item = dict(final)
                 item.update({
+                    "original_direction": original_direction,
+                    "direction": reversed_direction,
+                    "reverse_mode": True,
                     "created_at": now_iso(),
                     "entry_bucket": current_bucket,
                     "entry_price": live_price,
@@ -14045,7 +14083,7 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
         _structure_edge_state["last_reject_reason"] = "Pair pre-armed; waiting for candle close final check"
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Price Action Edge pre-arm job error: %s", exc)
+        logger.exception("Reverse Price Action pre-arm job error: %s", exc)
 
 
 # v1.02: Three Candle timing/filter tuning only; Public remains a mirror of accepted private signals.
@@ -21850,10 +21888,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
 
-        if text == "📐 Price Action Edge":
+        if text == "📐 Reverse Price Action":
             reset_signal_state(context)
             await update.message.reply_text(
-                "📐 Price Action Edge — نفس خانة الاختبار السابقة\n"
+                "📐 Reverse Price Action — نفس خانة الاختبار السابقة\n"
                 "3 مدارس بنفس المحرك: Trendline + Support/Resistance + Round Numbers.\n"
                 "كل مدرسة تختبر Break + Close مع الكسر، وBounce candle مع الارتداد بالشمعة التالية.\n"
                 "إذا اتفقت مدرستان أو أكثر بنفس الاتجاه والمنطقة تُرسل صفقة واحدة وتُسجل Confluence.\n"
@@ -21863,35 +21901,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
             return
 
-        if text == "🟢 تشغيل Price Action Edge":
+        if text == "🟢 تشغيل Reverse Price Action":
             ok = _structure_edge_set_enabled(True)
             await update.message.reply_text(
-                "✅ تم تشغيل Price Action Edge — DEMO Test." if ok else "❌ تعذر تشغيل Price Action Edge. راجع اللوج.",
+                "✅ تم تشغيل Reverse Price Action — DEMO Test." if ok else "❌ تعذر تشغيل Reverse Price Action. راجع اللوج.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
 
-        if text == "🔴 إيقاف Price Action Edge":
+        if text == "🔴 إيقاف Reverse Price Action":
             ok = _structure_edge_set_enabled(False)
             await update.message.reply_text(
-                "⛔ تم إيقاف Price Action Edge." if ok else "❌ تعذر إيقاف Price Action Edge. راجع اللوج.",
+                "⛔ تم إيقاف Reverse Price Action." if ok else "❌ تعذر إيقاف Reverse Price Action. راجع اللوج.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
 
-        if text == "📋 حالة Price Action Edge":
+        if text == "📋 حالة Reverse Price Action":
             await update.message.reply_text(build_structure_edge_status(), reply_markup=structure_edge_admin_keyboard)
             return
 
-        if text == "📊 ملخص Price Action Edge":
+        if text == "📊 ملخص Reverse Price Action":
             await update.message.reply_text(build_structure_edge_summary(), reply_markup=structure_edge_admin_keyboard)
             return
 
-        if text == "📚 كل نتائج Price Action Edge":
+        if text == "📚 كل نتائج Reverse Price Action":
             await update.message.reply_text(build_structure_edge_summary(limit=0), reply_markup=structure_edge_admin_keyboard)
             return
 
-        if text == "🧹 تصفير نتائج Price Action Edge":
+        if text == "🧹 تصفير نتائج Reverse Price Action":
             ok, msg = _structure_edge_reset_results()
             await update.message.reply_text(msg, reply_markup=structure_edge_admin_keyboard)
             return
@@ -22911,7 +22949,7 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         "m5_bias": str(payload.get("m5_bias") or "")[:16] or None,
         "m5_strength": int(payload.get("m5_strength")) if str(payload.get("m5_strength") or "").strip().isdigit() else None,
         "structure_confluences": [str(x)[:120] for x in (payload.get("structure_confluences") or [])[:8]] if isinstance(payload.get("structure_confluences"), list) else [],
-        # v1.21 Price Action Edge metadata.
+        # v1.21 Reverse Price Action metadata.
         "price_action_families": [str(x)[:24] for x in (payload.get("price_action_families") or [])[:4]] if isinstance(payload.get("price_action_families"), list) else [],
         "price_action_components": [str(x)[:80] for x in (payload.get("price_action_components") or [])[:8]] if isinstance(payload.get("price_action_components"), list) else [],
         "primary_family": str(payload.get("primary_family") or "")[:24] or None,
@@ -25111,7 +25149,7 @@ def run_telegram_bot_only():
         name="multi_user_otc_edge_watcher",
     )
 
-    # v1.21.0: Price Action Edge = Trendline + S/R + Round Numbers with confluence; PRE-ARM/open-sync + 200/all summary retained; v1.20.1 Telegram polling-loop hotfix retained.
+    # v1.22.0: Reverse Price Action = Trendline + S/R + Round Numbers with confluence; PRE-ARM/open-sync + 200/all summary retained; v1.20.1 Telegram polling-loop hotfix retained.
     job_queue.run_repeating(
         structure_edge_job,
         interval=STRUCTURE_EDGE_SCAN_SECONDS,
