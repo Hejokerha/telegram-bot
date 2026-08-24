@@ -1030,7 +1030,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.28.0"
+COPY_SERVER_VERSION = "1.29.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -15076,7 +15076,7 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
 # IMPORTANT product rule: account type, base amount, target/stop, martingale/sequence
 # are extension/user settings. The backend does not force DEMO and does not force $1.
 
-OCTOPUS_ENGINE_VERSION = "octopus_sr_retest_v2"
+OCTOPUS_ENGINE_VERSION = "octopus_sr_retest_v3"
 OCTOPUS_MODEL_FAMILY["ADAPTIVE_SELECTOR"] = "META_SELECTOR"
 OCTOPUS_MODEL_FAMILY["MARKET_THESIS"] = "MARKET_INTELLIGENCE"
 OCTOPUS_SELECTOR_SCHEDULER_SECONDS = max(0.25, min(1.0, float(os.getenv("OCTOPUS_SELECTOR_SCHEDULER_SECONDS", "0.5"))))
@@ -15102,7 +15102,7 @@ OCTOPUS_EXECUTION_SETUPS = {"MI_SUPPORT_REJECTION", "MI_RESISTANCE_REJECTION", "
 OCTOPUS_EXECUTION_LOCK_GRACE_SECONDS = max(5.0, min(30.0, float(os.getenv("OCTOPUS_EXECUTION_LOCK_GRACE_SECONDS", "12"))))
 OCTOPUS_EXECUTION_LOCK_FALLBACK_SECONDS = max(65.0, min(180.0, float(os.getenv("OCTOPUS_EXECUTION_LOCK_FALLBACK_SECONDS", "90"))))
 
-# v1.28 specialised execution: the S/R zone itself owns direction.
+# v1.29 specialised execution: the S/R zone itself owns direction.
 # Legacy detectors remain Shadow-only; only S/R-specific historical priors can gently calibrate confidence.
 OCTOPUS_MI_ZONE_CLUSTER_ATR = max(0.10, min(0.45, float(os.getenv("OCTOPUS_MI_ZONE_CLUSTER_ATR", "0.22"))))
 OCTOPUS_MI_ZONE_HALF_WIDTH_ATR = max(0.08, min(0.35, float(os.getenv("OCTOPUS_MI_ZONE_HALF_WIDTH_ATR", "0.16"))))
@@ -15111,7 +15111,11 @@ OCTOPUS_MI_MAX_ZONE_DISTANCE_ATR = max(0.35, min(2.0, float(os.getenv("OCTOPUS_M
 OCTOPUS_MI_BREAK_MARGIN_ATR = max(0.04, min(0.30, float(os.getenv("OCTOPUS_MI_BREAK_MARGIN_ATR", "0.10"))))
 OCTOPUS_MI_RETEST_LOOKBACK = max(3, min(14, int(os.getenv("OCTOPUS_MI_RETEST_LOOKBACK", "8"))))
 OCTOPUS_MI_MIN_THESIS_QUALITY = max(58.0, min(90.0, float(os.getenv("OCTOPUS_MI_MIN_THESIS_QUALITY", "70"))))
-OCTOPUS_MI_MIN_SPACE_ATR = max(0.15, min(1.0, float(os.getenv("OCTOPUS_MI_MIN_SPACE_ATR", "0.34"))))
+# v1.29: free-space is no longer measured against every geometric zone. Only a
+# technically meaningful opposing S/R zone can hard-block an otherwise clean setup.
+OCTOPUS_MI_MIN_SPACE_ATR = max(0.08, min(0.60, float(os.getenv("OCTOPUS_MI_MIN_SPACE_ATR", "0.18"))))
+OCTOPUS_MI_OBSTACLE_MIN_QUALITY = max(55.0, min(90.0, float(os.getenv("OCTOPUS_MI_OBSTACLE_MIN_QUALITY", "68"))))
+OCTOPUS_MI_OBSTACLE_STALE_AGE = max(12, min(60, int(os.getenv("OCTOPUS_MI_OBSTACLE_STALE_AGE", "30"))))
 OCTOPUS_MI_MIN_PROXY_EDGE_POINTS = max(0.0, min(8.0, float(os.getenv("OCTOPUS_MI_MIN_PROXY_EDGE_POINTS", "1.2"))))
 
 # Keep the historic v1.24 shadow snapshot namespace so the 7k+ observations collected
@@ -15121,8 +15125,8 @@ def _octopus_base_ref():
 
 
 def _structure_edge_base_ref():
-    # v1.28 gets a fresh execution/result namespace. v1.27 remains archived.
-    return system_ref().child("octopus_sr_retest_v2")
+    # v1.29 gets a fresh execution/result namespace. v1.28 remains archived.
+    return system_ref().child("octopus_sr_retest_v3")
 
 
 def _octopus_runtime_ref():
@@ -15214,8 +15218,8 @@ def _octopus_restore_snapshot_once():
             _octopus_state["total_observations"] = int(meta.get("total_observations", 0) or 0)
             _octopus_state["total_pair_minutes"] = int(meta.get("total_pair_minutes", 0) or 0)
 
-        # v1.28 execution telemetry is separate. Fresh deployment starts at zero;
-        # process restarts resume only v1.28's own counters and still-valid trade lock.
+        # v1.29 execution telemetry is separate. Fresh deployment starts at zero;
+        # process restarts resume only v1.29's own counters and still-valid trade lock.
         runtime = _octopus_runtime_ref().get() or {}
         if isinstance(runtime, dict) and str(runtime.get("engine") or "") == OCTOPUS_ENGINE_VERSION:
             for key in (
@@ -15485,18 +15489,78 @@ def _mi_cluster_zones(parts: list[dict], atr: float) -> list[dict]:
     return zones[:10]
 
 
-def _mi_space_to_obstacle(direction: str, price: float, zones: list[dict], current_zone: dict | None, atr: float) -> float:
+def _mi_space_to_obstacle(direction: str, price: float, zones: list[dict], current_zone: dict | None, atr: float) -> dict:
+    """Return the nearest *meaningful opposing* S/R obstacle.
+
+    v1.28 treated every zone geometrically in front of price as a hard obstacle. That
+    could suppress a clean support/rejection or retest because of a weak, stale or
+    over-tested cluster that was not a meaningful barrier. v1.29 keeps protection
+    against entering directly into a real opposing level, but requires technical
+    evidence that the level is actually strong enough to matter.
+    """
     if atr <= 0:
-        return 99.0
-    distances = []
+        return {"space_atr": 99.0, "raw_space_atr": 99.0, "hard_block": False, "obstacle": None}
+
+    direction = str(direction or "").upper()
+    raw = []
+    qualified = []
     for z in zones:
-        if current_zone is z:
+        if current_zone is z or not isinstance(z, dict):
             continue
-        if direction == "CALL" and float(z["low"]) > price:
-            distances.append((float(z["low"])-price)/atr)
-        elif direction == "PUT" and float(z["high"]) < price:
-            distances.append((price-float(z["high"]))/atr)
-    return min(distances) if distances else 99.0
+        try:
+            if direction == "CALL":
+                if float(z.get("low", 0)) <= price:
+                    continue
+                distance = (float(z["low"]) - price) / atr
+                opposing_role = str(z.get("role") or "") == "RESISTANCE"
+            elif direction == "PUT":
+                if float(z.get("high", 0)) >= price:
+                    continue
+                distance = (price - float(z["high"])) / atr
+                opposing_role = str(z.get("role") or "") == "SUPPORT"
+            else:
+                continue
+
+            if distance < 0:
+                continue
+            raw.append((distance, z))
+            if not opposing_role:
+                continue
+
+            quality = float(z.get("quality", 0) or 0)
+            reactions = int(z.get("reactions", 0) or 0)
+            pivots = int(z.get("pivot_touches", 0) or 0)
+            episodes = int(z.get("touch_episodes", 0) or 0)
+            age = int(z.get("last_pivot_age", 999) or 999)
+            role_flip = bool(z.get("role_flip"))
+
+            # A true obstacle needs both zone quality and evidence that price has
+            # respected this area. Role-flip levels are allowed through as strong
+            # evidence because they are precisely the retest structure we trade.
+            evidence = role_flip or reactions >= 1 or pivots >= 3
+            stale_weak = age > OCTOPUS_MI_OBSTACLE_STALE_AGE and reactions < 2 and not role_flip
+            overtested_weak = episodes >= 8 and reactions < 3 and not role_flip
+            if quality < OCTOPUS_MI_OBSTACLE_MIN_QUALITY or not evidence or stale_weak or overtested_weak:
+                continue
+
+            strength = quality + min(8.0, reactions * 2.0) + (4.0 if role_flip else 0.0)
+            qualified.append((distance, strength, z))
+        except Exception:
+            continue
+
+    raw_space = min((x[0] for x in raw), default=99.0)
+    if not qualified:
+        return {"space_atr": 99.0, "raw_space_atr": round(float(raw_space), 3), "hard_block": False, "obstacle": None}
+
+    qualified.sort(key=lambda x: (x[0], -x[1]))
+    distance, strength, obstacle = qualified[0]
+    return {
+        "space_atr": round(float(distance), 3),
+        "raw_space_atr": round(float(raw_space), 3),
+        "hard_block": bool(distance < OCTOPUS_MI_MIN_SPACE_ATR),
+        "obstacle": obstacle,
+        "obstacle_strength": round(float(strength), 2),
+    }
 
 
 def _mi_zone_event(parts: list[dict], zone: dict, atr: float) -> dict | None:
@@ -15564,7 +15628,7 @@ def _mi_zone_event(parts: list[dict], zone: dict, atr: float) -> dict | None:
 
 def _mi_proxy_models(setup: str) -> list[str]:
     # These remain descriptive priors only. They never generate or flip direction.
-    # v1.28 deliberately excludes Trendline/M5/Momentum from the execution manager.
+    # v1.29 deliberately excludes Trendline/M5/Momentum from the execution manager.
     s = str(setup or "")
     if s == "MI_ROLE_FLIP_RETEST":
         return ["SR_BREAKOUT", "SR_BOUNCE"]
@@ -15573,7 +15637,7 @@ def _mi_proxy_models(setup: str) -> list[str]:
     return []
 
 def _octopus_market_intelligence(pair: str, closed: list[dict], regime: dict) -> dict:
-    """v1.28 specialised market map: support, resistance and polarity retest only."""
+    """v1.29 specialised market map: support, resistance and polarity retest only."""
     parts = [_otc_edge_candle_parts(x) for x in closed[-90:]]
     atr = _trendline_avg_range(parts, 14)
     if len(parts) < OCTOPUS_MIN_CLOSED_M1 or atr <= 0:
@@ -15586,26 +15650,48 @@ def _octopus_market_intelligence(pair: str, closed: list[dict], regime: dict) ->
         if not ev or str(ev.get("setup")) not in OCTOPUS_EXECUTION_SETUPS:
             continue
         q = float(ev.get("quality",0))
-        space = _mi_space_to_obstacle(str(ev.get("direction")), price, zones, ev.get("zone"), atr)
-        # Avoid entering directly into the next opposing S/R zone.
-        if space < OCTOPUS_MI_MIN_SPACE_ATR:
-            q -= 12.0
+        obstacle_info = _mi_space_to_obstacle(str(ev.get("direction")), price, zones, ev.get("zone"), atr)
+        space = float(obstacle_info.get("space_atr", 99.0) or 99.0)
+        raw_space = float(obstacle_info.get("raw_space_atr", 99.0) or 99.0)
+        hard_block = bool(obstacle_info.get("hard_block"))
+
+        # Only a strong, technically meaningful opposing level can hard-block. A weak
+        # or stale geometric zone may slightly reduce quality, but must not erase a
+        # clean S/R opportunity.
+        if hard_block:
+            q -= 8.0
+        elif space < 0.34:
+            q -= 1.5
         elif space >= 0.75:
             q += 2.0
+        elif space >= 0.45:
+            q += 0.8
+        if raw_space < 0.12 and space >= 0.34:
+            q -= 0.5  # nearby weak clutter: informational only, never a hard veto
+
         ev.update({
             "quality": round(max(1.0,min(99.0,q)),2),
-            "space_atr": round(float(space),3), "atr":atr,
+            "space_atr": round(float(space),3), "raw_space_atr": round(float(raw_space),3),
+            "space_blocked": hard_block, "opposing_obstacle": obstacle_info.get("obstacle"),
+            "opposing_obstacle_strength": obstacle_info.get("obstacle_strength"), "atr":atr,
             "structure_bias":"DISABLED", "structure_strength":0.0,
             "m5_bias":"DISABLED", "m5_strength":0.0,
             "pressure_bias":"DISABLED", "pressure_strength":0.0,
             "pressure_meta":{},
         })
         candidates.append(ev)
+
+    # Critical v1.29 fix: if the highest raw-quality thesis is blocked by a *real*
+    # opposing level, do not throw away another technically valid thesis on the same
+    # pair. Prefer the best unblocked thesis first; keep blocked ones for diagnostics.
     candidates.sort(key=lambda x: float(x.get("quality",0)), reverse=True)
-    best = dict(candidates[0]) if candidates else None
+    valid_candidates = [x for x in candidates if not bool(x.get("space_blocked")) and float(x.get("quality",0)) >= OCTOPUS_MI_MIN_THESIS_QUALITY]
+    best = dict(valid_candidates[0]) if valid_candidates else (dict(candidates[0]) if candidates else None)
     return {
-        "ok": bool(best and float(best.get("quality",0)) >= OCTOPUS_MI_MIN_THESIS_QUALITY),
+        "ok": bool(valid_candidates),
         "thesis": best, "candidates": candidates[:4], "zones": zones,
+        "valid_candidate_count": len(valid_candidates),
+        "blocked_candidate_count": sum(1 for x in candidates if bool(x.get("space_blocked"))),
         "structure_bias":"DISABLED", "structure_strength":0.0,
         "m5_bias":"DISABLED", "m5_strength":0.0,
         "pressure_bias":"DISABLED", "pressure_strength":0.0,
@@ -15637,7 +15723,7 @@ def _mi_rank_thesis(pair: str, symbol: str, payout: int, regime: dict, hour: str
     ms_recent_n = msw + msl
     setup_recent_est = ((msw + (setup_est/100.0)*12.0) / max(1e-9, ms_recent_n + 12.0) * 100.0) if ms_recent_n else setup_est
 
-    # v1.28: technical S/R thesis is the ENTRY gate. History is calibration/ranking only.
+    # v1.29: technical S/R thesis is the ENTRY gate. History is calibration/ranking only.
     # A fresh, technically clean support/resistance/retest setup must not be blocked merely
     # because its exact thesis bucket has not yet accumulated 20+ Shadow outcomes.
     recent_weight = min(0.48, 0.22 + ms_recent_n / 220.0)
@@ -15671,13 +15757,16 @@ def _mi_rank_thesis(pair: str, symbol: str, payout: int, regime: dict, hour: str
 
     # Hard entry gates are technical only (plus payout, which is filtered before ranking).
     quality_gate = quality >= OCTOPUS_MI_MIN_THESIS_QUALITY
-    space_gate = float(thesis.get("space_atr",99) or 99) >= OCTOPUS_MI_MIN_SPACE_ATR
+    # v1.29: eligibility is blocked only by a confirmed strong opposing zone inside
+    # the hard-obstacle radius, not by raw geometric distance to any zone.
+    space_gate = not bool(thesis.get("space_blocked"))
     eligible = bool(quality_gate and space_gate)
 
     # Statistics rank simultaneous valid opportunities. Cold history lowers priority rather than
     # incorrectly suppressing a technically valid S/R setup altogether.
     drift_adjust = 1.2 if setup_hot else (-2.0 if setup_cold else 0.0)
-    space_bonus = max(0.0, min(2.5, (float(thesis.get("space_atr",0) or 0) - OCTOPUS_MI_MIN_SPACE_ATR) * 1.8))
+    measured_space = float(thesis.get("space_atr",99) or 99)
+    space_bonus = 2.0 if measured_space >= 0.75 else max(0.0, min(1.6, (measured_space - OCTOPUS_MI_MIN_SPACE_ATR) * 1.3))
     selector_score = quality*0.68 + expected*0.20 + conservative*0.08 + space_bonus + drift_adjust
     models = [m for m,_ in proxy_rows[:2]]
     return [{
@@ -15695,6 +15784,9 @@ def _mi_rank_thesis(pair: str, symbol: str, payout: int, regime: dict, hour: str
         "market_setup":setup_name, "market_reason":str(thesis.get("reason") or ""),
         "market_quality":round(quality,2), "market_zone":thesis.get("zone"),
         "market_space_atr":float(thesis.get("space_atr",99) or 99),
+        "market_raw_space_atr":float(thesis.get("raw_space_atr",99) or 99),
+        "market_space_blocked":bool(thesis.get("space_blocked")),
+        "market_opposing_obstacle":thesis.get("opposing_obstacle"),
         "market_approach_atr":float(thesis.get("approach_atr",0) or 0),
     }]
 
@@ -15853,7 +15945,7 @@ async def publish_copy_octopus_prepare_signal(candidate: dict, target_entry_buck
             "octopus_market_zone": candidate.get("market_zone"),
             "octopus_market_space_atr": candidate.get("market_space_atr"),
             "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"octopus_sr_retest_v1_prearm | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_account_amount_settings",
+            "note": f"octopus_sr_retest_v3_prearm | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_account_amount_settings",
         }
         return await publish_copy_trading_signal(payload, source="structure_edge")
     except Exception as exc:
@@ -15914,7 +16006,7 @@ async def publish_copy_octopus_signal(candidate: dict) -> dict:
             "octopus_market_zone": candidate.get("market_zone"),
             "octopus_market_space_atr": candidate.get("market_space_atr"),
             "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"octopus_sr_retest_v1 | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_controls_account_amount",
+            "note": f"octopus_sr_retest_v3 | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_controls_account_amount",
         }
         return await publish_copy_trading_signal(payload, source="structure_edge")
     except Exception as exc:
@@ -16058,7 +16150,7 @@ async def _octopus_adaptive_final(context: ContextTypes.DEFAULT_TYPE, now_ts: fl
         _octopus_state.setdefault("pending", {})[current_bucket] = pending_rows
     if not ranked:
         _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade", 0) or 0) + 1
-        _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: no S/R + Retest thesis passed technical quality/space gates"
+        _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: no S/R + Retest thesis passed technical quality / true-opposing-zone gate"
         _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
         _octopus_flush_snapshot(force=False)
         await _octopus_maybe_digest(context)
@@ -16240,7 +16332,7 @@ def build_structure_edge_status() -> str:
         f"Published OK/failed: {int(_octopus_state.get('selector_publish_ok',0) or 0)} / {int(_octopus_state.get('selector_publish_failed',0) or 0)}\n"
         f"Prearmed الآن: {(pre.get('pair') + ' ' + pre.get('direction') + ' ' + str(pre.get('market_setup') or '-') + ' Q' + str(pre.get('market_quality') or '-')) if pre else '-'}\n"
         f"Payout gate: ≥{OCTOPUS_SELECTOR_MIN_PAYOUT}% | Thesis quality gate: ≥{OCTOPUS_MI_MIN_THESIS_QUALITY:g}\n"
-        f"Free-space gate: ≥{OCTOPUS_MI_MIN_SPACE_ATR:.2f} ATR | التاريخ = ترتيب/معايرة فقط، مو مانع تنفيذ\n"
+        f"Obstacle gate: فقط S/R مقابلة قوية ضمن <{OCTOPUS_MI_MIN_SPACE_ATR:.2f} ATR | المناطق الضعيفة/القديمة لا تمنع\n"
         f"Open displacement max: {OCTOPUS_SELECTOR_MAX_OPEN_DISPLACEMENT_ATR:.3f} ATR\n"
         f"Execution Lock: {'ON 🔒' if _octopus_execution_lock_active() else 'OFF'} | {_octopus_state.get('execution_lock_pair') or '-'}\n"
         f"Execution scans paused while open: {int(_octopus_state.get('execution_lock_shadow_minutes',0) or 0)} minute(s) | PRE-ARM skips: {int(_octopus_state.get('execution_lock_skipped_prearms',0) or 0)}\n"
