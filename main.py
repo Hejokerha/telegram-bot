@@ -451,7 +451,7 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
         ["🔐 Copy Trading", "📡 حالة Copy"],
-        ["🐙 Octopus Adaptive Selector", "📡 قناة 3 شموع"],
+        ["🐙 Octopus Market Intelligence", "📡 قناة 3 شموع"],
         ["🌐 Public Three Candle"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
@@ -1030,7 +1030,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.25.0"
+COPY_SERVER_VERSION = "1.26.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -12705,7 +12705,7 @@ def _structure_edge_get_settings(force_refresh: bool = False) -> dict:
 def _structure_edge_set_enabled(enabled: bool) -> bool:
     try:
         value = bool(enabled)
-        _structure_edge_settings_ref().update({"enabled": value, "updated_at": now_iso(), "engine": "octopus_adaptive_selector_v1"})
+        _structure_edge_settings_ref().update({"enabled": value, "updated_at": now_iso(), "engine": "octopus_market_intelligence_v1"})
         # Immediate in-RAM update: the 0.5s scheduler never needs a Firebase read to notice the toggle.
         _structure_edge_state["enabled_cache"] = value
         _structure_edge_state["enabled_cache_loaded"] = True
@@ -14598,8 +14598,12 @@ def _octopus_restore_snapshot_once():
         meta = snap.get("meta") or {}
         _octopus_state["total_observations"] = int(meta.get("total_observations", 0) or 0)
         _octopus_state["total_pair_minutes"] = int(meta.get("total_pair_minutes", 0) or 0)
-        for key in ("selector_decisions", "selector_no_trade", "selector_publish_ok", "selector_publish_failed", "selector_prearm_sent", "selector_prearm_cancelled"):
-            _octopus_state[key] = int(meta.get(key, _octopus_state.get(key, 0)) or 0)
+        # Keep Shadow knowledge across versions, but do not contaminate fresh v1.26
+        # selector telemetry with the v1.25 manager counters. Once v1.26 has flushed
+        # its own snapshot, restarts restore its counters normally.
+        if str(meta.get("engine") or "") == OCTOPUS_ENGINE_VERSION:
+            for key in ("selector_decisions", "selector_no_trade", "selector_publish_ok", "selector_publish_failed", "selector_prearm_sent", "selector_prearm_cancelled"):
+                _octopus_state[key] = int(meta.get(key, _octopus_state.get(key, 0)) or 0)
     except Exception as exc:
         _octopus_state["last_error"] = f"snapshot load: {exc}"
         logger.warning("Octopus snapshot load failed: %s", exc)
@@ -14837,6 +14841,7 @@ def build_structure_edge_status() -> str:
         f"Payout الأدنى للرصد: {OCTOPUS_MIN_PAYOUT}%\n"
         f"المكتبة: {len(OCTOPUS_MODEL_FAMILY)} نموذج / {len(set(OCTOPUS_MODEL_FAMILY.values()))} مدارس\n"
         f"Pairs ready/scanned: {int(_octopus_state.get('pairs_ready',0) or 0)} / {int(_octopus_state.get('pairs_scanned',0) or 0)}\n"
+        f"Market zones/theses last scan: {int(_octopus_state.get('market_zones_last',0) or 0)} / {int(_octopus_state.get('market_theses',0) or 0)}\n"
         f"آخر Scan predictions: {int(_octopus_state.get('last_predictions',0) or 0)}\n"
         f"Pending observations: {pending_obs}\n"
         f"Settled observations: {int(_octopus_state.get('total_observations',0) or 0)}\n"
@@ -14956,7 +14961,7 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 
-# ===== v1.25.0 OCTOPUS ADAPTIVE SELECTOR ======================================
+# ===== v1.26.0 OCTOPUS MARKET INTELLIGENCE ====================================
 # Keeps the v1.24 same-market Shadow Lab running, but adds a conservative online
 # selector for the active owner test slot. The selector intentionally treats the
 # market as non-stationary: old evidence is shrunk, recent evidence has higher weight,
@@ -14967,8 +14972,9 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
 # IMPORTANT product rule: account type, base amount, target/stop, martingale/sequence
 # are extension/user settings. The backend does not force DEMO and does not force $1.
 
-OCTOPUS_ENGINE_VERSION = "octopus_adaptive_selector_v1"
+OCTOPUS_ENGINE_VERSION = "octopus_market_intelligence_v1"
 OCTOPUS_MODEL_FAMILY["ADAPTIVE_SELECTOR"] = "META_SELECTOR"
+OCTOPUS_MODEL_FAMILY["MARKET_THESIS"] = "MARKET_INTELLIGENCE"
 OCTOPUS_SELECTOR_SCHEDULER_SECONDS = max(0.25, min(1.0, float(os.getenv("OCTOPUS_SELECTOR_SCHEDULER_SECONDS", "0.5"))))
 OCTOPUS_SELECTOR_PREARM_MIN_SECOND = max(50.0, min(59.2, float(os.getenv("OCTOPUS_SELECTOR_PREARM_MIN_SECOND", "56.5"))))
 OCTOPUS_SELECTOR_PREARM_LAST_SECOND = max(OCTOPUS_SELECTOR_PREARM_MIN_SECOND, min(59.7, float(os.getenv("OCTOPUS_SELECTOR_PREARM_LAST_SECOND", "59.2"))))
@@ -14986,6 +14992,19 @@ OCTOPUS_SELECTOR_MAX_OPEN_DISPLACEMENT_ATR = max(0.01, min(0.25, float(os.getenv
 OCTOPUS_SELECTOR_MIN_PAYOUT = max(0, min(100, int(os.getenv("OCTOPUS_SELECTOR_MIN_PAYOUT", str(OCTOPUS_MIN_PAYOUT)))))
 OCTOPUS_SELECTOR_MAX_TRADES_PER_BUCKET = 1  # architectural invariant: rank the market, execute only the best opportunity.
 
+# v1.26 Market Intelligence: classical technical context is now the source of direction.
+# The 23 legacy detectors remain Shadow evidence; they support/oppose the market thesis
+# rather than inventing the trade direction from a local candle pattern alone.
+OCTOPUS_MI_ZONE_CLUSTER_ATR = max(0.10, min(0.45, float(os.getenv("OCTOPUS_MI_ZONE_CLUSTER_ATR", "0.22"))))
+OCTOPUS_MI_ZONE_HALF_WIDTH_ATR = max(0.08, min(0.35, float(os.getenv("OCTOPUS_MI_ZONE_HALF_WIDTH_ATR", "0.16"))))
+OCTOPUS_MI_MIN_ZONE_TOUCHES = max(2, min(6, int(os.getenv("OCTOPUS_MI_MIN_ZONE_TOUCHES", "2"))))
+OCTOPUS_MI_MAX_ZONE_DISTANCE_ATR = max(0.35, min(2.0, float(os.getenv("OCTOPUS_MI_MAX_ZONE_DISTANCE_ATR", "1.20"))))
+OCTOPUS_MI_BREAK_MARGIN_ATR = max(0.04, min(0.30, float(os.getenv("OCTOPUS_MI_BREAK_MARGIN_ATR", "0.10"))))
+OCTOPUS_MI_RETEST_LOOKBACK = max(3, min(14, int(os.getenv("OCTOPUS_MI_RETEST_LOOKBACK", "8"))))
+OCTOPUS_MI_MIN_THESIS_QUALITY = max(58.0, min(90.0, float(os.getenv("OCTOPUS_MI_MIN_THESIS_QUALITY", "70"))))
+OCTOPUS_MI_MIN_SPACE_ATR = max(0.15, min(1.0, float(os.getenv("OCTOPUS_MI_MIN_SPACE_ATR", "0.34"))))
+OCTOPUS_MI_MIN_PROXY_EDGE_POINTS = max(0.0, min(8.0, float(os.getenv("OCTOPUS_MI_MIN_PROXY_EDGE_POINTS", "1.2"))))
+
 # Keep the historic v1.24 shadow snapshot namespace so the 7k+ observations collected
 # before this deploy remain useful as priors. Actual selector executions are isolated.
 def _octopus_base_ref():
@@ -14993,7 +15012,7 @@ def _octopus_base_ref():
 
 
 def _structure_edge_base_ref():
-    return system_ref().child("octopus_adaptive_selector_v1")
+    return system_ref().child("octopus_market_intelligence_v1")
 
 
 def _octopus_deep_stats(root: dict, *keys: str) -> dict:
@@ -15029,6 +15048,12 @@ def _octopus_selector_extend_state():
         "selector_publish_ok": 0,
         "selector_publish_failed": 0,
         "selector_last_no_trade_reason": None,
+        "market_last_thesis": None,
+        "market_theses": 0,
+        "market_zones_last": 0,
+        "market_thesis_predictions": 0,
+        "market_setup_stats": {},
+        "recent_market_setup": {},
     }
     for key, value in defaults.items():
         if key not in _octopus_state:
@@ -15047,7 +15072,7 @@ def _octopus_restore_snapshot_once():
             return
         for key in (
             "model_stats", "family_stats", "pair_stats", "regime_stats", "hour_stats",
-            "pair_regime_stats", "pair_regime_hour_stats",
+            "pair_regime_stats", "pair_regime_hour_stats", "market_setup_stats",
         ):
             value = snap.get(key)
             if isinstance(value, dict):
@@ -15058,6 +15083,9 @@ def _octopus_restore_snapshot_once():
         recent_pr = snap.get("recent_pair_regime") or {}
         if isinstance(recent_pr, dict):
             _octopus_state["recent_pair_regime"] = {str(k): str(v)[-OCTOPUS_RECENT_MODEL_WINDOW:] for k, v in recent_pr.items()}
+        recent_ms = snap.get("recent_market_setup") or {}
+        if isinstance(recent_ms, dict):
+            _octopus_state["recent_market_setup"] = {str(k): str(v)[-OCTOPUS_RECENT_MODEL_WINDOW:] for k, v in recent_ms.items()}
         meta = snap.get("meta") or {}
         _octopus_state["total_observations"] = int(meta.get("total_observations", 0) or 0)
         _octopus_state["total_pair_minutes"] = int(meta.get("total_pair_minutes", 0) or 0)
@@ -15065,7 +15093,7 @@ def _octopus_restore_snapshot_once():
             _octopus_state[key] = int(meta.get(key, _octopus_state.get(key, 0)) or 0)
     except Exception as exc:
         _octopus_state["last_error"] = f"snapshot load: {exc}"
-        logger.warning("Octopus adaptive snapshot load failed: %s", exc)
+        logger.warning("Octopus Market Intelligence snapshot load failed: %s", exc)
 
 
 def _octopus_flush_snapshot(force: bool = False):
@@ -15096,14 +15124,16 @@ def _octopus_flush_snapshot(force: bool = False):
             "hour_stats": _octopus_state.get("hour_stats") or {},
             "pair_regime_stats": _octopus_state.get("pair_regime_stats") or {},
             "pair_regime_hour_stats": _octopus_state.get("pair_regime_hour_stats") or {},
+            "market_setup_stats": _octopus_state.get("market_setup_stats") or {},
             "recent": _octopus_state.get("recent") or {},
             "recent_pair_regime": _octopus_state.get("recent_pair_regime") or {},
+            "recent_market_setup": _octopus_state.get("recent_market_setup") or {},
         }
         _octopus_base_ref().child("snapshot").set(payload)
         _octopus_state["last_flush_ts"] = now_ts
     except Exception as exc:
         _octopus_state["last_error"] = f"snapshot flush: {exc}"
-        logger.warning("Octopus adaptive snapshot flush failed: %s", exc)
+        logger.warning("Octopus Market Intelligence snapshot flush failed: %s", exc)
 
 
 def _octopus_record_prediction_result(pred: dict, result: str):
@@ -15126,6 +15156,11 @@ def _octopus_record_prediction_result(pred: dict, result: str):
     pr_key = f"{pair_key}|{regime}|{model}"
     old_pr = str((_octopus_state.get("recent_pair_regime") or {}).get(pr_key) or "")
     _octopus_state["recent_pair_regime"][pr_key] = (old_pr + char)[-OCTOPUS_RECENT_MODEL_WINDOW:]
+    if model == "MARKET_THESIS":
+        setup = str(pred.get("market_setup") or "UNKNOWN")
+        _octopus_counter_update(_octopus_stats_bucket(_octopus_state["market_setup_stats"], setup), result)
+        old_ms = str((_octopus_state.get("recent_market_setup") or {}).get(setup) or "")
+        _octopus_state["recent_market_setup"][setup] = (old_ms + char)[-OCTOPUS_RECENT_MODEL_WINDOW:]
     _octopus_state["total_observations"] = int(_octopus_state.get("total_observations", 0) or 0) + 1
 
 
@@ -15157,6 +15192,376 @@ def _octopus_bucket(root: dict, *keys: str) -> dict:
 def _octopus_break_even_wr(payout: int | float) -> float:
     p = max(0.01, float(payout or 0) / 100.0)
     return 100.0 / (1.0 + p)
+
+
+
+def _mi_structure_bias(parts: list[dict]) -> tuple[str, int, str]:
+    """Read HH/HL vs LH/LL structure from confirmed local swings."""
+    if len(parts) < 12:
+        return "NEUTRAL", 0, "insufficient swings"
+    highs, lows = _trendline_swings(parts)
+    if len(highs) >= 2 and len(lows) >= 2:
+        h1, h2 = highs[-2][1], highs[-1][1]
+        l1, l2 = lows[-2][1], lows[-1][1]
+        if h2 > h1 and l2 > l1:
+            return "CALL", 78, "HH + HL"
+        if h2 < h1 and l2 < l1:
+            return "PUT", 78, "LH + LL"
+        if h2 > h1 and l2 <= l1:
+            return "CALL", 58, "higher high / mixed lows"
+        if h2 < h1 and l2 >= l1:
+            return "PUT", 58, "lower high / mixed lows"
+    return "NEUTRAL", 45, "mixed structure"
+
+
+def _mi_pressure_bias(parts: list[dict], atr: float) -> tuple[str, float, dict]:
+    rows = parts[-6:]
+    if len(rows) < 4 or atr <= 0:
+        return "NEUTRAL", 0.0, {}
+    net = (float(rows[-1]["close"]) - float(rows[0]["open"])) / max(atr, 1e-12)
+    dir_weight = sum(int(x.get("dir", 0) or 0) * max(0.20, float(x.get("body_ratio", 0) or 0)) for x in rows)
+    strong_up = sum(1 for x in rows if int(x.get("dir",0) or 0) > 0 and float(x.get("body_ratio",0) or 0) >= 0.45)
+    strong_dn = sum(1 for x in rows if int(x.get("dir",0) or 0) < 0 and float(x.get("body_ratio",0) or 0) >= 0.45)
+    score = min(99.0, 45.0 + abs(net) * 12.0 + abs(dir_weight) * 4.0)
+    if net >= 0.65 and dir_weight > 0.65:
+        return "CALL", score, {"net_atr": round(net,3), "strong": strong_up, "dir_weight": round(dir_weight,3)}
+    if net <= -0.65 and dir_weight < -0.65:
+        return "PUT", score, {"net_atr": round(net,3), "strong": strong_dn, "dir_weight": round(dir_weight,3)}
+    return "NEUTRAL", min(55.0, score), {"net_atr": round(net,3), "strong_up": strong_up, "strong_down": strong_dn, "dir_weight": round(dir_weight,3)}
+
+
+def _mi_cluster_zones(parts: list[dict], atr: float) -> list[dict]:
+    """Build horizontal S/R as price ZONES, not magic single-price lines.
+
+    Classical inputs only: confirmed swing highs/lows, repeated tests, reaction strength,
+    recency and polarity (broken support -> resistance / resistance -> support).
+    """
+    if len(parts) < 16 or atr <= 0:
+        return []
+    highs, lows = _trendline_swings(parts)
+    points = [(int(i), float(p), "H") for i,p in highs[-24:]] + [(int(i), float(p), "L") for i,p in lows[-24:]]
+    points.sort(key=lambda x: x[0])
+    if not points:
+        return []
+    tol = atr * OCTOPUS_MI_ZONE_CLUSTER_ATR
+    clusters = []
+    for idx, price, kind in points:
+        best = None; best_d = None
+        for c in clusters:
+            d = abs(price - float(c["center"]))
+            if d <= tol and (best_d is None or d < best_d):
+                best, best_d = c, d
+        if best is None:
+            clusters.append({"points": [(idx, price, kind)], "center": price})
+        else:
+            best["points"].append((idx, price, kind))
+            # Mild recency weighting while keeping the level anchored in repeated pivots.
+            ws = list(range(1, len(best["points"]) + 1))
+            best["center"] = sum(pt[1] * w for pt, w in zip(best["points"], ws)) / sum(ws)
+
+    last_idx = len(parts) - 1
+    close_now = float(parts[-1]["close"])
+    zones = []
+    for c in clusters:
+        pts = c["points"]
+        if len(pts) < OCTOPUS_MI_MIN_ZONE_TOUCHES:
+            continue
+        center = float(c["center"])
+        spread = max(abs(p-center) for _,p,_ in pts) if pts else 0.0
+        half = max(atr * OCTOPUS_MI_ZONE_HALF_WIDTH_ATR, spread + atr * 0.05)
+        half = min(atr * 0.34, half)
+        low, high = center - half, center + half
+        if abs(close_now-center) / atr > OCTOPUS_MI_MAX_ZONE_DISTANCE_ATR:
+            continue
+
+        # Count separate test episodes; several candles sitting inside one area are one test.
+        episodes = []
+        in_touch = False
+        for i, row in enumerate(parts[-60:], start=max(0, len(parts)-60)):
+            overlap = float(row["high"]) >= low and float(row["low"]) <= high
+            if overlap and not in_touch:
+                episodes.append(i); in_touch = True
+            elif not overlap:
+                in_touch = False
+        reactions = 0
+        for i in episodes:
+            base = parts[i]
+            for j in range(i+1, min(len(parts), i+4)):
+                if max(abs(float(parts[j]["close"])-center), abs(float(parts[j]["high"])-center), abs(float(parts[j]["low"])-center)) >= atr * 0.42:
+                    reactions += 1; break
+
+        # Last decisive close-through supplies polarity / role reversal state.
+        break_dir = None; break_idx = None
+        margin = atr * OCTOPUS_MI_BREAK_MARGIN_ATR
+        start = max(1, len(parts)-24)
+        for i in range(start, len(parts)):
+            prev, cur = parts[i-1], parts[i]
+            body = float(cur.get("body_ratio",0) or 0)
+            if body < 0.38:
+                continue
+            if float(prev["close"]) <= high and float(cur["close"]) > high + margin:
+                break_dir, break_idx = "CALL", i
+            elif float(prev["close"]) >= low and float(cur["close"]) < low - margin:
+                break_dir, break_idx = "PUT", i
+
+        # Current role follows location; if price is in-zone, approach determines role.
+        if close_now > high:
+            role = "SUPPORT"
+        elif close_now < low:
+            role = "RESISTANCE"
+        else:
+            approach = float(parts[-3]["close"]) if len(parts) >= 3 else close_now
+            role = "RESISTANCE" if approach < center else "SUPPORT"
+        role_flip = bool((break_dir == "PUT" and role == "RESISTANCE") or (break_dir == "CALL" and role == "SUPPORT"))
+        age = last_idx - max(i for i,_,_ in pts)
+        hpts = sum(1 for _,_,k in pts if k == "H"); lpts = len(pts)-hpts
+        churn = max(0, len(episodes) - 5)
+        quality = 46.0 + min(5, len(pts))*5.0 + min(4, reactions)*3.5 + (8.0 if role_flip else 0.0) + max(0.0, 8.0-age*0.35) - churn*2.0
+        quality = max(40.0, min(96.0, quality))
+        zones.append({
+            "center": center, "low": low, "high": high, "width_atr": round((high-low)/atr,3),
+            "quality": round(quality,1), "pivot_touches": len(pts), "touch_episodes": len(episodes),
+            "reactions": reactions, "role": role, "role_flip": role_flip,
+            "break_dir": break_dir, "break_idx": break_idx, "break_age": (last_idx-break_idx if break_idx is not None else None),
+            "high_pivots": hpts, "low_pivots": lpts, "last_pivot_age": age,
+            "distance_atr": round(abs(close_now-center)/atr,3),
+        })
+    zones.sort(key=lambda z: (float(z.get("quality",0)), -float(z.get("distance_atr",99))), reverse=True)
+    return zones[:10]
+
+
+def _mi_space_to_obstacle(direction: str, price: float, zones: list[dict], current_zone: dict | None, atr: float) -> float:
+    if atr <= 0:
+        return 99.0
+    distances = []
+    for z in zones:
+        if current_zone is z:
+            continue
+        if direction == "CALL" and float(z["low"]) > price:
+            distances.append((float(z["low"])-price)/atr)
+        elif direction == "PUT" and float(z["high"]) < price:
+            distances.append((price-float(z["high"]))/atr)
+    return min(distances) if distances else 99.0
+
+
+def _mi_zone_event(parts: list[dict], zone: dict, atr: float) -> dict | None:
+    if len(parts) < 5 or atr <= 0:
+        return None
+    last = parts[-1]; prev = parts[-2]
+    low, high, center = float(zone["low"]), float(zone["high"]), float(zone["center"])
+    zq = float(zone.get("quality", 50) or 50)
+    margin = atr * OCTOPUS_MI_BREAK_MARGIN_ATR
+    touch_now = float(last["high"]) >= low and float(last["low"]) <= high
+    touch_prev = float(prev["high"]) >= low and float(prev["low"]) <= high
+    upper_rej = float(last.get("upper_wick",0) or 0)
+    lower_rej = float(last.get("lower_wick",0) or 0)
+    body = float(last.get("body_ratio",0) or 0)
+    events = []
+
+    # 1) Polarity / role-flip retest: one of the most classical S/R situations.
+    bdir = zone.get("break_dir"); bage = zone.get("break_age")
+    if bage is not None and 1 <= int(bage) <= OCTOPUS_MI_RETEST_LOOKBACK:
+        if bdir == "PUT" and (touch_now or touch_prev) and float(last["close"]) < center and (int(last.get("dir",0) or 0) < 0 or upper_rej >= 0.28):
+            q = zq + 9 + min(7, upper_rej*12) + (4 if int(last.get("dir",0) or 0) < 0 else 0)
+            events.append({"direction":"PUT","setup":"MI_ROLE_FLIP_RETEST","quality":q,"reason":"broken support retested from below as resistance"})
+        if bdir == "CALL" and (touch_now or touch_prev) and float(last["close"]) > center and (int(last.get("dir",0) or 0) > 0 or lower_rej >= 0.28):
+            q = zq + 9 + min(7, lower_rej*12) + (4 if int(last.get("dir",0) or 0) > 0 else 0)
+            events.append({"direction":"CALL","setup":"MI_ROLE_FLIP_RETEST","quality":q,"reason":"broken resistance retested from above as support"})
+
+    # 2) Rejection from an intact/current zone. Direction is produced by the zone itself.
+    if zone.get("role") == "RESISTANCE" and (touch_now or touch_prev) and float(last["close"]) <= high and (int(last.get("dir",0) or 0) < 0 or upper_rej >= 0.40):
+        q = zq + min(9, upper_rej*15) + (5 if int(last.get("dir",0) or 0) < 0 and body >= 0.22 else 0)
+        events.append({"direction":"PUT","setup":"MI_RESISTANCE_REJECTION","quality":q,"reason":"price tested resistance zone and rejected lower"})
+    if zone.get("role") == "SUPPORT" and (touch_now or touch_prev) and float(last["close"]) >= low and (int(last.get("dir",0) or 0) > 0 or lower_rej >= 0.40):
+        q = zq + min(9, lower_rej*15) + (5 if int(last.get("dir",0) or 0) > 0 and body >= 0.22 else 0)
+        events.append({"direction":"CALL","setup":"MI_SUPPORT_REJECTION","quality":q,"reason":"price tested support zone and rejected higher"})
+
+    # 3) Decisive break / acceptance. Do not fade a level that price has actually accepted through.
+    if float(prev["close"]) <= high and float(last["close"]) > high + margin and int(last.get("dir",0) or 0) > 0 and body >= 0.42:
+        q = zq + 7 + min(8, body*10) + min(6, (float(last["close"])-high)/atr*12)
+        events.append({"direction":"CALL","setup":"MI_BREAKOUT_ACCEPTANCE","quality":q,"reason":"decisive close accepted above resistance zone"})
+    if float(prev["close"]) >= low and float(last["close"]) < low - margin and int(last.get("dir",0) or 0) < 0 and body >= 0.42:
+        q = zq + 7 + min(8, body*10) + min(6, (low-float(last["close"]))/atr*12)
+        events.append({"direction":"PUT","setup":"MI_BREAKDOWN_ACCEPTANCE","quality":q,"reason":"decisive close accepted below support zone"})
+
+    if not events:
+        return None
+    best = max(events, key=lambda e: float(e.get("quality",0)))
+    best = dict(best); best["zone"] = zone
+    return best
+
+
+def _mi_proxy_models(setup: str) -> list[str]:
+    s = str(setup or "")
+    if s == "MI_ROLE_FLIP_RETEST":
+        return ["BOS_RETEST", "SR_BOUNCE", "SR_BREAKOUT", "M5_STRUCTURE_CONTINUATION"]
+    if s in {"MI_RESISTANCE_REJECTION", "MI_SUPPORT_REJECTION"}:
+        return ["SR_BOUNCE", "PINBAR_REJECTION", "RANGE_EDGE_REVERSION", "EXTREME_MEAN_REVERSION"]
+    if s in {"MI_BREAKOUT_ACCEPTANCE", "MI_BREAKDOWN_ACCEPTANCE"}:
+        return ["SR_BREAKOUT", "MOMENTUM_CONTINUATION", "M5_STRUCTURE_CONTINUATION", "COMPRESSION_BREAKOUT"]
+    return ["M5_STRUCTURE_CONTINUATION", "MOMENTUM_CONTINUATION", "PULLBACK_CONTINUATION"]
+
+
+def _octopus_market_intelligence(pair: str, closed: list[dict], regime: dict) -> dict:
+    parts = [_otc_edge_candle_parts(x) for x in closed[-90:]]
+    atr = _trendline_avg_range(parts, 14)
+    if len(parts) < OCTOPUS_MIN_CLOSED_M1 or atr <= 0:
+        return {"ok":False, "reason":"warmup/no ATR", "zones":[]}
+    zones = _mi_cluster_zones(parts, atr)
+    sdir, sstrength, sreason = _mi_structure_bias(parts)
+    m5dir, m5strength = _octopus_m5_bias(closed)
+    pdir, pstrength, pmeta = _mi_pressure_bias(parts, atr)
+    price = float(parts[-1]["close"])
+    candidates = []
+    for zone in zones:
+        ev = _mi_zone_event(parts, zone, atr)
+        if not ev:
+            continue
+        d = ev["direction"]
+        q = float(ev.get("quality",0))
+        # Context confirms the thesis; it does not manufacture the initial direction.
+        if sdir == d: q += 5.0
+        elif sdir not in {"NEUTRAL", d}: q -= 3.5
+        if m5dir == d: q += 3.0
+        elif m5dir not in {"NEUTRAL", d}: q -= 2.0
+        if pdir == d: q += 4.0
+        elif pdir not in {"NEUTRAL", d}:
+            # A clean rejection/role-flip can legitimately turn against incoming pressure,
+            # so oppose it less harshly than a continuation thesis.
+            q -= 2.0 if "REJECTION" in ev["setup"] or "RETEST" in ev["setup"] else 5.0
+        space = _mi_space_to_obstacle(d, price, zones, ev.get("zone"), atr)
+        if space < OCTOPUS_MI_MIN_SPACE_ATR:
+            q -= 10.0
+        elif space >= 0.75:
+            q += 2.0
+        ev.update({
+            "quality": round(max(1.0,min(99.0,q)),2), "structure_bias":sdir, "structure_strength":sstrength,
+            "structure_reason":sreason, "m5_bias":m5dir, "m5_strength":m5strength,
+            "pressure_bias":pdir, "pressure_strength":round(float(pstrength),2), "pressure_meta":pmeta,
+            "space_atr": round(float(space),3), "atr":atr,
+        })
+        candidates.append(ev)
+
+    # 4) If price is not at a meaningful zone event, permit a clean structure continuation
+    # only when M1 structure, M5 and live pressure all agree AND there is room to next zone.
+    if not candidates and sdir in {"CALL","PUT"} and sdir == m5dir == pdir and sstrength >= 70 and m5strength >= 68 and pstrength >= 62:
+        space = _mi_space_to_obstacle(sdir, price, zones, None, atr)
+        q = 68.0 + min(8.0,(sstrength-70)*0.25) + min(7.0,(m5strength-68)*0.18) + min(7.0,(pstrength-62)*0.14)
+        if space < OCTOPUS_MI_MIN_SPACE_ATR:
+            q -= 12.0
+        else:
+            q += min(4.0, space*2.0)
+        candidates.append({
+            "direction":sdir, "setup":"MI_STRUCTURE_CONTINUATION", "quality":round(max(1.0,min(99.0,q)),2),
+            "reason":"M1 structure + M5 bias + current pressure aligned with clear space",
+            "zone":None, "structure_bias":sdir, "structure_strength":sstrength, "structure_reason":sreason,
+            "m5_bias":m5dir, "m5_strength":m5strength, "pressure_bias":pdir, "pressure_strength":round(float(pstrength),2),
+            "pressure_meta":pmeta, "space_atr":round(float(space),3), "atr":atr,
+        })
+    candidates.sort(key=lambda x: float(x.get("quality",0)), reverse=True)
+    best = dict(candidates[0]) if candidates else None
+    return {
+        "ok": bool(best and float(best.get("quality",0)) >= OCTOPUS_MI_MIN_THESIS_QUALITY),
+        "thesis": best, "candidates": candidates[:4], "zones": zones,
+        "structure_bias":sdir, "structure_strength":sstrength, "m5_bias":m5dir, "m5_strength":m5strength,
+        "pressure_bias":pdir, "pressure_strength":round(float(pstrength),2), "regime":str((regime or {}).get("name") or "UNKNOWN"),
+    }
+
+
+def _mi_rank_thesis(pair: str, symbol: str, payout: int, regime: dict, hour: str, signals: list[dict], intelligence: dict) -> list[dict]:
+    thesis = (intelligence or {}).get("thesis") if isinstance(intelligence, dict) else None
+    if not isinstance(thesis, dict) or float(thesis.get("quality",0) or 0) < OCTOPUS_MI_MIN_THESIS_QUALITY:
+        return []
+    direction = str(thesis.get("direction") or "").upper()
+    if direction not in {"CALL","PUT"}:
+        return []
+    rname = str((regime or {}).get("name") or "UNKNOWN")
+    be = _octopus_break_even_wr(payout)
+
+    # Historical suitability of the technical family is used as a statistical prior.
+    # The market thesis still owns direction; models can strengthen or challenge it.
+    proxies = []
+    for model in _mi_proxy_models(str(thesis.get("setup") or "")):
+        est = _octopus_context_estimate(pair, rname, hour, model, payout, 75)
+        proxies.append(est)
+    proxies.sort(key=lambda x: float(x.get("conservative_wr",0)), reverse=True)
+    usable = [x for x in proxies if int(x.get("global_n",0) or 0) >= OCTOPUS_SELECTOR_MIN_MODEL_SAMPLE and int(x.get("recent_n",0) or 0) >= OCTOPUS_SELECTOR_MIN_RECENT_SAMPLE and not (x.get("drift") or {}).get("state") == "COLD"]
+    base = usable[0] if usable else (proxies[0] if proxies else {"expected_wr":50.0,"conservative_wr":45.0,"basis":[]})
+    expected = float(base.get("expected_wr",50.0) or 50.0)
+    conservative = float(base.get("conservative_wr",45.0) or 45.0)
+
+    # Models that actually fired in the thesis direction add bounded corroboration.
+    evaluated = []
+    for sig in signals:
+        est = _octopus_context_estimate(pair, rname, hour, str(sig.get("model")), payout, int(sig.get("score",75) or 75))
+        row = dict(sig); row.update(est); evaluated.append(row)
+    aligned = [x for x in evaluated if str(x.get("direction")) == direction]
+    opposite = [x for x in evaluated if str(x.get("direction")) != direction]
+    aligned.sort(key=lambda x: float(x.get("conservative_wr",0)), reverse=True)
+    opposite.sort(key=lambda x: float(x.get("conservative_wr",0)), reverse=True)
+    aligned_good = [x for x in aligned if int(x.get("recent_n",0) or 0) >= 12 and float(x.get("expected_wr",0)) >= be]
+    families=[]; models=[]
+    for x in aligned_good:
+        fam=str(x.get("family") or "OTHER")
+        if fam not in families: families.append(fam)
+        m=str(x.get("model") or "")
+        if m and m not in models: models.append(m)
+    support_bonus = min(1.8, max(0,len(families))*0.55)
+    technical_bonus = max(-0.5, min(1.8, (float(thesis.get("quality",70))-70.0)*0.07))
+    expected = min(95.0, expected + support_bonus + technical_bonus)
+    conservative = min(expected, conservative + support_bonus*0.45 + technical_bonus*0.35)
+
+    # As v1.26 collects its own outcomes, calibrate each technical thesis type separately.
+    # Early deployment uses related historical models as priors; later the thesis learns from itself.
+    setup_name = str(thesis.get("setup") or "MARKET_THESIS")
+    setup_bucket = (_octopus_state.get("market_setup_stats") or {}).get(setup_name) or {}
+    setup_est, setup_n = _octopus_shrunk_rate(setup_bucket, prior_mean=0.50, prior_strength=14.0)
+    ms_seq = str((_octopus_state.get("recent_market_setup") or {}).get(setup_name) or "")
+    msw, msl, _, ms_recent_raw = _octopus_seq_stats(ms_seq)
+    ms_recent_n = msw + msl
+    setup_recent_est = ((msw + (setup_est/100.0)*10.0) / max(1e-9, ms_recent_n + 10.0) * 100.0) if ms_recent_n else setup_est
+    if setup_n >= 20:
+        setup_blend = 0.60*setup_est + 0.40*setup_recent_est
+        influence = min(0.42, setup_n / float(setup_n + 45.0) * 0.55)
+        expected = expected*(1.0-influence) + setup_blend*influence
+        conservative = conservative*(1.0-influence*0.85) + (setup_blend-2.0)*(influence*0.85)
+    setup_cold = bool(ms_recent_n >= 16 and ms_recent_raw < be - 5.0)
+
+    # Strong opposite evidence is a manager-level reason to stand aside, not to flip the thesis.
+    opp_c = float(opposite[0].get("conservative_wr",0)) if opposite else 0.0
+    conflict_penalty = 0.0
+    conflict_ok = True
+    if opposite and opp_c >= be + 1.0:
+        conflict_penalty = min(3.0, max(0.8, opp_c - be))
+        conservative -= conflict_penalty
+        expected -= conflict_penalty*0.45
+        if opp_c >= conservative + 1.0:
+            conflict_ok = False
+
+    quality = float(thesis.get("quality",0))
+    enough_proxy = bool(usable)
+    expected_gate = expected >= be + max(OCTOPUS_MI_MIN_PROXY_EDGE_POINTS, OCTOPUS_SELECTOR_MIN_EDGE_POINTS - 1.0)
+    conservative_gate = conservative >= be + max(-0.5, OCTOPUS_SELECTOR_MIN_CONSERVATIVE_EDGE_POINTS - 0.4)
+    quality_gate = quality >= OCTOPUS_MI_MIN_THESIS_QUALITY
+    space_gate = float(thesis.get("space_atr",99) or 99) >= OCTOPUS_MI_MIN_SPACE_ATR
+    eligible = bool(quality_gate and space_gate and expected_gate and conservative_gate and conflict_ok and enough_proxy and not setup_cold)
+    selector_score = conservative*0.52 + expected*0.24 + quality*0.24
+    return [{
+        "pair":pair, "symbol":symbol, "payout":int(payout), "regime":rname, "hour":str(hour),
+        "direction":direction, "primary_model":"MARKET_THESIS", "primary_family":"MARKET_INTELLIGENCE",
+        "models":["MARKET_THESIS"] + models[:6], "families":["MARKET_INTELLIGENCE"] + families[:5],
+        "raw_score":int(round(quality)), "expected_wr":round(expected,2), "conservative_wr":round(conservative,2),
+        "break_even_wr":round(be,2), "edge_points":round(expected-be,2), "conservative_edge_points":round(conservative-be,2),
+        "consensus_bonus":round(support_bonus,2), "direction_margin":round((conservative-opp_c) if opposite else 99.0,2),
+        "opposite_conservative_wr":round(opp_c,2) if opposite else None, "conflict_ok":conflict_ok,
+        "selector_score":round(selector_score,2), "eligible":eligible, "basis":list(base.get("basis") or []),
+        "drift":base.get("drift") or {}, "model_detail":base, "all_evaluated":aligned[:6],
+        "market_setup":str(thesis.get("setup") or "MARKET_THESIS"), "market_reason":str(thesis.get("reason") or ""),
+        "market_quality":round(quality,2), "market_zone":thesis.get("zone"), "market_space_atr":thesis.get("space_atr"),
+        "market_structure_bias":thesis.get("structure_bias"), "market_m5_bias":thesis.get("m5_bias"),
+        "market_pressure_bias":thesis.get("pressure_bias"), "market_proxy_models":_mi_proxy_models(str(thesis.get("setup") or "")),
+        "market_intelligence": {k:v for k,v in intelligence.items() if k not in {"zones","candidates"}},
+    }]
 
 
 def _octopus_drift_profile(model: str, break_even: float) -> dict:
@@ -15329,90 +15734,9 @@ def _octopus_context_estimate(pair: str, regime: str, hour: str, model: str, pay
     }
 
 
-def _octopus_rank_pair(pair: str, symbol: str, payout: int, regime: dict, hour: str, signals: list[dict]) -> list[dict]:
-    rname = str((regime or {}).get("name") or "UNKNOWN")
-    evaluated = []
-    for sig in signals:
-        model = str(sig.get("model") or "UNKNOWN")
-        ev = _octopus_context_estimate(pair, rname, hour, model, payout, int(sig.get("score", 75) or 75))
-        row = dict(sig)
-        row.update(ev)
-        evaluated.append(row)
-
-    groups = []
-    for direction in ("CALL", "PUT"):
-        same = [x for x in evaluated if str(x.get("direction")) == direction]
-        if not same:
-            continue
-        same.sort(key=lambda x: (float(x.get("conservative_wr", 0)), float(x.get("expected_wr", 0))), reverse=True)
-        eligible = [x for x in same if x.get("eligible")]
-        if not eligible:
-            continue
-        best = eligible[0]
-        be = float(best.get("break_even_wr", 50.0))
-        supporters = [x for x in same if float(x.get("expected_wr", 0)) >= be + 0.8 and int(x.get("recent_n", 0) or 0) >= 12]
-        families = []
-        models = []
-        for x in supporters:
-            fam = str(x.get("family") or OCTOPUS_MODEL_FAMILY.get(str(x.get("model")), "OTHER"))
-            if fam not in families:
-                families.append(fam)
-            m = str(x.get("model") or "")
-            if m and m not in models:
-                models.append(m)
-        # Only independent-family agreement earns a confidence bonus. Multiple
-        # correlated setups from the same school may support the narrative, but
-        # they must not manufacture statistical confidence.
-        diversity_bonus = min(2.25, max(0, len(families) - 1) * 0.75)
-        expected = min(95.0, float(best.get("expected_wr", 0)) + diversity_bonus)
-        conservative = min(expected, float(best.get("conservative_wr", 0)) + diversity_bonus * 0.55)
-        group = {
-            "pair": pair,
-            "symbol": symbol,
-            "payout": int(payout),
-            "regime": rname,
-            "hour": str(hour),
-            "direction": direction,
-            "primary_model": str(best.get("model") or "UNKNOWN"),
-            "primary_family": str(best.get("family") or "OTHER"),
-            "models": models or [str(best.get("model") or "UNKNOWN")],
-            "families": families or [str(best.get("family") or "OTHER")],
-            "raw_score": int(best.get("score", 0) or 0),
-            "expected_wr": round(expected, 2),
-            "conservative_wr": round(conservative, 2),
-            "break_even_wr": round(be, 2),
-            "edge_points": round(expected - be, 2),
-            "conservative_edge_points": round(conservative - be, 2),
-            "consensus_bonus": round(diversity_bonus, 2),
-            "basis": list(best.get("basis") or []),
-            "drift": best.get("drift") or {},
-            "model_detail": best,
-            "all_evaluated": same[:6],
-        }
-        groups.append(group)
-
-    # Explicit conflict gate: a strong opposite-direction model is not silently ignored.
-    for group in groups:
-        opposite = [x for x in groups if x is not group and x.get("direction") != group.get("direction")]
-        if opposite:
-            opp = max(opposite, key=lambda x: float(x.get("conservative_wr", 0)))
-            margin = float(group.get("conservative_wr", 0)) - float(opp.get("conservative_wr", 0))
-            group["direction_margin"] = round(margin, 2)
-            group["opposite_conservative_wr"] = float(opp.get("conservative_wr", 0))
-            group["conflict_ok"] = margin >= OCTOPUS_SELECTOR_MIN_DIRECTION_MARGIN
-        else:
-            group["direction_margin"] = 99.0
-            group["opposite_conservative_wr"] = None
-            group["conflict_ok"] = True
-        reliability = min(12.0, float(group.get("model_detail", {}).get("recent_n", 0) or 0) / 10.0)
-        group["selector_score"] = round(
-            float(group.get("conservative_wr", 0)) * 0.68
-            + float(group.get("expected_wr", 0)) * 0.32
-            + min(1.2, reliability * 0.08),
-            2,
-        )
-        group["eligible"] = bool(group.get("conflict_ok") and float(group.get("expected_wr", 0)) >= float(group.get("break_even_wr", 0)) + OCTOPUS_SELECTOR_MIN_EDGE_POINTS and float(group.get("conservative_wr", 0)) >= float(group.get("break_even_wr", 0)) + OCTOPUS_SELECTOR_MIN_CONSERVATIVE_EDGE_POINTS)
-    return sorted(groups, key=lambda x: float(x.get("selector_score", 0)), reverse=True)
+def _octopus_rank_pair(pair: str, symbol: str, payout: int, regime: dict, hour: str, signals: list[dict], intelligence: dict | None = None) -> list[dict]:
+    """v1.26: direction comes from Market Intelligence; adaptive models only corroborate/challenge it."""
+    return _mi_rank_thesis(pair, symbol, payout, regime, hour, signals, intelligence or {})
 
 
 def _octopus_scan_market_for_target(target_bucket: int, provisional: bool = False) -> dict:
@@ -15422,6 +15746,8 @@ def _octopus_scan_market_for_target(target_bucket: int, provisional: bool = Fals
     ranked_market = []
     ready = scanned = prediction_count = 0
     syria_hour = datetime.fromtimestamp(int(target_bucket), tz=UTC).astimezone(UTC_PLUS_3).strftime("%H")
+    total_zones = 0
+    thesis_count = 0
     for pair, symbol in pair_map.items():
         try:
             rows, last_tick, candles = _get_otc_rows_and_candles(symbol)
@@ -15431,10 +15757,7 @@ def _octopus_scan_market_for_target(target_bucket: int, provisional: bool = Fals
             payout = int(float((instrument or {}).get("payout", 0) or 0))
             if payout < OCTOPUS_SELECTOR_MIN_PAYOUT:
                 continue
-            history = sorted(
-                [dict(c) for c in candles if _structure_edge_candle_bucket(c) < int(target_bucket)],
-                key=_structure_edge_candle_bucket,
-            )
+            history = sorted([dict(c) for c in candles if _structure_edge_candle_bucket(c) < int(target_bucket)], key=_structure_edge_candle_bucket)
             if len(history) < OCTOPUS_MIN_CLOSED_M1:
                 continue
             ready += 1
@@ -15443,42 +15766,47 @@ def _octopus_scan_market_for_target(target_bucket: int, provisional: bool = Fals
             scanned += 1
             sigs, regime = _octopus_model_signals(pair, symbol, history, rows, payout, int(target_bucket))
             rname = str((regime or {}).get("name") or "UNKNOWN")
-            groups = _octopus_rank_pair(pair, symbol, payout, regime, syria_hour, sigs)
+            intelligence = _octopus_market_intelligence(pair, history, regime)
+            total_zones += len((intelligence or {}).get("zones") or [])
+            thesis = (intelligence or {}).get("thesis") if isinstance(intelligence, dict) else None
+            if isinstance(thesis, dict) and float(thesis.get("quality",0) or 0) >= OCTOPUS_MI_MIN_THESIS_QUALITY:
+                thesis_count += 1
+            groups = _octopus_rank_pair(pair, symbol, payout, regime, syria_hour, sigs, intelligence)
             for g in groups:
                 if g.get("eligible"):
                     ranked_market.append(g)
             compact = []
             for s in sigs:
                 estimate = _octopus_context_estimate(pair, rname, syria_hour, str(s.get("model")), payout, int(s.get("score", 75) or 75))
-                compact.append({
-                    "model": s.get("model"), "direction": s.get("direction"), "score": s.get("score"),
-                    "expected_wr": estimate.get("expected_wr"), "conservative_wr": estimate.get("conservative_wr"),
-                    "drift": (estimate.get("drift") or {}).get("state"),
-                })
+                compact.append({"model":s.get("model"),"direction":s.get("direction"),"score":s.get("score"),"expected_wr":estimate.get("expected_wr"),"conservative_wr":estimate.get("conservative_wr"),"drift":(estimate.get("drift") or {}).get("state")})
                 if not provisional:
-                    pred = dict(s)
-                    pred.update({
-                        "pair": pair, "symbol": symbol, "payout": payout, "regime": rname,
-                        "hour": syria_hour, "target_bucket": int(target_bucket), "created_at": now_iso(),
-                    })
+                    pred = dict(s); pred.update({"pair":pair,"symbol":symbol,"payout":payout,"regime":rname,"hour":syria_hour,"target_bucket":int(target_bucket),"created_at":now_iso()})
                     pending_rows.append(pred)
-            prediction_count += len(sigs)
+            # Benchmark the raw technical thesis independently from execution/selective gates.
+            if isinstance(thesis, dict) and str(thesis.get("direction") or "") in {"CALL","PUT"} and float(thesis.get("quality",0) or 0) >= OCTOPUS_MI_MIN_THESIS_QUALITY:
+                compact.append({"model":"MARKET_THESIS","direction":thesis.get("direction"),"score":int(round(float(thesis.get("quality",0)))),"setup":thesis.get("setup")})
+                if not provisional:
+                    pending_rows.append({
+                        "model":"MARKET_THESIS","family":"MARKET_INTELLIGENCE","direction":thesis.get("direction"),
+                        "score":int(round(float(thesis.get("quality",0)))),"reason":thesis.get("reason"),"market_setup":thesis.get("setup"),
+                        "pair":pair,"symbol":symbol,"payout":payout,"regime":rname,"hour":syria_hour,"target_bucket":int(target_bucket),"created_at":now_iso(),
+                    })
+            prediction_count += len(sigs) + (1 if isinstance(thesis, dict) and float(thesis.get("quality",0) or 0) >= OCTOPUS_MI_MIN_THESIS_QUALITY else 0)
+            zbrief = []
+            for z in ((intelligence or {}).get("zones") or [])[:4]:
+                zbrief.append({"role":z.get("role"),"center":z.get("center"),"quality":z.get("quality"),"distance_atr":z.get("distance_atr"),"role_flip":z.get("role_flip")})
             current_map[pair] = {
-                "regime": rname, "hour": syria_hour, "payout": payout, "predictions": compact,
-                "selector": groups[0] if groups else None,
+                "regime":rname,"hour":syria_hour,"payout":payout,"predictions":compact,"selector":groups[0] if groups else None,
+                "market_thesis":thesis,"zones":zbrief,"structure_bias":(intelligence or {}).get("structure_bias"),
+                "m5_bias":(intelligence or {}).get("m5_bias"),"pressure_bias":(intelligence or {}).get("pressure_bias"),
             }
         except Exception:
-            logger.debug("Octopus adaptive pair scan failed | pair=%s", pair, exc_info=True)
-    ranked_market.sort(key=lambda x: (float(x.get("selector_score", 0)), float(x.get("conservative_wr", 0))), reverse=True)
-    return {
-        "pair_map": pair_map,
-        "pending_rows": pending_rows,
-        "current_map": current_map,
-        "ranked": ranked_market,
-        "ready": ready,
-        "scanned": scanned,
-        "prediction_count": prediction_count,
-    }
+            logger.debug("Octopus Market Intelligence pair scan failed | pair=%s", pair, exc_info=True)
+    ranked_market.sort(key=lambda x:(float(x.get("selector_score",0)),float(x.get("market_quality",0)),float(x.get("conservative_wr",0))), reverse=True)
+    _octopus_state["market_zones_last"] = total_zones
+    _octopus_state["market_theses"] = thesis_count
+    _octopus_state["market_last_thesis"] = dict(ranked_market[0]) if ranked_market else None
+    return {"pair_map":pair_map,"pending_rows":pending_rows,"current_map":current_map,"ranked":ranked_market,"ready":ready,"scanned":scanned,"prediction_count":prediction_count,"market_zones":total_zones,"market_theses":thesis_count}
 
 
 def _octopus_current_open_snapshot(symbol: str, current_bucket: int, candidate: dict) -> tuple[float | None, float | None, float | None]:
@@ -15540,12 +15868,12 @@ async def publish_copy_octopus_prepare_signal(candidate: dict, target_entry_buck
             "quality": int(round(float(candidate.get("selector_score", 0)))),
             "confidence": int(round(float(candidate.get("selector_score", 0)))),
             "payout": candidate.get("payout"),
-            "structure_setup": "OCTOPUS_ADAPTIVE_SELECTOR",
+            "structure_setup": "OCTOPUS_MARKET_INTELLIGENCE",
             "structure_score": int(round(float(candidate.get("selector_score", 0)))),
             "primary_family": candidate.get("primary_family"),
             "price_action_families": list(candidate.get("families") or [])[:6],
             "price_action_components": list(candidate.get("models") or [])[:8],
-            "structure_confluences": [f"regime={candidate.get('regime')}", f"expected={candidate.get('expected_wr')}%", f"conservative={candidate.get('conservative_wr')}%"],
+            "structure_confluences": [f"thesis={candidate.get('market_setup')}", f"marketQ={candidate.get('market_quality')}", f"regime={candidate.get('regime')}", f"expected={candidate.get('expected_wr')}%", f"conservative={candidate.get('conservative_wr')}%"],
             "octopus_model": candidate.get("primary_model"),
             "octopus_models": list(candidate.get("models") or [])[:8],
             "octopus_regime": candidate.get("regime"),
@@ -15555,8 +15883,13 @@ async def publish_copy_octopus_prepare_signal(candidate: dict, target_entry_buck
             "octopus_edge_points": candidate.get("edge_points"),
             "octopus_selector_score": candidate.get("selector_score"),
             "octopus_basis": list(candidate.get("basis") or [])[:10],
+            "octopus_market_setup": candidate.get("market_setup"),
+            "octopus_market_reason": candidate.get("market_reason"),
+            "octopus_market_quality": candidate.get("market_quality"),
+            "octopus_market_zone": candidate.get("market_zone"),
+            "octopus_market_space_atr": candidate.get("market_space_atr"),
             "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"octopus_adaptive_v1_prearm | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_account_amount_settings",
+            "note": f"octopus_market_intelligence_v1_prearm | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_account_amount_settings",
         }
         return await publish_copy_trading_signal(payload, source="structure_edge")
     except Exception as exc:
@@ -15591,12 +15924,12 @@ async def publish_copy_octopus_signal(candidate: dict) -> dict:
             "quality": int(round(float(candidate.get("selector_score", 0)))),
             "confidence": int(round(float(candidate.get("selector_score", 0)))),
             "entry_price": candidate.get("entry_price"), "payout": candidate.get("payout"),
-            "structure_setup": "OCTOPUS_ADAPTIVE_SELECTOR",
+            "structure_setup": "OCTOPUS_MARKET_INTELLIGENCE",
             "structure_score": int(round(float(candidate.get("selector_score", 0)))),
             "primary_family": candidate.get("primary_family"),
             "price_action_families": list(candidate.get("families") or [])[:6],
             "price_action_components": list(candidate.get("models") or [])[:8],
-            "structure_confluences": [f"regime={candidate.get('regime')}", f"expected={candidate.get('expected_wr')}%", f"conservative={candidate.get('conservative_wr')}%", f"edge={candidate.get('edge_points')}pp"],
+            "structure_confluences": [f"thesis={candidate.get('market_setup')}", f"marketQ={candidate.get('market_quality')}", f"regime={candidate.get('regime')}", f"expected={candidate.get('expected_wr')}%", f"conservative={candidate.get('conservative_wr')}%", f"edge={candidate.get('edge_points')}pp"],
             "trendline_prearm": True, "trendline_target_bucket": entry_bucket,
             "trendline_candle_open": candidate.get("trendline_candle_open"),
             "trendline_signal_price": candidate.get("entry_price"),
@@ -15611,8 +15944,13 @@ async def publish_copy_octopus_signal(candidate: dict) -> dict:
             "octopus_edge_points": candidate.get("edge_points"),
             "octopus_selector_score": candidate.get("selector_score"),
             "octopus_basis": list(candidate.get("basis") or [])[:10],
+            "octopus_market_setup": candidate.get("market_setup"),
+            "octopus_market_reason": candidate.get("market_reason"),
+            "octopus_market_quality": candidate.get("market_quality"),
+            "octopus_market_zone": candidate.get("market_zone"),
+            "octopus_market_space_atr": candidate.get("market_space_atr"),
             "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"octopus_adaptive_v1 | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_controls_account_amount",
+            "note": f"octopus_market_intelligence_v1 | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_controls_account_amount",
         }
         return await publish_copy_trading_signal(payload, source="structure_edge")
     except Exception as exc:
@@ -15620,18 +15958,24 @@ async def publish_copy_octopus_signal(candidate: dict) -> dict:
         return {"ok": False, "error": str(exc)}
 
 
-def _octopus_selector_decision_text(candidate: dict, prefix: str = "🐙 OCTOPUS ADAPTIVE — SIGNAL") -> str:
+def _octopus_selector_decision_text(candidate: dict, prefix: str = "🐙 OCTOPUS MARKET INTELLIGENCE — SIGNAL") -> str:
     drift = (candidate.get("drift") or {}).get("state") or "-"
     models = " + ".join(str(x) for x in (candidate.get("models") or [candidate.get("primary_model")])[:4])
+    zone = candidate.get("market_zone") if isinstance(candidate.get("market_zone"), dict) else None
+    zone_text = "-"
+    if zone:
+        zone_text = f"{zone.get('role')} Q{zone.get('quality')} @ {float(zone.get('center',0)):g}"
     return (
-        f"{prefix}\n"
-        "━━━━━━━━━━━━━━\n"
+        f"{prefix}\n━━━━━━━━━━━━━━\n"
         f"💱 {candidate.get('pair')} | {candidate.get('regime')}\n"
         f"📌 {_structure_edge_direction_label(candidate.get('direction'))}\n"
-        f"🧠 {models}\n"
+        f"🗺 Thesis: {candidate.get('market_setup')} | Q{candidate.get('market_quality')}\n"
+        f"📍 Zone: {zone_text}\n"
+        f"🧭 {candidate.get('market_reason')}\n"
+        f"🧠 Support: {models}\n"
         f"📈 Expected: {candidate.get('expected_wr')}% | Conservative: {candidate.get('conservative_wr')}%\n"
         f"⚖️ Break-even: {candidate.get('break_even_wr')}% | Edge: +{candidate.get('edge_points')}pp\n"
-        f"🌊 Drift: {drift} | Consensus families: {len(candidate.get('families') or [])}\n"
+        f"🌊 Drift: {drift} | Free space: {candidate.get('market_space_atr')} ATR\n"
         f"💹 Payout: {candidate.get('payout')}%\n"
         "🎛 الحساب والمبلغ: حسب إعدادات الإضافة عندك."
     )[:3900]
@@ -15672,7 +16016,7 @@ async def _octopus_adaptive_prearm(context: ContextTypes.DEFAULT_TYPE, now_ts: f
     _octopus_state["selector_prearmed_candidate"] = candidate
     _octopus_state["selector_prearm_target_bucket"] = target_bucket
     _octopus_state["selector_prearm_sent"] = int(_octopus_state.get("selector_prearm_sent", 0) or 0) + 1
-    _octopus_state["last_reject_reason"] = f"Adaptive PRE-ARM {candidate.get('pair')} {candidate.get('direction')} {candidate.get('primary_model')}"
+    _octopus_state["last_reject_reason"] = f"Market PRE-ARM {candidate.get('pair')} {candidate.get('direction')} {candidate.get('market_setup')} Q{candidate.get('market_quality')}"
 
 
 async def _octopus_adaptive_final(context: ContextTypes.DEFAULT_TYPE, now_ts: float, current_bucket: int, sec: float, allow_execution: bool):
@@ -15704,7 +16048,7 @@ async def _octopus_adaptive_final(context: ContextTypes.DEFAULT_TYPE, now_ts: fl
         selector_pred = {
             "model": "ADAPTIVE_SELECTOR", "family": "META_SELECTOR",
             "direction": sel.get("direction"), "score": int(round(float(sel.get("selector_score", 0)))),
-            "reason": f"{sel.get('primary_model')} | E{sel.get('expected_wr')} C{sel.get('conservative_wr')}",
+            "reason": f"{sel.get('market_setup')} | E{sel.get('expected_wr')} C{sel.get('conservative_wr')}",
             "pair": sel.get("pair"), "symbol": sel.get("symbol"), "payout": sel.get("payout"),
             "regime": sel.get("regime"), "hour": sel.get("hour"), "target_bucket": int(current_bucket),
             "created_at": now_iso(), "selector_primary_model": sel.get("primary_model"),
@@ -15773,7 +16117,7 @@ async def _octopus_adaptive_final(context: ContextTypes.DEFAULT_TYPE, now_ts: fl
     candidate.update({
         "created_at": now_iso(), "entry_bucket": current_bucket, "entry_price": float(live_price),
         "trendline_candle_open": float(open_price), "trendline_entry_displacement_atr": round(float(displacement), 6),
-        "prearmed_at": prearmed.get("prearmed_at"), "setup": "OCTOPUS_ADAPTIVE_SELECTOR",
+        "prearmed_at": prearmed.get("prearmed_at"), "setup": "OCTOPUS_MARKET_INTELLIGENCE",
         "score": int(round(float(candidate.get("selector_score", 0)))), "reverse_mode": False,
         "original_direction": candidate.get("direction"),
     })
@@ -15792,7 +16136,7 @@ async def _octopus_adaptive_final(context: ContextTypes.DEFAULT_TYPE, now_ts: fl
     _structure_edge_state["pending_trade"] = dict(candidate)
     _structure_edge_state["copy_signals_sent"] = int(_structure_edge_state.get("copy_signals_sent", 0) or 0) + 1
     _octopus_state["selector_publish_ok"] = int(_octopus_state.get("selector_publish_ok", 0) or 0) + 1
-    _octopus_state["last_reject_reason"] = f"EXECUTE: {candidate.get('pair')} {candidate.get('direction')} {candidate.get('primary_model')}"
+    _octopus_state["last_reject_reason"] = f"EXECUTE: {candidate.get('pair')} {candidate.get('direction')} {candidate.get('market_setup')} Q{candidate.get('market_quality')}"
     await safe_send_message(context.bot, chat_id=_structure_edge_target_chat_id(), text=_octopus_selector_decision_text(candidate))
     _octopus_flush_snapshot(force=False)
     await _octopus_maybe_digest(context)
@@ -15809,14 +16153,14 @@ def build_octopus_pair_map() -> str:
         else:
             rows.append((0.0, pair, regime, None))
     rows.sort(reverse=True, key=lambda x: x[0])
-    lines = ["🗺 Octopus Adaptive — الأزواج الآن", "━━━━━━━━━━━━━━"]
+    lines = ["🗺 Octopus Market Intelligence — الأزواج الآن", "━━━━━━━━━━━━━━"]
     for _, pair, regime, sel in rows[:16]:
         if not sel:
             lines.append(f"• {pair} | {regime}: NO TRADE")
             continue
         mark = "✅" if sel.get("eligible") else "⏸"
         lines.append(
-            f"{mark} {pair} | {regime}: {sel.get('primary_model')} {sel.get('direction')} "
+            f"{mark} {pair} | {regime}: {sel.get('market_setup')} Q{sel.get('market_quality')} {sel.get('direction')} "
             f"E{float(sel.get('expected_wr',0)):.1f}% / C{float(sel.get('conservative_wr',0)):.1f}% "
             f"BE{float(sel.get('break_even_wr',0)):.1f}%"
         )
@@ -15840,7 +16184,7 @@ def build_structure_edge_summary(limit: int | None = None) -> str:
     rwr = round(rw / (rw + rl) * 100.0, 1) if (rw + rl) else 0.0
     model_actual = {}
     for row in rows:
-        model = str(row.get("octopus_model") or row.get("primary_model") or "UNKNOWN")
+        model = str(row.get("octopus_market_setup") or row.get("octopus_model") or row.get("primary_model") or "UNKNOWN")
         bucket = model_actual.setdefault(model, {"w":0,"l":0,"d":0})
         r = str(row.get("result") or "draw")
         if r == "win": bucket["w"] += 1
@@ -15848,7 +16192,7 @@ def build_structure_edge_summary(limit: int | None = None) -> str:
         else: bucket["d"] += 1
     top_actual = sorted(model_actual.items(), key=lambda kv: (kv[1]["w"] / max(1, kv[1]["w"] + kv[1]["l"]), kv[1]["w"] + kv[1]["l"]), reverse=True)[:5]
     lines = [
-        "📊 Octopus Adaptive Selector — الملخص",
+        "📊 Octopus Market Intelligence — الملخص",
         "━━━━━━━━━━━━━━",
         f"🔬 Shadow observations: {int(_octopus_state.get('total_observations',0) or 0)}",
         f"🧩 Pair-minutes: {int(_octopus_state.get('total_pair_minutes',0) or 0)}",
@@ -15862,14 +16206,14 @@ def build_structure_edge_summary(limit: int | None = None) -> str:
         f"🧨 Max loss streak: {_structure_edge_max_loss_streak(rows)}",
     ]
     if top_actual:
-        lines.append("\nحسب النموذج المختار فعليًا:")
+        lines.append("\nحسب Market Thesis المنفذ فعليًا:")
         for model, b in top_actual:
             n = b["w"] + b["l"]
             rate = round(b["w"] / n * 100.0, 1) if n else 0.0
             lines.append(f"• {model}: {b['w']}W/{b['l']}L/{b['d']}D — {rate}% (n={n})")
     last = _octopus_state.get("selector_last_decision") if isinstance(_octopus_state.get("selector_last_decision"), dict) else None
     if last:
-        lines.append(f"\nآخر قرار: {last.get('pair')} {last.get('direction')} | {last.get('primary_model')} | E{last.get('expected_wr')} C{last.get('conservative_wr')}")
+        lines.append(f"\nآخر قرار: {last.get('pair')} {last.get('direction')} | {last.get('market_setup')} Q{last.get('market_quality')} | E{last.get('expected_wr')} C{last.get('conservative_wr')}")
     if _octopus_state.get("selector_last_no_trade_reason"):
         lines.append(f"آخر NO TRADE: {_octopus_state.get('selector_last_no_trade_reason')}")
     return "\n".join(lines)[:3900]
@@ -15882,39 +16226,40 @@ def build_structure_edge_status() -> str:
     pending_obs = sum(len(v or []) for v in pending.values())
     pre = _octopus_state.get("selector_prearmed_candidate") if isinstance(_octopus_state.get("selector_prearmed_candidate"), dict) else None
     return (
-        "📋 حالة Octopus Adaptive Selector — TEST\n"
+        "📋 حالة Octopus Market Intelligence — TEST\n"
         "━━━━━━━━━━━━━━\n"
         f"الحالة: {'شغال ✅' if settings.get('enabled') else 'متوقف ⏸'}\n"
         f"المكتبة: {len(OCTOPUS_MODEL_FAMILY)} نموذج / {len(set(OCTOPUS_MODEL_FAMILY.values()))} مدارس\n"
         f"Shadow settled: {int(_octopus_state.get('total_observations',0) or 0)} | pending: {pending_obs}\n"
         f"Pairs ready/scanned: {int(_octopus_state.get('pairs_ready',0) or 0)} / {int(_octopus_state.get('pairs_scanned',0) or 0)}\n"
+        f"Market zones/theses last scan: {int(_octopus_state.get('market_zones_last',0) or 0)} / {int(_octopus_state.get('market_theses',0) or 0)}\n"
         f"Selector decisions: {int(_octopus_state.get('selector_decisions',0) or 0)} | NO TRADE: {int(_octopus_state.get('selector_no_trade',0) or 0)}\n"
         f"PRE-ARM sent/cancelled: {int(_octopus_state.get('selector_prearm_sent',0) or 0)} / {int(_octopus_state.get('selector_prearm_cancelled',0) or 0)}\n"
         f"Published OK/failed: {int(_octopus_state.get('selector_publish_ok',0) or 0)} / {int(_octopus_state.get('selector_publish_failed',0) or 0)}\n"
-        f"Prearmed الآن: {(pre.get('pair') + ' ' + pre.get('direction') + ' ' + pre.get('primary_model')) if pre else '-'}\n"
+        f"Prearmed الآن: {(pre.get('pair') + ' ' + pre.get('direction') + ' ' + str(pre.get('market_setup') or '-') + ' Q' + str(pre.get('market_quality') or '-')) if pre else '-'}\n"
         f"Payout gate: ≥{OCTOPUS_SELECTOR_MIN_PAYOUT}% | Expected edge ≥ +{OCTOPUS_SELECTOR_MIN_EDGE_POINTS:g}pp\n"
         f"Conservative edge ≥ +{OCTOPUS_SELECTOR_MIN_CONSERVATIVE_EDGE_POINTS:g}pp | Direction margin ≥ {OCTOPUS_SELECTOR_MIN_DIRECTION_MARGIN:g}pp\n"
         f"Open displacement max: {OCTOPUS_SELECTOR_MAX_OPEN_DISPLACEMENT_ATR:.3f} ATR\n"
         f"Firebase settings reads: {int(_structure_edge_state.get('settings_reads',0) or 0)} (RAM cache {STRUCTURE_EDGE_SETTINGS_CACHE_SECONDS}s)\n"
         f"آخر سبب: {_octopus_state.get('last_reject_reason') or _octopus_state.get('selector_last_no_trade_reason') or '-'}\n"
         f"آخر خطأ: {_octopus_state.get('last_error') or _structure_edge_state.get('last_error') or '-'}\n\n"
-        "🧠 القرار: Bayesian shrinkage + recent drift + Pair/Regime/Hour + joint context + consensus/conflict + payout-aware BE.\n"
+        "🧠 القرار: Market Map/SR zones + role reversal/retest + structure/pressure أولًا، ثم Adaptive/Bayesian manager للتأكيد والانتقاء.\n"
         "🎛 الحساب والمبلغ وإدارة الصفقة تُقرأ من إعدادات الإضافة؛ الباك اند لا يفرض DEMO ولا مبلغًا ثابتًا."
     )[:3900]
 
 
 def _structure_edge_reset_results() -> tuple[bool, str]:
     try:
-        # Reset both current adaptive execution audit and the continuing Shadow knowledge only
+        # Reset both current Market Intelligence execution audit and the continuing Shadow knowledge only
         # when the owner explicitly presses reset. Old strategy namespaces remain untouched.
         _octopus_base_ref().delete()
         _structure_edge_base_ref().delete()
         _octopus_state.clear(); _octopus_state.update(_octopus_empty_state()); _octopus_state["loaded"] = True
         _octopus_selector_extend_state()
         _structure_edge_state["pending_trade"] = None
-        return True, "✅ تم تصفير تعلم Octopus الحالي ونتائج Adaptive Selector. أرشيف الاستراتيجيات القديمة بقي كما هو."
+        return True, "✅ تم تصفير تعلم Octopus الحالي ونتائج Market Intelligence. أرشيف الاستراتيجيات القديمة بقي كما هو."
     except Exception as exc:
-        logger.exception("Octopus adaptive reset failed: %s", exc)
+        logger.exception("Octopus Market Intelligence reset failed: %s", exc)
         return False, f"❌ تعذر تصفير Octopus: {exc}"
 
 
@@ -15936,7 +16281,7 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
             "reported_at": now_iso(), "signal_id": signal_id, "pair": pick("pair"), "direction": pick("direction"),
             "asset": (payload_event or {}).get("asset"), "amount": float((payload_event or {}).get("amount") or 0),
             "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
-            "setup": pick("setup", "OCTOPUS_ADAPTIVE_SELECTOR"), "score": int(pick("score", 0) or 0),
+            "setup": pick("setup", "OCTOPUS_MARKET_INTELLIGENCE"), "score": int(pick("score", 0) or 0),
             "signal_created_at": (payload_event or {}).get("signal_created_at") or (pending or {}).get("created_at"),
             "executed_at": (payload_event or {}).get("executed_at") or now_iso(),
             "execution_latency_ms": (payload_event or {}).get("execution_latency_ms"),
@@ -15954,6 +16299,11 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
             "octopus_break_even_wr": float(pick("octopus_break_even_wr", (pending or {}).get("break_even_wr", 0)) or 0),
             "octopus_edge_points": float(pick("octopus_edge_points", (pending or {}).get("edge_points", 0)) or 0),
             "octopus_selector_score": float(pick("octopus_selector_score", (pending or {}).get("selector_score", 0)) or 0),
+            "octopus_market_setup": pick("octopus_market_setup", (pending or {}).get("market_setup")),
+            "octopus_market_reason": pick("octopus_market_reason", (pending or {}).get("market_reason")),
+            "octopus_market_quality": float(pick("octopus_market_quality", (pending or {}).get("market_quality", 0)) or 0),
+            "octopus_market_zone": pick("octopus_market_zone", (pending or {}).get("market_zone")),
+            "octopus_market_space_atr": float(pick("octopus_market_space_atr", (pending or {}).get("market_space_atr", 0)) or 0),
             "audit_status": "order_sent_to_quotex_bridge",
         }
         _structure_edge_executions_ref().child(safe_key(signal_id)).set(record)
@@ -15964,10 +16314,10 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
             TRADING_TIME_TELEGRAM_APP.bot if TRADING_TIME_TELEGRAM_APP is not None else None,
             chat_id=_structure_edge_target_chat_id(),
             text=(
-                "⚡ OCTOPUS ADAPTIVE — ORDER SENT\n━━━━━━━━━━━━━━\n"
+                "⚡ OCTOPUS MARKET INTELLIGENCE — ORDER SENT\n━━━━━━━━━━━━━━\n"
                 f"💱 {record.get('pair')} | {record.get('octopus_regime')}\n"
                 f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
-                f"🧠 {record.get('octopus_model')}\n"
+                f"🧠 {record.get('octopus_model')} | {record.get('octopus_market_setup') or '-'} Q{record.get('octopus_market_quality') or 0:g}\n"
                 f"📈 E {record.get('octopus_expected_wr'):.1f}% | C {record.get('octopus_conservative_wr'):.1f}% | BE {record.get('octopus_break_even_wr'):.1f}%\n"
                 f"💵 ${record.get('amount'):g} | account: {record.get('account_mode')}\n"
                 f"⚡ Latency: {record.get('execution_latency_ms') if record.get('execution_latency_ms') is not None else '-'} ms"
@@ -16008,7 +16358,7 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
             "created_at": (payload_event or {}).get("signal_created_at") or (pending or {}).get("created_at") or now_iso(),
             "closed_at": now_iso(), "signal_id": signal_id, "pair": pick("pair"), "symbol": (pending or {}).get("symbol"),
             "direction": pick("direction"), "original_direction": pick("direction"), "reverse_mode": False,
-            "setup": "OCTOPUS_ADAPTIVE_SELECTOR", "score": int(pick("score", 0) or 0),
+            "setup": "OCTOPUS_MARKET_INTELLIGENCE", "score": int(pick("score", 0) or 0),
             "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
             "result": outcome, "result_source": "extension_quotex_confirmed",
             "account_mode": (payload_event or {}).get("account_mode") or (execution_record or {}).get("account_mode") or "unknown",
@@ -16024,6 +16374,11 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
             "octopus_break_even_wr": float(pick("octopus_break_even_wr", (pending or {}).get("break_even_wr", 0)) or 0),
             "octopus_edge_points": float(pick("octopus_edge_points", (pending or {}).get("edge_points", 0)) or 0),
             "octopus_selector_score": float(pick("octopus_selector_score", (pending or {}).get("selector_score", 0)) or 0),
+            "octopus_market_setup": pick("octopus_market_setup", (pending or {}).get("market_setup")),
+            "octopus_market_reason": pick("octopus_market_reason", (pending or {}).get("market_reason")),
+            "octopus_market_quality": float(pick("octopus_market_quality", (pending or {}).get("market_quality", 0)) or 0),
+            "octopus_market_zone": pick("octopus_market_zone", (pending or {}).get("market_zone")),
+            "octopus_market_space_atr": float(pick("octopus_market_space_atr", (pending or {}).get("market_space_atr", 0)) or 0),
         }
         _structure_edge_results_ref().child(safe_key(signal_id)).set(record)
         _structure_edge_state["last_result_at"] = now_iso(); _structure_edge_state["last_copy_result"] = dict(record)
@@ -16039,10 +16394,10 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
             await safe_send_message(
                 TRADING_TIME_TELEGRAM_APP.bot, chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    f"🐙 OCTOPUS ADAPTIVE — {label}\n━━━━━━━━━━━━━━\n"
+                    f"🐙 OCTOPUS MARKET INTELLIGENCE — {label}\n━━━━━━━━━━━━━━\n"
                     f"💱 {record.get('pair')} | {record.get('octopus_regime')}\n"
                     f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
-                    f"🧠 {record.get('octopus_model')}\n"
+                    f"🧠 {record.get('octopus_model')} | {record.get('octopus_market_setup') or '-'} Q{record.get('octopus_market_quality') or 0:g}\n"
                     f"📈 E {record.get('octopus_expected_wr'):.1f}% | C {record.get('octopus_conservative_wr'):.1f}%\n"
                     f"💵 Net: {record.get('net_delta') if record.get('net_delta') is not None else '-'} | {record.get('account_mode')}\n"
                     "━━━━━━━━━━━━━━\n"
@@ -16074,7 +16429,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
             await safe_send_message(
                 TRADING_TIME_TELEGRAM_APP.bot, chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    "⏭️ OCTOPUS ADAPTIVE — SKIPPED\n━━━━━━━━━━━━━━\n"
+                    "⏭️ OCTOPUS MARKET INTELLIGENCE — SKIPPED\n━━━━━━━━━━━━━━\n"
                     f"💱 {(payload_event or {}).get('pair') or (pending or {}).get('pair')}\n"
                     f"📌 {_structure_edge_direction_label((payload_event or {}).get('direction') or (pending or {}).get('direction'))}\n"
                     f"🚫 {reason}\n📊 لم تُحسب Win/Loss لأن أمر الدخول لم يكتمل."
@@ -16087,7 +16442,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
 
 
 async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
-    """Octopus v1.25 adaptive state machine.
+    """Octopus v1.26 Market Intelligence state machine.
 
     56.5–59.2s: provisional multi-model scan -> PRE-ARM one best pair only.
     0–1.6s: settle prior Shadow results, re-run all models with the now-closed candle,
@@ -16125,7 +16480,7 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
             return
     except Exception as exc:
         _octopus_state["last_error"] = str(exc)
-        logger.exception("Octopus Adaptive Selector job failed: %s", exc)
+        logger.exception("Octopus Market Intelligence job failed: %s", exc)
 
 # v1.02: Three Candle timing/filter tuning only; Public remains a mirror of accepted private signals.
 # Set this to a public @username or numeric -100... Telegram channel ID.
@@ -23929,13 +24284,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
 
-        if text in {"🐙 Octopus Shadow Lab", "🐙 Octopus Adaptive Selector"}:
+        if text in {"🐙 Octopus Shadow Lab", "🐙 Octopus Adaptive Selector", "🐙 Octopus Market Intelligence"}:
             reset_signal_state(context)
             await update.message.reply_text(
-                "🐙 Octopus Adaptive Selector — المحرك المتكيّف\n"
-                "يبقي الـ23 نموذج Shadow شغالين، ويختار فقط أقوى فرصة متوافقة مع الزوج + Regime + الوقت + الأداء الحديث.\n"
-                "يستخدم Bayesian shrinkage + drift detection + consensus/conflict + payout-aware edge، ويقرر NO TRADE إذا الثقة غير كافية.\n"
-                "التنفيذ يمر عبر إعدادات الإضافة الحالية للحساب والمبلغ؛ لا يوجد DEMO أو مبلغ مفروض من الباك اند.",
+                "🐙 Octopus Market Intelligence — المحرك المتكيّف\n"
+                "الاتجاه يبدأ من Market Map فني: مناطق دعم/مقاومة كـZones، polarity/role reversal، break/retest، M1/M5 structure والضغط السعري.\n"
+                "بعدها يأتي Adaptive/Bayesian manager لقياس ملاءمة المدارس الحالية، التعارض، الـdrift والـpayout واختيار أقوى فرصة أو NO TRADE.\n"
+                "الـ23 نموذج يبقون Shadow للتعلّم والمقارنة، والحساب والمبلغ وإدارة الصفقة تبقى من إعدادات الإضافة.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
@@ -23943,7 +24298,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "🟢 تشغيل Octopus":
             ok = _structure_edge_set_enabled(True)
             await update.message.reply_text(
-                "✅ تم تشغيل Octopus Adaptive Selector. Shadow learning + adaptive execution شغالين حسب إعدادات الإضافة." if ok else "❌ تعذر تشغيل Octopus. راجع اللوج.",
+                "✅ تم تشغيل Octopus Market Intelligence. Shadow learning + Market Intelligence execution شغالين حسب إعدادات الإضافة." if ok else "❌ تعذر تشغيل Octopus. راجع اللوج.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
@@ -23951,7 +24306,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "🔴 إيقاف Octopus":
             ok = _structure_edge_set_enabled(False)
             await update.message.reply_text(
-                "⛔ تم إيقاف Octopus Adaptive Selector." if ok else "❌ تعذر إيقاف Octopus. راجع اللوج.",
+                "⛔ تم إيقاف Octopus Market Intelligence." if ok else "❌ تعذر إيقاف Octopus. راجع اللوج.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
@@ -27192,7 +27547,7 @@ def run_telegram_bot_only():
         name="multi_user_otc_edge_watcher",
     )
 
-    # v1.25.0: Octopus Adaptive Selector — Shadow learning stays active, while a conservative
+    # v1.26.0: Octopus Market Intelligence — technical thesis owns direction; Shadow learning stays active, while a conservative
     # non-stationary selector may PRE-ARM and execute the best qualified opportunity.
     # Firebase enabled-state remains RAM-cached; scheduler frequency does NOT imply Firebase reads.
     job_queue.run_repeating(
