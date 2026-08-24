@@ -1030,7 +1030,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.27.0"
+COPY_SERVER_VERSION = "1.28.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -14640,38 +14640,66 @@ def _octopus_event_expiry_ts(payload_event: dict | None) -> float | None:
 
 def _octopus_restore_snapshot_once():
     if _octopus_state.get("loaded"):
+        _octopus_selector_extend_state()
         return
     _octopus_state["loaded"] = True
+    _octopus_selector_extend_state()
     try:
+        # Long-lived Shadow knowledge is preserved across execution versions.
         snap = _octopus_base_ref().child("snapshot").get() or {}
-        if not isinstance(snap, dict):
-            return
-        for key in ("model_stats", "family_stats", "pair_stats", "regime_stats", "hour_stats"):
-            value = snap.get(key)
-            if isinstance(value, dict):
-                _octopus_state[key] = value
-        recent = snap.get("recent") or {}
-        if isinstance(recent, dict):
-            _octopus_state["recent"] = {str(k): str(v)[-OCTOPUS_RECENT_MODEL_WINDOW:] for k, v in recent.items()}
-        meta = snap.get("meta") or {}
-        _octopus_state["total_observations"] = int(meta.get("total_observations", 0) or 0)
-        _octopus_state["total_pair_minutes"] = int(meta.get("total_pair_minutes", 0) or 0)
-        # Keep Shadow knowledge across versions, but do not contaminate fresh v1.26
-        # selector telemetry with the v1.25 manager counters. Once v1.26 has flushed
-        # its own snapshot, restarts restore its counters normally.
-        if str(meta.get("engine") or "") == OCTOPUS_ENGINE_VERSION:
-            for key in ("selector_decisions", "selector_no_trade", "selector_publish_ok", "selector_publish_failed", "selector_prearm_sent", "selector_prearm_cancelled"):
-                _octopus_state[key] = int(meta.get(key, _octopus_state.get(key, 0)) or 0)
+        if isinstance(snap, dict):
+            for key in (
+                "model_stats", "family_stats", "pair_stats", "regime_stats", "hour_stats",
+                "pair_regime_stats", "pair_regime_hour_stats", "market_setup_stats",
+            ):
+                value = snap.get(key)
+                if isinstance(value, dict):
+                    _octopus_state[key] = value
+            recent = snap.get("recent") or {}
+            if isinstance(recent, dict):
+                _octopus_state["recent"] = {str(k): str(v)[-OCTOPUS_RECENT_MODEL_WINDOW:] for k, v in recent.items()}
+            recent_pr = snap.get("recent_pair_regime") or {}
+            if isinstance(recent_pr, dict):
+                _octopus_state["recent_pair_regime"] = {str(k): str(v)[-OCTOPUS_RECENT_MODEL_WINDOW:] for k, v in recent_pr.items()}
+            recent_ms = snap.get("recent_market_setup") or {}
+            if isinstance(recent_ms, dict):
+                _octopus_state["recent_market_setup"] = {str(k): str(v)[-OCTOPUS_RECENT_MODEL_WINDOW:] for k, v in recent_ms.items()}
+            meta = snap.get("meta") or {}
+            _octopus_state["total_observations"] = int(meta.get("total_observations", 0) or 0)
+            _octopus_state["total_pair_minutes"] = int(meta.get("total_pair_minutes", 0) or 0)
+
+        # Execution counters/lock are version-local. On first v1.28 deploy this node
+        # is empty, so counters genuinely start from zero. On a process restart,
+        # v1.28 resumes its own telemetry and any still-valid execution lock.
+        runtime = _octopus_runtime_ref().get() or {}
+        if isinstance(runtime, dict) and str(runtime.get("engine") or "") == OCTOPUS_ENGINE_VERSION:
+            for key in (
+                "selector_decisions", "selector_no_trade", "selector_publish_ok",
+                "selector_publish_failed", "selector_prearm_sent", "selector_prearm_cancelled",
+                "execution_lock_shadow_minutes", "execution_lock_skipped_prearms",
+            ):
+                _octopus_state[key] = int(runtime.get(key, _octopus_state.get(key, 0)) or 0)
+            for key in (
+                "execution_lock_active", "execution_lock_signal_id", "execution_lock_pair",
+                "execution_lock_until_ts", "execution_lock_started_at", "execution_lock_reason",
+            ):
+                if key in runtime:
+                    _octopus_state[key] = runtime.get(key)
+            if float(_octopus_state.get("execution_lock_until_ts", 0.0) or 0.0) <= time_module.time():
+                _octopus_execution_lock_clear(reason="restored_lock_expired")
     except Exception as exc:
         _octopus_state["last_error"] = f"snapshot load: {exc}"
-        logger.warning("Octopus snapshot load failed: %s", exc)
+        logger.warning("Octopus S/R + Retest snapshot load failed: %s", exc)
 
 
 def _octopus_flush_snapshot(force: bool = False):
+    _octopus_selector_extend_state()
     now_ts = time_module.time()
     if not force and now_ts - float(_octopus_state.get("last_flush_ts", 0.0) or 0.0) < OCTOPUS_FLUSH_SECONDS:
         return
     try:
+        # Shadow snapshot stores learning only; it deliberately does not carry
+        # execution counters across strategy versions.
         payload = {
             "meta": {
                 "engine": OCTOPUS_ENGINE_VERSION,
@@ -14680,25 +14708,43 @@ def _octopus_flush_snapshot(force: bool = False):
                 "total_observations": int(_octopus_state.get("total_observations", 0) or 0),
                 "total_pair_minutes": int(_octopus_state.get("total_pair_minutes", 0) or 0),
                 "model_count": len(OCTOPUS_MODEL_FAMILY),
-                "selector_decisions": int(_octopus_state.get("selector_decisions", 0) or 0),
-                "selector_no_trade": int(_octopus_state.get("selector_no_trade", 0) or 0),
-                "selector_publish_ok": int(_octopus_state.get("selector_publish_ok", 0) or 0),
-                "selector_publish_failed": int(_octopus_state.get("selector_publish_failed", 0) or 0),
-                "selector_prearm_sent": int(_octopus_state.get("selector_prearm_sent", 0) or 0),
-                "selector_prearm_cancelled": int(_octopus_state.get("selector_prearm_cancelled", 0) or 0),
             },
             "model_stats": _octopus_state.get("model_stats") or {},
             "family_stats": _octopus_state.get("family_stats") or {},
             "pair_stats": _octopus_state.get("pair_stats") or {},
             "regime_stats": _octopus_state.get("regime_stats") or {},
             "hour_stats": _octopus_state.get("hour_stats") or {},
+            "pair_regime_stats": _octopus_state.get("pair_regime_stats") or {},
+            "pair_regime_hour_stats": _octopus_state.get("pair_regime_hour_stats") or {},
+            "market_setup_stats": _octopus_state.get("market_setup_stats") or {},
             "recent": _octopus_state.get("recent") or {},
+            "recent_pair_regime": _octopus_state.get("recent_pair_regime") or {},
+            "recent_market_setup": _octopus_state.get("recent_market_setup") or {},
         }
         _octopus_base_ref().child("snapshot").set(payload)
+        _octopus_runtime_ref().set({
+            "engine": OCTOPUS_ENGINE_VERSION,
+            "server_version": COPY_SERVER_VERSION,
+            "updated_at": now_iso(),
+            "selector_decisions": int(_octopus_state.get("selector_decisions", 0) or 0),
+            "selector_no_trade": int(_octopus_state.get("selector_no_trade", 0) or 0),
+            "selector_publish_ok": int(_octopus_state.get("selector_publish_ok", 0) or 0),
+            "selector_publish_failed": int(_octopus_state.get("selector_publish_failed", 0) or 0),
+            "selector_prearm_sent": int(_octopus_state.get("selector_prearm_sent", 0) or 0),
+            "selector_prearm_cancelled": int(_octopus_state.get("selector_prearm_cancelled", 0) or 0),
+            "execution_lock_shadow_minutes": int(_octopus_state.get("execution_lock_shadow_minutes", 0) or 0),
+            "execution_lock_skipped_prearms": int(_octopus_state.get("execution_lock_skipped_prearms", 0) or 0),
+            "execution_lock_active": bool(_octopus_state.get("execution_lock_active")),
+            "execution_lock_signal_id": _octopus_state.get("execution_lock_signal_id"),
+            "execution_lock_pair": _octopus_state.get("execution_lock_pair"),
+            "execution_lock_until_ts": float(_octopus_state.get("execution_lock_until_ts", 0.0) or 0.0),
+            "execution_lock_started_at": _octopus_state.get("execution_lock_started_at"),
+            "execution_lock_reason": _octopus_state.get("execution_lock_reason"),
+        })
         _octopus_state["last_flush_ts"] = now_ts
     except Exception as exc:
         _octopus_state["last_error"] = f"snapshot flush: {exc}"
-        logger.warning("Octopus snapshot flush failed: %s", exc)
+        logger.warning("Octopus S/R + Retest snapshot flush failed: %s", exc)
 
 
 def _octopus_record_prediction_result(pred: dict, result: str):
@@ -15019,7 +15065,7 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 
-# ===== v1.27.0 OCTOPUS S/R + RETEST ==========================================
+# ===== v1.28.0 OCTOPUS S/R + RETEST — TECHNICAL ENTRY GATE ===================
 # Keeps the v1.24 same-market Shadow Lab running, but adds a conservative online
 # selector for the active owner test slot. The selector intentionally treats the
 # market as non-stationary: old evidence is shrunk, recent evidence has higher weight,
@@ -15030,7 +15076,7 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
 # IMPORTANT product rule: account type, base amount, target/stop, martingale/sequence
 # are extension/user settings. The backend does not force DEMO and does not force $1.
 
-OCTOPUS_ENGINE_VERSION = "octopus_sr_retest_v1"
+OCTOPUS_ENGINE_VERSION = "octopus_sr_retest_v2"
 OCTOPUS_MODEL_FAMILY["ADAPTIVE_SELECTOR"] = "META_SELECTOR"
 OCTOPUS_MODEL_FAMILY["MARKET_THESIS"] = "MARKET_INTELLIGENCE"
 OCTOPUS_SELECTOR_SCHEDULER_SECONDS = max(0.25, min(1.0, float(os.getenv("OCTOPUS_SELECTOR_SCHEDULER_SECONDS", "0.5"))))
@@ -15056,7 +15102,7 @@ OCTOPUS_EXECUTION_SETUPS = {"MI_SUPPORT_REJECTION", "MI_RESISTANCE_REJECTION", "
 OCTOPUS_EXECUTION_LOCK_GRACE_SECONDS = max(5.0, min(30.0, float(os.getenv("OCTOPUS_EXECUTION_LOCK_GRACE_SECONDS", "12"))))
 OCTOPUS_EXECUTION_LOCK_FALLBACK_SECONDS = max(65.0, min(180.0, float(os.getenv("OCTOPUS_EXECUTION_LOCK_FALLBACK_SECONDS", "90"))))
 
-# v1.27 specialised execution: the S/R zone itself owns direction.
+# v1.28 specialised execution: the S/R zone itself owns direction.
 # Legacy detectors remain Shadow-only; only S/R-specific historical priors can gently calibrate confidence.
 OCTOPUS_MI_ZONE_CLUSTER_ATR = max(0.10, min(0.45, float(os.getenv("OCTOPUS_MI_ZONE_CLUSTER_ATR", "0.22"))))
 OCTOPUS_MI_ZONE_HALF_WIDTH_ATR = max(0.08, min(0.35, float(os.getenv("OCTOPUS_MI_ZONE_HALF_WIDTH_ATR", "0.16"))))
@@ -15075,7 +15121,14 @@ def _octopus_base_ref():
 
 
 def _structure_edge_base_ref():
-    return system_ref().child("octopus_sr_retest_v1")
+    # v1.28 gets a fresh execution/result namespace. v1.27 remains archived.
+    return system_ref().child("octopus_sr_retest_v2")
+
+
+def _octopus_runtime_ref():
+    # Runtime telemetry is isolated from the long-lived Shadow snapshot so a new
+    # execution version starts counters at zero while Shadow priors stay intact.
+    return _structure_edge_base_ref().child("runtime_snapshot")
 
 
 def _octopus_deep_stats(root: dict, *keys: str) -> dict:
@@ -15138,30 +15191,47 @@ def _octopus_restore_snapshot_once():
     _octopus_state["loaded"] = True
     _octopus_selector_extend_state()
     try:
+        # Preserve long-lived Shadow learning, but never import old execution counters.
         snap = _octopus_base_ref().child("snapshot").get() or {}
-        if not isinstance(snap, dict):
-            return
-        for key in (
-            "model_stats", "family_stats", "pair_stats", "regime_stats", "hour_stats",
-            "pair_regime_stats", "pair_regime_hour_stats", "market_setup_stats",
-        ):
-            value = snap.get(key)
-            if isinstance(value, dict):
-                _octopus_state[key] = value
-        recent = snap.get("recent") or {}
-        if isinstance(recent, dict):
-            _octopus_state["recent"] = {str(k): str(v)[-OCTOPUS_RECENT_MODEL_WINDOW:] for k, v in recent.items()}
-        recent_pr = snap.get("recent_pair_regime") or {}
-        if isinstance(recent_pr, dict):
-            _octopus_state["recent_pair_regime"] = {str(k): str(v)[-OCTOPUS_RECENT_MODEL_WINDOW:] for k, v in recent_pr.items()}
-        recent_ms = snap.get("recent_market_setup") or {}
-        if isinstance(recent_ms, dict):
-            _octopus_state["recent_market_setup"] = {str(k): str(v)[-OCTOPUS_RECENT_MODEL_WINDOW:] for k, v in recent_ms.items()}
-        meta = snap.get("meta") or {}
-        _octopus_state["total_observations"] = int(meta.get("total_observations", 0) or 0)
-        _octopus_state["total_pair_minutes"] = int(meta.get("total_pair_minutes", 0) or 0)
-        for key in ("selector_decisions", "selector_no_trade", "selector_publish_ok", "selector_publish_failed", "selector_prearm_sent", "selector_prearm_cancelled"):
-            _octopus_state[key] = int(meta.get(key, _octopus_state.get(key, 0)) or 0)
+        if isinstance(snap, dict):
+            for key in (
+                "model_stats", "family_stats", "pair_stats", "regime_stats", "hour_stats",
+                "pair_regime_stats", "pair_regime_hour_stats", "market_setup_stats",
+            ):
+                value = snap.get(key)
+                if isinstance(value, dict):
+                    _octopus_state[key] = value
+            recent = snap.get("recent") or {}
+            if isinstance(recent, dict):
+                _octopus_state["recent"] = {str(k): str(v)[-OCTOPUS_RECENT_MODEL_WINDOW:] for k, v in recent.items()}
+            recent_pr = snap.get("recent_pair_regime") or {}
+            if isinstance(recent_pr, dict):
+                _octopus_state["recent_pair_regime"] = {str(k): str(v)[-OCTOPUS_RECENT_MODEL_WINDOW:] for k, v in recent_pr.items()}
+            recent_ms = snap.get("recent_market_setup") or {}
+            if isinstance(recent_ms, dict):
+                _octopus_state["recent_market_setup"] = {str(k): str(v)[-OCTOPUS_RECENT_MODEL_WINDOW:] for k, v in recent_ms.items()}
+            meta = snap.get("meta") or {}
+            _octopus_state["total_observations"] = int(meta.get("total_observations", 0) or 0)
+            _octopus_state["total_pair_minutes"] = int(meta.get("total_pair_minutes", 0) or 0)
+
+        # v1.28 execution telemetry is separate. Fresh deployment starts at zero;
+        # process restarts resume only v1.28's own counters and still-valid trade lock.
+        runtime = _octopus_runtime_ref().get() or {}
+        if isinstance(runtime, dict) and str(runtime.get("engine") or "") == OCTOPUS_ENGINE_VERSION:
+            for key in (
+                "selector_decisions", "selector_no_trade", "selector_publish_ok",
+                "selector_publish_failed", "selector_prearm_sent", "selector_prearm_cancelled",
+                "execution_lock_shadow_minutes", "execution_lock_skipped_prearms",
+            ):
+                _octopus_state[key] = int(runtime.get(key, _octopus_state.get(key, 0)) or 0)
+            for key in (
+                "execution_lock_active", "execution_lock_signal_id", "execution_lock_pair",
+                "execution_lock_until_ts", "execution_lock_started_at", "execution_lock_reason",
+            ):
+                if key in runtime:
+                    _octopus_state[key] = runtime.get(key)
+            if float(_octopus_state.get("execution_lock_until_ts", 0.0) or 0.0) <= time_module.time():
+                _octopus_execution_lock_clear(reason="restored_lock_expired")
     except Exception as exc:
         _octopus_state["last_error"] = f"snapshot load: {exc}"
         logger.warning("Octopus S/R + Retest snapshot load failed: %s", exc)
@@ -15173,6 +15243,7 @@ def _octopus_flush_snapshot(force: bool = False):
     if not force and now_ts - float(_octopus_state.get("last_flush_ts", 0.0) or 0.0) < OCTOPUS_FLUSH_SECONDS:
         return
     try:
+        # Shadow learning remains shared across versions. Execution counters do not.
         payload = {
             "meta": {
                 "engine": OCTOPUS_ENGINE_VERSION,
@@ -15181,12 +15252,6 @@ def _octopus_flush_snapshot(force: bool = False):
                 "total_observations": int(_octopus_state.get("total_observations", 0) or 0),
                 "total_pair_minutes": int(_octopus_state.get("total_pair_minutes", 0) or 0),
                 "model_count": len(OCTOPUS_MODEL_FAMILY),
-                "selector_decisions": int(_octopus_state.get("selector_decisions", 0) or 0),
-                "selector_no_trade": int(_octopus_state.get("selector_no_trade", 0) or 0),
-                "selector_publish_ok": int(_octopus_state.get("selector_publish_ok", 0) or 0),
-                "selector_publish_failed": int(_octopus_state.get("selector_publish_failed", 0) or 0),
-                "selector_prearm_sent": int(_octopus_state.get("selector_prearm_sent", 0) or 0),
-                "selector_prearm_cancelled": int(_octopus_state.get("selector_prearm_cancelled", 0) or 0),
             },
             "model_stats": _octopus_state.get("model_stats") or {},
             "family_stats": _octopus_state.get("family_stats") or {},
@@ -15201,6 +15266,25 @@ def _octopus_flush_snapshot(force: bool = False):
             "recent_market_setup": _octopus_state.get("recent_market_setup") or {},
         }
         _octopus_base_ref().child("snapshot").set(payload)
+        _octopus_runtime_ref().set({
+            "engine": OCTOPUS_ENGINE_VERSION,
+            "server_version": COPY_SERVER_VERSION,
+            "updated_at": now_iso(),
+            "selector_decisions": int(_octopus_state.get("selector_decisions", 0) or 0),
+            "selector_no_trade": int(_octopus_state.get("selector_no_trade", 0) or 0),
+            "selector_publish_ok": int(_octopus_state.get("selector_publish_ok", 0) or 0),
+            "selector_publish_failed": int(_octopus_state.get("selector_publish_failed", 0) or 0),
+            "selector_prearm_sent": int(_octopus_state.get("selector_prearm_sent", 0) or 0),
+            "selector_prearm_cancelled": int(_octopus_state.get("selector_prearm_cancelled", 0) or 0),
+            "execution_lock_shadow_minutes": int(_octopus_state.get("execution_lock_shadow_minutes", 0) or 0),
+            "execution_lock_skipped_prearms": int(_octopus_state.get("execution_lock_skipped_prearms", 0) or 0),
+            "execution_lock_active": bool(_octopus_state.get("execution_lock_active")),
+            "execution_lock_signal_id": _octopus_state.get("execution_lock_signal_id"),
+            "execution_lock_pair": _octopus_state.get("execution_lock_pair"),
+            "execution_lock_until_ts": float(_octopus_state.get("execution_lock_until_ts", 0.0) or 0.0),
+            "execution_lock_started_at": _octopus_state.get("execution_lock_started_at"),
+            "execution_lock_reason": _octopus_state.get("execution_lock_reason"),
+        })
         _octopus_state["last_flush_ts"] = now_ts
     except Exception as exc:
         _octopus_state["last_error"] = f"snapshot flush: {exc}"
@@ -15480,7 +15564,7 @@ def _mi_zone_event(parts: list[dict], zone: dict, atr: float) -> dict | None:
 
 def _mi_proxy_models(setup: str) -> list[str]:
     # These remain descriptive priors only. They never generate or flip direction.
-    # v1.27 deliberately excludes Trendline/M5/Momentum from the execution manager.
+    # v1.28 deliberately excludes Trendline/M5/Momentum from the execution manager.
     s = str(setup or "")
     if s == "MI_ROLE_FLIP_RETEST":
         return ["SR_BREAKOUT", "SR_BOUNCE"]
@@ -15489,7 +15573,7 @@ def _mi_proxy_models(setup: str) -> list[str]:
     return []
 
 def _octopus_market_intelligence(pair: str, closed: list[dict], regime: dict) -> dict:
-    """v1.27 specialised market map: support, resistance and polarity retest only."""
+    """v1.28 specialised market map: support, resistance and polarity retest only."""
     parts = [_otc_edge_candle_parts(x) for x in closed[-90:]]
     atr = _trendline_avg_range(parts, 14)
     if len(parts) < OCTOPUS_MIN_CLOSED_M1 or atr <= 0:
@@ -15553,18 +15637,17 @@ def _mi_rank_thesis(pair: str, symbol: str, payout: int, regime: dict, hour: str
     ms_recent_n = msw + msl
     setup_recent_est = ((msw + (setup_est/100.0)*12.0) / max(1e-9, ms_recent_n + 12.0) * 100.0) if ms_recent_n else setup_est
 
-    # Blend stable + recent evidence. Quality adds only a small bounded adjustment;
-    # a visually clean zone cannot manufacture statistical edge by itself.
+    # v1.28: technical S/R thesis is the ENTRY gate. History is calibration/ranking only.
+    # A fresh, technically clean support/resistance/retest setup must not be blocked merely
+    # because its exact thesis bucket has not yet accumulated 20+ Shadow outcomes.
     recent_weight = min(0.48, 0.22 + ms_recent_n / 220.0)
-    expected = setup_est*(1.0-recent_weight) + setup_recent_est*recent_weight
-    technical_bonus = max(-0.4, min(1.4, (quality-70.0)*0.055))
-    expected += technical_bonus
+    statistical_est = setup_est*(1.0-recent_weight) + setup_recent_est*recent_weight
 
-    # Optional S/R-specific shadow prior. Never flips direction and never uses trend models.
+    # Optional S/R-specific Shadow prior. It can nudge ranking, never create/flip/block a thesis.
     proxy_rows=[]
     for model in _mi_proxy_models(setup_name):
         est = _octopus_context_estimate(pair, rname, hour, model, payout, 75)
-        if int(est.get("global_n",0) or 0) >= OCTOPUS_SELECTOR_MIN_MODEL_SAMPLE and not (est.get("drift") or {}).get("state") == "COLD":
+        if int(est.get("global_n",0) or 0) >= OCTOPUS_SELECTOR_MIN_MODEL_SAMPLE:
             proxy_rows.append((model,est))
     proxy_rows.sort(key=lambda x: float(x[1].get("conservative_wr",0)), reverse=True)
     proxy_bonus = 0.0
@@ -15572,7 +15655,13 @@ def _mi_rank_thesis(pair: str, symbol: str, payout: int, regime: dict, hour: str
         best_proxy = proxy_rows[0][1]
         proxy_edge = float(best_proxy.get("expected_wr",50.0)) - be
         proxy_bonus = max(-0.8, min(0.8, proxy_edge*0.12))
-        expected += proxy_bonus
+        statistical_est += proxy_bonus
+
+    # Technical quality provides the baseline estimate. Historical evidence gradually earns
+    # weight as sample size grows, but cannot become a hard eligibility gate.
+    technical_est = max(52.0, min(61.5, 54.8 + (quality - OCTOPUS_MI_MIN_THESIS_QUALITY) * 0.22))
+    history_reliability = min(0.62, max(0.0, (float(setup_n) + 0.45*float(ms_recent_n)) / 150.0))
+    expected = technical_est*(1.0-history_reliability) + statistical_est*history_reliability
 
     effective_n = max(1.0, float(setup_n) + 0.35*float(ms_recent_n))
     penalty = max(1.15, min(4.8, 4.8*((24.0/max(24.0,effective_n))**0.5)))
@@ -15580,13 +15669,16 @@ def _mi_rank_thesis(pair: str, symbol: str, payout: int, regime: dict, hour: str
     setup_cold = bool(ms_recent_n >= 20 and ms_recent_raw < be - 4.0)
     setup_hot = bool(ms_recent_n >= 20 and ms_recent_raw >= be + 4.0)
 
-    expected_gate = expected >= be + OCTOPUS_SELECTOR_MIN_EDGE_POINTS
-    conservative_gate = conservative >= be + OCTOPUS_SELECTOR_MIN_CONSERVATIVE_EDGE_POINTS
+    # Hard entry gates are technical only (plus payout, which is filtered before ranking).
     quality_gate = quality >= OCTOPUS_MI_MIN_THESIS_QUALITY
     space_gate = float(thesis.get("space_atr",99) or 99) >= OCTOPUS_MI_MIN_SPACE_ATR
-    history_gate = setup_n >= 20 and ms_recent_n >= 12
-    eligible = bool(history_gate and quality_gate and space_gate and expected_gate and conservative_gate and not setup_cold)
-    selector_score = conservative*0.56 + expected*0.24 + quality*0.20
+    eligible = bool(quality_gate and space_gate)
+
+    # Statistics rank simultaneous valid opportunities. Cold history lowers priority rather than
+    # incorrectly suppressing a technically valid S/R setup altogether.
+    drift_adjust = 1.2 if setup_hot else (-2.0 if setup_cold else 0.0)
+    space_bonus = max(0.0, min(2.5, (float(thesis.get("space_atr",0) or 0) - OCTOPUS_MI_MIN_SPACE_ATR) * 1.8))
+    selector_score = quality*0.68 + expected*0.20 + conservative*0.08 + space_bonus + drift_adjust
     models = [m for m,_ in proxy_rows[:2]]
     return [{
         "pair":pair, "symbol":symbol, "payout":int(payout), "regime":rname, "hour":str(hour),
@@ -15596,9 +15688,9 @@ def _mi_rank_thesis(pair: str, symbol: str, payout: int, regime: dict, hour: str
         "break_even_wr":round(be,2), "edge_points":round(expected-be,2), "conservative_edge_points":round(conservative-be,2),
         "consensus_bonus":round(proxy_bonus,2), "direction_margin":99.0, "opposite_conservative_wr":None,
         "conflict_ok":True, "selector_score":round(selector_score,2), "eligible":eligible,
-        "basis":[f"SETUP{setup_n}",f"RECENT{ms_recent_n}",f"HOT={int(setup_hot)}",f"Q={quality:.1f}"],
+        "basis":[f"TECH_GATE=1",f"SETUP{setup_n}",f"RECENT{ms_recent_n}",f"HREL={history_reliability:.2f}",f"HOT={int(setup_hot)}",f"Q={quality:.1f}"],
         "drift":{"state":"COLD" if setup_cold else "HOT" if setup_hot else "STABLE", "recent_n":ms_recent_n, "recent_wr":round(ms_recent_raw,2)},
-        "model_detail":{"setup_n":setup_n,"setup_wr":round(setup_est,2),"recent_n":ms_recent_n,"recent_wr":round(ms_recent_raw,2),"proxy_bonus":round(proxy_bonus,2)},
+        "model_detail":{"setup_n":setup_n,"setup_wr":round(setup_est,2),"recent_n":ms_recent_n,"recent_wr":round(ms_recent_raw,2),"proxy_bonus":round(proxy_bonus,2),"history_reliability":round(history_reliability,3),"technical_est":round(technical_est,2)},
         "all_evaluated":[],
         "market_setup":setup_name, "market_reason":str(thesis.get("reason") or ""),
         "market_quality":round(quality,2), "market_zone":thesis.get("zone"),
@@ -15880,7 +15972,7 @@ async def _octopus_adaptive_prearm(context: ContextTypes.DEFAULT_TYPE, now_ts: f
     scan = _octopus_scan_market_for_target(target_bucket, provisional=True)
     ranked = scan.get("ranked") or []
     if not ranked:
-        _octopus_state["selector_last_no_trade_reason"] = "PRE-ARM: no qualified adaptive opportunity"
+        _octopus_state["selector_last_no_trade_reason"] = "PRE-ARM: no qualified S/R + Retest technical opportunity"
         return
     candidate = dict(ranked[0])
     candidate["prearmed_at"] = now_iso()
@@ -15966,7 +16058,7 @@ async def _octopus_adaptive_final(context: ContextTypes.DEFAULT_TYPE, now_ts: fl
         _octopus_state.setdefault("pending", {})[current_bucket] = pending_rows
     if not ranked:
         _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade", 0) or 0) + 1
-        _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: no candidate passed payout/edge/conflict gates"
+        _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: no S/R + Retest thesis passed technical quality/space gates"
         _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
         _octopus_flush_snapshot(force=False)
         await _octopus_maybe_digest(context)
@@ -16147,8 +16239,8 @@ def build_structure_edge_status() -> str:
         f"PRE-ARM sent/cancelled: {int(_octopus_state.get('selector_prearm_sent',0) or 0)} / {int(_octopus_state.get('selector_prearm_cancelled',0) or 0)}\n"
         f"Published OK/failed: {int(_octopus_state.get('selector_publish_ok',0) or 0)} / {int(_octopus_state.get('selector_publish_failed',0) or 0)}\n"
         f"Prearmed الآن: {(pre.get('pair') + ' ' + pre.get('direction') + ' ' + str(pre.get('market_setup') or '-') + ' Q' + str(pre.get('market_quality') or '-')) if pre else '-'}\n"
-        f"Payout gate: ≥{OCTOPUS_SELECTOR_MIN_PAYOUT}% | Expected edge ≥ +{OCTOPUS_SELECTOR_MIN_EDGE_POINTS:g}pp\n"
-        f"Conservative edge ≥ +{OCTOPUS_SELECTOR_MIN_CONSERVATIVE_EDGE_POINTS:g}pp | S/R setup history مطلوب\n"
+        f"Payout gate: ≥{OCTOPUS_SELECTOR_MIN_PAYOUT}% | Thesis quality gate: ≥{OCTOPUS_MI_MIN_THESIS_QUALITY:g}\n"
+        f"Free-space gate: ≥{OCTOPUS_MI_MIN_SPACE_ATR:.2f} ATR | التاريخ = ترتيب/معايرة فقط، مو مانع تنفيذ\n"
         f"Open displacement max: {OCTOPUS_SELECTOR_MAX_OPEN_DISPLACEMENT_ATR:.3f} ATR\n"
         f"Execution Lock: {'ON 🔒' if _octopus_execution_lock_active() else 'OFF'} | {_octopus_state.get('execution_lock_pair') or '-'}\n"
         f"Execution scans paused while open: {int(_octopus_state.get('execution_lock_shadow_minutes',0) or 0)} minute(s) | PRE-ARM skips: {int(_octopus_state.get('execution_lock_skipped_prearms',0) or 0)}\n"
@@ -16374,7 +16466,7 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
 
 
 async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
-    """Octopus v1.27 S/R + Retest state machine.
+    """Octopus v1.28 S/R + Retest technical-gate state machine.
 
     56.5–59.2s: provisional multi-model scan -> PRE-ARM one best pair only.
     0–1.6s: settle prior Shadow results, re-run all models with the now-closed candle,
@@ -27483,7 +27575,7 @@ def run_telegram_bot_only():
         name="multi_user_otc_edge_watcher",
     )
 
-    # v1.27.0: Octopus S/R + Retest — execution is restricted to support rejection, resistance rejection and role-flip retest.
+    # v1.28.0: Octopus S/R + Retest technical-gate calibration — execution is restricted to support rejection, resistance rejection and role-flip retest.
     # A backend execution lock pauses PRE-ARM/execution scans while any current trade is open; Shadow learning continues.
     # Firebase enabled-state remains RAM-cached; scheduler frequency does NOT imply Firebase reads.
     job_queue.run_repeating(
