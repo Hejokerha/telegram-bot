@@ -1030,7 +1030,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.34.0"
+COPY_SERVER_VERSION = "1.35.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -15065,7 +15065,7 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
 
 
 
-# ===== v1.33.0 OCTOPUS S/R + RETEST — PREARM/FINAL ALIGNMENT ==================
+# ===== v1.35.0 OCTOPUS S/R + RETEST — PREARM COMMIT / DIRECT EXECUTION =========
 # Keeps the v1.24 same-market Shadow Lab running, but adds a conservative online
 # selector for the active owner test slot. The selector intentionally treats the
 # market as non-stationary: old evidence is shrunk, recent evidence has higher weight,
@@ -15076,7 +15076,7 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
 # IMPORTANT product rule: account type, base amount, target/stop, martingale/sequence
 # are extension/user settings. The backend does not force DEMO and does not force $1.
 
-OCTOPUS_ENGINE_VERSION = "octopus_sr_retest_v7"
+OCTOPUS_ENGINE_VERSION = "octopus_sr_retest_v8"
 OCTOPUS_MODEL_FAMILY["ADAPTIVE_SELECTOR"] = "META_SELECTOR"
 OCTOPUS_MODEL_FAMILY["MARKET_THESIS"] = "MARKET_INTELLIGENCE"
 OCTOPUS_SELECTOR_SCHEDULER_SECONDS = max(0.25, min(1.0, float(os.getenv("OCTOPUS_SELECTOR_SCHEDULER_SECONDS", "0.5"))))
@@ -15084,8 +15084,8 @@ OCTOPUS_SELECTOR_PREARM_MIN_SECOND = max(50.0, min(59.2, float(os.getenv("OCTOPU
 OCTOPUS_SELECTOR_PREARM_LAST_SECOND = max(OCTOPUS_SELECTOR_PREARM_MIN_SECOND, min(59.7, float(os.getenv("OCTOPUS_SELECTOR_PREARM_LAST_SECOND", "59.2"))))
 OCTOPUS_SELECTOR_PREARM_MAX_ATTEMPTS = max(1, min(4, int(os.getenv("OCTOPUS_SELECTOR_PREARM_MAX_ATTEMPTS", "2"))))
 OCTOPUS_SELECTOR_PREARM_RETRY_SECONDS = max(0.4, min(3.0, float(os.getenv("OCTOPUS_SELECTOR_PREARM_RETRY_SECONDS", "1.4"))))
-OCTOPUS_SELECTOR_FINAL_MAX_SECOND = max(1.6, min(6.0, float(os.getenv("OCTOPUS_SELECTOR_FINAL_MAX_SECOND", "4.8"))))
-OCTOPUS_SELECTOR_SHADOW_FALLBACK_MAX_SECOND = max(OCTOPUS_SELECTOR_FINAL_MAX_SECOND, min(15.0, float(os.getenv("OCTOPUS_SELECTOR_SHADOW_FALLBACK_MAX_SECOND", "8.0"))))
+OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND = max(1.0, min(4.0, float(os.getenv("OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND", "2.5"))))
+OCTOPUS_SELECTOR_SHADOW_FALLBACK_MAX_SECOND = max(OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND, min(15.0, float(os.getenv("OCTOPUS_SELECTOR_SHADOW_FALLBACK_MAX_SECOND", "8.0"))))
 OCTOPUS_SELECTOR_MIN_MODEL_SAMPLE = max(12, int(os.getenv("OCTOPUS_SELECTOR_MIN_MODEL_SAMPLE", "30")))
 OCTOPUS_SELECTOR_MIN_RECENT_SAMPLE = max(10, int(os.getenv("OCTOPUS_SELECTOR_MIN_RECENT_SAMPLE", "20")))
 OCTOPUS_SELECTOR_MIN_LOCAL_RECENT_SAMPLE = max(10, int(os.getenv("OCTOPUS_SELECTOR_MIN_LOCAL_RECENT_SAMPLE", "16")))
@@ -15126,10 +15126,10 @@ OCTOPUS_SR_EXEC_MIN_CLOSED_M1 = max(16, min(30, int(os.getenv("OCTOPUS_SR_EXEC_M
 # while price is approaching/touching a real S/R zone; direction is decided ONLY after
 # the candle closes and one of the 3 approved S/R theses is actually confirmed.
 OCTOPUS_SR_PREARM_ZONE_DISTANCE_ATR = max(0.08, min(0.60, float(os.getenv("OCTOPUS_SR_PREARM_ZONE_DISTANCE_ATR", "0.32"))))
-# v1.33 PRE-ARM/FINAL alignment: first prefer a real provisional version of the same
-# three final S/R theses. If none is mature yet, allow only a touched-zone forming
-# response whose projected final quality is already close to the real quality gate.
-OCTOPUS_SR_PREARM_MIN_PROJECTED_QUALITY = max(60.0, min(75.0, float(os.getenv("OCTOPUS_SR_PREARM_MIN_PROJECTED_QUALITY", "66"))))
+# v1.35 PRE-ARM COMMIT: first prefer a mature practical S/R thesis on the almost-closed
+# candle. If none is mature yet, allow only a touched-zone FORMING response whose projected
+# quality already meets the real execution gate. There is no later S/R FINAL decision stage.
+OCTOPUS_SR_PREARM_MIN_PROJECTED_QUALITY = max(OCTOPUS_MI_MIN_THESIS_QUALITY, min(82.0, float(os.getenv("OCTOPUS_SR_PREARM_MIN_PROJECTED_QUALITY", "70"))))
 OCTOPUS_SR_PREARM_MIN_WICK_RATIO = max(0.08, min(0.30, float(os.getenv("OCTOPUS_SR_PREARM_MIN_WICK_RATIO", "0.14"))))
 OCTOPUS_SR_PREARM_ROLE_SIDE_TOLERANCE_ATR = max(0.02, min(0.15, float(os.getenv("OCTOPUS_SR_PREARM_ROLE_SIDE_TOLERANCE_ATR", "0.08"))))
 
@@ -15140,8 +15140,8 @@ def _octopus_base_ref():
 
 
 def _structure_edge_base_ref():
-    # v1.34 gets a fresh execution/result namespace. Earlier S/R experiments remain archived.
-    return system_ref().child("octopus_sr_retest_v7")
+    # v1.35 gets a fresh execution/result namespace. Earlier S/R experiments remain archived.
+    return system_ref().child("octopus_sr_retest_v8")
 
 
 def _octopus_runtime_ref():
@@ -15192,22 +15192,18 @@ def _octopus_selector_extend_state():
         "sr_prearm_watch_candidates_last": 0,
         "sr_prearm_watch_zones_last": 0,
         "sr_prearm_watch_found_total": 0,
-        "sr_final_prearmed_pair_confirmed": 0,
-        "sr_final_prearmed_pair_not_confirmed": 0,
         "sr_prearm_aligned_candidates_last": 0,
         "sr_prearm_forming_candidates_last": 0,
         "sr_prearm_selected_mode": None,
         "sr_prearm_locked_skips": 0,
-        "sr_final_scans": 0,
-        "sr_final_no_thesis": 0,
-        "sr_final_other_pair_valid": 0,
-        "sr_final_waiting_candle": 0,
-        "sr_final_frozen_confirmed": 0,
-        "sr_final_frozen_rejected": 0,
-        "sr_final_timing_missed": 0,
-        "sr_final_blocked_offline": 0,
-        "sr_final_blocked_open_snapshot": 0,
-        "sr_final_blocked_displacement": 0,
+        "sr_open_execution_attempts": 0,
+        "sr_open_wait_snapshot": 0,
+        "sr_open_committed": 0,
+        "sr_open_timing_missed": 0,
+        "sr_open_blocked_offline": 0,
+        "sr_open_blocked_payout": 0,
+        "sr_open_blocked_open_snapshot": 0,
+        "sr_open_blocked_displacement": 0,
         "market_zones_last": 0,
         "market_thesis_predictions": 0,
         "market_setup_stats": {},
@@ -15265,11 +15261,9 @@ def _octopus_restore_snapshot_once():
                 "selector_publish_failed", "selector_prearm_sent", "selector_prearm_cancelled",
                 "execution_lock_shadow_minutes", "execution_lock_skipped_prearms",
                 "sr_prearm_watch_found_total", "sr_prearm_locked_skips",
-                "sr_final_prearmed_pair_confirmed", "sr_final_prearmed_pair_not_confirmed",
-                "sr_final_scans", "sr_final_no_thesis", "sr_final_other_pair_valid",
-                "sr_final_waiting_candle", "sr_final_frozen_confirmed", "sr_final_frozen_rejected",
-                "sr_final_timing_missed", "sr_final_blocked_offline",
-                "sr_final_blocked_open_snapshot", "sr_final_blocked_displacement",
+                "sr_open_execution_attempts", "sr_open_wait_snapshot", "sr_open_committed",
+                "sr_open_timing_missed", "sr_open_blocked_offline", "sr_open_blocked_payout",
+                "sr_open_blocked_open_snapshot", "sr_open_blocked_displacement",
             ):
                 _octopus_state[key] = int(runtime.get(key, _octopus_state.get(key, 0)) or 0)
             for key in (
@@ -15328,18 +15322,14 @@ def _octopus_flush_snapshot(force: bool = False):
             "execution_lock_skipped_prearms": int(_octopus_state.get("execution_lock_skipped_prearms", 0) or 0),
             "sr_prearm_watch_found_total": int(_octopus_state.get("sr_prearm_watch_found_total", 0) or 0),
             "sr_prearm_locked_skips": int(_octopus_state.get("sr_prearm_locked_skips", 0) or 0),
-            "sr_final_prearmed_pair_confirmed": int(_octopus_state.get("sr_final_prearmed_pair_confirmed", 0) or 0),
-            "sr_final_prearmed_pair_not_confirmed": int(_octopus_state.get("sr_final_prearmed_pair_not_confirmed", 0) or 0),
-            "sr_final_scans": int(_octopus_state.get("sr_final_scans", 0) or 0),
-            "sr_final_no_thesis": int(_octopus_state.get("sr_final_no_thesis", 0) or 0),
-            "sr_final_other_pair_valid": int(_octopus_state.get("sr_final_other_pair_valid", 0) or 0),
-            "sr_final_waiting_candle": int(_octopus_state.get("sr_final_waiting_candle", 0) or 0),
-            "sr_final_frozen_confirmed": int(_octopus_state.get("sr_final_frozen_confirmed", 0) or 0),
-            "sr_final_frozen_rejected": int(_octopus_state.get("sr_final_frozen_rejected", 0) or 0),
-            "sr_final_timing_missed": int(_octopus_state.get("sr_final_timing_missed", 0) or 0),
-            "sr_final_blocked_offline": int(_octopus_state.get("sr_final_blocked_offline", 0) or 0),
-            "sr_final_blocked_open_snapshot": int(_octopus_state.get("sr_final_blocked_open_snapshot", 0) or 0),
-            "sr_final_blocked_displacement": int(_octopus_state.get("sr_final_blocked_displacement", 0) or 0),
+            "sr_open_execution_attempts": int(_octopus_state.get("sr_open_execution_attempts", 0) or 0),
+            "sr_open_wait_snapshot": int(_octopus_state.get("sr_open_wait_snapshot", 0) or 0),
+            "sr_open_committed": int(_octopus_state.get("sr_open_committed", 0) or 0),
+            "sr_open_timing_missed": int(_octopus_state.get("sr_open_timing_missed", 0) or 0),
+            "sr_open_blocked_offline": int(_octopus_state.get("sr_open_blocked_offline", 0) or 0),
+            "sr_open_blocked_payout": int(_octopus_state.get("sr_open_blocked_payout", 0) or 0),
+            "sr_open_blocked_open_snapshot": int(_octopus_state.get("sr_open_blocked_open_snapshot", 0) or 0),
+            "sr_open_blocked_displacement": int(_octopus_state.get("sr_open_blocked_displacement", 0) or 0),
             "execution_lock_active": bool(_octopus_state.get("execution_lock_active")),
             "execution_lock_signal_id": _octopus_state.get("execution_lock_signal_id"),
             "execution_lock_pair": _octopus_state.get("execution_lock_pair"),
@@ -16001,13 +15991,13 @@ def _octopus_scan_market_for_target(target_bucket: int, provisional: bool = Fals
 
 
 def _octopus_sr_prearm_watch_scan(target_bucket: int) -> dict:
-    """v1.33: choose the pair most likely to survive the FINAL closed-candle check.
+    """v1.35: choose the best execution-grade S/R pair before the candle boundary.
 
     Priority A: run the SAME practical S/R thesis/ranking logic provisionally on the
-    almost-closed candle. These are FINAL-like candidates and should have the highest
-    conversion into an executable final thesis.
+    almost-closed candle. These are MATURE candidates: the S/R thesis already satisfies
+    the execution-grade technical gate before the boundary.
 
-    Priority B: only when no final-like thesis exists yet, consider a FORMING S/R response.
+    Priority B: only when no MATURE thesis exists yet, consider a FORMING S/R response.
     The zone must already have been touched by the current/previous candle; pure geometric
     proximity is no longer enough. This preserves anticipation without spraying PRE-ARM at
     unrelated near-zone pairs.
@@ -16018,7 +16008,7 @@ def _octopus_sr_prearm_watch_scan(target_bucket: int) -> dict:
     aligned = []
     for row in (aligned_scan.get("ranked") or []):
         item = dict(row)
-        item["prearm_mode"] = "FINAL_LIKE"
+        item["prearm_mode"] = "MATURE"
         item["prearm_watch_only"] = False
         item["prearm_projected_quality"] = float(item.get("market_quality", 0) or 0)
         item["prearm_zone_overlap"] = True
@@ -16090,8 +16080,8 @@ def _octopus_sr_prearm_watch_scan(target_bucket: int) -> dict:
                 touch_prev = float(prev["high"]) >= zlow and float(prev["low"]) <= zhigh
                 touched = bool(touch_now or touch_prev)
                 if not touched:
-                    # FINAL requires a real touch on the closing/previous candle. A pair that
-                    # is merely nearby cannot currently survive final, so do not PRE-ARM it.
+                    # Direct execution requires a real S/R interaction before commitment. A pair
+                    # that is merely nearby is not enough, so do not PRE-ARM it.
                     continue
 
                 zq = float(z.get("quality", 50) or 50)
@@ -16145,8 +16135,25 @@ def _octopus_sr_prearm_watch_scan(target_bucket: int) -> dict:
                 if not events:
                     continue
                 direction, hint, projected_q, forming_reason = max(events, key=lambda e: float(e[2]))
+
+                # v1.35: PRE-ARM is the trade decision, so FORMING candidates must already
+                # pass the same hard opposing-zone concept used by execution. No later FINAL
+                # stage exists to rescue/reject a weak candidate.
+                obstacle_info = _mi_space_to_obstacle(direction, cl, zones, z, atr)
+                space = float(obstacle_info.get("space_atr", 99.0) or 99.0)
+                raw_space = float(obstacle_info.get("raw_space_atr", 99.0) or 99.0)
+                if bool(obstacle_info.get("hard_block")):
+                    continue
+                if space < 0.34:
+                    projected_q -= 1.5
+                elif space >= 0.75:
+                    projected_q += 2.0
+                elif space >= 0.45:
+                    projected_q += 0.8
+                if raw_space < 0.12 and space >= 0.34:
+                    projected_q -= 0.5
                 projected_q = max(1.0, min(99.0, float(projected_q)))
-                if projected_q < OCTOPUS_SR_PREARM_MIN_PROJECTED_QUALITY:
+                if projected_q < max(OCTOPUS_SR_PREARM_MIN_PROJECTED_QUALITY, OCTOPUS_MI_MIN_THESIS_QUALITY):
                     continue
 
                 reaction_bonus = 2.0 if touch_now else 1.0
@@ -16160,8 +16167,8 @@ def _octopus_sr_prearm_watch_scan(target_bucket: int) -> dict:
                     "primary_model": "SR_PREARM_FORMING", "primary_family": "MARKET_INTELLIGENCE",
                     "models": ["SR_PREARM_FORMING"], "families": ["MARKET_INTELLIGENCE"],
                     "market_setup": hint,
-                    "market_reason": f"S/R forming response — {forming_reason}; final closed candle still owns execution",
-                    "market_quality": round(projected_q, 2), "market_zone": z, "market_space_atr": 99.0,
+                    "market_reason": f"S/R forming response — {forming_reason}; committed by PRE-ARM for next-candle execution",
+                    "market_quality": round(projected_q, 2), "market_zone": z, "market_space_atr": round(space, 3),
                     "selector_score": round(watch_score, 2), "expected_wr": None, "conservative_wr": None,
                     "break_even_wr": round(_octopus_break_even_wr(payout), 2), "edge_points": None,
                     "regime": "SR_FORMING", "hour": datetime.fromtimestamp(int(target_bucket), tz=UTC).astimezone(UTC_PLUS_3).strftime("%H"),
@@ -16267,7 +16274,7 @@ async def publish_copy_octopus_prepare_signal(candidate: dict, target_entry_buck
             "octopus_market_zone": candidate.get("market_zone"),
             "octopus_market_space_atr": candidate.get("market_space_atr"),
             "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"octopus_sr_retest_v6_prearm | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_account_amount_settings",
+            "note": f"octopus_sr_retest_v8_prearm_commit | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_account_amount_settings",
         }
         return await publish_copy_trading_signal(payload, source="structure_edge")
     except Exception as exc:
@@ -16328,11 +16335,11 @@ async def publish_copy_octopus_signal(candidate: dict) -> dict:
             "octopus_market_zone": candidate.get("market_zone"),
             "octopus_market_space_atr": candidate.get("market_space_atr"),
             "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"octopus_sr_retest_v6 | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_controls_account_amount",
+            "note": f"octopus_sr_retest_v8_direct_open | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_controls_account_amount",
         }
         return await publish_copy_trading_signal(payload, source="structure_edge")
     except Exception as exc:
-        logger.exception("Octopus final Copy publish failed: %s", exc)
+        logger.exception("Octopus direct-open Copy publish failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
@@ -16404,7 +16411,7 @@ async def _octopus_adaptive_prearm(context: ContextTypes.DEFAULT_TYPE, now_ts: f
         _octopus_state["sr_prearm_watch_found_total"] = int(_octopus_state.get("sr_prearm_watch_found_total",0) or 0) + len(ranked)
     if not ranked:
         _octopus_state["sr_prearm_selected_mode"] = None
-        _octopus_state["selector_last_no_trade_reason"] = "PRE-ARM: no aligned/forming S/R response likely to survive final"
+        _octopus_state["selector_last_no_trade_reason"] = "PRE-ARM: no execution-grade mature/forming S/R response"
         return
 
     candidate = dict(ranked[0])
@@ -16425,6 +16432,7 @@ async def _octopus_adaptive_prearm(context: ContextTypes.DEFAULT_TYPE, now_ts: f
     _octopus_state["selector_prearmed_candidate"] = candidate
     _octopus_state["selector_prearm_target_bucket"] = target_bucket
     _octopus_state["selector_prearm_sent"] = int(_octopus_state.get("selector_prearm_sent", 0) or 0) + 1
+    _octopus_state["selector_last_no_trade_reason"] = None
     _octopus_state["last_reject_reason"] = (
         f"S/R PRE-ARM LOCK {candidate.get('pair')} | {candidate.get('prearm_mode')} | "
         f"hint {candidate.get('market_setup')} | projectedQ{candidate.get('prearm_projected_quality', candidate.get('market_quality'))}"
@@ -16455,125 +16463,16 @@ async def _octopus_shadow_only_while_trade_open(context: ContextTypes.DEFAULT_TY
 
 
 
-def _octopus_confirm_prearmed_frozen_zone(current_bucket: int, prearmed: dict) -> dict:
-    """Confirm the prepared trade against the exact S/R zone that existed BEFORE entry.
 
-    v1.34 invariant: a good S/R level must not disappear merely because the final signal
-    candle is allowed to redraw/recluster the whole map. PRE-ARM freezes the reference zone;
-    FINAL validates the fully closed signal candle against that same zone. Fresh zones are
-    used only for the opposing-obstacle check.
+
+async def _octopus_execute_prearmed_open(context: ContextTypes.DEFAULT_TYPE, now_ts: float, current_bucket: int, sec: float, allow_execution: bool):
+    """v1.35: PRE-ARM is the trading decision; there is NO S/R FINAL revalidation.
+
+    If a candidate was successfully prepared for this bucket, execute the same pair,
+    direction, setup and frozen S/R thesis at the new M1 open. The only remaining gates
+    are operational/execution-safety guards: execution lock, current payout, extension
+    connectivity, open/live price availability and maximum displacement from candle open.
     """
-    try:
-        pair = str((prearmed or {}).get("pair") or "")
-        symbol = str((prearmed or {}).get("symbol") or "")
-        frozen_zone = (prearmed or {}).get("market_zone")
-        if not pair or not symbol or not isinstance(frozen_zone, dict):
-            return {"state":"REJECTED", "reason":"missing prepared pair/symbol/frozen zone"}
-
-        rows, last_tick, candles = _get_otc_rows_and_candles(symbol)
-        signal_bucket = int(current_bucket) - 60
-        signal_candle = None
-        current_candle_seen = False
-        for c in candles:
-            b = _structure_edge_candle_bucket(c)
-            if b == signal_bucket:
-                signal_candle = dict(c)
-            elif b == int(current_bucket):
-                current_candle_seen = True
-        # Do not judge the setup until the feed has visibly rolled into the new M1 candle.
-        # This avoids cancelling a correct PRE-ARM on the first scheduler tick while the
-        # previous candle is still being finalized by the OTC feed.
-        if signal_candle is None or not current_candle_seen:
-            return {"state":"NOT_READY", "reason":"closed signal candle/new M1 not ready in feed"}
-
-        history = sorted(
-            [dict(c) for c in candles if _structure_edge_candle_bucket(c) < int(current_bucket)],
-            key=_structure_edge_candle_bucket,
-        )
-        if len(history) < OCTOPUS_SR_EXEC_MIN_CLOSED_M1:
-            return {"state":"NOT_READY", "reason":"S/R closed history not ready"}
-        parts = [_otc_edge_candle_parts(x) for x in history[-90:]]
-        atr = _trendline_avg_range(parts, 14)
-        if atr <= 0 or len(parts) < 5:
-            return {"state":"NOT_READY", "reason":"ATR/final candle parts not ready"}
-
-        zone = dict(frozen_zone)
-        ev = _mi_zone_event(parts, zone, atr)
-        if not ev or str(ev.get("setup") or "") not in OCTOPUS_EXECUTION_SETUPS:
-            return {"state":"REJECTED", "reason":"closed candle did not confirm prepared frozen S/R zone"}
-
-        # Obstacles may update, but do not allow the prepared zone to count as its own obstacle.
-        prior_parts = parts[:-1] if len(parts) > 1 else parts
-        fresh_zones = _mi_cluster_zones(prior_parts, atr) if len(prior_parts) >= 5 else []
-        frozen_center = float(zone.get("center", 0) or 0)
-        frozen_low = float(zone.get("low", frozen_center) or frozen_center)
-        frozen_high = float(zone.get("high", frozen_center) or frozen_center)
-        zone_tol = max(abs(frozen_high - frozen_low), atr * 0.18)
-        obstacle_zones = [
-            z for z in fresh_zones
-            if abs(float((z or {}).get("center", 0) or 0) - frozen_center) > zone_tol
-        ]
-        price = float(parts[-1]["close"])
-        obstacle_info = _mi_space_to_obstacle(str(ev.get("direction")), price, obstacle_zones, None, atr)
-        q = float(ev.get("quality", 0) or 0)
-        space = float(obstacle_info.get("space_atr", 99.0) or 99.0)
-        raw_space = float(obstacle_info.get("raw_space_atr", 99.0) or 99.0)
-        hard_block = bool(obstacle_info.get("hard_block"))
-        if hard_block:
-            q -= 8.0
-        elif space < 0.34:
-            q -= 1.5
-        elif space >= 0.75:
-            q += 2.0
-        elif space >= 0.45:
-            q += 0.8
-        if raw_space < 0.12 and space >= 0.34:
-            q -= 0.5
-        q = round(max(1.0, min(99.0, q)), 2)
-        ev.update({
-            "quality": q, "space_atr": round(space,3), "raw_space_atr": round(raw_space,3),
-            "space_blocked": hard_block, "opposing_obstacle": obstacle_info.get("obstacle"),
-            "opposing_obstacle_strength": obstacle_info.get("obstacle_strength"), "atr": atr,
-            "zone": zone, "confirm_source":"FROZEN_PREARM_ZONE_V1_34",
-            "structure_bias":"DISABLED", "structure_strength":0.0,
-            "m5_bias":"DISABLED", "m5_strength":0.0,
-            "pressure_bias":"DISABLED", "pressure_strength":0.0, "pressure_meta":{},
-        })
-        if hard_block:
-            return {"state":"REJECTED", "reason":"prepared S/R confirmed but strong adjacent opposing obstacle blocked it", "event":ev}
-        if q < OCTOPUS_MI_MIN_THESIS_QUALITY:
-            return {"state":"REJECTED", "reason":f"prepared S/R final quality {q:.2f} below gate", "event":ev}
-
-        payout = int(float((quotex_otc_feed.instrument(symbol) or {}).get("payout",0) or 0)) if "quotex_otc_feed" in globals() else 0
-        if payout < OCTOPUS_SELECTOR_MIN_PAYOUT:
-            return {"state":"REJECTED", "reason":f"payout {payout}% below gate", "event":ev}
-        if len(history) >= OCTOPUS_MIN_CLOSED_M1:
-            sigs, regime = _octopus_model_signals(pair, symbol, history, rows, payout, int(current_bucket))
-        else:
-            sigs = []
-            regime = _octopus_regime(parts[-40:]) if len(parts) >= 14 else {"name":"WARMUP"}
-        intelligence = {
-            "ok":True, "thesis":ev, "candidates":[ev], "zones":[zone] + obstacle_zones[:9],
-            "raw_candidate_count":1, "quality_candidate_count":1, "valid_candidate_count":1,
-            "blocked_candidate_count":0, "structure_bias":"DISABLED", "m5_bias":"DISABLED",
-            "pressure_bias":"DISABLED", "regime":str((regime or {}).get("name") or "UNKNOWN"),
-        }
-        hour = datetime.fromtimestamp(int(current_bucket), tz=UTC).astimezone(UTC_PLUS_3).strftime("%H")
-        groups = _octopus_rank_pair(pair, symbol, payout, regime, hour, sigs, intelligence)
-        groups = [dict(g) for g in groups if g.get("eligible")]
-        if not groups:
-            return {"state":"REJECTED", "reason":"frozen S/R confirmed technically but ranking produced no eligible candidate", "event":ev}
-        groups.sort(key=lambda x:(float(x.get("selector_score",0)), float(x.get("market_quality",0))), reverse=True)
-        candidate = dict(groups[0])
-        candidate["market_zone"] = zone
-        candidate["final_confirm_source"] = "FROZEN_PREARM_ZONE_V1_34"
-        return {"state":"CONFIRMED", "candidate":candidate, "event":ev}
-    except Exception as exc:
-        logger.exception("Octopus frozen PRE-ARM final confirmation failed: %s", exc)
-        return {"state":"ERROR", "reason":str(exc)}
-
-
-async def _octopus_adaptive_final(context: ContextTypes.DEFAULT_TYPE, now_ts: float, current_bucket: int, sec: float, allow_execution: bool):
     _octopus_selector_extend_state()
     if int(_octopus_state.get("selector_last_bucket", 0) or 0) == current_bucket:
         return
@@ -16585,146 +16484,178 @@ async def _octopus_adaptive_final(context: ContextTypes.DEFAULT_TYPE, now_ts: fl
     target = int(_octopus_state.get("selector_prearm_target_bucket", 0) or 0)
     current_prearm = prearmed if prearmed is not None and target == current_bucket else None
 
-    # EXECUTION PATH FIRST: validate the exact zone that caused the PRE-ARM. Do not redraw
-    # S/R before deciding whether that prepared setup survived the close.
-    if allow_execution and current_prearm is not None:
-        frozen = _octopus_confirm_prearmed_frozen_zone(current_bucket, current_prearm)
-        state = str((frozen or {}).get("state") or "ERROR")
-        if state == "NOT_READY":
-            _octopus_state["sr_final_waiting_candle"] = int(_octopus_state.get("sr_final_waiting_candle",0) or 0) + 1
-            _octopus_state["selector_last_no_trade_reason"] = f"FINAL WAIT: {(frozen or {}).get('reason') or 'feed candle not ready'}"
+    # Outside the direct-open execution window: resolve any still-prepared candidate as a
+    # technical timing miss, then run one normal closed-candle diagnostic/Shadow scan.
+    if not allow_execution:
+        if current_prearm is not None:
+            _octopus_state["sr_open_timing_missed"] = int(_octopus_state.get("sr_open_timing_missed",0) or 0) + 1
+            _octopus_state["selector_prearm_cancelled"] = int(_octopus_state.get("selector_prearm_cancelled",0) or 0) + 1
+            _octopus_state["selector_prearmed_candidate"] = None
+            _octopus_state["selector_prearm_target_bucket"] = 0
+            _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
+            _octopus_state["selector_last_no_trade_reason"] = f"NO TRADE: committed PRE-ARM missed open execution window ({sec:.2f}s)"
             _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
-            return  # critical: do NOT lock selector_last_bucket; scheduler will retry this same candle
 
+        pair_map = get_otc_analysis_pair_map()
+        _octopus_settle_pending(current_bucket, pair_map)
+        scan = _octopus_scan_market_for_target(current_bucket, provisional=False)
+        pending_rows = scan.get("pending_rows") or []
+        if pending_rows:
+            _octopus_state.setdefault("pending", {})[current_bucket] = pending_rows
+        _octopus_state["current_map"] = scan.get("current_map") or {}
+        _octopus_state["pairs_ready"] = int(scan.get("ready",0) or 0)
+        _octopus_state["pairs_scanned"] = int(scan.get("scanned",0) or 0)
+        _octopus_state["last_predictions"] = int(scan.get("prediction_count",0) or 0)
+        _octopus_state["last_scan_bucket"] = current_bucket
+        _octopus_state["last_scan_at"] = now_iso()
         _octopus_state["selector_last_bucket"] = current_bucket
         _octopus_state["selector_decisions"] = int(_octopus_state.get("selector_decisions",0) or 0) + 1
-        _octopus_state["sr_final_scans"] = int(_octopus_state.get("sr_final_scans",0) or 0) + 1
-
-        if state != "CONFIRMED":
-            _octopus_state["sr_final_frozen_rejected"] = int(_octopus_state.get("sr_final_frozen_rejected",0) or 0) + 1
-            _octopus_state["sr_final_no_thesis"] = int(_octopus_state.get("sr_final_no_thesis",0) or 0) + 1
-            _octopus_state["sr_final_prearmed_pair_not_confirmed"] = int(_octopus_state.get("sr_final_prearmed_pair_not_confirmed",0) or 0) + 1
-            _octopus_state["selector_prearm_cancelled"] = int(_octopus_state.get("selector_prearm_cancelled",0) or 0) + 1
+        if current_prearm is None:
             _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
-            failed_pair = str(current_prearm.get("pair") or "-")
-            reason = f"NO TRADE: PRE-ARMED {failed_pair} frozen-zone final rejected — {(frozen or {}).get('reason') or state}"
-            _octopus_state["selector_last_no_trade_reason"] = reason
-            _octopus_state["last_reject_reason"] = reason
-            _octopus_state["selector_prearmed_candidate"] = None
-            _octopus_state["selector_prearm_target_bucket"] = 0
-            # Update the market map only after the execution decision is resolved; diagnostics
-            # must never replace the frozen-zone decision gate.
-            scan = _octopus_scan_market_for_target(current_bucket, provisional=False)
-            _octopus_state["current_map"] = scan.get("current_map") or {}
-            _octopus_state["pairs_ready"] = int(scan.get("ready",0) or 0)
-            _octopus_state["pairs_scanned"] = int(scan.get("scanned",0) or 0)
-            _octopus_state["last_predictions"] = int(scan.get("prediction_count",0) or 0)
-            _octopus_state["last_scan_bucket"] = current_bucket
-            _octopus_state["last_scan_at"] = now_iso()
-            _octopus_flush_snapshot(force=False)
-            await _octopus_maybe_digest(context)
-            return
-
-        candidate = dict((frozen or {}).get("candidate") or {})
-        _octopus_state["sr_final_frozen_confirmed"] = int(_octopus_state.get("sr_final_frozen_confirmed",0) or 0) + 1
-        _octopus_state["sr_final_prearmed_pair_confirmed"] = int(_octopus_state.get("sr_final_prearmed_pair_confirmed",0) or 0) + 1
-        _octopus_state["selector_last_decision"] = dict(candidate)
-
-        if _copy_online_clients_for_user(ADMIN_TELEGRAM_ID) <= 0:
-            _octopus_state["sr_final_blocked_offline"] = int(_octopus_state.get("sr_final_blocked_offline",0) or 0) + 1
-            _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
-            _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: owner extension offline at final"
-            _octopus_state["selector_prearmed_candidate"] = None
-            _octopus_state["selector_prearm_target_bucket"] = 0
-            _octopus_flush_snapshot(force=False)
-            return
-
-        open_price, live_price, displacement = _octopus_current_open_snapshot(str(candidate.get("symbol") or ""), current_bucket, candidate)
-        if open_price is None or live_price is None or displacement is None:
-            _octopus_state["sr_final_blocked_open_snapshot"] = int(_octopus_state.get("sr_final_blocked_open_snapshot",0) or 0) + 1
-            _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
-            _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: current M1 open/price snapshot unavailable"
-            _octopus_state["selector_prearmed_candidate"] = None
-            _octopus_state["selector_prearm_target_bucket"] = 0
-            _octopus_flush_snapshot(force=False)
-            return
-        if float(displacement) > OCTOPUS_SELECTOR_MAX_OPEN_DISPLACEMENT_ATR:
-            _octopus_state["sr_final_blocked_displacement"] = int(_octopus_state.get("sr_final_blocked_displacement",0) or 0) + 1
-            _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
-            _octopus_state["selector_last_no_trade_reason"] = f"NO TRADE: price moved {float(displacement):.3f} ATR from candle Open"
-            _octopus_state["selector_prearmed_candidate"] = None
-            _octopus_state["selector_prearm_target_bucket"] = 0
-            _octopus_flush_snapshot(force=False)
-            return
-
-        candidate.update({
-            "created_at":now_iso(), "entry_bucket":current_bucket, "entry_price":float(live_price),
-            "trendline_candle_open":float(open_price), "trendline_entry_displacement_atr":round(float(displacement),6),
-            "prearmed_at":current_prearm.get("prearmed_at"), "setup":"OCTOPUS_SR_RETEST",
-            "score":int(round(float(candidate.get("selector_score",0)))), "reverse_mode":False,
-            "original_direction":candidate.get("direction"), "prearm_mode":current_prearm.get("prearm_mode"),
-            "prearm_projected_quality":current_prearm.get("prearm_projected_quality"),
-        })
-        copy_result = await publish_copy_octopus_signal(candidate)
-        _octopus_state["selector_prearmed_candidate"] = None
-        _octopus_state["selector_prearm_target_bucket"] = 0
-        _structure_edge_state["last_copy_result"] = copy_result
-        if not isinstance(copy_result, dict) or not copy_result.get("ok"):
-            _octopus_state["selector_publish_failed"] = int(_octopus_state.get("selector_publish_failed",0) or 0) + 1
-            _octopus_state["selector_last_no_trade_reason"] = f"Copy publish failed: {copy_result}"
-            _structure_edge_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
-            _octopus_flush_snapshot(force=False)
-            return
-        normalized_signal = copy_result.get("signal") if isinstance(copy_result.get("signal"), dict) else {}
-        candidate["copy_signal_id"] = normalized_signal.get("id") or f"octopus_{safe_key(candidate.get('pair'))}_{current_bucket}_{candidate.get('direction')}"
-        _structure_edge_state["pending_trade"] = dict(candidate)
-        _octopus_execution_lock_set(candidate.get("copy_signal_id"), candidate.get("pair"), current_bucket+60, reason="signal_published_waiting_platform_result")
-        _structure_edge_state["copy_signals_sent"] = int(_structure_edge_state.get("copy_signals_sent",0) or 0) + 1
-        _octopus_state["selector_publish_ok"] = int(_octopus_state.get("selector_publish_ok",0) or 0) + 1
-        _octopus_state["last_reject_reason"] = f"EXECUTE: {candidate.get('pair')} {candidate.get('direction')} {candidate.get('market_setup')} Q{candidate.get('market_quality')} | frozen-zone final"
-        await safe_send_message(context.bot, chat_id=_structure_edge_target_chat_id(), text=_octopus_selector_decision_text(candidate))
+            _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: no committed PRE-ARM for this candle"
+            _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
         _octopus_flush_snapshot(force=False)
         await _octopus_maybe_digest(context)
         return
 
-    # No prepared pair: run one normal closed-candle market scan for Shadow/map diagnostics.
-    pair_map = get_otc_analysis_pair_map()
-    _octopus_settle_pending(current_bucket, pair_map)
-    scan = _octopus_scan_market_for_target(current_bucket, provisional=False)
-    pending_rows = scan.get("pending_rows") or []
-    if pending_rows:
-        _octopus_state.setdefault("pending", {})[current_bucket] = pending_rows
-    _octopus_state["current_map"] = scan.get("current_map") or {}
-    _octopus_state["pairs_ready"] = int(scan.get("ready",0) or 0)
-    _octopus_state["pairs_scanned"] = int(scan.get("scanned",0) or 0)
-    _octopus_state["last_predictions"] = int(scan.get("prediction_count",0) or 0)
-    _octopus_state["last_scan_bucket"] = current_bucket
-    _octopus_state["last_scan_at"] = now_iso()
+    # No PRE-ARM means there is deliberately no executable trade this candle. Do not invent
+    # a new entry after the boundary; do one diagnostic scan and close the bucket.
+    if current_prearm is None:
+        pair_map = get_otc_analysis_pair_map()
+        _octopus_settle_pending(current_bucket, pair_map)
+        scan = _octopus_scan_market_for_target(current_bucket, provisional=False)
+        pending_rows = scan.get("pending_rows") or []
+        if pending_rows:
+            _octopus_state.setdefault("pending", {})[current_bucket] = pending_rows
+        _octopus_state["current_map"] = scan.get("current_map") or {}
+        _octopus_state["pairs_ready"] = int(scan.get("ready",0) or 0)
+        _octopus_state["pairs_scanned"] = int(scan.get("scanned",0) or 0)
+        _octopus_state["last_predictions"] = int(scan.get("prediction_count",0) or 0)
+        _octopus_state["last_scan_bucket"] = current_bucket
+        _octopus_state["last_scan_at"] = now_iso()
+        _octopus_state["selector_last_bucket"] = current_bucket
+        _octopus_state["selector_decisions"] = int(_octopus_state.get("selector_decisions",0) or 0) + 1
+        _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
+        _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: no committed PRE-ARM for this candle"
+        _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
+        _octopus_flush_snapshot(force=False)
+        await _octopus_maybe_digest(context)
+        return
+
+    _octopus_state["sr_open_execution_attempts"] = int(_octopus_state.get("sr_open_execution_attempts",0) or 0) + 1
+    candidate = dict(current_prearm)
+    _octopus_state["selector_last_decision"] = dict(candidate)
+
+    # PRE-ARM itself already passed the payout gate, but verify the instrument did not change
+    # economically between second 59 and the new candle open.
+    try:
+        instrument = quotex_otc_feed.instrument(str(candidate.get("symbol") or "")) if "quotex_otc_feed" in globals() else {}
+        live_payout = int(float((instrument or {}).get("payout", 0) or 0))
+    except Exception:
+        live_payout = int(candidate.get("payout", 0) or 0)
+    if live_payout < OCTOPUS_SELECTOR_MIN_PAYOUT:
+        _octopus_state["sr_open_blocked_payout"] = int(_octopus_state.get("sr_open_blocked_payout",0) or 0) + 1
+        _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
+        _octopus_state["selector_prearm_cancelled"] = int(_octopus_state.get("selector_prearm_cancelled",0) or 0) + 1
+        _octopus_state["selector_last_no_trade_reason"] = f"NO TRADE: payout dropped to {live_payout}% after PRE-ARM"
+        _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
+        _octopus_state["selector_prearmed_candidate"] = None
+        _octopus_state["selector_prearm_target_bucket"] = 0
+        _octopus_state["selector_last_bucket"] = current_bucket
+        _octopus_state["selector_decisions"] = int(_octopus_state.get("selector_decisions",0) or 0) + 1
+        _octopus_flush_snapshot(force=False)
+        return
+    candidate["payout"] = live_payout
+
+    # Connectivity/open snapshot are technical readiness checks, not a trading FINAL.
+    if _copy_online_clients_for_user(ADMIN_TELEGRAM_ID) <= 0:
+        if sec < max(0.5, OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND - 0.5):
+            _octopus_state["sr_open_wait_snapshot"] = int(_octopus_state.get("sr_open_wait_snapshot",0) or 0) + 1
+            _octopus_state["selector_last_no_trade_reason"] = "OPEN WAIT: owner extension temporarily offline"
+            _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
+            return
+        _octopus_state["sr_open_blocked_offline"] = int(_octopus_state.get("sr_open_blocked_offline",0) or 0) + 1
+        _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
+        _octopus_state["selector_prearm_cancelled"] = int(_octopus_state.get("selector_prearm_cancelled",0) or 0) + 1
+        _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: owner extension offline during open execution window"
+        _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
+        _octopus_state["selector_prearmed_candidate"] = None
+        _octopus_state["selector_prearm_target_bucket"] = 0
+        _octopus_state["selector_last_bucket"] = current_bucket
+        _octopus_state["selector_decisions"] = int(_octopus_state.get("selector_decisions",0) or 0) + 1
+        _octopus_flush_snapshot(force=False)
+        return
+
+    open_price, live_price, displacement = _octopus_current_open_snapshot(str(candidate.get("symbol") or ""), current_bucket, candidate)
+    if open_price is None or live_price is None or displacement is None:
+        if sec < max(0.5, OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND - 0.5):
+            _octopus_state["sr_open_wait_snapshot"] = int(_octopus_state.get("sr_open_wait_snapshot",0) or 0) + 1
+            _octopus_state["selector_last_no_trade_reason"] = "OPEN WAIT: current M1 open/live price not ready"
+            _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
+            return
+        _octopus_state["sr_open_blocked_open_snapshot"] = int(_octopus_state.get("sr_open_blocked_open_snapshot",0) or 0) + 1
+        _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
+        _octopus_state["selector_prearm_cancelled"] = int(_octopus_state.get("selector_prearm_cancelled",0) or 0) + 1
+        _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: current M1 open/live snapshot unavailable"
+        _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
+        _octopus_state["selector_prearmed_candidate"] = None
+        _octopus_state["selector_prearm_target_bucket"] = 0
+        _octopus_state["selector_last_bucket"] = current_bucket
+        _octopus_state["selector_decisions"] = int(_octopus_state.get("selector_decisions",0) or 0) + 1
+        _octopus_flush_snapshot(force=False)
+        return
+
+    if float(displacement) > OCTOPUS_SELECTOR_MAX_OPEN_DISPLACEMENT_ATR:
+        _octopus_state["sr_open_blocked_displacement"] = int(_octopus_state.get("sr_open_blocked_displacement",0) or 0) + 1
+        _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
+        _octopus_state["selector_prearm_cancelled"] = int(_octopus_state.get("selector_prearm_cancelled",0) or 0) + 1
+        _octopus_state["selector_last_no_trade_reason"] = f"NO TRADE: price moved {float(displacement):.3f} ATR from candle Open"
+        _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
+        _octopus_state["selector_prearmed_candidate"] = None
+        _octopus_state["selector_prearm_target_bucket"] = 0
+        _octopus_state["selector_last_bucket"] = current_bucket
+        _octopus_state["selector_decisions"] = int(_octopus_state.get("selector_decisions",0) or 0) + 1
+        _octopus_flush_snapshot(force=False)
+        return
+
+    # COMMIT: execute exactly what PRE-ARM selected. No closed-candle S/R revalidation.
     _octopus_state["selector_last_bucket"] = current_bucket
     _octopus_state["selector_decisions"] = int(_octopus_state.get("selector_decisions",0) or 0) + 1
-    ranked = scan.get("ranked") or []
+    _octopus_state["sr_open_committed"] = int(_octopus_state.get("sr_open_committed",0) or 0) + 1
+    candidate.update({
+        "created_at": now_iso(), "entry_bucket": current_bucket, "entry_price": float(live_price),
+        "trendline_candle_open": float(open_price), "trendline_entry_displacement_atr": round(float(displacement),6),
+        "prearmed_at": current_prearm.get("prearmed_at"), "setup": "OCTOPUS_SR_RETEST",
+        "score": int(round(float(candidate.get("selector_score",0)))), "reverse_mode": False,
+        "original_direction": candidate.get("direction"),
+        "execution_commit_mode": "PREARM_DIRECT_OPEN_V1_35",
+    })
+    copy_result = await publish_copy_octopus_signal(candidate)
+    _octopus_state["selector_prearmed_candidate"] = None
+    _octopus_state["selector_prearm_target_bucket"] = 0
+    _structure_edge_state["last_copy_result"] = copy_result
+    if not isinstance(copy_result, dict) or not copy_result.get("ok"):
+        _octopus_state["selector_publish_failed"] = int(_octopus_state.get("selector_publish_failed",0) or 0) + 1
+        _octopus_state["selector_last_no_trade_reason"] = f"Copy publish failed: {copy_result}"
+        _structure_edge_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
+        _octopus_flush_snapshot(force=False)
+        return
 
-    if not allow_execution:
-        if current_prearm is not None:
-            _octopus_state["sr_final_timing_missed"] = int(_octopus_state.get("sr_final_timing_missed",0) or 0) + 1
-            _octopus_state["sr_final_prearmed_pair_not_confirmed"] = int(_octopus_state.get("sr_final_prearmed_pair_not_confirmed",0) or 0) + 1
-            _octopus_state["selector_prearm_cancelled"] = int(_octopus_state.get("selector_prearm_cancelled",0) or 0) + 1
-            _octopus_state["selector_prearmed_candidate"] = None
-            _octopus_state["selector_prearm_target_bucket"] = 0
-        _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
-        _octopus_state["selector_last_no_trade_reason"] = f"SHADOW fallback after execution window: {sec:.2f}s"
-    else:
-        _octopus_state["sr_final_scans"] = int(_octopus_state.get("sr_final_scans",0) or 0) + 1
-        if not ranked:
-            _octopus_state["sr_final_no_thesis"] = int(_octopus_state.get("sr_final_no_thesis",0) or 0) + 1
-            _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
-            _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: no closed-candle S/R rejection/retest confirmed anywhere"
-        else:
-            _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
-            _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: valid final S/R existed but no pair was PRE-ARMED for this candle"
-    _octopus_state["last_reject_reason"] = _octopus_state.get("selector_last_no_trade_reason")
+    normalized_signal = copy_result.get("signal") if isinstance(copy_result.get("signal"), dict) else {}
+    candidate["copy_signal_id"] = normalized_signal.get("id") or f"octopus_{safe_key(candidate.get('pair'))}_{current_bucket}_{candidate.get('direction')}"
+    _structure_edge_state["pending_trade"] = dict(candidate)
+    _octopus_execution_lock_set(candidate.get("copy_signal_id"), candidate.get("pair"), current_bucket + 60, reason="prearm_committed_signal_published")
+    _structure_edge_state["copy_signals_sent"] = int(_structure_edge_state.get("copy_signals_sent",0) or 0) + 1
+    _octopus_state["selector_publish_ok"] = int(_octopus_state.get("selector_publish_ok",0) or 0) + 1
+    _octopus_state["selector_last_no_trade_reason"] = None
+    _octopus_state["last_reject_reason"] = (
+        f"EXECUTE PRE-ARM COMMIT: {candidate.get('pair')} {candidate.get('direction')} "
+        f"{candidate.get('market_setup')} Q{candidate.get('market_quality')} | no FINAL revalidation"
+    )
+    await safe_send_message(context.bot, chat_id=_structure_edge_target_chat_id(), text=_octopus_selector_decision_text(candidate))
     _octopus_flush_snapshot(force=False)
     await _octopus_maybe_digest(context)
+
 
 def build_octopus_pair_map() -> str:
     _octopus_selector_extend_state()
@@ -16818,27 +16749,25 @@ def build_structure_edge_status() -> str:
         f"Shadow settled: {int(_octopus_state.get('total_observations',0) or 0)} | pending: {pending_obs}\n"
         f"Pairs ready/scanned: {int(_octopus_state.get('pairs_ready',0) or 0)} / {int(_octopus_state.get('pairs_scanned',0) or 0)}\n"
         f"Market zones/raw/quality/valid/blocked: {int(_octopus_state.get('market_zones_last',0) or 0)} / {int(_octopus_state.get('market_raw_theses',0) or 0)} / {int(_octopus_state.get('market_quality_theses',0) or 0)} / {int(_octopus_state.get('market_theses',0) or 0)} / {int(_octopus_state.get('market_obstacle_blocked',0) or 0)}\n"
-        f"S/R PRE-ARM watch candidates/zones last: {int(_octopus_state.get('sr_prearm_watch_candidates_last',0) or 0)} / {int(_octopus_state.get('sr_prearm_watch_zones_last',0) or 0)}\n"
-        f"PRE-ARM watch found total: {int(_octopus_state.get('sr_prearm_watch_found_total',0) or 0)} | Final confirmed/not-confirmed: {int(_octopus_state.get('sr_final_prearmed_pair_confirmed',0) or 0)} / {int(_octopus_state.get('sr_final_prearmed_pair_not_confirmed',0) or 0)}\n"
-        f"PRE-ARM aligned/forming last: {int(_octopus_state.get('sr_prearm_aligned_candidates_last',0) or 0)} / {int(_octopus_state.get('sr_prearm_forming_candidates_last',0) or 0)} | selected: {_octopus_state.get('sr_prearm_selected_mode') or '-'} | locked re-sends blocked: {int(_octopus_state.get('sr_prearm_locked_skips',0) or 0)}\n"
-        f"Final scans/no-thesis/other-pair: {int(_octopus_state.get('sr_final_scans',0) or 0)} / {int(_octopus_state.get('sr_final_no_thesis',0) or 0)} / {int(_octopus_state.get('sr_final_other_pair_valid',0) or 0)}\n"
-        f"Frozen-zone final confirmed/rejected/wait-retries: {int(_octopus_state.get('sr_final_frozen_confirmed',0) or 0)} / {int(_octopus_state.get('sr_final_frozen_rejected',0) or 0)} / {int(_octopus_state.get('sr_final_waiting_candle',0) or 0)}\n"
-        f"Final blocks timing/offline/open/displacement: {int(_octopus_state.get('sr_final_timing_missed',0) or 0)} / {int(_octopus_state.get('sr_final_blocked_offline',0) or 0)} / {int(_octopus_state.get('sr_final_blocked_open_snapshot',0) or 0)} / {int(_octopus_state.get('sr_final_blocked_displacement',0) or 0)}\n"
-        f"Selector decisions: {int(_octopus_state.get('selector_decisions',0) or 0)} | NO TRADE: {int(_octopus_state.get('selector_no_trade',0) or 0)}\n"
+        f"PRE-ARM candidates/zones last: {int(_octopus_state.get('sr_prearm_watch_candidates_last',0) or 0)} / {int(_octopus_state.get('sr_prearm_watch_zones_last',0) or 0)} | found total: {int(_octopus_state.get('sr_prearm_watch_found_total',0) or 0)}\n"
+        f"PRE-ARM mature/forming last: {int(_octopus_state.get('sr_prearm_aligned_candidates_last',0) or 0)} / {int(_octopus_state.get('sr_prearm_forming_candidates_last',0) or 0)} | selected: {_octopus_state.get('sr_prearm_selected_mode') or '-'} | locked re-sends blocked: {int(_octopus_state.get('sr_prearm_locked_skips',0) or 0)}\n"
         f"PRE-ARM sent/cancelled: {int(_octopus_state.get('selector_prearm_sent',0) or 0)} / {int(_octopus_state.get('selector_prearm_cancelled',0) or 0)}\n"
-        f"Published OK/failed: {int(_octopus_state.get('selector_publish_ok',0) or 0)} / {int(_octopus_state.get('selector_publish_failed',0) or 0)}\n"
+        f"OPEN execution attempts/committed/published: {int(_octopus_state.get('sr_open_execution_attempts',0) or 0)} / {int(_octopus_state.get('sr_open_committed',0) or 0)} / {int(_octopus_state.get('selector_publish_ok',0) or 0)}\n"
+        f"OPEN wait retries: {int(_octopus_state.get('sr_open_wait_snapshot',0) or 0)} | blocks timing/offline/payout/open/displacement: {int(_octopus_state.get('sr_open_timing_missed',0) or 0)} / {int(_octopus_state.get('sr_open_blocked_offline',0) or 0)} / {int(_octopus_state.get('sr_open_blocked_payout',0) or 0)} / {int(_octopus_state.get('sr_open_blocked_open_snapshot',0) or 0)} / {int(_octopus_state.get('sr_open_blocked_displacement',0) or 0)}\n"
+        f"Selector decisions: {int(_octopus_state.get('selector_decisions',0) or 0)} | NO TRADE: {int(_octopus_state.get('selector_no_trade',0) or 0)} | Published failed: {int(_octopus_state.get('selector_publish_failed',0) or 0)}\n"
         f"Prearmed الآن: {(pre.get('pair') + ' ' + pre.get('direction') + ' ' + str(pre.get('market_setup') or '-') + ' Q' + str(pre.get('market_quality') or '-')) if pre else '-'}\n"
-        f"Payout gate: ≥{OCTOPUS_SELECTOR_MIN_PAYOUT}% | Thesis quality gate: ≥{OCTOPUS_MI_MIN_THESIS_QUALITY:g}\n"
-        f"Obstacle gate: فقط S/R مقابلة قوية وملاصقة ضمن <{OCTOPUS_MI_MIN_SPACE_ATR:.2f} ATR | غير هيك عامل ترتيب فقط\n"
-        f"Open displacement max: {OCTOPUS_SELECTOR_MAX_OPEN_DISPLACEMENT_ATR:.3f} ATR\n"
+        f"Payout gate: ≥{OCTOPUS_SELECTOR_MIN_PAYOUT}% | PRE-ARM execution quality gate: ≥{max(OCTOPUS_MI_MIN_THESIS_QUALITY, OCTOPUS_SR_PREARM_MIN_PROJECTED_QUALITY):g}\n"
+        f"Obstacle gate: فقط S/R مقابلة قوية وملاصقة ضمن <{OCTOPUS_MI_MIN_SPACE_ATR:.2f} ATR\n"
+        f"Open displacement max: {OCTOPUS_SELECTOR_MAX_OPEN_DISPLACEMENT_ATR:.3f} ATR | open execution window: ≤{OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND:.1f}s\n"
         f"Execution Lock: {'ON 🔒' if _octopus_execution_lock_active() else 'OFF'} | {_octopus_state.get('execution_lock_pair') or '-'}\n"
         f"Execution scans paused while open: {int(_octopus_state.get('execution_lock_shadow_minutes',0) or 0)} minute(s) | PRE-ARM skips: {int(_octopus_state.get('execution_lock_skipped_prearms',0) or 0)}\n"
         f"Firebase settings reads: {int(_structure_edge_state.get('settings_reads',0) or 0)} (RAM cache {STRUCTURE_EDGE_SETTINGS_CACHE_SECONDS}s)\n"
         f"آخر سبب: {_octopus_state.get('last_reject_reason') or _octopus_state.get('selector_last_no_trade_reason') or '-'}\n"
         f"آخر خطأ: {_octopus_state.get('last_error') or _structure_edge_state.get('last_error') or '-'}\n\n"
-        "🧠 القرار: PRE-ARM يثبت الزوج ومنطقة S/R نفسها. بعد الإغلاق تُفحص الشمعة المغلقة على نفس المنطقة المجمدة؛ إعادة رسم خريطة S/R لا تلغي فرصة كانت صحيحة قبل الإغلاق.\n"
-        "🎛 الحساب والمبلغ وإدارة الصفقة تُقرأ من إعدادات الإضافة؛ الباك اند لا يفرض DEMO ولا مبلغًا ثابتًا."
+        "🧠 القرار: لا يوجد FINAL تداول. PRE-ARM هو قرار الصفقة؛ إذا اجتاز S/R + الجودة + obstacle قبل الإغلاق، يُنفّذ نفس الزوج/الاتجاه عند Open الشمعة التالية مباشرة.\n"
+        "🛡️ بعد PRE-ARM تبقى فقط حراس التنفيذ: payout الحالي، اتصال الإضافة، توفر Open/live price، displacement، وExecution Lock."
     )[:3900]
+
 
 
 def _structure_edge_reset_results() -> tuple[bool, str]:
@@ -16849,7 +16778,7 @@ def _structure_edge_reset_results() -> tuple[bool, str]:
         _octopus_state.clear()
         _octopus_state.update(_octopus_empty_state())
         _octopus_state["loaded"] = False
-        _octopus_restore_snapshot_once()  # reload preserved Shadow priors into fresh v7 runtime
+        _octopus_restore_snapshot_once()  # reload preserved Shadow priors into fresh v8 runtime
         _structure_edge_state["pending_trade"] = None
         _octopus_execution_lock_clear(reason="owner_reset_results")
         return True, "✅ تم تصفير نتائج/عدادات S/R + Retest فقط. Shadow learning بقي محفوظًا."
@@ -17055,13 +16984,11 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
 
 
 async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
-    """Octopus v1.31 S/R pair-watch PRE-ARM + closed-candle final state machine.
+    """v1.35 PRE-ARM COMMIT state machine.
 
-    56.5–59.2s: provisional multi-model scan -> PRE-ARM one best pair only.
-    0–1.6s: settle prior Shadow results, re-run all models with the now-closed candle,
-    record the next Shadow benchmark, and execute only if the final best pair/direction
-    still matches PRE-ARM and remains above payout-aware conservative gates.
-    Later fallback window: keep Shadow learning alive but never chase a late execution.
+    56.5–59.2s: choose and prepare one execution-grade S/R opportunity.
+    0–2.5s next minute: execute that exact prepared trade directly. There is no S/R FINAL
+    revalidation. After the open window, only Shadow/map diagnostics may run.
     """
     try:
         if not _structure_edge_is_enabled():
@@ -17071,29 +16998,30 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
         current_bucket = int(now_ts // 60) * 60
         sec = float(now_ts - current_bucket)
 
-        # Clear stale PRE-ARM state from older minutes.
+        # A PRE-ARM is valid for exactly its target candle. If the open window was missed,
+        # never execute it one minute late.
         pre_target = int(_octopus_state.get("selector_prearm_target_bucket", 0) or 0)
         if pre_target and current_bucket > pre_target:
             _octopus_state["selector_prearmed_candidate"] = None
             _octopus_state["selector_prearm_target_bucket"] = 0
             _octopus_state["selector_prearm_cancelled"] = int(_octopus_state.get("selector_prearm_cancelled", 0) or 0) + 1
+            _octopus_state["sr_open_timing_missed"] = int(_octopus_state.get("sr_open_timing_missed", 0) or 0) + 1
 
         if OCTOPUS_SELECTOR_PREARM_MIN_SECOND <= sec <= OCTOPUS_SELECTOR_PREARM_LAST_SECOND:
             await _octopus_adaptive_prearm(context, now_ts, current_bucket, sec)
             return
 
-        if sec <= OCTOPUS_SELECTOR_FINAL_MAX_SECOND:
-            await _octopus_adaptive_final(context, now_ts, current_bucket, sec, allow_execution=True)
+        if sec <= OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND:
+            await _octopus_execute_prearmed_open(context, now_ts, current_bucket, sec, allow_execution=True)
             return
 
-        # If feed/job timing missed the strict open window, do one shadow-only scan so
-        # learning never stops; execution is intentionally not chased late.
         if sec <= OCTOPUS_SELECTOR_SHADOW_FALLBACK_MAX_SECOND:
-            await _octopus_adaptive_final(context, now_ts, current_bucket, sec, allow_execution=False)
+            await _octopus_execute_prearmed_open(context, now_ts, current_bucket, sec, allow_execution=False)
             return
     except Exception as exc:
         _octopus_state["last_error"] = str(exc)
-        logger.exception("Octopus S/R + Retest job failed: %s", exc)
+        logger.exception("Octopus S/R + Retest PRE-ARM direct execution job failed: %s", exc)
+
 
 # v1.02: Three Candle timing/filter tuning only; Public remains a mirror of accepted private signals.
 # Set this to a public @username or numeric -100... Telegram channel ID.
