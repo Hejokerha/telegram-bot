@@ -1030,7 +1030,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.31.0"
+COPY_SERVER_VERSION = "1.32.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -15580,52 +15580,123 @@ def _mi_space_to_obstacle(direction: str, price: float, zones: list[dict], curre
 
 
 def _mi_zone_event(parts: list[dict], zone: dict, atr: float) -> dict | None:
-    """v1.30: restore the proven v1.26 S/R rejection + role-flip definitions.
+    """v1.32 practical S/R confirmation.
 
-    Important: the zone itself creates direction. No trend/momentum model can create or
-    flip the execution direction. We intentionally do NOT require the stricter v1.27+
-    midpoint-close rejection rule because that changed the setup that produced the v1.26
-    live sample.
+    Execution is still limited to the same three classical S/R theses. The change is
+    intentionally narrow: a closed candle can confirm a real zone through direction,
+    wick rejection, close-location inside the candle, or clear one-candle follow-through.
+    This avoids requiring textbook-perfect wick ratios while keeping the zone, close side,
+    quality gate, obstacle gate and payout gate authoritative.
     """
     if len(parts) < 5 or atr <= 0:
         return None
-    last = parts[-1]; prev = parts[-2]
+
+    last = parts[-1]
+    prev = parts[-2]
     low, high, center = float(zone["low"]), float(zone["high"]), float(zone["center"])
     zq = float(zone.get("quality", 50) or 50)
-    touch_now = float(last["high"]) >= low and float(last["low"]) <= high
+
+    lo = float(last["low"]); hi = float(last["high"])
+    op = float(last["open"]); cl = float(last["close"])
+    rng = max(hi - lo, 1e-12)
+    close_pos = max(0.0, min(1.0, (cl - lo) / rng))  # 0=closed at low, 1=closed at high
+
+    touch_now = hi >= low and lo <= high
     touch_prev = float(prev["high"]) >= low and float(prev["low"]) <= high
-    upper_rej = float(last.get("upper_wick",0) or 0)
-    lower_rej = float(last.get("lower_wick",0) or 0)
-    body = float(last.get("body_ratio",0) or 0)
-    last_dir = int(last.get("dir",0) or 0)
+    touched = touch_now or touch_prev
+
+    upper_rej = float(last.get("upper_wick", 0) or 0)
+    lower_rej = float(last.get("lower_wick", 0) or 0)
+    body = float(last.get("body_ratio", 0) or 0)
+    last_dir = int(last.get("dir", 0) or 0)
+    prev_close = float(prev.get("close", cl) or cl)
+
+    # Small follow-through away from the tested zone is legitimate confirmation even when
+    # the final candle has no dramatic wick. 0.10 ATR is deliberately modest but non-zero.
+    moved_down = (prev_close - cl) >= atr * 0.10
+    moved_up = (cl - prev_close) >= atr * 0.10
+
+    # Practical response evidence. We no longer require 40% / 28% textbook wicks when
+    # the closed candle itself finishes decisively away from the tested side.
+    resist_response = bool(
+        last_dir < 0
+        or upper_rej >= 0.24
+        or close_pos <= 0.42
+        or (touch_prev and moved_down and cl <= center)
+    )
+    support_response = bool(
+        last_dir > 0
+        or lower_rej >= 0.24
+        or close_pos >= 0.58
+        or (touch_prev and moved_up and cl >= center)
+    )
+
     events = []
 
-    # 1) Role flip / retest — identical entry semantics to v1.26.
-    bdir = zone.get("break_dir"); bage = zone.get("break_age")
-    if bage is not None and 1 <= int(bage) <= OCTOPUS_MI_RETEST_LOOKBACK:
-        if bdir == "PUT" and (touch_now or touch_prev) and float(last["close"]) < center and (last_dir < 0 or upper_rej >= 0.28):
-            q = zq + 9 + min(7, upper_rej*12) + (4 if last_dir < 0 else 0)
-            events.append({"direction":"PUT","setup":"MI_ROLE_FLIP_RETEST","quality":q,"reason":"broken support retested from below as resistance"})
-        if bdir == "CALL" and (touch_now or touch_prev) and float(last["close"]) > center and (last_dir > 0 or lower_rej >= 0.28):
-            q = zq + 9 + min(7, lower_rej*12) + (4 if last_dir > 0 else 0)
-            events.append({"direction":"CALL","setup":"MI_ROLE_FLIP_RETEST","quality":q,"reason":"broken resistance retested from above as support"})
+    # 1) Role flip / retest. Break state and close on the correct side remain mandatory.
+    bdir = str(zone.get("break_dir") or "").upper()
+    bage = zone.get("break_age")
+    if bage is not None and 1 <= int(bage) <= OCTOPUS_MI_RETEST_LOOKBACK and touched:
+        if bdir == "PUT" and cl < center and resist_response:
+            q = zq + 10.0
+            q += min(7.0, upper_rej * 14.0)
+            q += 4.0 if last_dir < 0 and body >= 0.16 else (2.0 if last_dir < 0 else 0.0)
+            q += 3.0 if close_pos <= 0.35 else (1.5 if close_pos <= 0.45 else 0.0)
+            q += 2.0 if touch_prev and moved_down else 0.0
+            events.append({
+                "direction": "PUT", "setup": "MI_ROLE_FLIP_RETEST", "quality": q,
+                "reason": "broken support retested from below with practical bearish response",
+                "confirm_mode": "PRACTICAL_SR_V1_32",
+            })
+        if bdir == "CALL" and cl > center and support_response:
+            q = zq + 10.0
+            q += min(7.0, lower_rej * 14.0)
+            q += 4.0 if last_dir > 0 and body >= 0.16 else (2.0 if last_dir > 0 else 0.0)
+            q += 3.0 if close_pos >= 0.65 else (1.5 if close_pos >= 0.55 else 0.0)
+            q += 2.0 if touch_prev and moved_up else 0.0
+            events.append({
+                "direction": "CALL", "setup": "MI_ROLE_FLIP_RETEST", "quality": q,
+                "reason": "broken resistance retested from above with practical bullish response",
+                "confirm_mode": "PRACTICAL_SR_V1_32",
+            })
 
-    # 2) Intact-zone rejection — restore v1.26 boundary-close semantics.
-    # Resistance: touch the zone and close back at/below its upper boundary.
-    if zone.get("role") == "RESISTANCE" and (touch_now or touch_prev) and float(last["close"]) <= high and (last_dir < 0 or upper_rej >= 0.40):
-        q = zq + min(9, upper_rej*15) + (5 if last_dir < 0 and body >= 0.22 else 0)
-        events.append({"direction":"PUT","setup":"MI_RESISTANCE_REJECTION","quality":q,"reason":"price tested resistance zone and rejected lower"})
-    # Support: touch the zone and close back at/above its lower boundary.
-    if zone.get("role") == "SUPPORT" and (touch_now or touch_prev) and float(last["close"]) >= low and (last_dir > 0 or lower_rej >= 0.40):
-        q = zq + min(9, lower_rej*15) + (5 if last_dir > 0 and body >= 0.22 else 0)
-        events.append({"direction":"CALL","setup":"MI_SUPPORT_REJECTION","quality":q,"reason":"price tested support zone and rejected higher"})
+    # 2) Intact-zone rejection. The candle must still touch the real zone and close back
+    # at/inside the correct boundary; practical price response replaces the old rigid wick test.
+    if str(zone.get("role") or "").upper() == "RESISTANCE" and touched and cl <= high and resist_response:
+        q = zq + 6.0  # a real closed-candle rejection deserves a base confirmation bonus
+        q += min(8.0, upper_rej * 14.0)
+        q += 4.0 if last_dir < 0 and body >= 0.16 else (2.0 if last_dir < 0 else 0.0)
+        q += 3.0 if close_pos <= 0.35 else (1.5 if close_pos <= 0.45 else 0.0)
+        q += 2.0 if touch_prev and moved_down else 0.0
+        q += 1.5 if cl < center else 0.0
+        events.append({
+            "direction": "PUT", "setup": "MI_RESISTANCE_REJECTION", "quality": q,
+            "reason": "price tested resistance and closed with practical bearish rejection",
+            "confirm_mode": "PRACTICAL_SR_V1_32",
+        })
+
+    if str(zone.get("role") or "").upper() == "SUPPORT" and touched and cl >= low and support_response:
+        q = zq + 6.0
+        q += min(8.0, lower_rej * 14.0)
+        q += 4.0 if last_dir > 0 and body >= 0.16 else (2.0 if last_dir > 0 else 0.0)
+        q += 3.0 if close_pos >= 0.65 else (1.5 if close_pos >= 0.55 else 0.0)
+        q += 2.0 if touch_prev and moved_up else 0.0
+        q += 1.5 if cl > center else 0.0
+        events.append({
+            "direction": "CALL", "setup": "MI_SUPPORT_REJECTION", "quality": q,
+            "reason": "price tested support and closed with practical bullish rejection",
+            "confirm_mode": "PRACTICAL_SR_V1_32",
+        })
 
     events = [e for e in events if str(e.get("setup")) in OCTOPUS_EXECUTION_SETUPS]
     if not events:
         return None
-    best = max(events, key=lambda e: float(e.get("quality",0)))
+    best = max(events, key=lambda e: float(e.get("quality", 0)))
     best = dict(best)
     best["zone"] = zone
+    best["close_position"] = round(close_pos, 3)
+    best["touch_now"] = bool(touch_now)
+    best["touch_prev"] = bool(touch_prev)
     return best
 
 def _mi_proxy_models(setup: str) -> list[str]:
@@ -16468,7 +16539,7 @@ def build_structure_edge_status() -> str:
         f"Firebase settings reads: {int(_structure_edge_state.get('settings_reads',0) or 0)} (RAM cache {STRUCTURE_EDGE_SETTINGS_CACHE_SECONDS}s)\n"
         f"آخر سبب: {_octopus_state.get('last_reject_reason') or _octopus_state.get('selector_last_no_trade_reason') or '-'}\n"
         f"آخر خطأ: {_octopus_state.get('last_error') or _structure_edge_state.get('last_error') or '-'}\n\n"
-        "🧠 القرار: PRE-ARM يجهّز الزوج فقط قرب S/R؛ بعد الإغلاق فقط دعم/مقاومة Rejection أو Role-Flip Retest يحدد الاتجاه والتنفيذ.\n"
+        "🧠 القرار: PRE-ARM يجهّز الزوج فقط قرب S/R؛ بعد الإغلاق Practical S/R confirmation يقبل Rejection/Role-Flip واضح بالاتجاه أو wick أو close-location/follow-through.\n"
         "🎛 الحساب والمبلغ وإدارة الصفقة تُقرأ من إعدادات الإضافة؛ الباك اند لا يفرض DEMO ولا مبلغًا ثابتًا."
     )[:3900]
 
