@@ -438,7 +438,7 @@ if not firebase_admin._apps:
 main_keyboard = ReplyKeyboardMarkup(
     [
         ["📊 توليد إشارات"],
-        ["🧠 غرفة جلسة تداول", "⚡ OTC Edge"],
+        ["🐙 Octopus", "⚡ OTC Edge"],
         ["👤 حالة حسابي", "🎥 مشاهدة فيديو شرح البوت"],
         ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
     ],
@@ -496,11 +496,31 @@ structure_edge_admin_keyboard = ReplyKeyboardMarkup(
     [
         ["🟢 تشغيل Octopus", "🔴 إيقاف Octopus"],
         ["📋 حالة Octopus", "📊 ملخص Octopus"],
-        ["📊 وضع السوق 5 ساعات"],
+        ["📊 وضع السوق ساعتين"],
         ["🟢 تنفيذ NORMAL", "🔄 تنفيذ REVERSE"],
         ["🧠 أفضل النماذج", "🗺 الأزواج الآن"],
         ["🧹 تصفير Octopus"],
         ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+# v1.37: public/team Octopus UI is intentionally minimal.
+# NORMAL/REVERSE selection and research diagnostics remain owner-only.
+octopus_user_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🟢 تشغيل Octopus", "🔴 إيقاف Octopus"],
+        ["📋 حالة Octopus", "💡 نصائح البدء"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True
+)
+
+octopus_user_keyboard_en = ReplyKeyboardMarkup(
+    [
+        ["🟢 Start Octopus", "🔴 Stop Octopus"],
+        ["📋 Octopus Status", "💡 Start Tips"],
+        ["🔙 Back"],
     ],
     resize_keyboard=True
 )
@@ -601,7 +621,7 @@ copy_create_duplicate_keyboard = ReplyKeyboardMarkup(
 otc_list_manager_keyboard = ReplyKeyboardMarkup(
     [
         ["📊 توليد إشارات"],
-        ["🧠 غرفة جلسة تداول", "⚡ OTC Edge"],
+        ["🐙 Octopus", "⚡ OTC Edge"],
         ["👤 حالة حسابي", "🎥 مشاهدة فيديو شرح البوت"],
         ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
@@ -768,7 +788,7 @@ language_keyboard = ReplyKeyboardMarkup(
 main_keyboard_en = ReplyKeyboardMarkup(
     [
         ["📊 Generate Signals"],
-        ["🧠 Trading Session Room", "⚡ OTC Edge"],
+        ["🐙 Octopus", "⚡ OTC Edge"],
         ["👤 My Account", "🎥 Watch Bot Tutorial"],
         ["📞 Contact Support", "🌐 Change Language"],
     ],
@@ -1032,7 +1052,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.36.0"
+COPY_SERVER_VERSION = "1.37.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -12762,6 +12782,257 @@ def _structure_edge_is_enabled() -> bool:
     return bool(_structure_edge_get_settings(force_refresh=False).get("enabled"))
 
 
+# ===== v1.37 Team Octopus user sessions =====
+# Owner research controls stay global; normal users only control whether the same
+# owner-selected Octopus mode is delivered to their own authenticated extension.
+OCTOPUS_USER_SESSIONS_PATH = "octopus_user_sessions_v1"
+_octopus_user_sessions_cache: dict[int, dict] = {}
+_octopus_user_sessions_loaded = False
+_octopus_channel_result_keys: dict[str, float] = {}
+
+
+def _octopus_user_sessions_ref():
+    return system_ref().child(OCTOPUS_USER_SESSIONS_PATH)
+
+
+def _octopus_user_load_sessions_once(force: bool = False) -> None:
+    global _octopus_user_sessions_loaded
+    if _octopus_user_sessions_loaded and not force:
+        return
+    try:
+        raw = _octopus_user_sessions_ref().get() or {}
+        _octopus_user_sessions_cache.clear()
+        if isinstance(raw, dict):
+            for key, value in raw.items():
+                if not isinstance(value, dict):
+                    continue
+                try:
+                    uid = int(value.get("user_id") or key)
+                except Exception:
+                    continue
+                value = dict(value)
+                value["user_id"] = uid
+                _octopus_user_sessions_cache[uid] = value
+        _octopus_user_sessions_loaded = True
+    except Exception as exc:
+        logger.warning("Could not load Octopus user sessions: %s", exc)
+        _octopus_user_sessions_loaded = True
+
+
+def _octopus_user_state(user_id: int, create: bool = True) -> dict | None:
+    _octopus_user_load_sessions_once()
+    uid = int(user_id)
+    state = _octopus_user_sessions_cache.get(uid)
+    if state is None and create:
+        state = {
+            "user_id": uid, "enabled": False, "started_at": None, "stopped_at": None,
+            "session_trades": 0, "session_wins": 0, "session_losses": 0, "session_draws": 0,
+            "session_net_delta": 0.0, "target_status": "IDLE", "target_updated_at": None,
+            "last_result_at": None, "last_pair": None, "last_outcome": None,
+            "pending_trade": None, "prepared_signal": None,
+        }
+        _octopus_user_sessions_cache[uid] = state
+    return state
+
+
+def _octopus_user_persist(user_id: int, state: dict | None = None) -> bool:
+    try:
+        uid = int(user_id)
+        state = state if isinstance(state, dict) else _octopus_user_state(uid, create=True)
+        if not isinstance(state, dict):
+            return False
+        clean = dict(state)
+        clean["user_id"] = uid
+        clean["updated_at"] = now_iso()
+        _octopus_user_sessions_cache[uid] = clean
+        _octopus_user_sessions_ref().child(str(uid)).set(clean)
+        return True
+    except Exception as exc:
+        logger.warning("Could not persist Octopus user state | user=%s | %s", user_id, exc)
+        return False
+
+
+def _octopus_public_enabled_user_ids() -> list[int]:
+    _octopus_user_load_sessions_once()
+    rows = []
+    for uid, state in list(_octopus_user_sessions_cache.items()):
+        if uid == int(ADMIN_TELEGRAM_ID) or not bool((state or {}).get("enabled")):
+            continue
+        if not is_approved(uid):
+            state["enabled"] = False
+            state["stopped_at"] = now_iso()
+            state["stop_reason"] = "bot_access_inactive"
+            _octopus_user_persist(uid, state)
+            continue
+        rows.append(uid)
+    return sorted(set(rows))
+
+
+def _octopus_live_enabled_user_ids() -> list[int]:
+    ids = _octopus_public_enabled_user_ids()
+    if _structure_edge_is_enabled():
+        ids.insert(0, int(ADMIN_TELEGRAM_ID))
+    return list(dict.fromkeys(int(x) for x in ids))
+
+
+def _octopus_any_live_execution_enabled() -> bool:
+    return bool(_structure_edge_is_enabled() or _octopus_public_enabled_user_ids())
+
+
+def _octopus_user_set_enabled(user_id: int, enabled: bool) -> tuple[bool, str]:
+    uid = int(user_id)
+    if uid == int(ADMIN_TELEGRAM_ID):
+        ok = _structure_edge_set_enabled(bool(enabled))
+        return ok, ("✅ تم تشغيل Octopus." if enabled else "⛔ تم إيقاف Octopus.") if ok else "❌ تعذر تحديث Octopus."
+    if not is_approved(uid):
+        return False, "❌ اشتراكك غير فعال."
+    state = _octopus_user_state(uid, create=True)
+    if not isinstance(state, dict):
+        return False, "❌ تعذر تحميل حالة Octopus."
+    if enabled:
+        if not bool(state.get("enabled")):
+            state.update({
+                "enabled": True, "started_at": now_iso(), "stopped_at": None, "stop_reason": None,
+                "session_trades": 0, "session_wins": 0, "session_losses": 0, "session_draws": 0,
+                "session_net_delta": 0.0, "target_status": "RUNNING", "target_updated_at": now_iso(),
+                "last_result_at": None, "last_pair": None, "last_outcome": None,
+                "pending_trade": None, "prepared_signal": None,
+            })
+        state["enabled"] = True
+        state["execution_direction_mode"] = _structure_edge_execution_direction_mode()
+        ok = _octopus_user_persist(uid, state)
+        return ok, "✅ تم تشغيل Octopus.\nاترك إضافة TRADING TIME وQuotex مفتوحين أثناء الجلسة."
+    state["enabled"] = False
+    state["stopped_at"] = now_iso()
+    state["prepared_signal"] = None
+    # Keep an already-open pending trade until its confirmed result arrives.
+    ok = _octopus_user_persist(uid, state)
+    return ok, "⛔ تم إيقاف Octopus."
+
+
+def _octopus_user_result_update(user_id: int, record: dict) -> None:
+    uid = int(user_id)
+    state = _octopus_user_state(uid, create=True)
+    if not isinstance(state, dict):
+        return
+    outcome = str((record or {}).get("result") or "").lower()
+    if outcome not in {"win", "loss", "draw"}:
+        return
+    state["session_trades"] = int(state.get("session_trades", 0) or 0) + 1
+    if outcome == "win":
+        state["session_wins"] = int(state.get("session_wins", 0) or 0) + 1
+    elif outcome == "loss":
+        state["session_losses"] = int(state.get("session_losses", 0) or 0) + 1
+    else:
+        state["session_draws"] = int(state.get("session_draws", 0) or 0) + 1
+    delta = _copy_event_numeric((record or {}).get("net_delta"), None) if "_copy_event_numeric" in globals() else 0.0
+    state["session_net_delta"] = round(float(state.get("session_net_delta", 0) or 0) + float(delta or 0), 6)
+    state["last_result_at"] = now_iso()
+    state["last_pair"] = (record or {}).get("pair")
+    state["last_outcome"] = outcome
+    state["pending_trade"] = None
+    if state.get("target_status") not in {"PROFIT_REACHED", "LOSS_REACHED"}:
+        state["target_status"] = "RUNNING" if state.get("enabled") else "IDLE"
+    _octopus_user_persist(uid, state)
+
+
+def _octopus_user_note_target_event(event: dict, client: dict | None = None) -> None:
+    try:
+        kind = str((event or {}).get("kind") or "")
+        if kind not in {"target_profit_reached", "target_loss_reached"}:
+            return
+        source = str((event or {}).get("source") or "").strip()
+        if source and source != "structure_edge":
+            return
+        uid = normalize_copy_telegram_user_id((event or {}).get("telegram_user_id") or (client or {}).get("telegram_user_id") or (event or {}).get("target_user_id"))
+        if not uid:
+            return
+        state = _octopus_user_state(int(uid), create=False)
+        if not isinstance(state, dict) or not state.get("enabled"):
+            return
+        state["target_status"] = "PROFIT_REACHED" if kind == "target_profit_reached" else "LOSS_REACHED"
+        state["target_updated_at"] = now_iso()
+        state["enabled"] = False
+        state["stopped_at"] = now_iso()
+        state["stop_reason"] = kind
+        state["prepared_signal"] = None
+        _octopus_user_persist(int(uid), state)
+    except Exception:
+        logger.debug("Could not update Octopus target status", exc_info=True)
+
+
+def _octopus_target_status_text(state: dict, lang: str = "ar") -> str:
+    status = str((state or {}).get("target_status") or "IDLE")
+    if lang == "en":
+        return {"PROFIT_REACHED":"Profit target reached ✅", "LOSS_REACHED":"Loss target reached 🛑", "RUNNING":"Session running ⏳"}.get(status, "Not active")
+    return {"PROFIT_REACHED":"تم تحقيق تارجت الربح ✅", "LOSS_REACHED":"تم تحقيق تارجت الخسارة 🛑", "RUNNING":"الجلسة مستمرة ⏳"}.get(status, "غير نشط")
+
+
+def build_octopus_user_status(user_id: int, lang: str = "ar") -> str:
+    uid = int(user_id)
+    state = _octopus_user_state(uid, create=True) or {}
+    enabled = bool(state.get("enabled")) if uid != int(ADMIN_TELEGRAM_ID) else _structure_edge_is_enabled()
+    trades = int(state.get("session_trades", 0) or 0)
+    wins = int(state.get("session_wins", 0) or 0)
+    losses = int(state.get("session_losses", 0) or 0)
+    draws = int(state.get("session_draws", 0) or 0)
+    decided = wins + losses
+    wr = wins / decided * 100.0 if decided else 0.0
+    online = int(_copy_execution_transport_state_for_user(uid).get("extension", 0) or 0) if "_copy_execution_transport_state_for_user" in globals() else _copy_online_clients_for_user(uid)
+    mode = _structure_edge_execution_direction_mode()
+    if lang == "en":
+        return (
+            "📋 Octopus Status\n━━━━━━━━━━━━━━\n"
+            f"Status: {'Running ✅' if enabled else 'Stopped ⏸'}\n"
+            f"Extension: {'Online ✅' if online > 0 else 'Offline ⚠️'}\n"
+            f"Execution mode: {mode}\n"
+            f"Session trades: {trades}\n"
+            f"Results: {wins}W / {losses}L / {draws}D\n"
+            f"Win rate: {wr:.1f}%\n"
+            f"Session net: {float(state.get('session_net_delta',0) or 0):+.2f}$\n"
+            f"Target: {_octopus_target_status_text(state, 'en')}"
+        )[:3900]
+    return (
+        "📋 حالة Octopus\n━━━━━━━━━━━━━━\n"
+        f"الحالة: {'شغال ✅' if enabled else 'متوقف ⏸'}\n"
+        f"الإضافة: {'متصلة ✅' if online > 0 else 'غير متصلة ⚠️'}\n"
+        f"وضع التنفيذ الحالي: {mode}\n"
+        f"صفقات الجلسة: {trades}\n"
+        f"النتائج: ✅ {wins} | ❌ {losses} | ⚖️ {draws}\n"
+        f"نسبة الربح: {wr:.1f}%\n"
+        f"صافي الجلسة: {float(state.get('session_net_delta',0) or 0):+.2f}$\n"
+        f"حالة التارجت: {_octopus_target_status_text(state, 'ar')}"
+    )[:3900]
+
+
+def build_octopus_start_tips(lang: str = "ar") -> str:
+    if lang == "en":
+        return (
+            "💡 Octopus tips for better results\n━━━━━━━━━━━━━━\n"
+            "1) Avoid running the feature during global-market hours.\n"
+            "2) Avoid Saturdays and Sundays.\n"
+            "3) Recommended capital: at least $100.\n"
+            "4) Recommended profit target: 5%–10%.\n"
+            "5) Recommended loss target: 30%–40%.\n"
+            "6) Recommended trade amount: 2%–4% of capital.\n\n"
+            "‼️ Important before a real session\n"
+            "Run Octopus continuously on DEMO for 30 minutes first. If the test produces a positive target, continue with the same market conditions on your REAL account."
+        )[:3900]
+    return (
+        "💡 نصائح استخدام ميزة Octopus لتحصيل نتائج أفضل\n"
+        "━━━━━━━━━━━━━━\n"
+        "1️⃣ لا تشغّل الميزة أثناء أوقات السوق العالمي.\n"
+        "2️⃣ يُفضّل عدم تشغيلها يومي السبت والأحد.\n"
+        "3️⃣ يُفضّل رأس مال لا يقل عن 100$.\n"
+        "4️⃣ تارجت الربح المفضّل: من 5% إلى 10%.\n"
+        "5️⃣ تارجت الخسارة المفضّل: من 30% إلى 40%.\n"
+        "6️⃣ مبلغ الصفقة المفضّل: من 2% إلى 4% من رأس المال.\n\n"
+        "‼️ تحذير مهم قبل بدء الجلسة الحقيقية\n"
+        "اختبر الميزة أولًا على حساب تجريبي لمدة نصف ساعة بشكل متواصل. إذا حققت نتيجة/تارجت إيجابي خلال الاختبار، تابع بعدها على حسابك الحقيقي ضمن نفس ظروف السوق.\n\n"
+        "إدارة رأس المال والالتزام بالتارجت جزء أساسي من استخدام الميزة."
+    )[:3900]
+
+
 def _structure_edge_candle_bucket(candle: dict) -> int:
     try:
         return int(float(candle.get("bucket_ts", candle.get("time", 0)) or 0))
@@ -13653,285 +13924,187 @@ def _structure_edge_direction_label(direction: str) -> str:
 
 
 async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: dict | None = None) -> bool:
-    """Record/send the extension's successful orders/open delivery audit event.
-
-    This confirms that the secure extension bridge accepted and sent the open command.
-    It is intentionally NOT treated as the authoritative Quotex result; W/L is recorded
-    only by _copy_record_structure_edge_trade_result after closed-deal evidence arrives.
-    """
+    """Accept Octopus order-open audits for owner/team users without posting to the channel."""
     try:
-        client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
-        if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Round Number Edge opened event | user=%s", client_uid)
+        client = client or {}
+        uid = normalize_copy_telegram_user_id((payload_event or {}).get("telegram_user_id") or client.get("telegram_user_id") or (payload_event or {}).get("target_user_id"))
+        if not uid or str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
-        if str((payload_event or {}).get("source") or "") != "structure_edge":
+        if int(uid) != int(ADMIN_TELEGRAM_ID) and not is_approved(int(uid)):
             return False
-        signal_id = str((payload_event or {}).get("signal_id") or "").strip()
+        state = _octopus_user_state(int(uid), create=False) if int(uid) != int(ADMIN_TELEGRAM_ID) else None
+        pending = (state or {}).get("pending_trade") if isinstance((state or {}).get("pending_trade"), dict) else (_structure_edge_state.get("pending_trade") if int(uid) == int(ADMIN_TELEGRAM_ID) else {})
+        signal_id = str((payload_event or {}).get("signal_id") or (pending or {}).get("copy_signal_id") or "").strip()
         if not signal_id:
             return False
-
-        pending = _structure_edge_state.get("pending_trade") if isinstance(_structure_edge_state.get("pending_trade"), dict) else {}
         record = {
-            "reported_at": now_iso(),
-            "signal_id": signal_id,
+            "reported_at": now_iso(), "signal_id": signal_id, "user_id": int(uid),
             "pair": (payload_event or {}).get("pair") or (pending or {}).get("pair"),
             "direction": (payload_event or {}).get("direction") or (pending or {}).get("direction"),
             "original_direction": (payload_event or {}).get("original_direction") or (pending or {}).get("original_direction"),
             "reverse_mode": bool((payload_event or {}).get("reverse_mode") or (pending or {}).get("reverse_mode")),
-            "asset": (payload_event or {}).get("asset"),
+            "execution_direction_mode": (payload_event or {}).get("execution_direction_mode") or (pending or {}).get("execution_direction_mode") or "NORMAL",
             "amount": float((payload_event or {}).get("amount") or 0),
             "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
-            "setup": (payload_event or {}).get("setup") or (pending or {}).get("setup") or "UNKNOWN",
-            "score": int((payload_event or {}).get("score") or (pending or {}).get("score") or 0),
-            "m5_bias": (payload_event or {}).get("m5_bias") or (pending or {}).get("m5_bias"),
-            "m5_strength": int((payload_event or {}).get("m5_strength") or (pending or {}).get("m5_strength") or 0),
-            "line_type": (pending or {}).get("line_type") or (payload_event or {}).get("m5_bias"),
-            "line_quality": int((pending or {}).get("line_quality") or (payload_event or {}).get("m5_strength") or 0),
-            "line_touches": int((pending or {}).get("line_touches") or 0),
-            "line_slope_atr": float((pending or {}).get("line_slope_atr") or 0),
-            "primary_family": (payload_event or {}).get("primary_family") or (pending or {}).get("primary_family") or _price_action_family_from_setup((payload_event or {}).get("setup") or (pending or {}).get("setup")),
-            "price_action_families": (payload_event or {}).get("price_action_families") or (pending or {}).get("price_action_families") or [],
-            "price_action_components": (payload_event or {}).get("price_action_components") or (pending or {}).get("price_action_components") or [],
-            "level_type": (payload_event or {}).get("level_type") or (pending or {}).get("level_type") or (pending or {}).get("line_type"),
-            "level_value": (payload_event or {}).get("level_value") if (payload_event or {}).get("level_value") is not None else (pending or {}).get("level_value", (pending or {}).get("line_value")),
-            "signal_created_at": (payload_event or {}).get("signal_created_at") or (pending or {}).get("created_at"),
             "executed_at": (payload_event or {}).get("executed_at") or now_iso(),
+            "expires_at": (payload_event or {}).get("expires_at") or (datetime.fromtimestamp(int((pending or {}).get("entry_bucket") or 0), tz=UTC) + timedelta(seconds=60)).isoformat() if int((pending or {}).get("entry_bucket") or 0) > 0 else None,
             "execution_latency_ms": (payload_event or {}).get("execution_latency_ms"),
-            "expires_at": (payload_event or {}).get("expires_at"),
-            "pair_prepare_mode": (payload_event or {}).get("pair_prepare_mode"),
-            "entry_offset_from_candle_open_ms": (payload_event or {}).get("entry_offset_from_candle_open_ms"),
-            "trendline_candle_open": (payload_event or {}).get("trendline_candle_open") or (pending or {}).get("trendline_candle_open"),
-            "trendline_signal_price": (payload_event or {}).get("trendline_signal_price") or (pending or {}).get("trendline_signal_price"),
-            "trendline_entry_displacement_atr": (payload_event or {}).get("trendline_entry_displacement_atr") if (payload_event or {}).get("trendline_entry_displacement_atr") is not None else (pending or {}).get("trendline_entry_displacement_atr"),
-            "account_mode": "demo",
-            "audit_status": "order_sent_to_quotex_bridge",
+            "account_mode": (payload_event or {}).get("account_mode") or "unknown",
+            "market_signal_key": (pending or {}).get("market_signal_key"),
         }
         _structure_edge_executions_ref().child(safe_key(signal_id)).set(record)
-
-        seen = _structure_edge_state.setdefault("execution_signal_ids", {})
-        already_seen = signal_id in seen
-        seen[signal_id] = now_iso()
-        if len(seen) > 500:
-            for old_key in list(seen.keys())[:-500]:
-                seen.pop(old_key, None)
-        if not already_seen:
-            _structure_edge_state["execution_reports"] = int(_structure_edge_state.get("execution_reports", 0) or 0) + 1
-        _structure_edge_state["last_execution_at"] = now_iso()
-        _structure_edge_state["last_execution"] = dict(record)
-
-        if isinstance(pending, dict) and str(pending.get("copy_signal_id") or "") == signal_id:
+        if isinstance(pending, dict):
             pending["execution_report"] = dict(record)
-            _structure_edge_state["pending_trade"] = pending
-
-        if not already_seen and TRADING_TIME_TELEGRAM_APP is not None:
-            latency = record.get("execution_latency_ms")
-            latency_text = f"{int(latency)} ms" if isinstance(latency, (int, float)) else "-"
-            amount = float(record.get("amount") or 0)
-            await safe_send_message(
-                TRADING_TIME_TELEGRAM_APP.bot,
-                chat_id=_structure_edge_target_chat_id(),
-                text=(
-                    "⚡ ROUND NUMBER EDGE — ORDER SENT\n"
-                    "━━━━━━━━━━━━━━\n"
-                    f"💱 {record.get('pair')}\n"
-                    f"📌 الاتجاه: {_structure_edge_direction_label(record.get('direction'))}\n"
-                    f"🧠 {record.get('setup')} • {record.get('primary_family') or '-'}\n"
-                    f"📍 {record.get('level_type') or record.get('line_type')} @ {record.get('level_value') if record.get('level_value') is not None else '-'}\n"
-                    f"🤝 {' + '.join(str(x) for x in (record.get('price_action_families') or [record.get('primary_family') or '-']))}\n"
-                    f"💵 DEMO • ${amount:g}\n"
-                    f"🕐 إرسال أمر الدخول: {_structure_edge_local_hms(record.get('executed_at'))} UTC+3\n"
-                    f"🏁 انتهاء الصفقة: {_structure_edge_local_hms(record.get('expires_at'))} UTC+3\n"
-                    f"⚡ Latency من Final signal: {latency_text}\n"
-                    f"🎬 Δ عن Open الشمعة: {record.get('entry_offset_from_candle_open_ms') if record.get('entry_offset_from_candle_open_ms') is not None else '-'} ms\n"
-                    f"📍 Open ref: {record.get('trendline_candle_open') if record.get('trendline_candle_open') is not None else '-'} | signal price: {record.get('trendline_signal_price') if record.get('trendline_signal_price') is not None else '-'}\n"
-                    "✅ الإضافة أرسلت أمر orders/open عبر قناة Quotex الآمنة.\n"
-                    "ℹ️ Win/Loss لا يُحسب إلا بعد وصول نتيجة Quotex المؤكدة."
-                )[:3900],
-            )
+            if int(uid) == int(ADMIN_TELEGRAM_ID):
+                _structure_edge_state["pending_trade"] = pending
+            elif isinstance(state, dict):
+                state["pending_trade"] = pending
+                _octopus_user_persist(int(uid), state)
         return True
     except Exception as exc:
-        _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Round Number Edge opened audit record failed: %s", exc)
+        logger.exception("Octopus team opened audit failed: %s", exc)
         return False
 
 
-async def _copy_record_structure_edge_trade_result(payload_event: dict, client: dict | None = None) -> bool:
-    """Persist a confirmed Round Number Edge result reported by the owner's extension."""
+async def _copy_record_structure_edge_trade_lock(payload_event: dict, client: dict | None = None) -> bool:
+    # The strategy-level lock is already set when at least one team signal is published.
+    # Per-user extension lock events are accepted but do not create channel output.
     try:
-        client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
-        if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Round Number Edge result event | user=%s", client_uid)
+        uid = normalize_copy_telegram_user_id((payload_event or {}).get("telegram_user_id") or (client or {}).get("telegram_user_id"))
+        return bool(uid and str((payload_event or {}).get("source") or "") == "structure_edge")
+    except Exception:
+        return False
+
+
+def _octopus_channel_claim_result(key: str) -> bool:
+    now_ts = time_module.time()
+    for k, ts in list(_octopus_channel_result_keys.items()):
+        if now_ts - float(ts or 0) > 21600:
+            _octopus_channel_result_keys.pop(k, None)
+    key = str(key or "")
+    if not key or key in _octopus_channel_result_keys:
+        return False
+    _octopus_channel_result_keys[key] = now_ts
+    return True
+
+
+async def _copy_record_structure_edge_trade_result(payload_event: dict, client: dict | None = None) -> bool:
+    try:
+        client = client or {}
+        uid = normalize_copy_telegram_user_id((payload_event or {}).get("telegram_user_id") or client.get("telegram_user_id") or (payload_event or {}).get("target_user_id"))
+        if not uid or str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
-        if str((payload_event or {}).get("source") or "") != "structure_edge":
+        uid = int(uid)
+        user_state = _octopus_user_state(uid, create=False) if uid != int(ADMIN_TELEGRAM_ID) else None
+        if uid != int(ADMIN_TELEGRAM_ID) and not is_approved(uid) and not isinstance((user_state or {}).get("pending_trade"), dict):
             return False
         outcome = str((payload_event or {}).get("outcome") or "").lower().strip()
-        if outcome not in {"win", "loss", "draw"}:
-            return False
         signal_id = str((payload_event or {}).get("signal_id") or "").strip()
-        if not signal_id:
+        if outcome not in {"win", "loss", "draw"} or not signal_id:
             return False
-
-        pending = _structure_edge_state.get("pending_trade") if isinstance(_structure_edge_state.get("pending_trade"), dict) else {}
-        pending_id = str((pending or {}).get("copy_signal_id") or "")
-        execution_record = {}
+        pending = (user_state or {}).get("pending_trade") if isinstance((user_state or {}).get("pending_trade"), dict) else (_structure_edge_state.get("pending_trade") if uid == int(ADMIN_TELEGRAM_ID) else {})
         try:
             execution_record = _structure_edge_executions_ref().child(safe_key(signal_id)).get() or {}
-            if not isinstance(execution_record, dict):
-                execution_record = {}
         except Exception:
             execution_record = {}
-
+        def pick(name, default=None):
+            value = (payload_event or {}).get(name)
+            if value is not None:
+                return value
+            value = (pending or {}).get(name)
+            if value is not None:
+                return value
+            return (execution_record or {}).get(name, default)
+        entry_bucket = int((pending or {}).get("entry_bucket") or 0)
+        market_key = str((pending or {}).get("market_signal_key") or f"{entry_bucket}|{pick('pair')}|{pick('direction')}")
         record = {
             "created_at": (payload_event or {}).get("signal_created_at") or (pending or {}).get("created_at") or now_iso(),
-            "closed_at": now_iso(),
-            "signal_id": signal_id,
-            "pair": (payload_event or {}).get("pair") or (pending or {}).get("pair"),
-            "symbol": (pending or {}).get("symbol"),
-            "direction": (payload_event or {}).get("direction") or (pending or {}).get("direction"),
-            "original_direction": (payload_event or {}).get("original_direction") or (pending or {}).get("original_direction"),
-            "reverse_mode": bool((payload_event or {}).get("reverse_mode") or (pending or {}).get("reverse_mode")),
-            "setup": (payload_event or {}).get("setup") or (pending or {}).get("setup") or "UNKNOWN",
-            "score": int((payload_event or {}).get("score") or (pending or {}).get("score") or 0),
+            "closed_at": now_iso(), "signal_id": signal_id, "market_signal_key": market_key, "result_user_id": uid,
+            "pair": pick("pair"), "symbol": (pending or {}).get("symbol"), "entry_bucket": entry_bucket,
+            "direction": pick("direction"), "original_direction": pick("original_direction", (pending or {}).get("original_direction") or pick("direction")),
+            "reverse_mode": bool(pick("reverse_mode", (pending or {}).get("reverse_mode", False))),
+            "execution_direction_mode": pick("execution_direction_mode", (pending or {}).get("execution_direction_mode", "NORMAL")),
+            "setup": "OCTOPUS_SR_RETEST", "score": int(pick("score", 0) or 0),
             "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
-            "m5_bias": (payload_event or {}).get("m5_bias") or (pending or {}).get("m5_bias"),
-            "m5_strength": int((payload_event or {}).get("m5_strength") or (pending or {}).get("m5_strength") or 0),
-            "line_type": (pending or {}).get("line_type") or (payload_event or {}).get("m5_bias"),
-            "line_quality": int((pending or {}).get("line_quality") or (payload_event or {}).get("m5_strength") or 0),
-            "line_touches": int((pending or {}).get("line_touches") or 0),
-            "line_slope_atr": float((pending or {}).get("line_slope_atr") or 0),
-            "primary_family": (payload_event or {}).get("primary_family") or (pending or {}).get("primary_family") or _price_action_family_from_setup((payload_event or {}).get("setup") or (pending or {}).get("setup")),
-            "price_action_families": (payload_event or {}).get("price_action_families") or (pending or {}).get("price_action_families") or [],
-            "price_action_components": (payload_event or {}).get("price_action_components") or (pending or {}).get("price_action_components") or [],
-            "level_type": (payload_event or {}).get("level_type") or (pending or {}).get("level_type") or (pending or {}).get("line_type"),
-            "level_value": (payload_event or {}).get("level_value") if (payload_event or {}).get("level_value") is not None else (pending or {}).get("level_value", (pending or {}).get("line_value")),
-            "entry_bucket": int((pending or {}).get("entry_bucket") or 0),
-            "entry_price": float((pending or {}).get("entry_price") or 0),
-            "close_price": 0.0,
-            "result": outcome,
-            "confluences": (payload_event or {}).get("confluences") or (pending or {}).get("confluences") or [],
-            "result_source": "extension_quotex_confirmed",
-            "account_mode": "demo",
-            "executed_at": (payload_event or {}).get("executed_at") or execution_record.get("executed_at"),
-            "execution_latency_ms": (payload_event or {}).get("execution_latency_ms") if (payload_event or {}).get("execution_latency_ms") is not None else execution_record.get("execution_latency_ms"),
-            "net_delta": (payload_event or {}).get("net_delta"),
-            "amount": (payload_event or {}).get("amount") or execution_record.get("amount"),
-            "platform_deal_id": (payload_event or {}).get("platform_deal_id"),
-            "result_evidence": (payload_event or {}).get("result_source"),
+            "result": outcome, "result_source": "extension_quotex_confirmed",
+            "account_mode": (payload_event or {}).get("account_mode") or (execution_record or {}).get("account_mode") or "unknown",
+            "executed_at": (payload_event or {}).get("executed_at") or (execution_record or {}).get("executed_at"),
+            "expires_at": (payload_event or {}).get("expires_at") or (execution_record or {}).get("expires_at") or ((datetime.fromtimestamp(entry_bucket, tz=UTC) + timedelta(seconds=60)).isoformat() if entry_bucket > 0 else None),
+            "execution_latency_ms": (payload_event or {}).get("execution_latency_ms") if (payload_event or {}).get("execution_latency_ms") is not None else (execution_record or {}).get("execution_latency_ms"),
+            "net_delta": (payload_event or {}).get("net_delta"), "amount": (payload_event or {}).get("amount") or (execution_record or {}).get("amount"),
+            "platform_deal_id": (payload_event or {}).get("platform_deal_id"), "result_evidence": (payload_event or {}).get("result_source"),
+            "octopus_model": pick("octopus_model", (pending or {}).get("primary_model")),
+            "octopus_models": pick("octopus_models", (pending or {}).get("models") or []),
+            "octopus_regime": pick("octopus_regime", (pending or {}).get("regime")),
+            "octopus_expected_wr": float(pick("octopus_expected_wr", (pending or {}).get("expected_wr", 0)) or 0),
+            "octopus_conservative_wr": float(pick("octopus_conservative_wr", (pending or {}).get("conservative_wr", 0)) or 0),
+            "octopus_break_even_wr": float(pick("octopus_break_even_wr", (pending or {}).get("break_even_wr", 0)) or 0),
+            "octopus_edge_points": float(pick("octopus_edge_points", (pending or {}).get("edge_points", 0)) or 0),
+            "octopus_selector_score": float(pick("octopus_selector_score", (pending or {}).get("selector_score", 0)) or 0),
+            "octopus_market_setup": pick("octopus_market_setup", (pending or {}).get("market_setup")),
+            "octopus_market_reason": pick("octopus_market_reason", (pending or {}).get("market_reason")),
+            "octopus_market_quality": float(pick("octopus_market_quality", (pending or {}).get("market_quality", 0)) or 0),
+            "octopus_market_zone": pick("octopus_market_zone", (pending or {}).get("market_zone")),
+            "octopus_market_space_atr": float(pick("octopus_market_space_atr", (pending or {}).get("market_space_atr", 0)) or 0),
         }
-        # Deterministic child key makes retrying the same outbox event idempotent.
-        _structure_edge_results_ref().child(safe_key(signal_id)).set(record)
-        seen = _structure_edge_state.setdefault("result_signal_ids", {})
-        already_seen = signal_id in seen
-        seen[signal_id] = now_iso()
-        if len(seen) > 500:
-            for old_key in list(seen.keys())[:-500]:
-                seen.pop(old_key, None)
-        if not already_seen:
-            _structure_edge_state["results_sent"] = int(_structure_edge_state.get("results_sent", 0) or 0) + 1
-        _structure_edge_state["last_result_at"] = now_iso()
-        _structure_edge_state["last_copy_result"] = dict(record)
-        if pending_id == signal_id or not pending_id:
+
+        if uid != int(ADMIN_TELEGRAM_ID):
+            _octopus_user_result_update(uid, record)
+        else:
             _structure_edge_state["pending_trade"] = None
-        result_text = "WIN ✅" if outcome == "win" else "LOSS ❌" if outcome == "loss" else "DRAW ⚖️"
-        if TRADING_TIME_TELEGRAM_APP is not None:
-            rows = _structure_edge_fetch_results(limit=STRUCTURE_EDGE_RESULT_REPORT_LIMIT)
-            wins = sum(1 for x in rows if str(x.get("result") or "") == "win")
-            losses = sum(1 for x in rows if str(x.get("result") or "") == "loss")
-            draws = sum(1 for x in rows if str(x.get("result") or "") == "draw")
-            decided = wins + losses
-            wr = round((wins / decided * 100.0), 1) if decided else 0.0
-            max_loss_streak = _structure_edge_max_loss_streak(rows)
-            latency = record.get("execution_latency_ms")
-            latency_text = f"{int(latency)} ms" if isinstance(latency, (int, float)) else "-"
-            net = record.get("net_delta")
-            try:
-                net_text = f"{float(net):+.2f}" if net is not None else "-"
-            except Exception:
-                net_text = str(net or "-")
+
+        # Canonical strategy history: one row per market opportunity, never one duplicate per team member.
+        canonical_key = safe_key(market_key)
+        existing = _structure_edge_results_ref().child(canonical_key).get() or {}
+        is_new_canonical = not isinstance(existing, dict) or not existing
+        if is_new_canonical:
+            _structure_edge_results_ref().child(canonical_key).set(record)
+            _structure_edge_state["last_result_at"] = now_iso()
+            _structure_edge_state["last_copy_result"] = dict(record)
+
+        _octopus_execution_lock_clear(reason=f"result_{outcome}")
+
+        # RESULT-ONLY channel, de-duplicated persistently by the canonical market-signal row.
+        if is_new_canonical and TRADING_TIME_TELEGRAM_APP is not None and _octopus_channel_claim_result(market_key):
+            label = "WIN ✅" if outcome == "win" else "LOSS ❌" if outcome == "loss" else "DRAW ⚖️"
+            entry_text = _structure_edge_local_hms(record.get("executed_at") or (datetime.fromtimestamp(entry_bucket, tz=UTC).isoformat() if entry_bucket > 0 else None))
+            end_text = _structure_edge_local_hms(record.get("expires_at") or record.get("closed_at"))
+            direction_label = "🟢 صعود CALL" if str(record.get("direction") or "").upper() == "CALL" else "🔴 هبوط PUT"
             await safe_send_message(
-                TRADING_TIME_TELEGRAM_APP.bot,
-                chat_id=_structure_edge_target_chat_id(),
+                TRADING_TIME_TELEGRAM_APP.bot, chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    f"🎯 ROUND NUMBER EDGE — {result_text}\n"
-                    "━━━━━━━━━━━━━━\n"
-                    f"💱 {record.get('pair')}\n"
-                    f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
-                    f"🧠 {record.get('setup')} • {record.get('primary_family') or '-'}\n"
-                    f"📍 {record.get('level_type') or record.get('line_type')} @ {record.get('level_value') if record.get('level_value') is not None else '-'}\n"
-                    f"🤝 {' + '.join(str(x) for x in (record.get('price_action_families') or [record.get('primary_family') or '-']))}\n"
-                    f"💵 Net: {net_text} | DEMO\n"
-                    f"⚡ Latency: {latency_text}\n"
-                    "━━━━━━━━━━━━━━\n"
-                    f"📊 آخر {len(rows)} نتيجة: ✅ {wins} | ❌ {losses} | ⚖️ {draws}\n"
-                    f"📈 Win Rate: {wr}% | أقصى سلسلة خسائر: {max_loss_streak}"
+                    "🐙 OCTOPUS — RESULT\n━━━━━━━━━━━━━━\n"
+                    f"💱 الزوج: {record.get('pair')}\n"
+                    f"🕒 وقت الدخول: {entry_text} UTC+3\n"
+                    f"🏁 وقت الانتهاء: {end_text} UTC+3\n"
+                    f"📌 نوع الصفقة: {direction_label}\n"
+                    f"📊 النتيجة: {label}"
                 )[:3900],
             )
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Round Number Edge extension result record failed: %s", exc)
+        logger.exception("Octopus team confirmed result record failed: %s", exc)
         return False
 
 
 async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: dict | None = None) -> bool:
-    """Record a Round Number Edge signal that the owner extension intentionally skipped.
-
-    A skip is diagnostic only: it clears a matching pending trade and never creates a
-    Win/Loss row. Idempotency prevents outbox retries from inflating the skip counter.
-    """
+    # v1.37: skips are telemetry only; RESULT-ONLY channel receives nothing for non-executed trades.
     try:
-        client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
-        if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            logger.warning("Ignored non-owner Round Number Edge skip event | user=%s", client_uid)
-            return False
-        if str((payload_event or {}).get("source") or "") != "structure_edge":
-            return False
+        uid = normalize_copy_telegram_user_id((payload_event or {}).get("telegram_user_id") or (client or {}).get("telegram_user_id"))
         signal_id = str((payload_event or {}).get("signal_id") or "").strip()
-        if not signal_id:
-            return False
-        reason = str((payload_event or {}).get("reason") or "extension_skip").strip()[:240]
-
-        seen = _structure_edge_state.setdefault("skip_signal_ids", {})
-        already_seen = signal_id in seen
-        seen[signal_id] = now_iso()
-        if len(seen) > 500:
-            for old_key in list(seen.keys())[:-500]:
-                seen.pop(old_key, None)
-
-        if not already_seen:
-            _structure_edge_state["extension_skips"] = int(_structure_edge_state.get("extension_skips", 0) or 0) + 1
-        _structure_edge_state["last_skip_at"] = now_iso()
-        _structure_edge_state["last_skip_reason"] = reason
-        _structure_edge_state["last_reject_reason"] = f"Extension skip: {reason}"
-
-        pending = _structure_edge_state.get("pending_trade")
-        if isinstance(pending, dict) and str(pending.get("copy_signal_id") or "") == signal_id:
+        if uid and int(uid) != int(ADMIN_TELEGRAM_ID):
+            state = _octopus_user_state(int(uid), create=False)
+            if isinstance(state, dict):
+                pending = state.get("pending_trade") if isinstance(state.get("pending_trade"), dict) else {}
+                if not signal_id or str((pending or {}).get("copy_signal_id") or "") == signal_id:
+                    state["pending_trade"] = None
+                    state["prepared_signal"] = None
+                    _octopus_user_persist(int(uid), state)
+        elif uid:
             _structure_edge_state["pending_trade"] = None
-
-        logger.info(
-            "Round Number Edge extension skip | signal=%s | pair=%s | direction=%s | reason=%s",
-            signal_id,
-            (payload_event or {}).get("pair"),
-            (payload_event or {}).get("direction"),
-            reason,
-        )
-        if not already_seen and TRADING_TIME_TELEGRAM_APP is not None:
-            await safe_send_message(
-                TRADING_TIME_TELEGRAM_APP.bot,
-                chat_id=_structure_edge_target_chat_id(),
-                text=(
-                    "⏭️ ROUND NUMBER EDGE — SKIPPED\n"
-                    "━━━━━━━━━━━━━━\n"
-                    f"💱 {(payload_event or {}).get('pair') or (pending or {}).get('pair')}\n"
-                    f"📌 الاتجاه: {_structure_edge_direction_label((payload_event or {}).get('direction') or (pending or {}).get('direction'))}\n"
-                    f"🚫 السبب: {reason}\n"
-                    "📊 لم تُحسب Win/Loss لأن الصفقة لم تدخل ضمن شروط التنفيذ."
-                )[:3900],
-            )
         return True
-    except Exception as exc:
-        _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Round Number Edge extension skip record failed: %s", exc)
+    except Exception:
         return False
 
 
@@ -15012,20 +15185,8 @@ def _structure_edge_reset_results() -> tuple[bool, str]:
 
 
 async def _octopus_maybe_digest(context: ContextTypes.DEFAULT_TYPE):
-    if OCTOPUS_DIGEST_MINUTES <= 0:
-        return
-    now_ts = time_module.time()
-    if now_ts - float(_octopus_state.get("last_digest_ts", 0.0) or 0.0) < OCTOPUS_DIGEST_MINUTES * 60:
-        return
-    total = int(_octopus_state.get("total_observations", 0) or 0)
-    if total - int(_octopus_state.get("last_digest_observations", 0) or 0) < 20:
-        return
-    text = build_octopus_leaderboard(limit=8)
-    text = text.replace("🧠 Octopus — أفضل النماذج Shadow", "🐙 Octopus Shadow Lab — Digest")
-    sent = await safe_send_message(context.bot, chat_id=_structure_edge_target_chat_id(), text=text)
-    if sent:
-        _octopus_state["last_digest_ts"] = now_ts
-        _octopus_state["last_digest_observations"] = total
+    # v1.37: Octopus channel is RESULT-ONLY. No Shadow/leaderboard digest posts.
+    return
 
 
 async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
@@ -15129,7 +15290,7 @@ OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND = max(1.0, min(4.0, float(os.getenv("
 # v1.36: continuous internal NORMAL-vs-REVERSE market-mode detector.
 # It runs even while real Octopus execution is OFF and mirrors the live PRE-ARM/open guards
 # without requiring the browser extension. Report window defaults to the owner-requested 5h.
-OCTOPUS_MODE_DETECTOR_REPORT_HOURS = max(1.0, min(24.0, float(os.getenv("OCTOPUS_MODE_DETECTOR_REPORT_HOURS", "5"))))
+OCTOPUS_MODE_DETECTOR_REPORT_HOURS = max(1.0, min(24.0, float(os.getenv("OCTOPUS_MODE_DETECTOR_REPORT_HOURS", "2"))))
 OCTOPUS_MODE_DETECTOR_MIN_SAMPLE = max(1, min(100, int(os.getenv("OCTOPUS_MODE_DETECTOR_MIN_SAMPLE", "12"))))
 OCTOPUS_SELECTOR_SHADOW_FALLBACK_MAX_SECOND = max(OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND, min(15.0, float(os.getenv("OCTOPUS_SELECTOR_SHADOW_FALLBACK_MAX_SECOND", "8.0"))))
 OCTOPUS_SELECTOR_MIN_MODEL_SAMPLE = max(12, int(os.getenv("OCTOPUS_SELECTOR_MIN_MODEL_SAMPLE", "30")))
@@ -16553,76 +16714,68 @@ def build_octopus_market_mode_report(hours: float | None = None) -> str:
 
 
 
-async def publish_copy_octopus_prepare_signal(candidate: dict, target_entry_bucket: int) -> dict:
+async def publish_copy_octopus_prepare_signal(candidate: dict, target_entry_bucket: int, target_user_id: int | None = None) -> dict:
     if not COPY_SEND_STRUCTURE_EDGE:
         return {"ok": False, "skipped": True, "reason": "COPY_SEND_STRUCTURE_EDGE=false"}
     try:
+        target_uid = normalize_copy_telegram_user_id(target_user_id or ADMIN_TELEGRAM_ID)
         pair = str(candidate.get("pair") or "").strip()
         symbol = str(candidate.get("symbol") or "").strip()
         direction = str(candidate.get("direction") or "").upper()
-        if not pair or direction not in {"CALL", "PUT"}:
-            return {"ok": False, "skipped": True, "reason": "missing pair/direction"}
+        if not target_uid or not pair or direction not in {"CALL", "PUT"}:
+            return {"ok": False, "skipped": True, "reason": "missing target/pair/direction"}
         entry_dt = datetime.fromtimestamp(int(target_entry_bucket), tz=UTC)
+        user_key = safe_key(str(target_uid))
         payload = {
             "ok": True,
-            "id": f"octopus_prepare_{safe_key(pair)}_{int(target_entry_bucket)}_{direction}",
+            "id": f"octopus_prepare_{user_key}_{safe_key(pair)}_{int(target_entry_bucket)}_{direction}",
             "pair": pair, "pair_display": pair, "symbol": symbol or None, "platform_symbol": symbol or pair,
             "direction": direction, "original_direction": str(candidate.get("original_direction") or candidate.get("analysis_direction") or direction).upper(), "reverse_mode": bool(candidate.get("reverse_mode")),
             "execution_direction_mode": str(candidate.get("execution_direction_mode") or ("REVERSE" if candidate.get("reverse_mode") else "NORMAL")),
             "timeframe": "M1", "duration_seconds": 60, "duration_minutes": 1,
             "entry_time": entry_dt.isoformat(), "expires_at": (entry_dt + timedelta(seconds=10)).isoformat(),
-            "expiry_time": (entry_dt + timedelta(seconds=60)).isoformat(),
-            "expiry_timestamp": int((entry_dt + timedelta(seconds=60)).timestamp()),
+            "expiry_time": (entry_dt + timedelta(seconds=60)).isoformat(), "expiry_timestamp": int((entry_dt + timedelta(seconds=60)).timestamp()),
             "trade_expiry_mode": "absolute_time", "entry_mode": "prepare", "copy_entry_mode": "prepare",
             "execution_mode": "prepare_pair", "signal_kind": "prepare", "prepare_only": True,
             "preselected_pair_mode": True, "watch_pair": pair,
-            "quality": int(round(float(candidate.get("selector_score", 0)))),
-            "confidence": int(round(float(candidate.get("selector_score", 0)))),
-            "payout": candidate.get("payout"),
-            "structure_setup": "OCTOPUS_SR_RETEST",
-            "structure_score": int(round(float(candidate.get("selector_score", 0)))),
-            "primary_family": candidate.get("primary_family"),
-            "price_action_families": list(candidate.get("families") or [])[:6],
-            "price_action_components": list(candidate.get("models") or [])[:8],
+            "quality": int(round(float(candidate.get("selector_score", 0)))), "confidence": int(round(float(candidate.get("selector_score", 0)))),
+            "payout": candidate.get("payout"), "structure_setup": "OCTOPUS_SR_RETEST",
+            "structure_score": int(round(float(candidate.get("selector_score", 0)))), "primary_family": candidate.get("primary_family"),
+            "price_action_families": list(candidate.get("families") or [])[:6], "price_action_components": list(candidate.get("models") or [])[:8],
             "structure_confluences": [f"thesis={candidate.get('market_setup')}", f"marketQ={candidate.get('market_quality')}", f"regime={candidate.get('regime')}", f"expected={candidate.get('expected_wr')}%", f"conservative={candidate.get('conservative_wr')}%"],
-            "octopus_model": candidate.get("primary_model"),
-            "octopus_models": list(candidate.get("models") or [])[:8],
-            "octopus_regime": candidate.get("regime"),
-            "octopus_expected_wr": candidate.get("expected_wr"),
-            "octopus_conservative_wr": candidate.get("conservative_wr"),
-            "octopus_break_even_wr": candidate.get("break_even_wr"),
-            "octopus_edge_points": candidate.get("edge_points"),
-            "octopus_selector_score": candidate.get("selector_score"),
-            "octopus_basis": list(candidate.get("basis") or [])[:10],
-            "octopus_market_setup": candidate.get("market_setup"),
-            "octopus_market_reason": candidate.get("market_reason"),
-            "octopus_market_quality": candidate.get("market_quality"),
-            "octopus_market_zone": candidate.get("market_zone"),
-            "octopus_market_space_atr": candidate.get("market_space_atr"),
-            "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"octopus_sr_retest_v8_prearm_commit_v136_mode | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_account_amount_settings",
+            "octopus_model": candidate.get("primary_model"), "octopus_models": list(candidate.get("models") or [])[:8],
+            "octopus_regime": candidate.get("regime"), "octopus_expected_wr": candidate.get("expected_wr"),
+            "octopus_conservative_wr": candidate.get("conservative_wr"), "octopus_break_even_wr": candidate.get("break_even_wr"),
+            "octopus_edge_points": candidate.get("edge_points"), "octopus_selector_score": candidate.get("selector_score"),
+            "octopus_basis": list(candidate.get("basis") or [])[:10], "octopus_market_setup": candidate.get("market_setup"),
+            "octopus_market_reason": candidate.get("market_reason"), "octopus_market_quality": candidate.get("market_quality"),
+            "octopus_market_zone": candidate.get("market_zone"), "octopus_market_space_atr": candidate.get("market_space_atr"),
+            "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(target_uid),
+            "note": f"octopus_sr_retest_v8_prearm_commit_v137_team | target={target_uid} | user_account_amount_settings",
         }
         return await publish_copy_trading_signal(payload, source="structure_edge")
     except Exception as exc:
-        logger.exception("Octopus PRE-ARM publish failed: %s", exc)
+        logger.exception("Octopus targeted PRE-ARM publish failed: %s", exc)
         return {"ok": False, "error": str(exc)}
 
 
-async def publish_copy_octopus_signal(candidate: dict) -> dict:
+async def publish_copy_octopus_signal(candidate: dict, target_user_id: int | None = None) -> dict:
     if not COPY_SEND_STRUCTURE_EDGE:
         return {"ok": False, "skipped": True, "reason": "COPY_SEND_STRUCTURE_EDGE=false"}
     try:
+        target_uid = normalize_copy_telegram_user_id(target_user_id or ADMIN_TELEGRAM_ID)
         entry_bucket = int(candidate.get("entry_bucket") or 0)
         pair = str(candidate.get("pair") or "").strip()
         symbol = str(candidate.get("symbol") or "").strip()
         direction = str(candidate.get("direction") or "").upper()
-        if entry_bucket <= 0 or not pair or direction not in {"CALL", "PUT"}:
-            return {"ok": False, "skipped": True, "reason": "missing entry bucket/pair/direction"}
+        if not target_uid or entry_bucket <= 0 or not pair or direction not in {"CALL", "PUT"}:
+            return {"ok": False, "skipped": True, "reason": "missing target/entry bucket/pair/direction"}
         entry_dt = datetime.fromtimestamp(entry_bucket, tz=UTC)
         expiry_dt = entry_dt + timedelta(seconds=60)
+        user_key = safe_key(str(target_uid))
         payload = {
             "ok": True,
-            "id": f"octopus_{safe_key(pair)}_{entry_bucket}_{direction}_{safe_key(candidate.get('primary_model'))}",
+            "id": f"octopus_{user_key}_{safe_key(pair)}_{entry_bucket}_{direction}_{safe_key(candidate.get('primary_model'))}",
             "pair": pair, "pair_display": pair, "symbol": symbol or None, "platform_symbol": symbol or pair,
             "direction": direction, "original_direction": str(candidate.get("original_direction") or candidate.get("analysis_direction") or direction).upper(), "reverse_mode": bool(candidate.get("reverse_mode")),
             "execution_direction_mode": str(candidate.get("execution_direction_mode") or ("REVERSE" if candidate.get("reverse_mode") else "NORMAL")),
@@ -16633,41 +16786,38 @@ async def publish_copy_octopus_signal(candidate: dict) -> dict:
             "execution_mode": "instant_user_selected_account_amount", "immediate_entry": True,
             "direct_entry": True, "instant_entry": True, "allow_background_entry": True,
             "max_entry_delay_seconds": int(TRENDLINE_EXECUTION_MAX_DELAY_SECONDS),
-            "quality": int(round(float(candidate.get("selector_score", 0)))),
-            "confidence": int(round(float(candidate.get("selector_score", 0)))),
+            "quality": int(round(float(candidate.get("selector_score", 0)))), "confidence": int(round(float(candidate.get("selector_score", 0)))),
             "entry_price": candidate.get("entry_price"), "payout": candidate.get("payout"),
-            "structure_setup": "OCTOPUS_SR_RETEST",
-            "structure_score": int(round(float(candidate.get("selector_score", 0)))),
-            "primary_family": candidate.get("primary_family"),
-            "price_action_families": list(candidate.get("families") or [])[:6],
+            "structure_setup": "OCTOPUS_SR_RETEST", "structure_score": int(round(float(candidate.get("selector_score", 0)))),
+            "primary_family": candidate.get("primary_family"), "price_action_families": list(candidate.get("families") or [])[:6],
             "price_action_components": list(candidate.get("models") or [])[:8],
             "structure_confluences": [f"thesis={candidate.get('market_setup')}", f"marketQ={candidate.get('market_quality')}", f"regime={candidate.get('regime')}", f"expected={candidate.get('expected_wr')}%", f"conservative={candidate.get('conservative_wr')}%", f"edge={candidate.get('edge_points')}pp"],
             "trendline_prearm": True, "trendline_target_bucket": entry_bucket,
-            "trendline_candle_open": candidate.get("trendline_candle_open"),
-            "trendline_signal_price": candidate.get("entry_price"),
-            "trendline_entry_displacement_atr": candidate.get("trendline_entry_displacement_atr"),
-            "trendline_prearmed_at": candidate.get("prearmed_at"),
-            "octopus_model": candidate.get("primary_model"),
-            "octopus_models": list(candidate.get("models") or [])[:8],
-            "octopus_regime": candidate.get("regime"),
-            "octopus_expected_wr": candidate.get("expected_wr"),
-            "octopus_conservative_wr": candidate.get("conservative_wr"),
-            "octopus_break_even_wr": candidate.get("break_even_wr"),
-            "octopus_edge_points": candidate.get("edge_points"),
-            "octopus_selector_score": candidate.get("selector_score"),
-            "octopus_basis": list(candidate.get("basis") or [])[:10],
-            "octopus_market_setup": candidate.get("market_setup"),
-            "octopus_market_reason": candidate.get("market_reason"),
-            "octopus_market_quality": candidate.get("market_quality"),
-            "octopus_market_zone": candidate.get("market_zone"),
-            "octopus_market_space_atr": candidate.get("market_space_atr"),
-            "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"octopus_sr_retest_v8_direct_open_v136_mode | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_controls_account_amount",
+            "trendline_candle_open": candidate.get("trendline_candle_open"), "trendline_signal_price": candidate.get("entry_price"),
+            "trendline_entry_displacement_atr": candidate.get("trendline_entry_displacement_atr"), "trendline_prearmed_at": candidate.get("prearmed_at"),
+            "octopus_model": candidate.get("primary_model"), "octopus_models": list(candidate.get("models") or [])[:8],
+            "octopus_regime": candidate.get("regime"), "octopus_expected_wr": candidate.get("expected_wr"),
+            "octopus_conservative_wr": candidate.get("conservative_wr"), "octopus_break_even_wr": candidate.get("break_even_wr"),
+            "octopus_edge_points": candidate.get("edge_points"), "octopus_selector_score": candidate.get("selector_score"),
+            "octopus_basis": list(candidate.get("basis") or [])[:10], "octopus_market_setup": candidate.get("market_setup"),
+            "octopus_market_reason": candidate.get("market_reason"), "octopus_market_quality": candidate.get("market_quality"),
+            "octopus_market_zone": candidate.get("market_zone"), "octopus_market_space_atr": candidate.get("market_space_atr"),
+            "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(target_uid),
+            "note": f"octopus_sr_retest_v8_direct_open_v137_team | target={target_uid} | user_controls_account_amount",
         }
         return await publish_copy_trading_signal(payload, source="structure_edge")
     except Exception as exc:
-        logger.exception("Octopus direct-open Copy publish failed: %s", exc)
+        logger.exception("Octopus targeted direct-open Copy publish failed: %s", exc)
         return {"ok": False, "error": str(exc)}
+
+
+def _octopus_delivery_succeeded(result: dict, target_user_id: int) -> bool:
+    if not isinstance(result, dict) or not result.get("ok"):
+        return False
+    if result.get("duplicate"):
+        return False
+    delivery = result.get("delivery") if isinstance(result.get("delivery"), dict) else {}
+    return int(delivery.get("delivered", 0) or 0) > 0
 
 
 def _octopus_selector_decision_text(candidate: dict, prefix: str = "🐙 OCTOPUS S/R + RETEST — SIGNAL") -> str:
@@ -16752,15 +16902,37 @@ async def _octopus_adaptive_prearm(context: ContextTypes.DEFAULT_TYPE, now_ts: f
     _octopus_state["selector_last_decision"] = dict(candidate)
     _octopus_state["sr_prearm_selected_mode"] = str(candidate.get("prearm_mode") or "-")
 
-    # Shadow can run without the extension; execution PRE-ARM cannot.
-    if _copy_online_clients_for_user(ADMIN_TELEGRAM_ID) <= 0:
-        _octopus_state["selector_last_no_trade_reason"] = "PRE-ARM candidate exists; owner extension offline"
-        return
-    prepare_result = await publish_copy_octopus_prepare_signal(candidate, target_bucket)
-    if not isinstance(prepare_result, dict) or not prepare_result.get("ok"):
-        _octopus_state["selector_last_no_trade_reason"] = f"PRE-ARM publish failed: {prepare_result}"
+    # v1.37 team rollout: prepare the same market decision only for users who
+    # explicitly enabled Octopus and currently have their own authenticated extension online.
+    prepared_user_ids = []
+    prepare_results = {}
+    online_targets = [uid for uid in _octopus_live_enabled_user_ids() if _copy_online_clients_for_user(uid) > 0]
+    if online_targets:
+        raw_results = await asyncio.gather(
+            *(publish_copy_octopus_prepare_signal(candidate, target_bucket, target_user_id=uid) for uid in online_targets),
+            return_exceptions=True,
+        )
+        for target_uid, raw in zip(online_targets, raw_results):
+            result = raw if isinstance(raw, dict) else {"ok": False, "error": str(raw)}
+            prepare_results[str(target_uid)] = result
+            if _octopus_delivery_succeeded(result, target_uid):
+                prepared_user_ids.append(int(target_uid))
+                if int(target_uid) != int(ADMIN_TELEGRAM_ID):
+                    user_state = _octopus_user_state(int(target_uid), create=True)
+                    if isinstance(user_state, dict):
+                        user_state["prepared_signal"] = {
+                            "pair": candidate.get("pair"), "direction": candidate.get("direction"),
+                            "analysis_direction": candidate.get("analysis_direction"),
+                            "market_setup": candidate.get("market_setup"), "target_entry_bucket": target_bucket,
+                        }
+                        user_state["execution_direction_mode"] = candidate.get("execution_direction_mode")
+                        _octopus_user_persist(int(target_uid), user_state)
+    if not prepared_user_ids:
+        _octopus_state["selector_last_no_trade_reason"] = "PRE-ARM candidate exists; no enabled user extension accepted prepare"
         return
 
+    candidate["prepared_user_ids"] = prepared_user_ids
+    candidate["prepare_results"] = prepare_results
     _octopus_state["selector_prearmed_candidate"] = candidate
     _octopus_state["selector_prearm_target_bucket"] = target_bucket
     _octopus_state["selector_prearm_sent"] = int(_octopus_state.get("selector_prearm_sent", 0) or 0) + 1
@@ -16900,16 +17072,22 @@ async def _octopus_execute_prearmed_open(context: ContextTypes.DEFAULT_TYPE, now
     candidate["payout"] = live_payout
 
     # Connectivity/open snapshot are technical readiness checks, not a trading FINAL.
-    if _copy_online_clients_for_user(ADMIN_TELEGRAM_ID) <= 0:
+    prepared_user_ids = [int(x) for x in (candidate.get("prepared_user_ids") or [])]
+    execution_user_ids = []
+    active_now = set(_octopus_live_enabled_user_ids())
+    for uid in prepared_user_ids:
+        if uid in active_now and _copy_online_clients_for_user(uid) > 0:
+            execution_user_ids.append(uid)
+    if not execution_user_ids:
         if sec < max(0.5, OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND - 0.5):
             _octopus_state["sr_open_wait_snapshot"] = int(_octopus_state.get("sr_open_wait_snapshot",0) or 0) + 1
-            _octopus_state["selector_last_no_trade_reason"] = "OPEN WAIT: owner extension temporarily offline"
+            _octopus_state["selector_last_no_trade_reason"] = "OPEN WAIT: prepared user extensions temporarily offline"
             _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
             return
         _octopus_state["sr_open_blocked_offline"] = int(_octopus_state.get("sr_open_blocked_offline",0) or 0) + 1
         _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
         _octopus_state["selector_prearm_cancelled"] = int(_octopus_state.get("selector_prearm_cancelled",0) or 0) + 1
-        _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: owner extension offline during open execution window"
+        _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: no prepared enabled user extension online during open window"
         _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
         _octopus_state["selector_prearmed_candidate"] = None
         _octopus_state["selector_prearm_target_bucket"] = 0
@@ -16962,31 +17140,60 @@ async def _octopus_execute_prearmed_open(context: ContextTypes.DEFAULT_TYPE, now
         "reverse_mode": bool(candidate.get("reverse_mode")),
         "original_direction": str(candidate.get("original_direction") or candidate.get("analysis_direction") or candidate.get("direction") or "").upper(),
         "execution_direction_mode": str(candidate.get("execution_direction_mode") or ("REVERSE" if candidate.get("reverse_mode") else "NORMAL")),
-        "execution_commit_mode": "PREARM_DIRECT_OPEN_V1_36_NORMAL_REVERSE",
+        "execution_commit_mode": "PREARM_DIRECT_OPEN_V1_37_TEAM",
+        "market_signal_key": f"{current_bucket}|{candidate.get('pair')}|{candidate.get('direction')}",
     })
-    copy_result = await publish_copy_octopus_signal(candidate)
+
+    published_user_ids = []
+    copy_results = {}
+    raw_results = await asyncio.gather(
+        *(publish_copy_octopus_signal(dict(candidate), target_user_id=uid) for uid in execution_user_ids),
+        return_exceptions=True,
+    ) if execution_user_ids else []
+    for target_uid, raw in zip(execution_user_ids, raw_results):
+        result = raw if isinstance(raw, dict) else {"ok": False, "error": str(raw)}
+        copy_results[str(target_uid)] = result
+        if not _octopus_delivery_succeeded(result, target_uid):
+            continue
+        normalized_signal = result.get("signal") if isinstance(result.get("signal"), dict) else {}
+        signal_id = normalized_signal.get("id") or f"octopus_{safe_key(str(target_uid))}_{safe_key(candidate.get('pair'))}_{current_bucket}_{candidate.get('direction')}"
+        published_user_ids.append(int(target_uid))
+        user_candidate = dict(candidate)
+        for bulky_key in ("prepare_results", "copy_results", "prepared_user_ids", "published_user_ids"):
+            user_candidate.pop(bulky_key, None)
+        user_candidate["copy_signal_id"] = signal_id
+        user_candidate["target_user_id"] = int(target_uid)
+        if int(target_uid) == int(ADMIN_TELEGRAM_ID):
+            _structure_edge_state["pending_trade"] = dict(user_candidate)
+        else:
+            user_state = _octopus_user_state(int(target_uid), create=True)
+            if isinstance(user_state, dict):
+                user_state["pending_trade"] = dict(user_candidate)
+                user_state["prepared_signal"] = None
+                user_state["execution_direction_mode"] = candidate.get("execution_direction_mode")
+                _octopus_user_persist(int(target_uid), user_state)
+
     _octopus_state["selector_prearmed_candidate"] = None
     _octopus_state["selector_prearm_target_bucket"] = 0
-    _structure_edge_state["last_copy_result"] = copy_result
-    if not isinstance(copy_result, dict) or not copy_result.get("ok"):
+    _structure_edge_state["last_copy_result"] = {"ok": bool(published_user_ids), "published_users": published_user_ids, "results": copy_results}
+    if not published_user_ids:
         _octopus_state["selector_publish_failed"] = int(_octopus_state.get("selector_publish_failed",0) or 0) + 1
-        _octopus_state["selector_last_no_trade_reason"] = f"Copy publish failed: {copy_result}"
+        _octopus_state["selector_last_no_trade_reason"] = "Copy publish failed for every prepared user"
         _structure_edge_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
         _octopus_flush_snapshot(force=False)
         return
 
-    normalized_signal = copy_result.get("signal") if isinstance(copy_result.get("signal"), dict) else {}
-    candidate["copy_signal_id"] = normalized_signal.get("id") or f"octopus_{safe_key(candidate.get('pair'))}_{current_bucket}_{candidate.get('direction')}"
-    _structure_edge_state["pending_trade"] = dict(candidate)
-    _octopus_execution_lock_set(candidate.get("copy_signal_id"), candidate.get("pair"), current_bucket + 60, reason="prearm_committed_signal_published")
-    _structure_edge_state["copy_signals_sent"] = int(_structure_edge_state.get("copy_signals_sent",0) or 0) + 1
+    candidate["published_user_ids"] = published_user_ids
+    candidate["copy_results"] = copy_results
+    _octopus_execution_lock_set(candidate.get("market_signal_key"), candidate.get("pair"), current_bucket + 60, reason="team_prearm_committed_signal_published")
+    _structure_edge_state["copy_signals_sent"] = int(_structure_edge_state.get("copy_signals_sent",0) or 0) + len(published_user_ids)
     _octopus_state["selector_publish_ok"] = int(_octopus_state.get("selector_publish_ok",0) or 0) + 1
     _octopus_state["selector_last_no_trade_reason"] = None
     _octopus_state["last_reject_reason"] = (
-        f"EXECUTE PRE-ARM COMMIT: {candidate.get('pair')} {candidate.get('direction')} "
-        f"{candidate.get('market_setup')} Q{candidate.get('market_quality')} | no FINAL revalidation"
+        f"EXECUTE TEAM PRE-ARM COMMIT: {candidate.get('pair')} {candidate.get('direction')} "
+        f"{candidate.get('market_setup')} Q{candidate.get('market_quality')} | users={len(published_user_ids)} | no FINAL"
     )
-    await safe_send_message(context.bot, chat_id=_structure_edge_target_chat_id(), text=_octopus_selector_decision_text(candidate))
+    # v1.37: no signal/order Telegram posts. Octopus channel publishes RESULT ONLY after settlement.
     _octopus_flush_snapshot(force=False)
     await _octopus_maybe_digest(context)
 
@@ -17136,105 +17343,85 @@ def _structure_edge_reset_results() -> tuple[bool, str]:
         return False, f"❌ تعذر تصفير Octopus: {exc}"
 
 async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: dict | None = None) -> bool:
+    """Accept Octopus order-open audits for owner/team users without posting to the channel."""
     try:
-        client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
-        if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
+        client = client or {}
+        uid = normalize_copy_telegram_user_id((payload_event or {}).get("telegram_user_id") or client.get("telegram_user_id") or (payload_event or {}).get("target_user_id"))
+        if not uid or str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
-        if str((payload_event or {}).get("source") or "") != "structure_edge":
+        if int(uid) != int(ADMIN_TELEGRAM_ID) and not is_approved(int(uid)):
             return False
-        signal_id = str((payload_event or {}).get("signal_id") or "").strip()
+        state = _octopus_user_state(int(uid), create=False) if int(uid) != int(ADMIN_TELEGRAM_ID) else None
+        pending = (state or {}).get("pending_trade") if isinstance((state or {}).get("pending_trade"), dict) else (_structure_edge_state.get("pending_trade") if int(uid) == int(ADMIN_TELEGRAM_ID) else {})
+        signal_id = str((payload_event or {}).get("signal_id") or (pending or {}).get("copy_signal_id") or "").strip()
         if not signal_id:
             return False
-        _octopus_execution_lock_set(signal_id, (payload_event or {}).get("pair"), _octopus_event_expiry_ts(payload_event), reason="quotex_order_opened")
-        pending = _structure_edge_state.get("pending_trade") if isinstance(_structure_edge_state.get("pending_trade"), dict) else {}
-        def pick(name, default=None):
-            value = (payload_event or {}).get(name)
-            return value if value is not None else (pending or {}).get(name, default)
         record = {
-            "reported_at": now_iso(), "signal_id": signal_id, "pair": pick("pair"), "direction": pick("direction"),
-            "original_direction": pick("original_direction", (pending or {}).get("original_direction")),
-            "reverse_mode": bool(pick("reverse_mode", (pending or {}).get("reverse_mode", False))),
-            "execution_direction_mode": pick("execution_direction_mode", (pending or {}).get("execution_direction_mode", "NORMAL")),
-            "asset": (payload_event or {}).get("asset"), "amount": float((payload_event or {}).get("amount") or 0),
+            "reported_at": now_iso(), "signal_id": signal_id, "user_id": int(uid),
+            "pair": (payload_event or {}).get("pair") or (pending or {}).get("pair"),
+            "direction": (payload_event or {}).get("direction") or (pending or {}).get("direction"),
+            "original_direction": (payload_event or {}).get("original_direction") or (pending or {}).get("original_direction"),
+            "reverse_mode": bool((payload_event or {}).get("reverse_mode") or (pending or {}).get("reverse_mode")),
+            "execution_direction_mode": (payload_event or {}).get("execution_direction_mode") or (pending or {}).get("execution_direction_mode") or "NORMAL",
+            "amount": float((payload_event or {}).get("amount") or 0),
             "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
-            "setup": pick("setup", "OCTOPUS_SR_RETEST"), "score": int(pick("score", 0) or 0),
-            "signal_created_at": (payload_event or {}).get("signal_created_at") or (pending or {}).get("created_at"),
             "executed_at": (payload_event or {}).get("executed_at") or now_iso(),
+            "expires_at": (payload_event or {}).get("expires_at") or (datetime.fromtimestamp(int((pending or {}).get("entry_bucket") or 0), tz=UTC) + timedelta(seconds=60)).isoformat() if int((pending or {}).get("entry_bucket") or 0) > 0 else None,
             "execution_latency_ms": (payload_event or {}).get("execution_latency_ms"),
-            "expires_at": (payload_event or {}).get("expires_at"),
-            "entry_offset_from_candle_open_ms": (payload_event or {}).get("entry_offset_from_candle_open_ms"),
-            "trendline_candle_open": (payload_event or {}).get("trendline_candle_open") or (pending or {}).get("trendline_candle_open"),
-            "trendline_signal_price": (payload_event or {}).get("trendline_signal_price") or (pending or {}).get("entry_price"),
-            "trendline_entry_displacement_atr": (payload_event or {}).get("trendline_entry_displacement_atr") if (payload_event or {}).get("trendline_entry_displacement_atr") is not None else (pending or {}).get("trendline_entry_displacement_atr"),
             "account_mode": (payload_event or {}).get("account_mode") or "unknown",
-            "octopus_model": pick("octopus_model", (pending or {}).get("primary_model")),
-            "octopus_models": pick("octopus_models", (pending or {}).get("models") or []),
-            "octopus_regime": pick("octopus_regime", (pending or {}).get("regime")),
-            "octopus_expected_wr": float(pick("octopus_expected_wr", (pending or {}).get("expected_wr", 0)) or 0),
-            "octopus_conservative_wr": float(pick("octopus_conservative_wr", (pending or {}).get("conservative_wr", 0)) or 0),
-            "octopus_break_even_wr": float(pick("octopus_break_even_wr", (pending or {}).get("break_even_wr", 0)) or 0),
-            "octopus_edge_points": float(pick("octopus_edge_points", (pending or {}).get("edge_points", 0)) or 0),
-            "octopus_selector_score": float(pick("octopus_selector_score", (pending or {}).get("selector_score", 0)) or 0),
-            "octopus_market_setup": pick("octopus_market_setup", (pending or {}).get("market_setup")),
-            "octopus_market_reason": pick("octopus_market_reason", (pending or {}).get("market_reason")),
-            "octopus_market_quality": float(pick("octopus_market_quality", (pending or {}).get("market_quality", 0)) or 0),
-            "octopus_market_zone": pick("octopus_market_zone", (pending or {}).get("market_zone")),
-            "octopus_market_space_atr": float(pick("octopus_market_space_atr", (pending or {}).get("market_space_atr", 0)) or 0),
-            "audit_status": "order_sent_to_quotex_bridge",
+            "market_signal_key": (pending or {}).get("market_signal_key"),
         }
         _structure_edge_executions_ref().child(safe_key(signal_id)).set(record)
-        _structure_edge_state["last_execution_at"] = now_iso(); _structure_edge_state["last_execution"] = dict(record)
-        if isinstance(pending, dict) and str(pending.get("copy_signal_id") or "") == signal_id:
-            pending["execution_report"] = dict(record); _structure_edge_state["pending_trade"] = pending
-        await safe_send_message(
-            TRADING_TIME_TELEGRAM_APP.bot if TRADING_TIME_TELEGRAM_APP is not None else None,
-            chat_id=_structure_edge_target_chat_id(),
-            text=(
-                "⚡ OCTOPUS MARKET INTELLIGENCE — ORDER SENT\n━━━━━━━━━━━━━━\n"
-                f"💱 {record.get('pair')} | {record.get('octopus_regime')}\n"
-                f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
-                f"🎛 Mode: {record.get('execution_direction_mode') or ('REVERSE' if record.get('reverse_mode') else 'NORMAL')}" + (f" | original {record.get('original_direction')}" if record.get('reverse_mode') else "") + "\n"
-                f"🧠 {record.get('octopus_model')} | {record.get('octopus_market_setup') or '-'} Q{record.get('octopus_market_quality') or 0:g}\n"
-                f"📈 E {record.get('octopus_expected_wr'):.1f}% | C {record.get('octopus_conservative_wr'):.1f}% | BE {record.get('octopus_break_even_wr'):.1f}%\n"
-                f"💵 ${record.get('amount'):g} | account: {record.get('account_mode')}\n"
-                f"⚡ Latency: {record.get('execution_latency_ms') if record.get('execution_latency_ms') is not None else '-'} ms"
-            )[:3900],
-        ) if TRADING_TIME_TELEGRAM_APP is not None else None
+        if isinstance(pending, dict):
+            pending["execution_report"] = dict(record)
+            if int(uid) == int(ADMIN_TELEGRAM_ID):
+                _structure_edge_state["pending_trade"] = pending
+            elif isinstance(state, dict):
+                state["pending_trade"] = pending
+                _octopus_user_persist(int(uid), state)
         return True
     except Exception as exc:
-        _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Octopus opened audit failed: %s", exc)
+        logger.exception("Octopus team opened audit failed: %s", exc)
         return False
-
 
 
 async def _copy_record_structure_edge_trade_lock(payload_event: dict, client: dict | None = None) -> bool:
+    # The strategy-level lock is already set when at least one team signal is published.
+    # Per-user extension lock events are accepted but do not create channel output.
     try:
-        client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
-        if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            return False
-        if str((payload_event or {}).get("source") or "") != "structure_edge":
-            return False
-        signal_id = str((payload_event or {}).get("signal_id") or "").strip()
-        _octopus_execution_lock_set(signal_id or None, (payload_event or {}).get("pair"), _octopus_event_expiry_ts(payload_event), reason=str((payload_event or {}).get("reason") or "extension_trade_lock"))
-        return True
-    except Exception as exc:
-        logger.exception("Octopus execution lock event failed: %s", exc)
+        uid = normalize_copy_telegram_user_id((payload_event or {}).get("telegram_user_id") or (client or {}).get("telegram_user_id"))
+        return bool(uid and str((payload_event or {}).get("source") or "") == "structure_edge")
+    except Exception:
         return False
+
+
+def _octopus_channel_claim_result(key: str) -> bool:
+    now_ts = time_module.time()
+    for k, ts in list(_octopus_channel_result_keys.items()):
+        if now_ts - float(ts or 0) > 21600:
+            _octopus_channel_result_keys.pop(k, None)
+    key = str(key or "")
+    if not key or key in _octopus_channel_result_keys:
+        return False
+    _octopus_channel_result_keys[key] = now_ts
+    return True
 
 
 async def _copy_record_structure_edge_trade_result(payload_event: dict, client: dict | None = None) -> bool:
     try:
-        client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
-        if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
+        client = client or {}
+        uid = normalize_copy_telegram_user_id((payload_event or {}).get("telegram_user_id") or client.get("telegram_user_id") or (payload_event or {}).get("target_user_id"))
+        if not uid or str((payload_event or {}).get("source") or "") != "structure_edge":
             return False
-        if str((payload_event or {}).get("source") or "") != "structure_edge":
+        uid = int(uid)
+        user_state = _octopus_user_state(uid, create=False) if uid != int(ADMIN_TELEGRAM_ID) else None
+        if uid != int(ADMIN_TELEGRAM_ID) and not is_approved(uid) and not isinstance((user_state or {}).get("pending_trade"), dict):
             return False
         outcome = str((payload_event or {}).get("outcome") or "").lower().strip()
         signal_id = str((payload_event or {}).get("signal_id") or "").strip()
         if outcome not in {"win", "loss", "draw"} or not signal_id:
             return False
-        pending = _structure_edge_state.get("pending_trade") if isinstance(_structure_edge_state.get("pending_trade"), dict) else {}
+        pending = (user_state or {}).get("pending_trade") if isinstance((user_state or {}).get("pending_trade"), dict) else (_structure_edge_state.get("pending_trade") if uid == int(ADMIN_TELEGRAM_ID) else {})
         try:
             execution_record = _structure_edge_executions_ref().child(safe_key(signal_id)).get() or {}
         except Exception:
@@ -17247,11 +17434,13 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
             if value is not None:
                 return value
             return (execution_record or {}).get(name, default)
+        entry_bucket = int((pending or {}).get("entry_bucket") or 0)
+        market_key = str((pending or {}).get("market_signal_key") or f"{entry_bucket}|{pick('pair')}|{pick('direction')}")
         record = {
             "created_at": (payload_event or {}).get("signal_created_at") or (pending or {}).get("created_at") or now_iso(),
-            "closed_at": now_iso(), "signal_id": signal_id, "pair": pick("pair"), "symbol": (pending or {}).get("symbol"),
-            "direction": pick("direction"),
-            "original_direction": pick("original_direction", (pending or {}).get("original_direction") or pick("direction")),
+            "closed_at": now_iso(), "signal_id": signal_id, "market_signal_key": market_key, "result_user_id": uid,
+            "pair": pick("pair"), "symbol": (pending or {}).get("symbol"), "entry_bucket": entry_bucket,
+            "direction": pick("direction"), "original_direction": pick("original_direction", (pending or {}).get("original_direction") or pick("direction")),
             "reverse_mode": bool(pick("reverse_mode", (pending or {}).get("reverse_mode", False))),
             "execution_direction_mode": pick("execution_direction_mode", (pending or {}).get("execution_direction_mode", "NORMAL")),
             "setup": "OCTOPUS_SR_RETEST", "score": int(pick("score", 0) or 0),
@@ -17259,6 +17448,7 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
             "result": outcome, "result_source": "extension_quotex_confirmed",
             "account_mode": (payload_event or {}).get("account_mode") or (execution_record or {}).get("account_mode") or "unknown",
             "executed_at": (payload_event or {}).get("executed_at") or (execution_record or {}).get("executed_at"),
+            "expires_at": (payload_event or {}).get("expires_at") or (execution_record or {}).get("expires_at") or ((datetime.fromtimestamp(entry_bucket, tz=UTC) + timedelta(seconds=60)).isoformat() if entry_bucket > 0 else None),
             "execution_latency_ms": (payload_event or {}).get("execution_latency_ms") if (payload_event or {}).get("execution_latency_ms") is not None else (execution_record or {}).get("execution_latency_ms"),
             "net_delta": (payload_event or {}).get("net_delta"), "amount": (payload_event or {}).get("amount") or (execution_record or {}).get("amount"),
             "platform_deal_id": (payload_event or {}).get("platform_deal_id"), "result_evidence": (payload_event or {}).get("result_source"),
@@ -17276,67 +17466,64 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
             "octopus_market_zone": pick("octopus_market_zone", (pending or {}).get("market_zone")),
             "octopus_market_space_atr": float(pick("octopus_market_space_atr", (pending or {}).get("market_space_atr", 0)) or 0),
         }
-        _structure_edge_results_ref().child(safe_key(signal_id)).set(record)
-        _structure_edge_state["last_result_at"] = now_iso(); _structure_edge_state["last_copy_result"] = dict(record)
-        _octopus_execution_lock_clear(signal_id=signal_id, reason=f"result_{outcome}")
-        if str((pending or {}).get("copy_signal_id") or "") == signal_id:
+
+        if uid != int(ADMIN_TELEGRAM_ID):
+            _octopus_user_result_update(uid, record)
+        else:
             _structure_edge_state["pending_trade"] = None
-        rows = _structure_edge_fetch_results(STRUCTURE_EDGE_RESULT_REPORT_LIMIT)
-        wins = sum(1 for x in rows if str(x.get("result")) == "win")
-        losses = sum(1 for x in rows if str(x.get("result")) == "loss")
-        draws = sum(1 for x in rows if str(x.get("result")) == "draw")
-        wr = round(wins / max(1, wins + losses) * 100.0, 1) if wins + losses else 0.0
-        label = "WIN ✅" if outcome == "win" else "LOSS ❌" if outcome == "loss" else "DRAW ⚖️"
-        if TRADING_TIME_TELEGRAM_APP is not None:
+
+        # Canonical strategy history: one row per market opportunity, never one duplicate per team member.
+        canonical_key = safe_key(market_key)
+        existing = _structure_edge_results_ref().child(canonical_key).get() or {}
+        is_new_canonical = not isinstance(existing, dict) or not existing
+        if is_new_canonical:
+            _structure_edge_results_ref().child(canonical_key).set(record)
+            _structure_edge_state["last_result_at"] = now_iso()
+            _structure_edge_state["last_copy_result"] = dict(record)
+
+        _octopus_execution_lock_clear(reason=f"result_{outcome}")
+
+        # RESULT-ONLY channel, de-duplicated persistently by the canonical market-signal row.
+        if is_new_canonical and TRADING_TIME_TELEGRAM_APP is not None and _octopus_channel_claim_result(market_key):
+            label = "WIN ✅" if outcome == "win" else "LOSS ❌" if outcome == "loss" else "DRAW ⚖️"
+            entry_text = _structure_edge_local_hms(record.get("executed_at") or (datetime.fromtimestamp(entry_bucket, tz=UTC).isoformat() if entry_bucket > 0 else None))
+            end_text = _structure_edge_local_hms(record.get("expires_at") or record.get("closed_at"))
+            direction_label = "🟢 صعود CALL" if str(record.get("direction") or "").upper() == "CALL" else "🔴 هبوط PUT"
             await safe_send_message(
                 TRADING_TIME_TELEGRAM_APP.bot, chat_id=_structure_edge_target_chat_id(),
                 text=(
-                    f"🐙 OCTOPUS S/R + RETEST — {label}\n━━━━━━━━━━━━━━\n"
-                    f"💱 {record.get('pair')} | {record.get('octopus_regime')}\n"
-                    f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
-                    f"🎛 Mode: {record.get('execution_direction_mode') or ('REVERSE' if record.get('reverse_mode') else 'NORMAL')}" + (f" | original {record.get('original_direction')}" if record.get('reverse_mode') else "") + "\n"
-                    f"🧠 {record.get('octopus_model')} | {record.get('octopus_market_setup') or '-'} Q{record.get('octopus_market_quality') or 0:g}\n"
-                    f"📈 E {record.get('octopus_expected_wr'):.1f}% | C {record.get('octopus_conservative_wr'):.1f}%\n"
-                    f"💵 Net: {record.get('net_delta') if record.get('net_delta') is not None else '-'} | {record.get('account_mode')}\n"
-                    "━━━━━━━━━━━━━━\n"
-                    f"📊 آخر {len(rows)}: ✅ {wins} | ❌ {losses} | ⚖️ {draws} | WR {wr}%\n"
-                    f"🧨 Max loss streak: {_structure_edge_max_loss_streak(rows)}"
+                    "🐙 OCTOPUS — RESULT\n━━━━━━━━━━━━━━\n"
+                    f"💱 الزوج: {record.get('pair')}\n"
+                    f"🕒 وقت الدخول: {entry_text} UTC+3\n"
+                    f"🏁 وقت الانتهاء: {end_text} UTC+3\n"
+                    f"📌 نوع الصفقة: {direction_label}\n"
+                    f"📊 النتيجة: {label}"
                 )[:3900],
             )
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
-        logger.exception("Octopus confirmed result record failed: %s", exc)
+        logger.exception("Octopus team confirmed result record failed: %s", exc)
         return False
 
 
 async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: dict | None = None) -> bool:
+    # v1.37: skips are telemetry only; RESULT-ONLY channel receives nothing for non-executed trades.
     try:
-        client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
-        if client_uid != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            return False
-        if str((payload_event or {}).get("source") or "") != "structure_edge":
-            return False
+        uid = normalize_copy_telegram_user_id((payload_event or {}).get("telegram_user_id") or (client or {}).get("telegram_user_id"))
         signal_id = str((payload_event or {}).get("signal_id") or "").strip()
-        reason = str((payload_event or {}).get("reason") or "extension_skip")[:300]
-        _structure_edge_state["last_skip_at"] = now_iso(); _structure_edge_state["last_skip_reason"] = reason
-        _octopus_execution_lock_clear(signal_id=signal_id or None, reason=f"extension_skip:{reason[:80]}")
-        pending = _structure_edge_state.get("pending_trade")
-        if isinstance(pending, dict) and (not signal_id or str(pending.get("copy_signal_id") or "") == signal_id):
+        if uid and int(uid) != int(ADMIN_TELEGRAM_ID):
+            state = _octopus_user_state(int(uid), create=False)
+            if isinstance(state, dict):
+                pending = state.get("pending_trade") if isinstance(state.get("pending_trade"), dict) else {}
+                if not signal_id or str((pending or {}).get("copy_signal_id") or "") == signal_id:
+                    state["pending_trade"] = None
+                    state["prepared_signal"] = None
+                    _octopus_user_persist(int(uid), state)
+        elif uid:
             _structure_edge_state["pending_trade"] = None
-        if TRADING_TIME_TELEGRAM_APP is not None:
-            await safe_send_message(
-                TRADING_TIME_TELEGRAM_APP.bot, chat_id=_structure_edge_target_chat_id(),
-                text=(
-                    "⏭️ OCTOPUS S/R + RETEST — SKIPPED\n━━━━━━━━━━━━━━\n"
-                    f"💱 {(payload_event or {}).get('pair') or (pending or {}).get('pair')}\n"
-                    f"📌 {_structure_edge_direction_label((payload_event or {}).get('direction') or (pending or {}).get('direction'))}\n"
-                    f"🚫 {reason}\n📊 لم تُحسب Win/Loss لأن أمر الدخول لم يكتمل."
-                )[:3900],
-            )
         return True
-    except Exception as exc:
-        logger.exception("Octopus skip record failed: %s", exc)
+    except Exception:
         return False
 
 
@@ -17352,11 +17539,11 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
         current_bucket = int(now_ts // 60) * 60
         sec = float(now_ts - current_bucket)
 
-        # v1.36: internal paper detector never stops. This is what makes the 5-hour
+        # v1.36: internal paper detector never stops. This is what makes the 2-hour
         # NORMAL-vs-REVERSE report available before real execution is turned on.
         _octopus_mode_detector_tick(now_ts, current_bucket, sec)
 
-        if not _structure_edge_is_enabled():
+        if not _octopus_any_live_execution_enabled():
             return
 
         # A PRE-ARM is valid for exactly its target candle. If the open window was missed,
@@ -21427,6 +21614,21 @@ def reset_signal_state(context: ContextTypes.DEFAULT_TYPE):
 # This prevents navigation labels such as "رجوع" from being consumed as message bodies
 # or Copy license tokens, and keeps unrelated generic replies such as "نعم" from being
 # stolen by the Trading Room handler.
+TRADING_ROOM_RETIRED_TEXTS = {
+    "🧠 غرفة جلسة تداول", "🧠 Trading Session Room", "🚀 بدء جلسة تداول", "🚀 Start Trading Session",
+    "🛑 إيقاف الجلسة", "🛑 Stop Session", "✅ نعم، أنا مستعد", "✅ Yes, I am ready",
+    "❌ إلغاء الجلسة", "❌ Cancel Session", "📊 حالة الجلسة", "📊 Session Status",
+    "🩺 فحص بيانات OTC Live", "🩺 OTC Live Check", "🛑 إيقاف وحفظ النتيجة", "🛑 Stop and secure result",
+    "▶️ متابعة الجلسة", "▶️ Continue session", "🚀 جلسة جديدة", "🚀 New Session",
+    "🛑 إنهاء اليوم", "🛑 End Today", "🚀 بدء جلسة جديدة", "🚀 Start New Session",
+    "⏰ ذكرني بعد نصف ساعة", "⏰ Remind me in 30 minutes", "🧊 تعطيل غرفة التداول نصف ساعة", "🧊 Lock room for 30 minutes",
+    "نعم متأكد", "Yes, I am sure", "لا، خليني أتراجع", "No, let me step back",
+    "لا يهمني دعنا نكمل", "I do not care, continue", "حسنا شكرا لتذكيري", "Thanks for reminding me",
+    "عندي خطة واضحة", "I have a clear plan", "غالبًا غضب، أوقفني", "Probably anger, stop me",
+    "أتحمل القرار", "I accept responsibility", "أوقفني نصف ساعة", "Stop me for 30 minutes",
+    "أوافق، ابدأ جلسة جديدة", "I agree, start a new session", "تراجع وتعطيل نصف ساعة", "Step back and lock 30 minutes",
+}
+
 ADMIN_CANCEL_TEXTS = {
     "رجوع", "⬅️ رجوع", "🔙 رجوع", "إلغاء", "الغاء", "❌ إلغاء",
     "Back", "🔙 Back", "⬅️ Back", "Cancel", "❌ Cancel",
@@ -21624,7 +21826,7 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
             return ReplyKeyboardMarkup(
                 [
                     ["📊 Generate Signals"],
-                    ["🧠 Trading Session Room", "⚡ OTC Edge"],
+                    ["🐙 Octopus", "⚡ OTC Edge"],
                     ["👤 My Account", "📞 Contact Support"],
                     ["🌐 Change Language", "🛠 Admin Panel"],
                 ],
@@ -21633,7 +21835,7 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
         return ReplyKeyboardMarkup(
             [
                 ["📊 توليد إشارات"],
-                ["🧠 غرفة جلسة تداول", "⚡ OTC Edge"],
+                ["🐙 Octopus", "⚡ OTC Edge"],
                 ["👤 حالة حسابي", "📞 تواصل مع المسؤول"],
                 ["🌐 تغيير اللغة", "🛠 لوحة الأدمن"],
             ],
@@ -21880,6 +22082,8 @@ async def send_maintenance_message(update: Update, context: ContextTypes.DEFAULT
 
 
 async def handle_trading_room_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    # v1.37: Trading Room retired from the bot. Legacy function body below is unreachable.
+    return False
     """Inline-button handler for Trading Session Room. Keeps button presses silent (no quoted user messages)."""
     query = update.callback_query
     if not query:
@@ -22819,6 +23023,32 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_welcome_flow(update, "en")
         return
 
+    # ===== Public/team Octopus v1.37 =====
+    if text in {"🐙 Octopus", "Octopus"}:
+        reset_signal_state(context)
+        if is_admin(user.id):
+            await update.message.reply_text("🐙 Octopus owner controls", reply_markup=structure_edge_admin_keyboard)
+        else:
+            await update.message.reply_text(
+                "🐙 Octopus\n\nRun or stop automated S/R + Retest execution on the extension linked to your Telegram ID.",
+                reply_markup=octopus_user_keyboard_en,
+            )
+        return
+    if not is_admin(user.id) and text == "🟢 Start Octopus":
+        ok, msg = _octopus_user_set_enabled(user.id, True)
+        await update.message.reply_text(msg, reply_markup=octopus_user_keyboard_en)
+        return
+    if not is_admin(user.id) and text == "🔴 Stop Octopus":
+        ok, msg = _octopus_user_set_enabled(user.id, False)
+        await update.message.reply_text(msg, reply_markup=octopus_user_keyboard_en)
+        return
+    if not is_admin(user.id) and text == "📋 Octopus Status":
+        await update.message.reply_text(build_octopus_user_status(user.id, "en"), reply_markup=octopus_user_keyboard_en)
+        return
+    if not is_admin(user.id) and text == "💡 Start Tips":
+        await update.message.reply_text(build_octopus_start_tips("en"), reply_markup=octopus_user_keyboard_en)
+        return
+
     # Approved English user flow
     if text in {"⚡ OTC Edge", "OTC Edge"}:
         reset_signal_state(context)
@@ -23168,14 +23398,16 @@ async def block_signal_for_unapproved_user(update: Update, context: ContextTypes
 
 
 async def handle_trading_room_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    # v1.37: Trading Room retired from the bot.
+    return False
     """Handle Trading Session Room messages for both Arabic and English users before language-specific fallbacks."""
     if not update.message or not update.message.text:
         return False
     user = update.effective_user
     text = (update.message.text or "").strip()
     step = context.user_data.get("step")
-    # ===== Trading session room =====
-    if (is_admin(user.id) or is_approved(user.id)) and text in {"🧠 غرفة جلسة تداول", "🧠 Trading Session Room"}:
+    # ===== Trading session room RETIRED v1.37 =====
+    if False and (is_admin(user.id) or is_approved(user.id)) and text in {"🧠 غرفة جلسة تداول", "🧠 Trading Session Room"}:
         reset_signal_state(context)
         await safe_send_message(
             context.bot,
@@ -23499,8 +23731,14 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_maintenance_message(update, context, lang)
         return
 
-    # Trading Session Room is shared between Arabic and English users; handle it before English fallback.
-    if await handle_trading_room_message(update, context):
+    # v1.37: Trading Room was fully retired from the user product. Old cached buttons are rejected.
+    if text in TRADING_ROOM_RETIRED_TEXTS:
+        reset_signal_state(context)
+        context.user_data.pop("trading_room_loss_confirm_stage", None)
+        await update.message.reply_text(
+            "تم إلغاء غرفة جلسة التداول واستبدالها بميزة Octopus." if lang != "en" else "Trading Session Room has been retired and replaced by Octopus.",
+            reply_markup=build_main_menu_for_user(user.id, lang),
+        )
         return
 
     if lang == "en":
@@ -24377,6 +24615,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ===== Public/team Octopus v1.37 =====
+    if text in {"🐙 Octopus", "🐙 ميزة Octopus"}:
+        reset_signal_state(context)
+        if is_admin(user.id):
+            await update.message.reply_text("🐙 Octopus — لوحة المالك", reply_markup=structure_edge_admin_keyboard)
+        else:
+            await update.message.reply_text(
+                "🐙 ميزة Octopus\n\nتشغيل آلي لفرص الدعم/المقاومة وإعادة الاختبار على إضافتك المرتبطة بنفس Telegram ID.",
+                reply_markup=octopus_user_keyboard,
+            )
+        return
+    if not is_admin(user.id) and text == "🟢 تشغيل Octopus":
+        ok, msg = _octopus_user_set_enabled(user.id, True)
+        await update.message.reply_text(msg, reply_markup=octopus_user_keyboard)
+        return
+    if not is_admin(user.id) and text == "🔴 إيقاف Octopus":
+        ok, msg = _octopus_user_set_enabled(user.id, False)
+        await update.message.reply_text(msg, reply_markup=octopus_user_keyboard)
+        return
+    if not is_admin(user.id) and text == "📋 حالة Octopus":
+        await update.message.reply_text(build_octopus_user_status(user.id, "ar"), reply_markup=octopus_user_keyboard)
+        return
+    if not is_admin(user.id) and text == "💡 نصائح البدء":
+        await update.message.reply_text(build_octopus_start_tips("ar"), reply_markup=octopus_user_keyboard)
+        return
+
     # ===== Public OTC Edge (v0.71) =====
     if text in {"⚡ OTC Edge", "OTC Edge"}:
         reset_signal_state(context)
@@ -25222,8 +25486,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(build_structure_edge_summary(), reply_markup=structure_edge_admin_keyboard)
             return
 
-        if text == "📊 وضع السوق 5 ساعات":
-            await update.message.reply_text(build_octopus_market_mode_report(5), reply_markup=structure_edge_admin_keyboard)
+        if text == "📊 وضع السوق ساعتين":
+            await update.message.reply_text(build_octopus_market_mode_report(2), reply_markup=structure_edge_admin_keyboard)
             return
 
         if text == "🟢 تنفيذ NORMAL":
@@ -27447,76 +27711,14 @@ def create_embedded_copy_api():
 
     @copy_api.get("/api/mobile/trading-room/status")
     async def mobile_trading_room_status(authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
-        tid = _mobile_session_tid(session)
-        uid = int(tid)
-        state = {}
-        app_ref = globals().get("TRADING_TIME_TELEGRAM_APP")
-        if app_ref is not None:
-            state = dict(get_trading_room_state(app_ref, uid) or {})
-        else:
-            try:
-                state = dict(trading_room_sessions_ref().child(str(uid)).get() or {})
-            except Exception:
-                state = {}
-        safe_state = {k: v for k, v in state.items() if k not in {"trade_ledger"}}
-        return {"ok": True, "active": bool(state.get("active")), "state": safe_state, "server_time": now_iso()}
+        _mobile_bearer_session(authorization)
+        return {"ok": False, "retired": True, "message": "Trading Room retired; use Octopus."}
 
     @copy_api.post("/api/mobile/trading-room/action")
     async def mobile_trading_room_action(request: Request, authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
-        tid = _mobile_session_tid(session)
-        uid = int(tid)
-        app_ref = _mobile_runtime_app()
-        try:
-            body = await request.json()
-        except Exception:
-            raise HTTPException(status_code=400, detail="invalid request body")
-        action = str(body.get("action") or "status").strip().lower()
-        if action == "start":
-            balance = float(body.get("balance") or 0)
-            if balance <= 0:
-                raise HTTPException(status_code=400, detail="أدخل رصيد صحيح")
-            plan = build_session_money_plan(balance)
-            state = {
-                "active": True, "pending_ready": True, "ready_confirmed": False,
-                "admin_id": uid, "balance": plan["balance"], "trade_amount": plan["trade_amount"],
-                "recovery_amount": plan["recovery_amount"], "target_profit_amount": plan["target_profit_amount"],
-                "max_loss_amount": plan["max_loss_amount"], "max_trades": plan["max_trades"],
-                "wins": 0, "losses": 0, "net_profit": 0.0, "trade_ledger": [],
-                "pending_loss_units": 0, "pending_loss_amount": 0.0, "pending_loss_payout": 0.0,
-                "unrecovered_loss": False, "session_mode": "normal", "trades_done": 0,
-                "recovery_losses": 0, "extra_recovery_used": 0, "recovery_mode": False,
-                "recovery_notified_at": 0.0, "waiting_result": False,
-                "started_at": time_module.time(), "expires_at": time_module.time() + TRADING_ROOM_SCAN_SECONDS,
-                "brain_mode": "normal", "market_mood": None, "pair_health": None,
-                "pair_health_label": None, "pair_switches": 0, "bad_symbols": [],
-                "last_loss_setup": None, "last_loss_direction": None, "last_trade_setup": None,
-                "last_trade_direction": None, "no_entry_scans": 0, "last_brain_notice_at": 0.0,
-                "pair_selected_at": 0.0, "last_pair_switch_at": 0.0, "pair_bad_scans": 0,
-                "smart_exit_waiting": False, "smart_exit_reason": None, "smart_exit_last_suggested_at": 0.0,
-                "origin": "mobile",
-            }
-            app_ref.bot_data[trading_room_key(uid)] = state
-            save_trading_room_state(app_ref, uid, state)
-            return {"ok": True, "message": build_trading_room_intro(plan, get_user_language(uid)), "state": {k:v for k,v in state.items() if k != "trade_ledger"}}
-        state = get_trading_room_state(app_ref, uid)
-        if action == "ready":
-            if not state or not state.get("active"):
-                raise HTTPException(status_code=409, detail="لا توجد جلسة نشطة")
-            state["pending_ready"] = False
-            state["ready_confirmed"] = True
-            save_trading_room_state(app_ref, uid, state)
-            app_ref.job_queue.run_once(
-                trading_room_begin_market_job, when=1,
-                data={"admin_id": uid},
-                name=f"mobile_trading_room_begin_{uid}_{int(time_module.time())}",
-            )
-            return {"ok": True, "message": "تم بدء البحث عن زوج مناسب.", "state": {k:v for k,v in state.items() if k != "trade_ledger"}}
-        if action == "stop":
-            clear_trading_room_state(app_ref, uid)
-            return {"ok": True, "message": "تم إيقاف غرفة جلسة التداول.", "state": {}}
-        return {"ok": True, "state": {k:v for k,v in (state or {}).items() if k != "trade_ledger"}}
+        _mobile_bearer_session(authorization)
+        raise HTTPException(status_code=410, detail="Trading Room retired; use Octopus")
+
 
     @copy_api.get("/api/mobile/admin/overview")
     async def mobile_admin_overview(authorization: str | None = Header(default=None)):
@@ -28151,6 +28353,7 @@ def create_embedded_copy_api():
                                 # v0.97: accept and aggregate silently; send one session summary on stop.
                                 sent = _copy_record_otc_edge_trade_result(payload_event, _copy_clients.get(client_id) or {})
                             else:
+                                _octopus_user_note_target_event(payload_event, _copy_clients.get(client_id) or {})
                                 sent = await _copy_send_extension_alert_to_user(payload_event, _copy_clients.get(client_id) or {})
                         await _copy_send_json_safe(websocket, {
                             "type": "extension_event_saved",
@@ -28461,9 +28664,7 @@ def run_telegram_bot_only():
 
     # Restore user runtime state before periodic jobs begin.
     restore_otc_edge_watcher_states()
-    restore_trading_room_states(app)
-    restored_room_jobs = schedule_restored_trading_room_jobs(app)
-    logger.warning("Persistent runtime restored | trading_room_jobs=%s", restored_room_jobs)
+    # v1.37: Trading Room retired; no session restore or jobs are scheduled.
 
     # v0.71: OTC Edge watcher serves independent all-market/selected-pair user states and routes each signal to its owner extension only.
     job_queue.run_repeating(
