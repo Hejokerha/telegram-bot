@@ -496,6 +496,8 @@ structure_edge_admin_keyboard = ReplyKeyboardMarkup(
     [
         ["🟢 تشغيل Octopus", "🔴 إيقاف Octopus"],
         ["📋 حالة Octopus", "📊 ملخص Octopus"],
+        ["📊 وضع السوق 5 ساعات"],
+        ["🟢 تنفيذ NORMAL", "🔄 تنفيذ REVERSE"],
         ["🧠 أفضل النماذج", "🗺 الأزواج الآن"],
         ["🧹 تصفير Octopus"],
         ["⬅️ رجوع"],
@@ -1030,7 +1032,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.35.0"
+COPY_SERVER_VERSION = "1.36.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
@@ -12647,6 +12649,7 @@ _structure_edge_state = {
     "enabled_cache_loaded": False,
     "enabled_cache_last_refresh_ts": 0.0,
     "settings_reads": 0,
+    "execution_direction_mode_cache": "NORMAL",
 }
 
 # Reuse old settings node so the currently-enabled test slot remains enabled after deployment.
@@ -12677,8 +12680,9 @@ def _structure_edge_target_chat_id():
 
 
 def _structure_edge_get_settings(force_refresh: bool = False) -> dict:
-    """Return enabled state from RAM; Firebase is only a periodic fallback refresh."""
+    """Return enabled + execution direction mode from RAM; Firebase is a periodic fallback."""
     default_enabled = bool(STRUCTURE_EDGE_DEFAULT_ENABLED)
+    default_mode = "NORMAL"
     now_ts = time_module.time()
     loaded = bool(_structure_edge_state.get("enabled_cache_loaded"))
     last_refresh = float(_structure_edge_state.get("enabled_cache_last_refresh_ts", 0.0) or 0.0)
@@ -12689,17 +12693,28 @@ def _structure_edge_get_settings(force_refresh: bool = False) -> dict:
             if not isinstance(data, dict):
                 data = {}
             enabled = bool(data.get("enabled", default_enabled))
+            mode = str(data.get("execution_direction_mode") or default_mode).strip().upper()
+            if mode not in {"NORMAL", "REVERSE"}:
+                mode = default_mode
             _structure_edge_state["enabled_cache"] = enabled
+            _structure_edge_state["execution_direction_mode_cache"] = mode
             _structure_edge_state["enabled_cache_loaded"] = True
             _structure_edge_state["enabled_cache_last_refresh_ts"] = now_ts
             _structure_edge_state["settings_reads"] = int(_structure_edge_state.get("settings_reads", 0) or 0) + 1
         except Exception as exc:
-            logger.debug("Round Number Edge settings refresh failed: %s", exc)
+            logger.debug("Octopus settings refresh failed: %s", exc)
             if not loaded:
                 _structure_edge_state["enabled_cache"] = default_enabled
+                _structure_edge_state["execution_direction_mode_cache"] = default_mode
                 _structure_edge_state["enabled_cache_loaded"] = True
                 _structure_edge_state["enabled_cache_last_refresh_ts"] = now_ts
-    return {"enabled": bool(_structure_edge_state.get("enabled_cache", default_enabled))}
+    mode = str(_structure_edge_state.get("execution_direction_mode_cache") or default_mode).upper()
+    if mode not in {"NORMAL", "REVERSE"}:
+        mode = default_mode
+    return {
+        "enabled": bool(_structure_edge_state.get("enabled_cache", default_enabled)),
+        "execution_direction_mode": mode,
+    }
 
 
 def _structure_edge_set_enabled(enabled: bool) -> bool:
@@ -12715,6 +12730,32 @@ def _structure_edge_set_enabled(enabled: bool) -> bool:
         _structure_edge_state["last_error"] = str(exc)
         logger.exception("Round Number Edge enabled update failed: %s", exc)
         return False
+
+
+def _structure_edge_set_execution_direction_mode(mode: str) -> bool:
+    try:
+        value = str(mode or "NORMAL").strip().upper()
+        if value not in {"NORMAL", "REVERSE"}:
+            return False
+        _structure_edge_settings_ref().update({
+            "execution_direction_mode": value,
+            "execution_direction_mode_updated_at": now_iso(),
+        })
+        _structure_edge_state["execution_direction_mode_cache"] = value
+        # Do not mark the whole settings cache as loaded here: if this is the first owner
+        # action after a restart, enabled-state must still be refreshed from Firebase.
+        if bool(_structure_edge_state.get("enabled_cache_loaded")):
+            _structure_edge_state["enabled_cache_last_refresh_ts"] = time_module.time()
+        return True
+    except Exception as exc:
+        _structure_edge_state["last_error"] = str(exc)
+        logger.exception("Octopus execution direction mode update failed: %s", exc)
+        return False
+
+
+def _structure_edge_execution_direction_mode() -> str:
+    mode = str(_structure_edge_get_settings(force_refresh=False).get("execution_direction_mode") or "NORMAL").upper()
+    return mode if mode in {"NORMAL", "REVERSE"} else "NORMAL"
 
 
 def _structure_edge_is_enabled() -> bool:
@@ -15085,6 +15126,11 @@ OCTOPUS_SELECTOR_PREARM_LAST_SECOND = max(OCTOPUS_SELECTOR_PREARM_MIN_SECOND, mi
 OCTOPUS_SELECTOR_PREARM_MAX_ATTEMPTS = max(1, min(4, int(os.getenv("OCTOPUS_SELECTOR_PREARM_MAX_ATTEMPTS", "2"))))
 OCTOPUS_SELECTOR_PREARM_RETRY_SECONDS = max(0.4, min(3.0, float(os.getenv("OCTOPUS_SELECTOR_PREARM_RETRY_SECONDS", "1.4"))))
 OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND = max(1.0, min(4.0, float(os.getenv("OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND", "2.5"))))
+# v1.36: continuous internal NORMAL-vs-REVERSE market-mode detector.
+# It runs even while real Octopus execution is OFF and mirrors the live PRE-ARM/open guards
+# without requiring the browser extension. Report window defaults to the owner-requested 5h.
+OCTOPUS_MODE_DETECTOR_REPORT_HOURS = max(1.0, min(24.0, float(os.getenv("OCTOPUS_MODE_DETECTOR_REPORT_HOURS", "5"))))
+OCTOPUS_MODE_DETECTOR_MIN_SAMPLE = max(1, min(100, int(os.getenv("OCTOPUS_MODE_DETECTOR_MIN_SAMPLE", "12"))))
 OCTOPUS_SELECTOR_SHADOW_FALLBACK_MAX_SECOND = max(OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND, min(15.0, float(os.getenv("OCTOPUS_SELECTOR_SHADOW_FALLBACK_MAX_SECOND", "8.0"))))
 OCTOPUS_SELECTOR_MIN_MODEL_SAMPLE = max(12, int(os.getenv("OCTOPUS_SELECTOR_MIN_MODEL_SAMPLE", "30")))
 OCTOPUS_SELECTOR_MIN_RECENT_SAMPLE = max(10, int(os.getenv("OCTOPUS_SELECTOR_MIN_RECENT_SAMPLE", "20")))
@@ -15132,6 +15178,21 @@ OCTOPUS_SR_PREARM_ZONE_DISTANCE_ATR = max(0.08, min(0.60, float(os.getenv("OCTOP
 OCTOPUS_SR_PREARM_MIN_PROJECTED_QUALITY = max(OCTOPUS_MI_MIN_THESIS_QUALITY, min(82.0, float(os.getenv("OCTOPUS_SR_PREARM_MIN_PROJECTED_QUALITY", "70"))))
 OCTOPUS_SR_PREARM_MIN_WICK_RATIO = max(0.08, min(0.30, float(os.getenv("OCTOPUS_SR_PREARM_MIN_WICK_RATIO", "0.14"))))
 OCTOPUS_SR_PREARM_ROLE_SIDE_TOLERANCE_ATR = max(0.02, min(0.15, float(os.getenv("OCTOPUS_SR_PREARM_ROLE_SIDE_TOLERANCE_ATR", "0.08"))))
+
+_octopus_mode_detector_state = {
+    "prearm_bucket": 0,
+    "prearm_attempts": 0,
+    "last_prearm_attempt_ts": 0.0,
+    "prearmed_candidate": None,
+    "prearm_target_bucket": 0,
+    "pending_trade": None,
+    "virtual_committed": 0,
+    "virtual_settled": 0,
+    "virtual_skipped": 0,
+    "last_candidate": None,
+    "last_result": None,
+    "last_error": None,
+}
 
 # Keep the historic v1.24 shadow snapshot namespace so the 7k+ observations collected
 # before this deploy remain useful as priors. Actual selector executions are isolated.
@@ -16228,6 +16289,270 @@ def _octopus_current_open_snapshot(symbol: str, current_bucket: int, candidate: 
         return None, None, None
 
 
+def _octopus_mode_detector_base_ref():
+    # Independent long-lived audit. It is intentionally NOT cleared by normal Octopus reset.
+    return system_ref().child("octopus_normal_reverse_mode_v1")
+
+
+def _octopus_mode_detector_results_ref():
+    return _octopus_mode_detector_base_ref().child("results")
+
+
+def _octopus_flip_direction(direction: str) -> str:
+    return "PUT" if str(direction or "").upper() == "CALL" else "CALL"
+
+
+def _octopus_apply_execution_direction_mode(candidate: dict) -> dict:
+    item = dict(candidate or {})
+    original = str(item.get("original_direction") or item.get("analysis_direction") or item.get("direction") or "").upper()
+    if original not in {"CALL", "PUT"}:
+        return item
+    mode = _structure_edge_execution_direction_mode()
+    item["analysis_direction"] = original
+    item["original_direction"] = original
+    item["execution_direction_mode"] = mode
+    item["reverse_mode"] = bool(mode == "REVERSE")
+    item["direction"] = _octopus_flip_direction(original) if mode == "REVERSE" else original
+    return item
+
+
+def _octopus_mode_result(direction: str, entry_price: float, close_price: float) -> str:
+    try:
+        entry = float(entry_price); close = float(close_price)
+        eps = max(abs(entry) * 1e-10, 1e-12)
+        if abs(close - entry) <= eps:
+            return "draw"
+        if str(direction or "").upper() == "CALL":
+            return "win" if close > entry else "loss"
+        return "win" if close < entry else "loss"
+    except Exception:
+        return "draw"
+
+
+def _octopus_mode_detector_store_result(trade: dict, close_price: float) -> None:
+    original_direction = str(trade.get("analysis_direction") or trade.get("original_direction") or trade.get("direction") or "").upper()
+    if original_direction not in {"CALL", "PUT"}:
+        return
+    reverse_direction = _octopus_flip_direction(original_direction)
+    normal_result = _octopus_mode_result(original_direction, float(trade.get("entry_price") or 0), float(close_price))
+    reverse_result = _octopus_mode_result(reverse_direction, float(trade.get("entry_price") or 0), float(close_price))
+    entry_bucket = int(trade.get("entry_bucket") or 0)
+    record = {
+        "entry_bucket": entry_bucket,
+        "created_at": trade.get("created_at") or now_iso(),
+        "closed_at": now_iso(),
+        "pair": trade.get("pair"), "symbol": trade.get("symbol"),
+        "analysis_direction": original_direction,
+        "reverse_direction": reverse_direction,
+        "market_setup": trade.get("market_setup"),
+        "prearm_mode": trade.get("prearm_mode"),
+        "market_quality": float(trade.get("market_quality", 0) or 0),
+        "payout": int(trade.get("payout", 0) or 0),
+        "entry_price": float(trade.get("entry_price", 0) or 0),
+        "close_price": float(close_price),
+        "displacement_atr": float(trade.get("trendline_entry_displacement_atr", 0) or 0),
+        "normal_result": normal_result,
+        "reverse_result": reverse_result,
+        "source": "INTERNAL_PREARM_OPEN_SIM_V1_36",
+    }
+    _octopus_mode_detector_results_ref().child(str(entry_bucket)).set(record)
+    _octopus_mode_detector_state["virtual_settled"] = int(_octopus_mode_detector_state.get("virtual_settled", 0) or 0) + 1
+    _octopus_mode_detector_state["last_result"] = dict(record)
+
+
+def _octopus_mode_detector_settle(current_bucket: int) -> None:
+    pending = _octopus_mode_detector_state.get("pending_trade") if isinstance(_octopus_mode_detector_state.get("pending_trade"), dict) else None
+    if not pending:
+        return
+    entry_bucket = int(pending.get("entry_bucket") or 0)
+    if entry_bucket <= 0 or current_bucket <= entry_bucket:
+        return
+    try:
+        symbol = str(pending.get("symbol") or "")
+        _, _, candles = _get_otc_rows_and_candles(symbol)
+        target_candle = None
+        for c in candles:
+            if _structure_edge_candle_bucket(c) == entry_bucket:
+                target_candle = dict(c)
+                break
+        if target_candle is None:
+            # Give the feed up to two minutes to expose the completed target candle.
+            if current_bucket - entry_bucket > 180:
+                _octopus_mode_detector_state["pending_trade"] = None
+                _octopus_mode_detector_state["virtual_skipped"] = int(_octopus_mode_detector_state.get("virtual_skipped", 0) or 0) + 1
+            return
+        _octopus_mode_detector_store_result(pending, float(target_candle.get("close")))
+        _octopus_mode_detector_state["pending_trade"] = None
+    except Exception as exc:
+        _octopus_mode_detector_state["last_error"] = str(exc)
+        logger.debug("Octopus mode detector settle failed: %s", exc)
+
+
+def _octopus_mode_detector_prearm(now_ts: float, current_bucket: int, sec: float) -> None:
+    # Mirror live Execution Lock semantics: while the virtual 1-minute trade is still open,
+    # do not prepare the immediately following candle.
+    if isinstance(_octopus_mode_detector_state.get("pending_trade"), dict):
+        return
+    target_bucket = current_bucket + 60
+    existing = _octopus_mode_detector_state.get("prearmed_candidate") if isinstance(_octopus_mode_detector_state.get("prearmed_candidate"), dict) else None
+    existing_target = int(_octopus_mode_detector_state.get("prearm_target_bucket", 0) or 0)
+    if existing is not None and existing_target == target_bucket:
+        return
+    if int(_octopus_mode_detector_state.get("prearm_bucket", 0) or 0) != current_bucket:
+        _octopus_mode_detector_state["prearm_bucket"] = current_bucket
+        _octopus_mode_detector_state["prearm_attempts"] = 0
+        _octopus_mode_detector_state["last_prearm_attempt_ts"] = 0.0
+    attempts = int(_octopus_mode_detector_state.get("prearm_attempts", 0) or 0)
+    last_attempt = float(_octopus_mode_detector_state.get("last_prearm_attempt_ts", 0.0) or 0.0)
+    if attempts >= OCTOPUS_SELECTOR_PREARM_MAX_ATTEMPTS or (last_attempt and now_ts - last_attempt < OCTOPUS_SELECTOR_PREARM_RETRY_SECONDS):
+        return
+    _octopus_mode_detector_state["prearm_attempts"] = attempts + 1
+    _octopus_mode_detector_state["last_prearm_attempt_ts"] = now_ts
+    scan = _octopus_sr_prearm_watch_scan(target_bucket)
+    ranked = scan.get("ranked") or []
+    if not ranked:
+        return
+    candidate = dict(ranked[0])
+    candidate["analysis_direction"] = str(candidate.get("direction") or "").upper()
+    candidate["original_direction"] = candidate["analysis_direction"]
+    candidate["target_entry_bucket"] = target_bucket
+    candidate["prearmed_at"] = now_iso()
+    _octopus_mode_detector_state["prearmed_candidate"] = candidate
+    _octopus_mode_detector_state["prearm_target_bucket"] = target_bucket
+    _octopus_mode_detector_state["last_candidate"] = dict(candidate)
+
+
+def _octopus_mode_detector_open(now_ts: float, current_bucket: int, sec: float) -> None:
+    candidate = _octopus_mode_detector_state.get("prearmed_candidate") if isinstance(_octopus_mode_detector_state.get("prearmed_candidate"), dict) else None
+    target = int(_octopus_mode_detector_state.get("prearm_target_bucket", 0) or 0)
+    if not candidate or target != current_bucket:
+        return
+    if sec > OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND:
+        _octopus_mode_detector_state["prearmed_candidate"] = None
+        _octopus_mode_detector_state["prearm_target_bucket"] = 0
+        _octopus_mode_detector_state["virtual_skipped"] = int(_octopus_mode_detector_state.get("virtual_skipped", 0) or 0) + 1
+        return
+    try:
+        instrument = quotex_otc_feed.instrument(str(candidate.get("symbol") or "")) if "quotex_otc_feed" in globals() else {}
+        payout = int(float((instrument or {}).get("payout", 0) or 0))
+        if payout < OCTOPUS_SELECTOR_MIN_PAYOUT:
+            _octopus_mode_detector_state["prearmed_candidate"] = None
+            _octopus_mode_detector_state["prearm_target_bucket"] = 0
+            _octopus_mode_detector_state["virtual_skipped"] = int(_octopus_mode_detector_state.get("virtual_skipped", 0) or 0) + 1
+            return
+        open_price, live_price, displacement = _octopus_current_open_snapshot(str(candidate.get("symbol") or ""), current_bucket, candidate)
+        if open_price is None or live_price is None or displacement is None:
+            return  # retry inside the same 0-2.5s window
+        if float(displacement) > OCTOPUS_SELECTOR_MAX_OPEN_DISPLACEMENT_ATR:
+            _octopus_mode_detector_state["prearmed_candidate"] = None
+            _octopus_mode_detector_state["prearm_target_bucket"] = 0
+            _octopus_mode_detector_state["virtual_skipped"] = int(_octopus_mode_detector_state.get("virtual_skipped", 0) or 0) + 1
+            return
+        trade = dict(candidate)
+        trade.update({
+            "created_at": now_iso(), "entry_bucket": current_bucket,
+            "entry_price": float(live_price), "payout": payout,
+            "trendline_candle_open": float(open_price),
+            "trendline_entry_displacement_atr": round(float(displacement), 6),
+        })
+        _octopus_mode_detector_state["pending_trade"] = trade
+        _octopus_mode_detector_state["prearmed_candidate"] = None
+        _octopus_mode_detector_state["prearm_target_bucket"] = 0
+        _octopus_mode_detector_state["virtual_committed"] = int(_octopus_mode_detector_state.get("virtual_committed", 0) or 0) + 1
+    except Exception as exc:
+        _octopus_mode_detector_state["last_error"] = str(exc)
+        logger.debug("Octopus mode detector open commit failed: %s", exc)
+
+
+def _octopus_mode_detector_tick(now_ts: float, current_bucket: int, sec: float) -> None:
+    """Always-on internal paper engine. No Telegram/extension side effects."""
+    try:
+        _octopus_mode_detector_settle(current_bucket)
+        pre_target = int(_octopus_mode_detector_state.get("prearm_target_bucket", 0) or 0)
+        if pre_target and current_bucket > pre_target:
+            _octopus_mode_detector_state["prearmed_candidate"] = None
+            _octopus_mode_detector_state["prearm_target_bucket"] = 0
+            _octopus_mode_detector_state["virtual_skipped"] = int(_octopus_mode_detector_state.get("virtual_skipped", 0) or 0) + 1
+        if OCTOPUS_SELECTOR_PREARM_MIN_SECOND <= sec <= OCTOPUS_SELECTOR_PREARM_LAST_SECOND:
+            _octopus_mode_detector_prearm(now_ts, current_bucket, sec)
+        elif sec <= OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND:
+            _octopus_mode_detector_open(now_ts, current_bucket, sec)
+    except Exception as exc:
+        _octopus_mode_detector_state["last_error"] = str(exc)
+        logger.debug("Octopus mode detector tick failed: %s", exc)
+
+
+def _octopus_mode_detector_fetch(hours: float | None = None) -> list[dict]:
+    lookback_hours = float(hours if hours is not None else OCTOPUS_MODE_DETECTOR_REPORT_HOURS)
+    cutoff = int((time_module.time() - lookback_hours * 3600.0) // 60) * 60
+    try:
+        data = _octopus_mode_detector_results_ref().order_by_key().start_at(str(cutoff)).get() or {}
+        if not isinstance(data, dict):
+            return []
+        rows = [dict(v, _key=k) for k, v in data.items() if isinstance(v, dict)]
+        rows = [r for r in rows if int(r.get("entry_bucket", 0) or 0) >= cutoff]
+        rows.sort(key=lambda r: int(r.get("entry_bucket", 0) or 0))
+        return rows
+    except Exception as exc:
+        _octopus_mode_detector_state["last_error"] = str(exc)
+        logger.exception("Octopus mode detector report read failed: %s", exc)
+        return []
+
+
+def _octopus_mode_stats(rows: list[dict], field: str) -> dict:
+    w = sum(1 for r in rows if str(r.get(field) or "") == "win")
+    l = sum(1 for r in rows if str(r.get(field) or "") == "loss")
+    d = sum(1 for r in rows if str(r.get(field) or "") == "draw")
+    decided = w + l
+    wr = (w / decided * 100.0) if decided else 0.0
+    net = 0.0
+    for r in rows:
+        result = str(r.get(field) or "")
+        payout = max(0.0, float(r.get("payout", 0) or 0) / 100.0)
+        if result == "win": net += payout
+        elif result == "loss": net -= 1.0
+    return {"w": w, "l": l, "d": d, "decided": decided, "wr": wr, "net": net}
+
+
+def build_octopus_market_mode_report(hours: float | None = None) -> str:
+    lookback = float(hours if hours is not None else OCTOPUS_MODE_DETECTOR_REPORT_HOURS)
+    rows = _octopus_mode_detector_fetch(lookback)
+    settings = _structure_edge_get_settings(force_refresh=False)
+    current_mode = str(settings.get("execution_direction_mode") or "NORMAL")
+    if not rows:
+        return (
+            f"📊 Octopus Market Mode — آخر {lookback:g} ساعات\n"
+            "━━━━━━━━━━━━━━\n"
+            "لسا ما في صفقات افتراضية محسومة ضمن النافذة.\n"
+            "المراقب الداخلي شغال بالخلفية حتى لو تنفيذ Octopus مطفّى.\n"
+            f"🎛 نمط التنفيذ الحالي: {current_mode}"
+        )
+    normal = _octopus_mode_stats(rows, "normal_result")
+    reverse = _octopus_mode_stats(rows, "reverse_result")
+    avg_payout = sum(float(r.get("payout", 0) or 0) for r in rows) / max(1, len(rows))
+    best = "NORMAL" if normal["net"] > reverse["net"] else "REVERSE" if reverse["net"] > normal["net"] else "TIE"
+    best_icon = "🟢" if best == "NORMAL" else "🔄" if best == "REVERSE" else "⚖️"
+    enough = len(rows) >= OCTOPUS_MODE_DETECTOR_MIN_SAMPLE
+    sample_note = "العينة كافية مبدئيًا ✅" if enough else f"العينة صغيرة لسا ({len(rows)}/{OCTOPUS_MODE_DETECTOR_MIN_SAMPLE}) ⚠️"
+    best_net = normal["net"] if best == "NORMAL" else reverse["net"] if best == "REVERSE" else normal["net"]
+    profitability_note = "الأفضل رابح افتراضيًا ضمن النافذة ✅" if best_net > 0 else "الأفضل نسبيًا فقط؛ النمطين مو رابحين ضمن النافذة ⚠️"
+    return (
+        f"📊 Octopus Market Mode — آخر {lookback:g} ساعات\n"
+        "━━━━━━━━━━━━━━\n"
+        f"🧪 صفقات افتراضية مطابقة لمسار PRE-ARM/Open: {len(rows)}\n"
+        f"💹 متوسط Payout: {avg_payout:.1f}%\n\n"
+        f"🟢 NORMAL: {normal['w']}W/{normal['l']}L/{normal['d']}D | WR {normal['wr']:.1f}% | Net {normal['net']:+.2f}u\n"
+        f"🔄 REVERSE: {reverse['w']}W/{reverse['l']}L/{reverse['d']}D | WR {reverse['wr']:.1f}% | Net {reverse['net']:+.2f}u\n\n"
+        f"{best_icon} الأفضل آخر {lookback:g} ساعات: {best}\n"
+        f"📏 فرق Net: {abs(normal['net'] - reverse['net']):.2f}u\n"
+        f"🧠 {sample_note}\n"
+        f"⚠️ {profitability_note}\n"
+        f"🎛 نمط التنفيذ المختار حاليًا: {current_mode}\n\n"
+        "ملاحظة: التقرير لا يغيّر النمط تلقائيًا؛ أنت تختار NORMAL أو REVERSE من أزرار Octopus."
+    )[:3900]
+
+
+
 async def publish_copy_octopus_prepare_signal(candidate: dict, target_entry_bucket: int) -> dict:
     if not COPY_SEND_STRUCTURE_EDGE:
         return {"ok": False, "skipped": True, "reason": "COPY_SEND_STRUCTURE_EDGE=false"}
@@ -16242,7 +16567,8 @@ async def publish_copy_octopus_prepare_signal(candidate: dict, target_entry_buck
             "ok": True,
             "id": f"octopus_prepare_{safe_key(pair)}_{int(target_entry_bucket)}_{direction}",
             "pair": pair, "pair_display": pair, "symbol": symbol or None, "platform_symbol": symbol or pair,
-            "direction": direction, "original_direction": direction, "reverse_mode": False,
+            "direction": direction, "original_direction": str(candidate.get("original_direction") or candidate.get("analysis_direction") or direction).upper(), "reverse_mode": bool(candidate.get("reverse_mode")),
+            "execution_direction_mode": str(candidate.get("execution_direction_mode") or ("REVERSE" if candidate.get("reverse_mode") else "NORMAL")),
             "timeframe": "M1", "duration_seconds": 60, "duration_minutes": 1,
             "entry_time": entry_dt.isoformat(), "expires_at": (entry_dt + timedelta(seconds=10)).isoformat(),
             "expiry_time": (entry_dt + timedelta(seconds=60)).isoformat(),
@@ -16274,7 +16600,7 @@ async def publish_copy_octopus_prepare_signal(candidate: dict, target_entry_buck
             "octopus_market_zone": candidate.get("market_zone"),
             "octopus_market_space_atr": candidate.get("market_space_atr"),
             "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"octopus_sr_retest_v8_prearm_commit | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_account_amount_settings",
+            "note": f"octopus_sr_retest_v8_prearm_commit_v136_mode | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_account_amount_settings",
         }
         return await publish_copy_trading_signal(payload, source="structure_edge")
     except Exception as exc:
@@ -16298,7 +16624,8 @@ async def publish_copy_octopus_signal(candidate: dict) -> dict:
             "ok": True,
             "id": f"octopus_{safe_key(pair)}_{entry_bucket}_{direction}_{safe_key(candidate.get('primary_model'))}",
             "pair": pair, "pair_display": pair, "symbol": symbol or None, "platform_symbol": symbol or pair,
-            "direction": direction, "original_direction": direction, "reverse_mode": False,
+            "direction": direction, "original_direction": str(candidate.get("original_direction") or candidate.get("analysis_direction") or direction).upper(), "reverse_mode": bool(candidate.get("reverse_mode")),
+            "execution_direction_mode": str(candidate.get("execution_direction_mode") or ("REVERSE" if candidate.get("reverse_mode") else "NORMAL")),
             "timeframe": "M1", "duration_seconds": 60, "duration_minutes": 1,
             "entry_time": entry_dt.isoformat(), "expires_at": (entry_dt + timedelta(seconds=TRENDLINE_EXECUTION_MAX_DELAY_SECONDS)).isoformat(),
             "expiry_time": expiry_dt.isoformat(), "expiry_timestamp": int(expiry_dt.timestamp()),
@@ -16335,7 +16662,7 @@ async def publish_copy_octopus_signal(candidate: dict) -> dict:
             "octopus_market_zone": candidate.get("market_zone"),
             "octopus_market_space_atr": candidate.get("market_space_atr"),
             "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(ADMIN_TELEGRAM_ID),
-            "note": f"octopus_sr_retest_v8_direct_open | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_controls_account_amount",
+            "note": f"octopus_sr_retest_v8_direct_open_v136_mode | model={candidate.get('primary_model')} | regime={candidate.get('regime')} | user_controls_account_amount",
         }
         return await publish_copy_trading_signal(payload, source="structure_edge")
     except Exception as exc:
@@ -16350,10 +16677,14 @@ def _octopus_selector_decision_text(candidate: dict, prefix: str = "🐙 OCTOPUS
     zone_text = "-"
     if zone:
         zone_text = f"{zone.get('role')} Q{zone.get('quality')} @ {float(zone.get('center',0)):g}"
+    execution_mode = str(candidate.get("execution_direction_mode") or ("REVERSE" if candidate.get("reverse_mode") else "NORMAL"))
+    original_direction = str(candidate.get("original_direction") or candidate.get("analysis_direction") or candidate.get("direction") or "-")
+    mode_line = f"🔄 Mode: REVERSE | الأصل {original_direction} → التنفيذ {candidate.get('direction')}\n" if execution_mode == "REVERSE" else "🟢 Mode: NORMAL\n"
     return (
         f"{prefix}\n━━━━━━━━━━━━━━\n"
         f"💱 {candidate.get('pair')} | {candidate.get('regime')}\n"
         f"📌 {_structure_edge_direction_label(candidate.get('direction'))}\n"
+        f"{mode_line}"
         f"🗺 Thesis: {candidate.get('market_setup')} | Q{candidate.get('market_quality')}\n"
         f"📍 Zone: {zone_text}\n"
         f"🧭 {candidate.get('market_reason')}\n"
@@ -16417,6 +16748,7 @@ async def _octopus_adaptive_prearm(context: ContextTypes.DEFAULT_TYPE, now_ts: f
     candidate = dict(ranked[0])
     candidate["prearmed_at"] = now_iso()
     candidate["target_entry_bucket"] = target_bucket
+    candidate = _octopus_apply_execution_direction_mode(candidate)
     _octopus_state["selector_last_decision"] = dict(candidate)
     _octopus_state["sr_prearm_selected_mode"] = str(candidate.get("prearm_mode") or "-")
 
@@ -16434,7 +16766,7 @@ async def _octopus_adaptive_prearm(context: ContextTypes.DEFAULT_TYPE, now_ts: f
     _octopus_state["selector_prearm_sent"] = int(_octopus_state.get("selector_prearm_sent", 0) or 0) + 1
     _octopus_state["selector_last_no_trade_reason"] = None
     _octopus_state["last_reject_reason"] = (
-        f"S/R PRE-ARM LOCK {candidate.get('pair')} | {candidate.get('prearm_mode')} | "
+        f"S/R PRE-ARM LOCK {candidate.get('pair')} | {candidate.get('prearm_mode')} | mode {candidate.get('execution_direction_mode', 'NORMAL')} | "
         f"hint {candidate.get('market_setup')} | projectedQ{candidate.get('prearm_projected_quality', candidate.get('market_quality'))}"
     )
 
@@ -16626,9 +16958,11 @@ async def _octopus_execute_prearmed_open(context: ContextTypes.DEFAULT_TYPE, now
         "created_at": now_iso(), "entry_bucket": current_bucket, "entry_price": float(live_price),
         "trendline_candle_open": float(open_price), "trendline_entry_displacement_atr": round(float(displacement),6),
         "prearmed_at": current_prearm.get("prearmed_at"), "setup": "OCTOPUS_SR_RETEST",
-        "score": int(round(float(candidate.get("selector_score",0)))), "reverse_mode": False,
-        "original_direction": candidate.get("direction"),
-        "execution_commit_mode": "PREARM_DIRECT_OPEN_V1_35",
+        "score": int(round(float(candidate.get("selector_score",0)))),
+        "reverse_mode": bool(candidate.get("reverse_mode")),
+        "original_direction": str(candidate.get("original_direction") or candidate.get("analysis_direction") or candidate.get("direction") or "").upper(),
+        "execution_direction_mode": str(candidate.get("execution_direction_mode") or ("REVERSE" if candidate.get("reverse_mode") else "NORMAL")),
+        "execution_commit_mode": "PREARM_DIRECT_OPEN_V1_36_NORMAL_REVERSE",
     })
     copy_result = await publish_copy_octopus_signal(candidate)
     _octopus_state["selector_prearmed_candidate"] = None
@@ -16697,8 +17031,15 @@ def build_structure_edge_summary(limit: int | None = None) -> str:
     rw = sum(1 for x in recent if str(x.get("result")) == "win")
     rl = sum(1 for x in recent if str(x.get("result")) == "loss")
     rwr = round(rw / (rw + rl) * 100.0, 1) if (rw + rl) else 0.0
+    mode_actual = {"NORMAL":{"w":0,"l":0,"d":0}, "REVERSE":{"w":0,"l":0,"d":0}}
     model_actual = {}
     for row in rows:
+        live_mode = str(row.get("execution_direction_mode") or ("REVERSE" if row.get("reverse_mode") else "NORMAL")).upper()
+        if live_mode not in mode_actual: live_mode = "NORMAL"
+        rr = str(row.get("result") or "draw")
+        if rr == "win": mode_actual[live_mode]["w"] += 1
+        elif rr == "loss": mode_actual[live_mode]["l"] += 1
+        else: mode_actual[live_mode]["d"] += 1
         model = str(row.get("octopus_market_setup") or row.get("octopus_model") or row.get("primary_model") or "UNKNOWN")
         bucket = model_actual.setdefault(model, {"w":0,"l":0,"d":0})
         r = str(row.get("result") or "draw")
@@ -16720,6 +17061,11 @@ def build_structure_edge_summary(limit: int | None = None) -> str:
         f"🕒 آخر {len(recent)}: {rw}W/{rl}L — {rwr}%",
         f"🧨 Max loss streak: {_structure_edge_max_loss_streak(rows)}",
     ]
+    lines.append("\nحسب نمط التنفيذ الفعلي:")
+    for mode_name in ("NORMAL", "REVERSE"):
+        b = mode_actual[mode_name]; n = b["w"] + b["l"]
+        rate = round(b["w"] / n * 100.0, 1) if n else 0.0
+        lines.append(f"• {mode_name}: {b['w']}W/{b['l']}L/{b['d']}D — {rate}% (n={n})")
     if top_actual:
         lines.append("\nحسب Market Thesis المنفذ فعليًا:")
         for model, b in top_actual:
@@ -16744,6 +17090,8 @@ def build_structure_edge_status() -> str:
         "📋 حالة Octopus S/R + Retest — TEST\n"
         "━━━━━━━━━━━━━━\n"
         f"الحالة: {'شغال ✅' if settings.get('enabled') else 'متوقف ⏸'}\n"
+        f"🎛 Execution mode: {settings.get('execution_direction_mode') or 'NORMAL'}\n"
+        f"🧪 Mode detector: شغال دائمًا بالخلفية | session committed/settled/skipped: {int(_octopus_mode_detector_state.get('virtual_committed',0) or 0)} / {int(_octopus_mode_detector_state.get('virtual_settled',0) or 0)} / {int(_octopus_mode_detector_state.get('virtual_skipped',0) or 0)}\n"
         f"Shadow library: {len(OCTOPUS_MODEL_FAMILY)} نموذج / {len(set(OCTOPUS_MODEL_FAMILY.values()))} مدارس | التنفيذ: 3 Theses فقط\n"
         f"S/R execution warmup: {OCTOPUS_SR_EXEC_MIN_CLOSED_M1} M1 | Shadow full warmup: {OCTOPUS_MIN_CLOSED_M1} M1\n"
         f"Shadow settled: {int(_octopus_state.get('total_observations',0) or 0)} | pending: {pending_obs}\n"
@@ -16765,7 +17113,8 @@ def build_structure_edge_status() -> str:
         f"آخر سبب: {_octopus_state.get('last_reject_reason') or _octopus_state.get('selector_last_no_trade_reason') or '-'}\n"
         f"آخر خطأ: {_octopus_state.get('last_error') or _structure_edge_state.get('last_error') or '-'}\n\n"
         "🧠 القرار: لا يوجد FINAL تداول. PRE-ARM هو قرار الصفقة؛ إذا اجتاز S/R + الجودة + obstacle قبل الإغلاق، يُنفّذ نفس الزوج/الاتجاه عند Open الشمعة التالية مباشرة.\n"
-        "🛡️ بعد PRE-ARM تبقى فقط حراس التنفيذ: payout الحالي، اتصال الإضافة، توفر Open/live price، displacement، وExecution Lock."
+        "🛡️ بعد PRE-ARM تبقى فقط حراس التنفيذ: payout الحالي، اتصال الإضافة، توفر Open/live price، displacement، وExecution Lock.\n"
+        "🔄 NORMAL/REVERSE يغيّر اتجاه التنفيذ فقط بعد اختيار الفرصة؛ التحليل والـThesis الأصليان يبقيان محفوظين."
     )[:3900]
 
 
@@ -16803,6 +17152,9 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
             return value if value is not None else (pending or {}).get(name, default)
         record = {
             "reported_at": now_iso(), "signal_id": signal_id, "pair": pick("pair"), "direction": pick("direction"),
+            "original_direction": pick("original_direction", (pending or {}).get("original_direction")),
+            "reverse_mode": bool(pick("reverse_mode", (pending or {}).get("reverse_mode", False))),
+            "execution_direction_mode": pick("execution_direction_mode", (pending or {}).get("execution_direction_mode", "NORMAL")),
             "asset": (payload_event or {}).get("asset"), "amount": float((payload_event or {}).get("amount") or 0),
             "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
             "setup": pick("setup", "OCTOPUS_SR_RETEST"), "score": int(pick("score", 0) or 0),
@@ -16841,6 +17193,7 @@ async def _copy_record_structure_edge_trade_opened(payload_event: dict, client: 
                 "⚡ OCTOPUS MARKET INTELLIGENCE — ORDER SENT\n━━━━━━━━━━━━━━\n"
                 f"💱 {record.get('pair')} | {record.get('octopus_regime')}\n"
                 f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
+                f"🎛 Mode: {record.get('execution_direction_mode') or ('REVERSE' if record.get('reverse_mode') else 'NORMAL')}" + (f" | original {record.get('original_direction')}" if record.get('reverse_mode') else "") + "\n"
                 f"🧠 {record.get('octopus_model')} | {record.get('octopus_market_setup') or '-'} Q{record.get('octopus_market_quality') or 0:g}\n"
                 f"📈 E {record.get('octopus_expected_wr'):.1f}% | C {record.get('octopus_conservative_wr'):.1f}% | BE {record.get('octopus_break_even_wr'):.1f}%\n"
                 f"💵 ${record.get('amount'):g} | account: {record.get('account_mode')}\n"
@@ -16897,7 +17250,10 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
         record = {
             "created_at": (payload_event or {}).get("signal_created_at") or (pending or {}).get("created_at") or now_iso(),
             "closed_at": now_iso(), "signal_id": signal_id, "pair": pick("pair"), "symbol": (pending or {}).get("symbol"),
-            "direction": pick("direction"), "original_direction": pick("direction"), "reverse_mode": False,
+            "direction": pick("direction"),
+            "original_direction": pick("original_direction", (pending or {}).get("original_direction") or pick("direction")),
+            "reverse_mode": bool(pick("reverse_mode", (pending or {}).get("reverse_mode", False))),
+            "execution_direction_mode": pick("execution_direction_mode", (pending or {}).get("execution_direction_mode", "NORMAL")),
             "setup": "OCTOPUS_SR_RETEST", "score": int(pick("score", 0) or 0),
             "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
             "result": outcome, "result_source": "extension_quotex_confirmed",
@@ -16938,6 +17294,7 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
                     f"🐙 OCTOPUS S/R + RETEST — {label}\n━━━━━━━━━━━━━━\n"
                     f"💱 {record.get('pair')} | {record.get('octopus_regime')}\n"
                     f"📌 {_structure_edge_direction_label(record.get('direction'))}\n"
+                    f"🎛 Mode: {record.get('execution_direction_mode') or ('REVERSE' if record.get('reverse_mode') else 'NORMAL')}" + (f" | original {record.get('original_direction')}" if record.get('reverse_mode') else "") + "\n"
                     f"🧠 {record.get('octopus_model')} | {record.get('octopus_market_setup') or '-'} Q{record.get('octopus_market_quality') or 0:g}\n"
                     f"📈 E {record.get('octopus_expected_wr'):.1f}% | C {record.get('octopus_conservative_wr'):.1f}%\n"
                     f"💵 Net: {record.get('net_delta') if record.get('net_delta') is not None else '-'} | {record.get('account_mode')}\n"
@@ -16984,19 +17341,23 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
 
 
 async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
-    """v1.35 PRE-ARM COMMIT state machine.
+    """v1.36 PRE-ARM COMMIT + always-on NORMAL/REVERSE market-mode detector.
 
-    56.5–59.2s: choose and prepare one execution-grade S/R opportunity.
-    0–2.5s next minute: execute that exact prepared trade directly. There is no S/R FINAL
-    revalidation. After the open window, only Shadow/map diagnostics may run.
+    Internal detector mirrors PRE-ARM/open execution even when real execution is OFF.
+    Real path remains v1.35 direct PRE-ARM commit, with owner-selectable NORMAL/REVERSE direction.
     """
     try:
-        if not _structure_edge_is_enabled():
-            return
         _octopus_restore_snapshot_once()
         now_ts = time_module.time()
         current_bucket = int(now_ts // 60) * 60
         sec = float(now_ts - current_bucket)
+
+        # v1.36: internal paper detector never stops. This is what makes the 5-hour
+        # NORMAL-vs-REVERSE report available before real execution is turned on.
+        _octopus_mode_detector_tick(now_ts, current_bucket, sec)
+
+        if not _structure_edge_is_enabled():
+            return
 
         # A PRE-ARM is valid for exactly its target candle. If the open window was missed,
         # never execute it one minute late.
@@ -24859,6 +25220,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         if text == "📊 ملخص Octopus":
             await update.message.reply_text(build_structure_edge_summary(), reply_markup=structure_edge_admin_keyboard)
+            return
+
+        if text == "📊 وضع السوق 5 ساعات":
+            await update.message.reply_text(build_octopus_market_mode_report(5), reply_markup=structure_edge_admin_keyboard)
+            return
+
+        if text == "🟢 تنفيذ NORMAL":
+            ok = _structure_edge_set_execution_direction_mode("NORMAL")
+            await update.message.reply_text(
+                "✅ نمط تنفيذ Octopus صار NORMAL. الصفقات الجديدة ستنفذ بنفس اتجاه التحليل الأصلي." if ok else "❌ تعذر تغيير نمط التنفيذ.",
+                reply_markup=structure_edge_admin_keyboard,
+            )
+            return
+
+        if text == "🔄 تنفيذ REVERSE":
+            ok = _structure_edge_set_execution_direction_mode("REVERSE")
+            await update.message.reply_text(
+                "🔄 نمط تنفيذ Octopus صار REVERSE. كل صفقة جديدة ستنفذ بعكس اتجاه التحليل الأصلي؛ الـThesis الأصلي يبقى محفوظًا للتدقيق." if ok else "❌ تعذر تغيير نمط التنفيذ.",
+                reply_markup=structure_edge_admin_keyboard,
+            )
             return
 
         if text == "🧠 أفضل النماذج":
