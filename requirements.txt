@@ -10,3 +10,4 @@ pytz==2025.2
 fastapi==0.116.1
 uvicorn[standard]==0.35.0
 pydantic==2.11.7
+curl_cffi==0.16.2
