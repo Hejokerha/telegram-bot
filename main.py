@@ -26,9 +26,11 @@ except Exception:
 # Diagnostic changes are observational only and do not alter strategy/execution decisions.
 try:
     from curl_cffi import AsyncSession as CurlAsyncSession
+    from curl_cffi import WebSocketTimeout as CurlWebSocketTimeout
     from curl_cffi.const import CurlWsFlag
 except Exception:
     CurlAsyncSession = None
+    CurlWebSocketTimeout = None
     CurlWsFlag = None
 from datetime import time
 from datetime import datetime, timedelta, timezone
@@ -212,7 +214,7 @@ QUOTEX_SUBSCRIBE_DELAY_SECONDS = float(os.getenv("QUOTEX_SUBSCRIBE_DELAY_SECONDS
 # v1.39.5: mirror the exact Render test that produced live quotes before adding any optional app init.
 # The live web app was observed sending the same instruments/update twice about
 # 0.33s apart; keep that exact bootstrap behavior before expanding the universe.
-# v1.39.6: single-coroutine seed bootstrap; no concurrent recv during the known-good two sends.
+# v1.39.7: normalize curl_cffi WebSocketTimeout into asyncio.TimeoutError so bootstrap deadlines work as designed.
 QUOTEX_BOOTSTRAP_SYMBOL = os.getenv("QUOTEX_BOOTSTRAP_SYMBOL", "AUDNZD_otc").strip() or "AUDNZD_otc"
 QUOTEX_BOOTSTRAP_DUPLICATE_DELAY_SECONDS = float(os.getenv("QUOTEX_BOOTSTRAP_DUPLICATE_DELAY_SECONDS", "0.33"))
 QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS = float(os.getenv("QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS", "8"))
@@ -1089,7 +1091,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.39.5"
+COPY_SERVER_VERSION = "1.39.7"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -5471,7 +5473,10 @@ class QuotexOTCLiveFeed:
                 namespace_ok = False
                 deadline = time_module.monotonic() + float(QUOTEX_AUTH_TIMEOUT_SECONDS)
                 while time_module.monotonic() < deadline:
-                    data, is_text, is_binary = await self._recv_frame(ws, timeout=5)
+                    try:
+                        data, is_text, is_binary = await self._recv_frame(ws, timeout=5)
+                    except asyncio.TimeoutError:
+                        continue
                     text = data.decode("utf-8", "ignore") if is_text else ""
                     if text == "2":
                         await self._send_raw_async(ws, "3")
@@ -5504,7 +5509,10 @@ class QuotexOTCLiveFeed:
                 # s_authorization; parse every frame rather than discarding it.
                 auth_deadline = time_module.monotonic() + float(QUOTEX_AUTH_TIMEOUT_SECONDS)
                 while time_module.monotonic() < auth_deadline and not self.authorized:
-                    data, is_text, is_binary = await self._recv_frame(ws, timeout=5)
+                    try:
+                        data, is_text, is_binary = await self._recv_frame(ws, timeout=5)
+                    except asyncio.TimeoutError:
+                        continue
                     await self._handle_frame(ws, data, is_text, is_binary, pre_auth=True)
 
                 if not self.authorized:
@@ -5560,7 +5568,19 @@ class QuotexOTCLiveFeed:
                 return authorized_once
 
     async def _recv_frame(self, ws, timeout=5):
-        data, flags = await ws.recv(timeout=timeout)
+        try:
+            data, flags = await ws.recv(timeout=timeout)
+        except Exception as exc:
+            # curl_cffi does NOT raise asyncio.TimeoutError for recv timeouts;
+            # it raises its own WebSocketTimeout. Normalize it here so all of
+            # our namespace/auth/bootstrap/steady-state deadline logic treats
+            # an idle read as a retryable timeout rather than a dead transport.
+            if (
+                (CurlWebSocketTimeout is not None and isinstance(exc, CurlWebSocketTimeout))
+                or type(exc).__name__ == "WebSocketTimeout"
+            ):
+                raise asyncio.TimeoutError() from exc
+            raise
         data = bytes(data)
         is_text = bool(flags & CurlWsFlag.TEXT)
         is_binary = bool(flags & CurlWsFlag.BINARY)
@@ -5671,7 +5691,7 @@ class QuotexOTCLiveFeed:
         for attempt in (1, 2):
             if attempt == 1:
                 logger.info(
-                    "Quotex inline bootstrap starting | symbol=%s | recv_concurrency=off | duplicate_update=yes",
+                    "Quotex inline bootstrap starting | symbol=%s | recv_concurrency=off | duplicate_update=yes | timeout_normalized=yes",
                     seed,
                 )
             else:
