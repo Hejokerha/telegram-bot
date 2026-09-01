@@ -22,7 +22,7 @@ try:
 except Exception:
     websocket = None
 
-# v1.39.3: owner full-system diagnostics center; v1.39 browser-compatible Quotex transport retained.
+# v1.39.4: owner full-system diagnostics center; v1.39 browser-compatible Quotex transport retained.
 # Diagnostic changes are observational only and do not alter strategy/execution decisions.
 try:
     from curl_cffi import AsyncSession as CurlAsyncSession
@@ -209,7 +209,7 @@ QUOTEX_RECONNECT_INITIAL_SECONDS = float(os.getenv("QUOTEX_RECONNECT_INITIAL_SEC
 QUOTEX_RECONNECT_MAX_SECONDS = float(os.getenv("QUOTEX_RECONNECT_MAX_SECONDS", "300"))
 QUOTEX_RECONNECT_JITTER_SECONDS = float(os.getenv("QUOTEX_RECONNECT_JITTER_SECONDS", "1"))
 QUOTEX_SUBSCRIBE_DELAY_SECONDS = float(os.getenv("QUOTEX_SUBSCRIBE_DELAY_SECONDS", "0.35"))
-# v1.39.3: stage the live-price bootstrap on the same long-lived production socket.
+# v1.39.4: stage the live-price bootstrap on the same long-lived production socket.
 # The live web app was observed sending the same instruments/update twice about
 # 0.33s apart; keep that exact bootstrap behavior before expanding the universe.
 QUOTEX_BOOTSTRAP_SYMBOL = os.getenv("QUOTEX_BOOTSTRAP_SYMBOL", "AUDNZD_otc").strip() or "AUDNZD_otc"
@@ -1088,7 +1088,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.39.3"
+COPY_SERVER_VERSION = "1.39.4"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -5132,8 +5132,9 @@ class QuotexOTCLiveFeed:
     v1.39 transport contract (verified against the live Quotex web app on Render):
       * Engine.IO v3 websocket endpoint.
       * Browser-compatible TLS/HTTP fingerprint via curl_cffi.
-      * Socket.IO default namespace (``40``), then ``authorization`` using
-        ``QUOTEX_SESSION`` from the same browser session as ``QUOTEX_COOKIES``.
+      * Socket.IO default namespace (``40``), browser-style pre-auth bootstrap,
+        then ``authorization`` using ``QUOTEX_SESSION`` from the same browser
+        session as ``QUOTEX_COOKIES``.
       * ``instruments/get`` / ``instruments/list`` for instrument metadata/payout.
       * ``instruments/update`` + chart/depth bootstrap for subscribed OTC symbols.
       * binary ``history/list/v2`` and ``quotes/stream`` payloads.
@@ -5388,7 +5389,15 @@ class QuotexOTCLiveFeed:
                 # socket drops, so preserve whether authorization had succeeded.
                 authorized_once = authorized_once or bool(self.authorized)
                 detail = self._safe_exception_detail(e)
-                if self.last_failure_category not in {"authorization_rejected", "session_disconnected"}:
+                preserve_categories = {
+                    "authorization_rejected",
+                    "session_disconnected",
+                    "subscription_bootstrap_no_quotes",
+                    "stream_stale",
+                    "authorization_timeout",
+                    "socketio_namespace_timeout",
+                }
+                if self.last_failure_category not in preserve_categories:
                     status = getattr(e, "status_code", None)
                     if status == 403:
                         self._set_failure("cloudflare_rejection", detail)
@@ -5475,6 +5484,28 @@ class QuotexOTCLiveFeed:
                     raise RuntimeError("socketio_namespace_timeout")
 
                 logger.info("Quotex OTC Socket.IO namespace connected")
+
+                # v1.39.4: Mirror the initialization sequence used by the current
+                # Quotex web/PyQuotex client BEFORE sending authorization.  The
+                # live platform opens the namespace, starts the application
+                # heartbeat and asks for the core UI/market bootstrap resources
+                # before the SSID/session authorization packet.  Earlier v1.39.x
+                # authorized first and only requested instruments afterwards; on
+                # Render that authenticated successfully but the socket stayed
+                # market-silent (no instruments/list, history/list/v2 or
+                # quotes/stream).
+                preauth_packets = (
+                    '42["tick"]',
+                    '42["indicator/list"]',
+                    '42["drawing/load"]',
+                    '42["pending/list"]',
+                    '42["chart_notification/get"]',
+                    '42["instruments/get"]',
+                )
+                for packet in preauth_packets:
+                    await self._send_raw_async(ws, packet)
+                    await asyncio.sleep(0.03)
+                logger.info("Quotex pre-auth browser init sent | packets=%s", len(preauth_packets))
 
                 auth_payload = {
                     "session": session_token,
@@ -5597,7 +5628,7 @@ class QuotexOTCLiveFeed:
         v1.39.2 could report 56/56 subscription packets sent while receiving zero
         quotes because it blasted the full universe immediately and mixed
         chart_notification/depth requests into the central price subscription.
-        v1.39.3 makes the socket prove one quotes/stream first, on the SAME
+        v1.39.4 makes the socket prove one quotes/stream first, on the SAME
         production connection, before expanding symbols.
         """
         try:
@@ -9378,7 +9409,7 @@ def build_otc_live_health_message() -> str:
     )
 
 
-# ===== v1.39.3 OWNER FULL-SYSTEM DIAGNOSTICS =====
+# ===== v1.39.4 OWNER FULL-SYSTEM DIAGNOSTICS =====
 def _diag_age_seconds(value) -> int | None:
     """Return age in seconds for ISO strings or unix timestamps without raising."""
     try:
@@ -24753,7 +24784,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_maintenance_message(update, context, lang)
         return
 
-    # v1.39.3: owner-wide diagnostic center. Keep this before any retired-button guards
+    # v1.39.4: owner-wide diagnostic center. Keep this before any retired-button guards
     # so cached keyboards cannot shadow the health request.
     if is_admin(user.id) and text in {
         "🩺 فحص النظام الكامل", "🩺 Full System Check",
