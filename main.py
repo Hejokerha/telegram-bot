@@ -1,4 +1,4 @@
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 import os
 import html
 import json
@@ -186,7 +186,18 @@ CHANNEL_SIGNAL_INTERVAL_MINUTES = 3
 # ===== Quotex OTC live websocket settings =====
 # ضع ملف cookies.txt بجانب main.py. الملف يجب أن يحتوي cookies جلسة Quotex بسطر واحد.
 QUOTEX_COOKIE_FILE = os.getenv("QUOTEX_COOKIE_FILE", "cookies.txt")
-QUOTEX_WS_URL = "wss://ws2.qxbroker.com/socket.io/?EIO=4&transport=websocket"
+_QUOTEX_DEFAULT_WS_URL = "wss://ws2.qxbroker.com/socket.io/?EIO=4&transport=websocket"
+QUOTEX_WS_URL = os.getenv("QUOTEX_WS_URL", _QUOTEX_DEFAULT_WS_URL).strip() or _QUOTEX_DEFAULT_WS_URL
+QUOTEX_ORIGIN = os.getenv("QUOTEX_ORIGIN", "https://qxbroker.com").strip().rstrip("/") or "https://qxbroker.com"
+QUOTEX_REFERER = os.getenv("QUOTEX_REFERER", "https://qxbroker.com/en/trade").strip() or "https://qxbroker.com/en/trade"
+QUOTEX_ACCEPT_LANGUAGE = os.getenv(
+    "QUOTEX_ACCEPT_LANGUAGE",
+    "ar-TR,ar;q=0.9,en-TR;q=0.8,en;q=0.7,tr-TR;q=0.6,tr;q=0.5,en-US;q=0.4",
+).strip()
+QUOTEX_CONNECT_TIMEOUT_SECONDS = float(os.getenv("QUOTEX_CONNECT_TIMEOUT_SECONDS", "15"))
+QUOTEX_RECONNECT_INITIAL_SECONDS = float(os.getenv("QUOTEX_RECONNECT_INITIAL_SECONDS", "5"))
+QUOTEX_RECONNECT_MAX_SECONDS = float(os.getenv("QUOTEX_RECONNECT_MAX_SECONDS", "300"))
+QUOTEX_RECONNECT_JITTER_SECONDS = float(os.getenv("QUOTEX_RECONNECT_JITTER_SECONDS", "2"))
 QUOTEX_USER_AGENT = os.getenv(
     "QUOTEX_USER_AGENT",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -1740,6 +1751,7 @@ def get_otc_feed_diagnostics_for_pair(pair_text: str) -> str:
         rows, last_tick, candles = _get_otc_rows_and_candles(symbol) if "_get_otc_rows_and_candles" in globals() else ([], {}, [])
         connected = bool(getattr(quotex_otc_feed, "connected", False)) if "quotex_otc_feed" in globals() else False
         started = bool(getattr(quotex_otc_feed, "started", False)) if "quotex_otc_feed" in globals() else False
+        transport = quotex_otc_feed.diagnostics() if "quotex_otc_feed" in globals() and hasattr(quotex_otc_feed, "diagnostics") else {}
         age = None
         if isinstance(last_tick, dict):
             ts = float(last_tick.get("time") or last_tick.get("ts") or last_tick.get("timestamp") or 0)
@@ -1758,6 +1770,16 @@ def get_otc_feed_diagnostics_for_pair(pair_text: str) -> str:
             f"عمر آخر tick: {f'{age:.1f} ثانية' if age is not None else 'لا يوجد'}",
             f"آخر tick: {last_tick or 'لا يوجد'}",
             f"آخر شمعة: {last_candle or 'لا يوجد'}",
+            "",
+            f"تشخيص الاتصال: {transport.get('category') or 'unknown'}",
+            f"سبب الاتصال: {transport.get('message') or '-'}",
+            f"HTTP status: {transport.get('http_status') or '-'} | CF-Ray: {transport.get('cf_ray') or '-'}",
+            f"Server-Timing: {transport.get('server_timing') or '-'}",
+            f"مصدر الكوكيز: {transport.get('cookie_source') or '-'} | أسماء الكوكيز: {', '.join(transport.get('cookie_names') or []) or '-'}",
+            f"Origin: {transport.get('origin') or '-'} | Origin headers: {transport.get('origin_header_count') or '-'}",
+            f"Endpoint: {transport.get('endpoint_host') or '-'}{transport.get('endpoint_path') or ''} | EIO={transport.get('endpoint_eio') or '-'} | transport={transport.get('endpoint_transport') or '-'}",
+            f"Proxy env: {'yes' if transport.get('https_proxy_configured') or transport.get('all_proxy_configured') else 'no'}",
+            f"فشل متتالٍ: {transport.get('consecutive_failures', 0)} | المحاولة القادمة: {transport.get('next_retry_at') or '-'}",
         ]
         return "\n".join(lines)[:3900]
     except Exception as exc:
@@ -5106,6 +5128,22 @@ class QuotexOTCLiveFeed:
         self.last_tick = {}
         self.instruments = {}
         self.thread = None
+        self.consecutive_failures = 0
+        self.last_connect_attempt_at = None
+        self.last_opened_at = None
+        self.last_namespace_connected_at = None
+        self.last_message_at = None
+        self.last_data_at = None
+        self.last_close_at = None
+        self.last_close_status_code = None
+        self.last_close_msg = None
+        self.next_retry_at = None
+        self.next_retry_seconds = 0.0
+        self._attempt_opened = False
+        self._attempt_error_diagnostic = None
+        self._attempt_context = {}
+        self.transport_diagnostic = {}
+        self._set_transport_diagnostic("not_started", "Quotex OTC live feed has not started yet")
 
     def add_symbol(self, symbol: str):
         """إضافة رمز OTC جديد أثناء التشغيل والاشتراك به مباشرة إذا الاتصال مفتوح."""
@@ -5132,6 +5170,160 @@ class QuotexOTCLiveFeed:
 
         except Exception as e:
             logger.exception("Could not add dynamic OTC symbol: %s", e)
+
+    def diagnostics(self) -> dict:
+        with self.lock:
+            data = dict(self.transport_diagnostic or {})
+            data.update({
+                "started": bool(self.started),
+                "connected": bool(self.connected),
+                "consecutive_failures": int(self.consecutive_failures or 0),
+                "last_connect_attempt_at": self.last_connect_attempt_at,
+                "last_opened_at": self.last_opened_at,
+                "last_namespace_connected_at": self.last_namespace_connected_at,
+                "last_message_at": self.last_message_at,
+                "last_data_at": self.last_data_at,
+                "last_close_at": self.last_close_at,
+                "last_close_status_code": self.last_close_status_code,
+                "last_close_msg": self.last_close_msg,
+                "next_retry_at": self.next_retry_at,
+                "next_retry_seconds": round(float(self.next_retry_seconds or 0.0), 1),
+            })
+            return data
+
+    def _endpoint_state(self) -> dict:
+        try:
+            parsed = urlparse(QUOTEX_WS_URL)
+            query = parse_qs(parsed.query or "")
+            return {
+                "endpoint_scheme": parsed.scheme,
+                "endpoint_host": parsed.hostname or "",
+                "endpoint_path": parsed.path or "",
+                "endpoint_eio": ",".join(query.get("EIO", [])) or None,
+                "endpoint_transport": ",".join(query.get("transport", [])) or None,
+                "endpoint_has_sid": bool(query.get("sid")),
+            }
+        except Exception as exc:
+            return {
+                "endpoint_scheme": "",
+                "endpoint_host": "",
+                "endpoint_path": "",
+                "endpoint_eio": None,
+                "endpoint_transport": None,
+                "endpoint_has_sid": False,
+                "endpoint_parse_error": str(exc)[:200],
+            }
+
+    def _validate_endpoint_config(self) -> str | None:
+        endpoint = self._endpoint_state()
+        if endpoint.get("endpoint_scheme") != "wss":
+            return "QUOTEX_WS_URL must use wss:// so TLS and SNI stay enabled"
+        if not endpoint.get("endpoint_host"):
+            return "QUOTEX_WS_URL is missing a hostname"
+        transport = str(endpoint.get("endpoint_transport") or "").lower()
+        if transport and transport != "websocket":
+            return f"QUOTEX_WS_URL transport must be websocket, got {transport}"
+        return None
+
+    def _proxy_state(self) -> dict:
+        return {
+            "https_proxy_configured": bool(os.getenv("https_proxy") or os.getenv("HTTPS_PROXY")),
+            "all_proxy_configured": bool(os.getenv("all_proxy") or os.getenv("ALL_PROXY")),
+            "no_proxy_configured": bool(os.getenv("no_proxy") or os.getenv("NO_PROXY")),
+        }
+
+    def _cookie_names(self, cookie_header: str | None) -> list[str]:
+        names = []
+        try:
+            raw = str(cookie_header or "").replace("\r", ";").replace("\n", ";")
+            for part in raw.split(";"):
+                if "=" not in part:
+                    continue
+                name = part.split("=", 1)[0].strip()
+                if name and name.lower() not in {"path", "domain", "expires", "max-age"}:
+                    names.append(name[:80])
+            return list(dict.fromkeys(names))[:30]
+        except Exception:
+            return []
+
+    def _sanitize_error_text(self, text) -> str:
+        raw = str(text or "")
+        raw = re.sub(r"(__cf_bm=)[^;,\s'\"]+", r"\1<redacted>", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"(cf_clearance=)[^;,\s'\"]+", r"\1<redacted>", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"(Cookie:\s*)[^\r\n]+", r"\1<redacted>", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"(set-cookie['\"]?\s*[:=]\s*)[^}\r\n]+", r"\1<redacted>", raw, flags=re.IGNORECASE)
+        return raw[:800]
+
+    def _set_transport_diagnostic(self, category: str, message: str, **details) -> dict:
+        payload = {
+            "category": str(category or "unknown"),
+            "message": self._sanitize_error_text(message),
+            "updated_at": now_iso(),
+            "origin": QUOTEX_ORIGIN,
+            "referer": QUOTEX_REFERER,
+            "origin_header_count": 1,
+        }
+        payload.update(self._endpoint_state())
+        payload.update(self._proxy_state())
+        for key, value in (details or {}).items():
+            if value is None:
+                continue
+            if key in {"cookie", "cookies", "set_cookie", "authorization"}:
+                continue
+            if isinstance(value, str):
+                payload[key] = self._sanitize_error_text(value)
+            else:
+                payload[key] = value
+        with self.lock:
+            self.transport_diagnostic = payload
+        return payload
+
+    def _load_cookie_context(self) -> tuple[str | None, dict]:
+        try:
+            env_cookies = os.getenv("QUOTEX_COOKIES", "").strip()
+            if env_cookies:
+                return env_cookies, {
+                    "cookie_source": "env:QUOTEX_COOKIES",
+                    "cookie_names": self._cookie_names(env_cookies),
+                    "cookies_present": True,
+                }
+
+            cookie_path = os.path.abspath(QUOTEX_COOKIE_FILE)
+            if not os.path.exists(cookie_path):
+                logger.warning("Quotex cookies not found. Set QUOTEX_COOKIES env var or add file: %s", cookie_path)
+                return None, {
+                    "cookie_source": "missing",
+                    "cookie_file": cookie_path,
+                    "cookie_names": [],
+                    "cookies_present": False,
+                    "missing_cookie_reason": "cookie file not found and QUOTEX_COOKIES is unset",
+                }
+
+            cookies = open(cookie_path, "r", encoding="utf-8").read().strip()
+            if not cookies:
+                logger.warning("Quotex cookies file is empty: %s", cookie_path)
+                return None, {
+                    "cookie_source": "file:empty",
+                    "cookie_file": cookie_path,
+                    "cookie_names": [],
+                    "cookies_present": False,
+                    "missing_cookie_reason": "cookie file is empty",
+                }
+
+            return cookies, {
+                "cookie_source": "file",
+                "cookie_file": cookie_path,
+                "cookie_names": self._cookie_names(cookies),
+                "cookies_present": True,
+            }
+        except Exception as e:
+            logger.exception("Could not read Quotex cookies: %s", e)
+            return None, {
+                "cookie_source": "read_error",
+                "cookie_names": [],
+                "cookies_present": False,
+                "missing_cookie_reason": str(e)[:300],
+            }
 
     def get_dynamic_otc_pairs(self, min_payout: int | None = None) -> dict:
         """يرجع خريطة name -> symbol للأزواج OTC المتاحة من instruments/list."""
@@ -5181,63 +5373,255 @@ class QuotexOTCLiveFeed:
         self.thread.start()
 
     def _load_cookies(self) -> str | None:
+        cookies, _ = self._load_cookie_context()
+        return cookies
+
+    def _build_ws_headers(self) -> list[str]:
+        headers = [
+            f"User-Agent: {QUOTEX_USER_AGENT}",
+            f"Referer: {QUOTEX_REFERER}",
+            f"Accept-Language: {QUOTEX_ACCEPT_LANGUAGE}" if QUOTEX_ACCEPT_LANGUAGE else "",
+            "Cache-Control: no-cache",
+            "Pragma: no-cache",
+        ]
+        # Origin and Cookie are passed through websocket-client's dedicated
+        # arguments. Keeping them out of custom headers prevents duplicates.
+        return [
+            h for h in headers
+            if h and not h.lower().startswith(("origin:", "cookie:"))
+        ]
+
+    def _header_value(self, headers, name: str) -> str:
         try:
-            env_cookies = os.getenv("QUOTEX_COOKIES", "").strip()
-            if env_cookies:
-                return env_cookies
+            wanted = name.lower()
+            if isinstance(headers, dict):
+                for key, value in headers.items():
+                    if str(key).lower() == wanted:
+                        return str(value or "")
+            return ""
+        except Exception:
+            return ""
 
-            cookie_path = os.path.abspath(QUOTEX_COOKIE_FILE)
-            if not os.path.exists(cookie_path):
-                logger.warning("Quotex cookies not found. Set QUOTEX_COOKIES env var or add file: %s", cookie_path)
-                return None
+    def _classify_ws_error(self, error) -> dict:
+        status_code = getattr(error, "status_code", None)
+        resp_headers = getattr(error, "resp_headers", None) or {}
+        resp_body = getattr(error, "resp_body", None)
+        if isinstance(resp_body, bytes):
+            body_text = resp_body.decode("utf-8", errors="ignore")
+        else:
+            body_text = str(resp_body or "")
 
-            cookies = open(cookie_path, "r", encoding="utf-8").read().strip()
-            if not cookies:
-                logger.warning("Quotex cookies file is empty: %s", cookie_path)
-                return None
+        server = self._header_value(resp_headers, "server")
+        cf_ray = self._header_value(resp_headers, "cf-ray")
+        server_timing = self._header_value(resp_headers, "server-timing")
+        set_cookie = self._header_value(resp_headers, "set-cookie")
+        lower_text = " ".join([
+            str(server),
+            str(cf_ray),
+            str(server_timing),
+            str(set_cookie),
+            body_text,
+            str(error),
+        ]).lower()
 
-            return cookies
-        except Exception as e:
-            logger.exception("Could not read Quotex cookies: %s", e)
-            return None
+        is_cloudflare = (
+            "cloudflare" in lower_text
+            or bool(cf_ray)
+            or "__cf_bm" in lower_text
+            or "cforigin;dur=0" in lower_text
+        )
+        mentions_origin_or_headers = any(
+            term in lower_text
+            for term in ("origin", "referer", "header", "cors", "forbidden origin")
+        )
+        mentions_auth_or_session = any(
+            term in lower_text
+            for term in ("unauthorized", "authentication", "auth", "session", "cookie", "forbidden")
+        )
+
+        if status_code == 403 and is_cloudflare:
+            category = "cloudflare_rejection"
+            message = "Cloudflare rejected the Quotex WebSocket upgrade before Engine.IO accepted it"
+        elif status_code in {400, 403} and mentions_origin_or_headers:
+            category = "origin_header_rejection"
+            message = "Quotex rejected the WebSocket handshake headers or Origin"
+        elif status_code in {401, 403} and mentions_auth_or_session:
+            category = "authentication_session_rejection"
+            message = "Quotex rejected the supplied session cookies or authentication state"
+        elif status_code in {400, 404, 410, 426}:
+            category = "endpoint_protocol_failure"
+            message = "Quotex endpoint or Engine.IO/WebSocket protocol rejected the request"
+        elif "proxy" in lower_text:
+            category = "proxy_failure"
+            message = "Proxy configuration prevented the Quotex WebSocket connection"
+        elif any(term in lower_text for term in ("ssl", "tls", "certificate", "sni")):
+            category = "network_tls_failure"
+            message = "TLS/SNI setup failed before the Quotex WebSocket handshake completed"
+        else:
+            category = "endpoint_protocol_failure"
+            message = "Quotex WebSocket connection failed before live ticks were received"
+
+        details = dict(self._attempt_context or {})
+        details.update({
+            "http_status": status_code,
+            "server": server or None,
+            "cf_ray": cf_ray or None,
+            "server_timing": server_timing or None,
+            "set_cookie_names": self._cookie_names(set_cookie),
+            "error_type": error.__class__.__name__,
+            "error": self._sanitize_error_text(error),
+        })
+        return {"category": category, "message": message, **details}
+
+    def _compute_reconnect_delay(self, minimum_delay: float | None = None) -> float:
+        initial = max(1.0, float(QUOTEX_RECONNECT_INITIAL_SECONDS or 5))
+        maximum = max(initial, float(QUOTEX_RECONNECT_MAX_SECONDS or 300))
+        failures = max(1, int(self.consecutive_failures or 1))
+        delay = min(maximum, initial * (2 ** min(failures - 1, 8)))
+        if minimum_delay is not None:
+            delay = max(delay, float(minimum_delay))
+        jitter_limit = max(0.0, min(float(QUOTEX_RECONNECT_JITTER_SECONDS or 0), delay * 0.25))
+        if jitter_limit > 0:
+            delay += random.uniform(0, jitter_limit)
+        return min(maximum, delay)
+
+    def _sleep_after_failure(self, diagnostic: dict, minimum_delay: float | None = None):
+        self.consecutive_failures = min(1000, int(self.consecutive_failures or 0) + 1)
+        delay = self._compute_reconnect_delay(minimum_delay=minimum_delay)
+        retry_at = (now_utc() + timedelta(seconds=delay)).isoformat()
+        self.next_retry_seconds = delay
+        self.next_retry_at = retry_at
+
+        diagnostic = dict(diagnostic or {})
+        category = diagnostic.pop("category", "endpoint_protocol_failure")
+        message = diagnostic.pop("message", "Quotex WebSocket connection failed")
+        state = self._set_transport_diagnostic(
+            category,
+            message,
+            retry_in_seconds=round(delay, 1),
+            next_retry_at=retry_at,
+            consecutive_failures=self.consecutive_failures,
+            **diagnostic,
+        )
+        logger.warning(
+            "Quotex OTC transport failure | category=%s | http_status=%s | cf_ray=%s | "
+            "retry_in=%.1fs | failures=%s | cookie_source=%s | cookie_names=%s | "
+            "endpoint=%s%s | eio=%s | transport=%s | origin=%s | proxy_env=%s | message=%s",
+            state.get("category"),
+            state.get("http_status") or "-",
+            state.get("cf_ray") or "-",
+            delay,
+            state.get("consecutive_failures"),
+            state.get("cookie_source") or "-",
+            ",".join(state.get("cookie_names") or []) or "-",
+            state.get("endpoint_host") or "-",
+            state.get("endpoint_path") or "",
+            state.get("endpoint_eio") or "-",
+            state.get("endpoint_transport") or "-",
+            state.get("origin") or "-",
+            bool(state.get("https_proxy_configured") or state.get("all_proxy_configured")),
+            state.get("message"),
+        )
+        time_module.sleep(delay)
 
     def _run_forever(self):
         if websocket is None:
+            self._set_transport_diagnostic(
+                "endpoint_protocol_failure",
+                "websocket-client is not installed, Quotex OTC live feed cannot start",
+            )
             logger.warning("websocket-client غير مثبت، لن يعمل بث OTC المباشر")
             return
 
         while True:
-            cookies = self._load_cookies()
-            if not cookies:
-                time_module.sleep(30)
+            self._attempt_opened = False
+            self._attempt_error_diagnostic = None
+            self._attempt_context = {}
+            self.connected = False
+            self.last_connect_attempt_at = now_iso()
+
+            endpoint_error = self._validate_endpoint_config()
+            if endpoint_error:
+                self._sleep_after_failure({
+                    "category": "endpoint_protocol_failure",
+                    "message": endpoint_error,
+                }, minimum_delay=30)
                 continue
 
-            headers = [
-                f"Cookie: {cookies}",
-                f"User-Agent: {QUOTEX_USER_AGENT}",
-                "Origin: https://qxbroker.com",
-                "Referer: https://qxbroker.com/en/trade",
-                "Accept-Language: ar-TR,ar;q=0.9,en-TR;q=0.8,en;q=0.7,tr-TR;q=0.6,tr;q=0.5,en-US;q=0.4",
-                "Cache-Control: no-cache",
-                "Pragma: no-cache",
-            ]
+            cookies, cookie_context = self._load_cookie_context()
+            if not cookies:
+                self._sleep_after_failure({
+                    "category": "missing_cookies",
+                    "message": "Quotex cookies are missing; set QUOTEX_COOKIES or provide QUOTEX_COOKIE_FILE",
+                    **cookie_context,
+                }, minimum_delay=30)
+                continue
+
+            headers = self._build_ws_headers()
+            self._attempt_context = {
+                **cookie_context,
+                "origin_header_count": 1,
+                "custom_header_names": [h.split(":", 1)[0] for h in headers],
+            }
+            self._set_transport_diagnostic(
+                "connecting",
+                "Opening Quotex WebSocket connection",
+                **self._attempt_context,
+            )
 
             try:
-                logger.info("Starting Quotex OTC live websocket for symbols: %s", ", ".join(self.symbols))
+                logger.info(
+                    "Starting Quotex OTC live websocket | symbols=%s | endpoint_host=%s | origin=%s | "
+                    "cookie_source=%s | cookie_names=%s | proxy_env=%s",
+                    ", ".join(self.symbols),
+                    self._endpoint_state().get("endpoint_host") or "-",
+                    QUOTEX_ORIGIN,
+                    cookie_context.get("cookie_source") or "-",
+                    ",".join(cookie_context.get("cookie_names") or []) or "-",
+                    bool(self._proxy_state().get("https_proxy_configured") or self._proxy_state().get("all_proxy_configured")),
+                )
+                try:
+                    websocket.setdefaulttimeout(max(5.0, float(QUOTEX_CONNECT_TIMEOUT_SECONDS or 15)))
+                except Exception:
+                    logger.debug("Could not set websocket-client default timeout", exc_info=True)
                 ws_app = websocket.WebSocketApp(
                     QUOTEX_WS_URL,
                     header=headers,
+                    cookie=cookies,
                     on_open=self._on_open,
                     on_message=self._on_message,
                     on_error=self._on_error,
                     on_close=self._on_close,
                 )
-                ws_app.run_forever(ping_interval=0, ping_timeout=None)
+                ws_app.run_forever(
+                    ping_interval=0,
+                    ping_timeout=None,
+                    origin=QUOTEX_ORIGIN,
+                )
             except Exception as e:
-                logger.exception("Quotex OTC websocket crashed: %s", e)
+                self._attempt_error_diagnostic = self._classify_ws_error(e)
 
             self.connected = False
-            time_module.sleep(5)
+            self.ws = None
+            if self._attempt_error_diagnostic:
+                diagnostic = self._attempt_error_diagnostic
+            elif self._attempt_opened:
+                diagnostic = {
+                    "category": "connection_closed",
+                    "message": "Quotex WebSocket closed after a successful connection",
+                    "close_status_code": self.last_close_status_code,
+                    "close_msg": self.last_close_msg,
+                    **self._attempt_context,
+                }
+            else:
+                diagnostic = {
+                    "category": "endpoint_protocol_failure",
+                    "message": "Quotex WebSocket ended before the open callback completed",
+                    "close_status_code": self.last_close_status_code,
+                    "close_msg": self.last_close_msg,
+                    **self._attempt_context,
+                }
+            self._sleep_after_failure(diagnostic)
 
     def _send_raw(self, packet: str):
         try:
@@ -5272,6 +5656,16 @@ class QuotexOTCLiveFeed:
     def _on_open(self, ws):
         self.ws = ws
         self.connected = True
+        self._attempt_opened = True
+        self.consecutive_failures = 0
+        self.next_retry_at = None
+        self.next_retry_seconds = 0.0
+        self.last_opened_at = now_iso()
+        self._set_transport_diagnostic(
+            "websocket_open",
+            "Quotex WebSocket upgrade completed",
+            **self._attempt_context,
+        )
         logger.info("Quotex OTC websocket opened")
         self._send_raw("40")  # Socket.IO default namespace
         threading.Thread(target=self._keepalive_loop, daemon=True).start()
@@ -5282,11 +5676,18 @@ class QuotexOTCLiveFeed:
                 self._parse_quote_binary(message)
                 return
 
+            self.last_message_at = now_iso()
             if message == "2":
                 ws.send("3")
                 return
 
             if isinstance(message, str) and message.startswith("40"):
+                self.last_namespace_connected_at = now_iso()
+                self._set_transport_diagnostic(
+                    "connected",
+                    "Quotex Socket.IO namespace connected",
+                    **self._attempt_context,
+                )
                 logger.info("Quotex OTC Socket.IO namespace connected")
                 threading.Thread(target=self._subscribe_loop, daemon=True).start()
                 return
@@ -5311,6 +5712,8 @@ class QuotexOTCLiveFeed:
         # ["BRLUSD_otc", timestamp, price, flag]
         # instruments/list rows شكلها:
         # [id, "BRLUSD_otc", "USD/BRL (OTC)", ..., payout, ..., is_otc, ...]
+        parsed_ticks = 0
+        parsed_instruments = 0
         with self.lock:
             for row in data:
                 if not isinstance(row, list) or len(row) < 3:
@@ -5333,6 +5736,7 @@ class QuotexOTCLiveFeed:
                         "is_otc": is_otc,
                         "updated_at": now_iso(),
                     }
+                    parsed_instruments += 1
                     continue
 
                 # quotes/stream
@@ -5387,17 +5791,29 @@ class QuotexOTCLiveFeed:
                     "flag": flag,
                     "received_at": now_iso(),
                 }
+                parsed_ticks += 1
+
+            if parsed_ticks or parsed_instruments:
+                self.last_data_at = now_iso()
 
     def instrument(self, symbol: str):
         with self.lock:
             return dict(self.instruments.get(symbol) or {})
 
     def _on_error(self, ws, error):
-        logger.warning("Quotex OTC websocket error: %s", error)
+        self._attempt_error_diagnostic = self._classify_ws_error(error)
 
     def _on_close(self, ws, close_status_code, close_msg):
         self.connected = False
-        logger.warning("Quotex OTC websocket closed | code=%s | msg=%s", close_status_code, close_msg)
+        self.last_close_at = now_iso()
+        self.last_close_status_code = close_status_code
+        self.last_close_msg = self._sanitize_error_text(close_msg)
+        if close_status_code is not None or close_msg:
+            logger.warning(
+                "Quotex OTC websocket closed | code=%s | msg=%s",
+                close_status_code,
+                self.last_close_msg or "-",
+            )
 
     def snapshot(self, symbol: str):
         with self.lock:
@@ -8683,6 +9099,7 @@ def get_otc_live_feed_health() -> dict:
     try:
         enabled = bool(OTC_LIVE_CHANNEL_ENABLED and is_channel_publish_enabled("otc_live"))
         connected = bool(getattr(quotex_otc_feed, "connected", False)) if "quotex_otc_feed" in globals() else False
+        transport = quotex_otc_feed.diagnostics() if "quotex_otc_feed" in globals() and hasattr(quotex_otc_feed, "diagnostics") else {}
 
         latest_tick = None
         latest_symbol = None
@@ -8746,6 +9163,14 @@ def get_otc_live_feed_health() -> dict:
             "tick_count": tick_count,
             "instruments_count": instruments_count,
             "followed_count": followed_count,
+            "transport": transport,
+            "transport_category": transport.get("category"),
+            "transport_message": transport.get("message"),
+            "transport_http_status": transport.get("http_status"),
+            "transport_cf_ray": transport.get("cf_ray"),
+            "transport_server_timing": transport.get("server_timing"),
+            "transport_next_retry_at": transport.get("next_retry_at"),
+            "transport_consecutive_failures": transport.get("consecutive_failures"),
         }
     except Exception as e:
         logger.exception("OTC live health check error: %s", e)
@@ -8760,6 +9185,14 @@ def get_otc_live_feed_health() -> dict:
             "tick_count": 0,
             "instruments_count": 0,
             "followed_count": 0,
+            "transport": {},
+            "transport_category": "health_error",
+            "transport_message": str(e)[:300],
+            "transport_http_status": None,
+            "transport_cf_ray": None,
+            "transport_server_timing": None,
+            "transport_next_retry_at": None,
+            "transport_consecutive_failures": 0,
         }
 
 
@@ -8789,6 +9222,9 @@ def build_otc_live_health_message() -> str:
         f"أزواج لديها ticks: {health.get('tick_count', 0)}\n"
         f"الأزواج المتابعة: {health.get('followed_count', 0)}\n"
         f"الأدوات/الـ payout بالكاش: {health.get('instruments_count', 0)}\n"
+        f"تشخيص الاتصال: {health.get('transport_category') or '-'}\n"
+        f"HTTP status: {health.get('transport_http_status') or '-'} | CF-Ray: {health.get('transport_cf_ray') or '-'}\n"
+        f"المحاولة القادمة: {health.get('transport_next_retry_at') or '-'}\n"
         "━━━━━━━━━━━━━━\n"
         f"حد التنبيه: لا ticks لأكثر من {OTC_LIVE_NO_TICKS_ALERT_SECONDS} ثانية"
     )
