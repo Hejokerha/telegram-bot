@@ -22,8 +22,9 @@ try:
 except Exception:
     websocket = None
 
-# v1.39.5: exact known-good Quotex bootstrap; owner full-system diagnostics retained.
-# Diagnostic changes are observational only and do not alter strategy/execution decisions.
+# v1.39.9: Quotex binary JSON normalization; owner full-system diagnostics retained.
+# Strategy/execution decisions are unchanged. The only functional change is decoding
+# Socket.IO binary attachment payloads that can carry a small Engine.IO prefix before JSON.
 try:
     from curl_cffi import AsyncSession as CurlAsyncSession
     from curl_cffi import WebSocketTimeout as CurlWebSocketTimeout
@@ -215,6 +216,8 @@ QUOTEX_SUBSCRIBE_DELAY_SECONDS = float(os.getenv("QUOTEX_SUBSCRIBE_DELAY_SECONDS
 # The live web app was observed sending the same instruments/update twice about
 # 0.33s apart; keep that exact bootstrap behavior before expanding the universe.
 # v1.39.8: normalize curl_cffi WebSocketTimeout into asyncio.TimeoutError so bootstrap deadlines work as designed.
+# v1.39.9: normalize binary attachment payloads before json.loads (some live frames
+# arrive with one/few non-JSON Engine.IO bytes ahead of the JSON document).
 QUOTEX_BOOTSTRAP_SYMBOL = os.getenv("QUOTEX_BOOTSTRAP_SYMBOL", "AUDNZD_otc").strip() or "AUDNZD_otc"
 QUOTEX_BOOTSTRAP_DUPLICATE_DELAY_SECONDS = float(os.getenv("QUOTEX_BOOTSTRAP_DUPLICATE_DELAY_SECONDS", "0.33"))
 QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS = float(os.getenv("QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS", "8"))
@@ -1091,7 +1094,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.39.7"
+COPY_SERVER_VERSION = "1.39.9"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -5132,7 +5135,7 @@ def can_autopublish_timeframe(timeframe_minutes: int, check_dt: datetime | None 
 class QuotexOTCLiveFeed:
     """Central Quotex OTC market-data feed.
 
-    v1.39 transport contract (verified against the live Quotex web app on Render):
+    v1.39.9 transport contract (verified against the live Quotex web app on Render):
       * Engine.IO v3 websocket endpoint.
       * Browser-compatible TLS/HTTP fingerprint via curl_cffi.
       * Socket.IO default namespace (``40``), browser-style pre-auth bootstrap,
@@ -5644,6 +5647,45 @@ class QuotexOTCLiveFeed:
             await asyncio.sleep(0.10)
         return False
 
+    def _decode_binary_json_payload(self, data: bytes):
+        """Decode Quotex Socket.IO binary attachment JSON robustly.
+
+        On the live production socket, curl_cffi can expose the Engine.IO binary
+        message marker/prefix together with the attachment bytes. The payload itself
+        is still UTF-8 JSON (quotes/stream, history/list/v2, instruments/list).
+
+        We first try the frame exactly as received. If that fails, we only inspect a
+        very small prefix window and retry from the first JSON opener. This keeps the
+        normalization bounded and event-scoped instead of blindly decoding arbitrary
+        binary data.
+
+        Returns (object, skipped_prefix_bytes). Raises ValueError if no JSON document
+        can be decoded.
+        """
+        raw = bytes(data or b"")
+        if not raw:
+            raise ValueError("empty_binary_payload")
+
+        candidates = [(0, raw)]
+        # Common Engine.IO websocket binary packet framing is a tiny prefix. Limit
+        # recovery to the first 8 bytes so we cannot accidentally scan arbitrary
+        # binary blobs for a JSON-looking byte far inside the payload.
+        for idx in range(1, min(8, len(raw))):
+            if raw[idx:idx + 1] in (b"[", b"{"):
+                candidates.append((idx, raw[idx:]))
+                break
+
+        last_exc = None
+        for skipped, candidate in candidates:
+            try:
+                cleaned = candidate.strip().lstrip(b"\xef\xbb\xbf")
+                obj = json.loads(cleaned.decode("utf-8"))
+                return obj, skipped
+            except Exception as exc:
+                last_exc = exc
+
+        raise ValueError("binary_json_decode_failed") from last_exc
+
     def _trace_bootstrap_frame(self, data: bytes, is_text: bool, is_binary: bool):
         """Log a bounded, secret-safe summary of inbound bootstrap frames.
 
@@ -5694,23 +5736,25 @@ class QuotexOTCLiveFeed:
                 pending = self.pending_binary_event or "-"
                 payload_summary = "binary"
                 try:
-                    obj = json.loads(data.decode("utf-8"))
+                    obj, skipped = self._decode_binary_json_payload(data)
+                    prefix_note = f" prefix_skip={skipped}" if skipped else ""
                     if pending == "quotes/stream" and isinstance(obj, list):
                         symbols = []
                         for row in obj[:5]:
                             if isinstance(row, list) and row:
                                 symbols.append(str(row[0]))
-                        payload_summary = f"quotes rows={len(obj)} symbols={','.join(symbols) or '-'}"
+                        payload_summary = f"quotes rows={len(obj)} symbols={','.join(symbols) or '-'}{prefix_note}"
                     elif pending == "instruments/list" and isinstance(obj, list):
-                        payload_summary = f"instruments rows={len(obj)}"
+                        payload_summary = f"instruments rows={len(obj)}{prefix_note}"
                     elif pending == "history/list/v2" and isinstance(obj, dict):
-                        payload_summary = f"history asset={str(obj.get('asset') or '-')[:40]} rows={len(obj.get('history') or [])}"
+                        payload_summary = f"history asset={str(obj.get('asset') or '-')[:40]} rows={len(obj.get('history') or [])}{prefix_note}"
                     elif isinstance(obj, list):
-                        payload_summary = f"list rows={len(obj)}"
+                        payload_summary = f"list rows={len(obj)}{prefix_note}"
                     elif isinstance(obj, dict):
-                        payload_summary = f"dict keys={','.join(list(obj.keys())[:6])}"
+                        payload_summary = f"dict keys={','.join(list(obj.keys())[:6])}{prefix_note}"
                 except Exception:
-                    payload_summary = "binary non-json"
+                    head_hex = data[:8].hex()
+                    payload_summary = f"binary undecoded head={head_hex}"
                 logger.info(
                     "Quotex bootstrap RAW frame | n=%s | type=BINARY | bytes=%s | pending_before=%s | summary=%s",
                     n, len(data), pending, payload_summary,
@@ -5964,9 +6008,19 @@ class QuotexOTCLiveFeed:
             if not event_name:
                 return
             try:
-                payload = json.loads(data.decode("utf-8"))
+                payload, skipped = self._decode_binary_json_payload(data)
             except Exception:
+                if should_log_quiet(f"quotex_binary_decode_{event_name}", 30):
+                    logger.warning(
+                        "Quotex binary payload decode failed | event=%s | bytes=%s | head=%s",
+                        event_name, len(data), data[:8].hex(),
+                    )
                 return
+            if skipped and should_log_quiet("quotex_binary_prefix_normalized", 60):
+                logger.info(
+                    "Quotex binary JSON normalization active | event=%s | prefix_bytes=%s",
+                    event_name, skipped,
+                )
             self._dispatch_event_payload(event_name, payload)
 
     def _dispatch_event_payload(self, event_name: str, payload):
