@@ -214,7 +214,7 @@ QUOTEX_SUBSCRIBE_DELAY_SECONDS = float(os.getenv("QUOTEX_SUBSCRIBE_DELAY_SECONDS
 # v1.39.5: mirror the exact Render test that produced live quotes before adding any optional app init.
 # The live web app was observed sending the same instruments/update twice about
 # 0.33s apart; keep that exact bootstrap behavior before expanding the universe.
-# v1.39.7: normalize curl_cffi WebSocketTimeout into asyncio.TimeoutError so bootstrap deadlines work as designed.
+# v1.39.8: normalize curl_cffi WebSocketTimeout into asyncio.TimeoutError so bootstrap deadlines work as designed.
 QUOTEX_BOOTSTRAP_SYMBOL = os.getenv("QUOTEX_BOOTSTRAP_SYMBOL", "AUDNZD_otc").strip() or "AUDNZD_otc"
 QUOTEX_BOOTSTRAP_DUPLICATE_DELAY_SECONDS = float(os.getenv("QUOTEX_BOOTSTRAP_DUPLICATE_DELAY_SECONDS", "0.33"))
 QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS = float(os.getenv("QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS", "8"))
@@ -5178,6 +5178,11 @@ class QuotexOTCLiveFeed:
         self.subscription_bootstrap_failed = False
         self.bootstrap_symbol = None
         self.bootstrap_quote_ok = False
+        # v1.39.8: bounded production-socket frame trace used only during the
+        # seed bootstrap. It logs event/type/size summaries, never session/cookie values.
+        self.bootstrap_trace_active = False
+        self.bootstrap_trace_count = 0
+        self.bootstrap_trace_timeout_count = 0
 
     # ------------------------------------------------------------------
     # Public cache/universe contract
@@ -5639,6 +5644,80 @@ class QuotexOTCLiveFeed:
             await asyncio.sleep(0.10)
         return False
 
+    def _trace_bootstrap_frame(self, data: bytes, is_text: bool, is_binary: bool):
+        """Log a bounded, secret-safe summary of inbound bootstrap frames.
+
+        This intentionally does not parse or mutate protocol state. It lets us
+        distinguish "server sent nothing" from "server sent frames our parser
+        did not turn into cache data" on the exact production websocket.
+        """
+        if not self.bootstrap_trace_active:
+            return
+        self.bootstrap_trace_count += 1
+        n = int(self.bootstrap_trace_count)
+        if n > 40:
+            return
+
+        try:
+            if is_text:
+                text = data.decode("utf-8", "ignore")
+                summary = "text"
+                if text == "2":
+                    summary = "engine_ping"
+                elif text == "40":
+                    summary = "socketio_namespace"
+                elif text.startswith("451-"):
+                    try:
+                        header = json.loads(text[4:])
+                        event_name = header[0] if isinstance(header, list) and header else "?"
+                    except Exception:
+                        event_name = "?"
+                    summary = f"binary_header:{event_name}"
+                elif text.startswith("42"):
+                    try:
+                        payload = json.loads(text[2:])
+                        event_name = payload[0] if isinstance(payload, list) and payload else "?"
+                    except Exception:
+                        event_name = "?"
+                    summary = f"event:{event_name}"
+                elif text.startswith("0"):
+                    summary = "engine_open"
+                elif text.startswith("41"):
+                    summary = "socketio_disconnect"
+                logger.info(
+                    "Quotex bootstrap RAW frame | n=%s | type=TEXT | bytes=%s | summary=%s | pending_before=%s",
+                    n, len(data), summary, self.pending_binary_event or "-",
+                )
+                return
+
+            if is_binary:
+                pending = self.pending_binary_event or "-"
+                payload_summary = "binary"
+                try:
+                    obj = json.loads(data.decode("utf-8"))
+                    if pending == "quotes/stream" and isinstance(obj, list):
+                        symbols = []
+                        for row in obj[:5]:
+                            if isinstance(row, list) and row:
+                                symbols.append(str(row[0]))
+                        payload_summary = f"quotes rows={len(obj)} symbols={','.join(symbols) or '-'}"
+                    elif pending == "instruments/list" and isinstance(obj, list):
+                        payload_summary = f"instruments rows={len(obj)}"
+                    elif pending == "history/list/v2" and isinstance(obj, dict):
+                        payload_summary = f"history asset={str(obj.get('asset') or '-')[:40]} rows={len(obj.get('history') or [])}"
+                    elif isinstance(obj, list):
+                        payload_summary = f"list rows={len(obj)}"
+                    elif isinstance(obj, dict):
+                        payload_summary = f"dict keys={','.join(list(obj.keys())[:6])}"
+                except Exception:
+                    payload_summary = "binary non-json"
+                logger.info(
+                    "Quotex bootstrap RAW frame | n=%s | type=BINARY | bytes=%s | pending_before=%s | summary=%s",
+                    n, len(data), pending, payload_summary,
+                )
+        except Exception:
+            logger.debug("Quotex bootstrap frame trace failed", exc_info=True)
+
     async def _recv_until_quote_inline(self, ws, symbol: str, timeout_seconds: float) -> bool:
         """Receive and parse frames on the SAME coroutine until ``symbol`` has a tick.
 
@@ -5656,8 +5735,16 @@ class QuotexOTCLiveFeed:
             try:
                 data, is_text, is_binary = await self._recv_frame(ws, timeout=min(2.0, remaining))
             except asyncio.TimeoutError:
+                if self.bootstrap_trace_active:
+                    self.bootstrap_trace_timeout_count += 1
+                    logger.info(
+                        "Quotex bootstrap RAW idle | timeout_no=%s | frames_seen=%s | pending=%s",
+                        self.bootstrap_trace_timeout_count, self.bootstrap_trace_count,
+                        self.pending_binary_event or "-",
+                    )
                 continue
 
+            self._trace_bootstrap_frame(data, is_text, is_binary)
             await self._handle_frame(ws, data, is_text, is_binary, pre_auth=False)
 
         with self.lock:
@@ -5688,32 +5775,47 @@ class QuotexOTCLiveFeed:
         with self.lock:
             self.subscribed_symbols = {seed}
 
-        for attempt in (1, 2):
-            if attempt == 1:
-                logger.info(
-                    "Quotex inline bootstrap starting | symbol=%s | recv_concurrency=off | duplicate_update=yes | timeout_normalized=yes",
-                    seed,
+        self.bootstrap_trace_active = True
+        self.bootstrap_trace_count = 0
+        self.bootstrap_trace_timeout_count = 0
+        try:
+            for attempt in (1, 2):
+                if attempt == 1:
+                    logger.info(
+                        "Quotex inline bootstrap starting | symbol=%s | recv_concurrency=off | duplicate_update=yes | timeout_normalized=yes | raw_trace=yes",
+                        seed,
+                    )
+                else:
+                    logger.warning("Quotex inline bootstrap retry | symbol=%s", seed)
+
+                # Both sends complete before any recv starts, exactly like the known-good test.
+                logger.info("Quotex bootstrap wire | attempt=%s | update1=send | symbol=%s", attempt, seed)
+                payload = {"asset": seed, "period": 60}
+                await self._send_event_async(ws, "instruments/update", payload)
+                await asyncio.sleep(max(0.05, float(QUOTEX_BOOTSTRAP_DUPLICATE_DELAY_SECONDS)))
+                logger.info("Quotex bootstrap wire | attempt=%s | update2=send | symbol=%s", attempt, seed)
+                await self._send_event_async(ws, "instruments/update", payload)
+                logger.info("Quotex bootstrap wire | attempt=%s | recv=start | symbol=%s", attempt, seed)
+
+                ok = await self._recv_until_quote_inline(
+                    ws, seed, QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS
                 )
-            else:
-                logger.warning("Quotex inline bootstrap retry | symbol=%s", seed)
-
-            # Both sends complete before any recv starts, exactly like the known-good test.
-            await self._send_price_subscription(ws, seed, duplicate=True)
-            ok = await self._recv_until_quote_inline(
-                ws, seed, QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS
-            )
-            if ok:
-                self.bootstrap_quote_ok = True
-                self.subscription_bootstrap_failed = False
-                logger.info("Quotex inline bootstrap SUCCESS | symbol=%s", seed)
-                return seed
-
+                if ok:
+                    self.bootstrap_quote_ok = True
+                    self.subscription_bootstrap_failed = False
+                    logger.info(
+                        "Quotex inline bootstrap SUCCESS | symbol=%s | raw_frames=%s | raw_timeouts=%s",
+                        seed, self.bootstrap_trace_count, self.bootstrap_trace_timeout_count,
+                    )
+                    return seed
+        finally:
+            self.bootstrap_trace_active = False
         self.bootstrap_quote_ok = False
         self._set_failure("subscription_bootstrap_no_quotes", f"symbol={seed}")
         self.subscription_bootstrap_failed = True
         logger.error(
-            "Quotex inline bootstrap FAILED | symbol=%s | authorized=yes | no quotes/stream",
-            seed,
+            "Quotex inline bootstrap FAILED | symbol=%s | authorized=yes | no quotes/stream | raw_frames=%s | raw_timeouts=%s",
+            seed, self.bootstrap_trace_count, self.bootstrap_trace_timeout_count,
         )
         return None
 
