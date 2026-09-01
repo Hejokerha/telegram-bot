@@ -22,7 +22,7 @@ try:
 except Exception:
     websocket = None
 
-# v1.39.4: owner full-system diagnostics center; v1.39 browser-compatible Quotex transport retained.
+# v1.39.5: exact known-good Quotex bootstrap; owner full-system diagnostics retained.
 # Diagnostic changes are observational only and do not alter strategy/execution decisions.
 try:
     from curl_cffi import AsyncSession as CurlAsyncSession
@@ -209,7 +209,7 @@ QUOTEX_RECONNECT_INITIAL_SECONDS = float(os.getenv("QUOTEX_RECONNECT_INITIAL_SEC
 QUOTEX_RECONNECT_MAX_SECONDS = float(os.getenv("QUOTEX_RECONNECT_MAX_SECONDS", "300"))
 QUOTEX_RECONNECT_JITTER_SECONDS = float(os.getenv("QUOTEX_RECONNECT_JITTER_SECONDS", "1"))
 QUOTEX_SUBSCRIBE_DELAY_SECONDS = float(os.getenv("QUOTEX_SUBSCRIBE_DELAY_SECONDS", "0.35"))
-# v1.39.4: stage the live-price bootstrap on the same long-lived production socket.
+# v1.39.5: mirror the exact Render test that produced live quotes before adding any optional app init.
 # The live web app was observed sending the same instruments/update twice about
 # 0.33s apart; keep that exact bootstrap behavior before expanding the universe.
 QUOTEX_BOOTSTRAP_SYMBOL = os.getenv("QUOTEX_BOOTSTRAP_SYMBOL", "AUDNZD_otc").strip() or "AUDNZD_otc"
@@ -1088,7 +1088,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.39.4"
+COPY_SERVER_VERSION = "1.39.5"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -5434,12 +5434,12 @@ class QuotexOTCLiveFeed:
 
     async def _connection_main(self, raw_cookies: str, session_token: str) -> bool:
         cookie_jar = self._cookie_dict(raw_cookies)
+        # v1.39.5: keep the websocket request identical to the known-good
+        # Render shell test. curl_cffi supplies the browser fingerprint; only
+        # Origin/Referer are added explicitly.
         headers = {
             "Origin": QUOTEX_ORIGIN,
             "Referer": QUOTEX_REFERER,
-            "Accept-Language": "ar-TR,ar;q=0.9,en-TR;q=0.8,en;q=0.7,tr-TR;q=0.6,tr;q=0.5,en-US;q=0.4",
-            "Cache-Control": "no-cache",
-            "Pragma": "no-cache",
         }
 
         async with CurlAsyncSession() as session:
@@ -5485,27 +5485,12 @@ class QuotexOTCLiveFeed:
 
                 logger.info("Quotex OTC Socket.IO namespace connected")
 
-                # v1.39.4: Mirror the initialization sequence used by the current
-                # Quotex web/PyQuotex client BEFORE sending authorization.  The
-                # live platform opens the namespace, starts the application
-                # heartbeat and asks for the core UI/market bootstrap resources
-                # before the SSID/session authorization packet.  Earlier v1.39.x
-                # authorized first and only requested instruments afterwards; on
-                # Render that authenticated successfully but the socket stayed
-                # market-silent (no instruments/list, history/list/v2 or
-                # quotes/stream).
-                preauth_packets = (
-                    '42["tick"]',
-                    '42["indicator/list"]',
-                    '42["drawing/load"]',
-                    '42["pending/list"]',
-                    '42["chart_notification/get"]',
-                    '42["instruments/get"]',
-                )
-                for packet in preauth_packets:
-                    await self._send_raw_async(ws, packet)
-                    await asyncio.sleep(0.03)
-                logger.info("Quotex pre-auth browser init sent | packets=%s", len(preauth_packets))
+                # v1.39.5: do NOT send speculative/pre-auth application packets here.
+                # The only sequence we have already proven live on this same Render
+                # environment is: Engine.IO OPEN -> 40 -> authorization ->
+                # duplicate instruments/update. Keep production identical to that
+                # known-good wire sequence until the first real quotes/stream arrives.
+                logger.info("Quotex exact bootstrap mode | pre_auth_init=off | optional_heartbeat=off")
 
                 auth_payload = {
                     "session": session_token,
@@ -5532,7 +5517,9 @@ class QuotexOTCLiveFeed:
                 self.last_failure_detail = None
                 logger.info("Quotex OTC authorization SUCCESS")
 
-                heartbeat_task = asyncio.create_task(self._heartbeat_worker(ws))
+                # Do not start the optional Socket.IO application heartbeat before
+                # market bootstrap. The successful diagnostic connection did not send
+                # 42["tick"]; Engine.IO ping/pong is handled by the receive loop.
                 subscription_task = asyncio.create_task(self._subscription_worker(ws))
                 authorized_once = True
 
@@ -5552,13 +5539,11 @@ class QuotexOTCLiveFeed:
                                 raise RuntimeError("quotex_stream_stale")
                             continue
                 finally:
-                    heartbeat_task.cancel()
                     subscription_task.cancel()
-                    for task in (heartbeat_task, subscription_task):
-                        try:
-                            await task
-                        except BaseException:
-                            pass
+                    try:
+                        await subscription_task
+                    except BaseException:
+                        pass
 
                 return authorized_once
 
@@ -5628,14 +5613,14 @@ class QuotexOTCLiveFeed:
         v1.39.2 could report 56/56 subscription packets sent while receiving zero
         quotes because it blasted the full universe immediately and mixed
         chart_notification/depth requests into the central price subscription.
-        v1.39.4 makes the socket prove one quotes/stream first, on the SAME
-        production connection, before expanding symbols.
+        v1.39.5 makes the socket prove one quotes/stream first using the exact
+        already-successful Render wire sequence, before expanding symbols.
         """
         try:
-            # Metadata request is independent of live-price subscription.
-            await self._send_raw_async(ws, '42["instruments/get"]')
-            await asyncio.sleep(0.20)
-
+            # v1.39.5: no instruments/get before the first quote. The known-good
+            # Render test went directly from authorization to duplicate
+            # instruments/update and the server then emitted instruments/list,
+            # history/list/v2 and quotes/stream on its own.
             with self.lock:
                 desired = list(self.symbols)
 
@@ -5656,8 +5641,6 @@ class QuotexOTCLiveFeed:
             if not ok:
                 # One controlled retry only; do not flood 56 symbols on a silent socket.
                 logger.warning("Quotex live bootstrap retry | symbol=%s", seed)
-                await self._send_raw_async(ws, '42["instruments/get"]')
-                await asyncio.sleep(0.20)
                 await self._send_price_subscription(ws, seed, duplicate=True)
                 ok = await self._wait_first_quote(seed, QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS)
 
@@ -9409,7 +9392,7 @@ def build_otc_live_health_message() -> str:
     )
 
 
-# ===== v1.39.4 OWNER FULL-SYSTEM DIAGNOSTICS =====
+# ===== v1.39.5 OWNER FULL-SYSTEM DIAGNOSTICS =====
 def _diag_age_seconds(value) -> int | None:
     """Return age in seconds for ISO strings or unix timestamps without raising."""
     try:
