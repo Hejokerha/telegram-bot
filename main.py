@@ -212,6 +212,7 @@ QUOTEX_SUBSCRIBE_DELAY_SECONDS = float(os.getenv("QUOTEX_SUBSCRIBE_DELAY_SECONDS
 # v1.39.5: mirror the exact Render test that produced live quotes before adding any optional app init.
 # The live web app was observed sending the same instruments/update twice about
 # 0.33s apart; keep that exact bootstrap behavior before expanding the universe.
+# v1.39.6: single-coroutine seed bootstrap; no concurrent recv during the known-good two sends.
 QUOTEX_BOOTSTRAP_SYMBOL = os.getenv("QUOTEX_BOOTSTRAP_SYMBOL", "AUDNZD_otc").strip() or "AUDNZD_otc"
 QUOTEX_BOOTSTRAP_DUPLICATE_DELAY_SECONDS = float(os.getenv("QUOTEX_BOOTSTRAP_DUPLICATE_DELAY_SECONDS", "0.33"))
 QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS = float(os.getenv("QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS", "8"))
@@ -5517,10 +5518,21 @@ class QuotexOTCLiveFeed:
                 self.last_failure_detail = None
                 logger.info("Quotex OTC authorization SUCCESS")
 
-                # Do not start the optional Socket.IO application heartbeat before
-                # market bootstrap. The successful diagnostic connection did not send
-                # 42["tick"]; Engine.IO ping/pong is handled by the receive loop.
-                subscription_task = asyncio.create_task(self._subscription_worker(ws))
+                # v1.39.6: the previously successful Render diagnostic did NOT
+                # call ws.recv concurrently with the two bootstrap sends. v1.39.5
+                # still did: _subscription_worker() sent instruments/update while
+                # this coroutine was already blocked in ws.recv(). That means the
+                # production wire sequence was not actually identical to the known-
+                # good test. Bootstrap the seed entirely inline on one coroutine:
+                # send update -> 0.33s -> send update -> then start recv/parse.
+                seed = await self._bootstrap_seed_inline(ws)
+                if not seed:
+                    raise RuntimeError("quotex_subscription_bootstrap_failed")
+
+                # Only after a real seed quote is parsed do we allow the expansion
+                # worker to add the rest of the OTC universe. The main receive loop
+                # remains the sole websocket reader.
+                subscription_task = asyncio.create_task(self._subscription_worker(ws, seed))
                 authorized_once = True
 
                 try:
@@ -5607,58 +5619,97 @@ class QuotexOTCLiveFeed:
             await asyncio.sleep(0.10)
         return False
 
-    async def _subscription_worker(self, ws):
-        """Bootstrap one verified live stream, then expand the OTC universe.
+    async def _recv_until_quote_inline(self, ws, symbol: str, timeout_seconds: float) -> bool:
+        """Receive and parse frames on the SAME coroutine until ``symbol`` has a tick.
 
-        v1.39.2 could report 56/56 subscription packets sent while receiving zero
-        quotes because it blasted the full universe immediately and mixed
-        chart_notification/depth requests into the central price subscription.
-        v1.39.5 makes the socket prove one quotes/stream first using the exact
-        already-successful Render wire sequence, before expanding symbols.
+        curl_cffi websocket bootstrap is kept single-reader/single-coroutine here.
+        No background recv is active while the seed subscription is being sent.
+        """
+        deadline = time_module.monotonic() + max(0.1, float(timeout_seconds))
+        while self.connected and time_module.monotonic() < deadline:
+            with self.lock:
+                tick = dict(self.last_tick.get(symbol) or {})
+            if tick and tick.get("price") is not None:
+                return True
+
+            remaining = max(0.1, deadline - time_module.monotonic())
+            try:
+                data, is_text, is_binary = await self._recv_frame(ws, timeout=min(2.0, remaining))
+            except asyncio.TimeoutError:
+                continue
+
+            await self._handle_frame(ws, data, is_text, is_binary, pre_auth=False)
+
+        with self.lock:
+            tick = dict(self.last_tick.get(symbol) or {})
+        return bool(tick and tick.get("price") is not None)
+
+    async def _bootstrap_seed_inline(self, ws) -> str | None:
+        """Prove one real Quotex quotes/stream with the exact successful ordering.
+
+        Critical ordering:
+          authorization SUCCESS
+          -> instruments/update(seed)
+          -> sleep ~0.33s
+          -> instruments/update(seed)
+          -> ONLY NOW begin ws.recv()/parsing
+
+        v1.39.5 started a background sender while the main coroutine was already
+        inside ws.recv(), so it was not wire-equivalent to the successful shell
+        test even though the packets themselves matched.
+        """
+        with self.lock:
+            desired = list(self.symbols)
+        if not desired:
+            return None
+
+        seed = QUOTEX_BOOTSTRAP_SYMBOL if QUOTEX_BOOTSTRAP_SYMBOL in desired else desired[0]
+        self.bootstrap_symbol = seed
+        with self.lock:
+            self.subscribed_symbols = {seed}
+
+        for attempt in (1, 2):
+            if attempt == 1:
+                logger.info(
+                    "Quotex inline bootstrap starting | symbol=%s | recv_concurrency=off | duplicate_update=yes",
+                    seed,
+                )
+            else:
+                logger.warning("Quotex inline bootstrap retry | symbol=%s", seed)
+
+            # Both sends complete before any recv starts, exactly like the known-good test.
+            await self._send_price_subscription(ws, seed, duplicate=True)
+            ok = await self._recv_until_quote_inline(
+                ws, seed, QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS
+            )
+            if ok:
+                self.bootstrap_quote_ok = True
+                self.subscription_bootstrap_failed = False
+                logger.info("Quotex inline bootstrap SUCCESS | symbol=%s", seed)
+                return seed
+
+        self.bootstrap_quote_ok = False
+        self._set_failure("subscription_bootstrap_no_quotes", f"symbol={seed}")
+        self.subscription_bootstrap_failed = True
+        logger.error(
+            "Quotex inline bootstrap FAILED | symbol=%s | authorized=yes | no quotes/stream",
+            seed,
+        )
+        return None
+
+    async def _subscription_worker(self, ws, seed: str):
+        """Expand the OTC universe after the inline seed quote is proven.
+
+        This worker is a sender/poller only; the main connection coroutine remains
+        the sole websocket reader and populates ``last_tick`` / candles / metadata.
         """
         try:
-            # v1.39.5: no instruments/get before the first quote. The known-good
-            # Render test went directly from authorization to duplicate
-            # instruments/update and the server then emitted instruments/list,
-            # history/list/v2 and quotes/stream on its own.
             with self.lock:
                 desired = list(self.symbols)
 
             if not desired:
                 return
 
-            seed = QUOTEX_BOOTSTRAP_SYMBOL if QUOTEX_BOOTSTRAP_SYMBOL in desired else desired[0]
-            self.bootstrap_symbol = seed
-
-            # The known-good live-app sequence: same instruments/update twice,
-            # ~0.33 seconds apart, then wait for an actual quotes/stream payload.
-            logger.info("Quotex live bootstrap starting | symbol=%s | duplicate_update=yes", seed)
-            await self._send_price_subscription(ws, seed, duplicate=True)
-            with self.lock:
-                self.subscribed_symbols = {seed}
-
-            ok = await self._wait_first_quote(seed, QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS)
-            if not ok:
-                # One controlled retry only; do not flood 56 symbols on a silent socket.
-                logger.warning("Quotex live bootstrap retry | symbol=%s", seed)
-                await self._send_price_subscription(ws, seed, duplicate=True)
-                ok = await self._wait_first_quote(seed, QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS)
-
-            if not ok:
-                self.bootstrap_quote_ok = False
-                self._set_failure("subscription_bootstrap_no_quotes", f"symbol={seed}")
-                self.subscription_bootstrap_failed = True
-                logger.error(
-                    "Quotex live bootstrap FAILED | symbol=%s | authorized=yes | no quotes/stream",
-                    seed,
-                )
-                return
-
-            self.bootstrap_quote_ok = True
-            logger.info("Quotex live bootstrap SUCCESS | symbol=%s", seed)
-
-            # Prefer the 22 production symbols first, then their reverse/dynamic
-            # candidates.  This gets strategy-critical data ready before extras.
             production = []
             try:
                 production = [
@@ -5705,7 +5756,6 @@ class QuotexOTCLiveFeed:
 
                 await asyncio.sleep(max(0.05, float(QUOTEX_SUBSCRIBE_DELAY_SECONDS)))
 
-            # Keep the worker alive so dynamically added symbols can be appended.
             while self.connected:
                 with self.lock:
                     desired_now = list(self.symbols)
