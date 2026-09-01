@@ -1052,20 +1052,20 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.37.0"
-MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "0.27.0").strip() or "0.27.0"
-MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "93"))
-MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "92"))
+COPY_SERVER_VERSION = "1.38.0"
+MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
+MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
+MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
 MOBILE_APP_FORCE_UPDATE = os.getenv("MOBILE_APP_FORCE_UPDATE", "false").lower() in {"1", "true", "yes", "on"}
-MOBILE_APP_RELEASE_URL = os.getenv("MOBILE_APP_RELEASE_URL", "").strip()
+MOBILE_APP_RELEASE_URL = os.getenv("MOBILE_APP_RELEASE_URL", "https://trading-time-official.web.app/download").strip()
 MOBILE_APP_RELEASE_NOTES = os.getenv(
     "MOBILE_APP_RELEASE_NOTES",
-    "تحسينات الاستقرار، سجل التداول، مركز الحالة وOTC Live Auto.",
+    "دعم Octopus على Android مع تحسينات التنفيذ بالخلفية وعزل Telegram ID.",
 ).strip()
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
 TRADING_TIME_TELEGRAM_LOOP = None
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.00").strip() or "v1.00"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.14.1").strip() or "v1.14.1"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -12901,7 +12901,7 @@ def _octopus_user_set_enabled(user_id: int, enabled: bool) -> tuple[bool, str]:
         state["enabled"] = True
         state["execution_direction_mode"] = _structure_edge_execution_direction_mode()
         ok = _octopus_user_persist(uid, state)
-        return ok, "✅ تم تشغيل Octopus.\nاترك إضافة TRADING TIME وQuotex مفتوحين أثناء الجلسة."
+        return ok, "✅ تم تشغيل Octopus.\nاترك أداة TRADING TIME (الإضافة أو التطبيق) وQuotex جاهزين أثناء الجلسة."
     state["enabled"] = False
     state["stopped_at"] = now_iso()
     state["prepared_signal"] = None
@@ -12978,13 +12978,16 @@ def build_octopus_user_status(user_id: int, lang: str = "ar") -> str:
     draws = int(state.get("session_draws", 0) or 0)
     decided = wins + losses
     wr = wins / decided * 100.0 if decided else 0.0
-    online = int(_copy_execution_transport_state_for_user(uid).get("extension", 0) or 0) if "_copy_execution_transport_state_for_user" in globals() else _copy_online_clients_for_user(uid)
+    transport = _copy_execution_transport_state_for_user(uid) if "_copy_execution_transport_state_for_user" in globals() else {"extension": _copy_online_clients_for_user(uid), "mobile_online": False}
+    extension_online = int(transport.get("extension", 0) or 0) > 0
+    mobile_online = bool(transport.get("mobile_online"))
+    execution_online = bool(extension_online or mobile_online)
     mode = _structure_edge_execution_direction_mode()
     if lang == "en":
         return (
             "📋 Octopus Status\n━━━━━━━━━━━━━━\n"
             f"Status: {'Running ✅' if enabled else 'Stopped ⏸'}\n"
-            f"Extension: {'Online ✅' if online > 0 else 'Offline ⚠️'}\n"
+            f"Execution device: {'Online ✅' if execution_online else 'Offline ⚠️'} (App {'✅' if mobile_online else '—'} / Extension {'✅' if extension_online else '—'})\n"
             f"Execution mode: {mode}\n"
             f"Session trades: {trades}\n"
             f"Results: {wins}W / {losses}L / {draws}D\n"
@@ -12995,7 +12998,7 @@ def build_octopus_user_status(user_id: int, lang: str = "ar") -> str:
     return (
         "📋 حالة Octopus\n━━━━━━━━━━━━━━\n"
         f"الحالة: {'شغال ✅' if enabled else 'متوقف ⏸'}\n"
-        f"الإضافة: {'متصلة ✅' if online > 0 else 'غير متصلة ⚠️'}\n"
+        f"أداة التنفيذ: {'متصلة ✅' if execution_online else 'غير متصلة ⚠️'} • التطبيق {'✅' if mobile_online else '—'} • الإضافة {'✅' if extension_online else '—'}\n"
         f"وضع التنفيذ الحالي: {mode}\n"
         f"صفقات الجلسة: {trades}\n"
         f"النتائج: ✅ {wins} | ❌ {losses} | ⚖️ {draws}\n"
@@ -14026,7 +14029,7 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
             "execution_direction_mode": pick("execution_direction_mode", (pending or {}).get("execution_direction_mode", "NORMAL")),
             "setup": "OCTOPUS_SR_RETEST", "score": int(pick("score", 0) or 0),
             "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
-            "result": outcome, "result_source": "extension_quotex_confirmed",
+            "result": outcome, "result_source": ("mobile_quotex_confirmed" if str(client.get("client_kind") or "").lower() == "mobile" else "extension_quotex_confirmed"),
             "account_mode": (payload_event or {}).get("account_mode") or (execution_record or {}).get("account_mode") or "unknown",
             "executed_at": (payload_event or {}).get("executed_at") or (execution_record or {}).get("executed_at"),
             "expires_at": (payload_event or {}).get("expires_at") or (execution_record or {}).get("expires_at") or ((datetime.fromtimestamp(entry_bucket, tz=UTC) + timedelta(seconds=60)).isoformat() if entry_bucket > 0 else None),
@@ -16751,7 +16754,7 @@ async def publish_copy_octopus_prepare_signal(candidate: dict, target_entry_buck
             "octopus_market_reason": candidate.get("market_reason"), "octopus_market_quality": candidate.get("market_quality"),
             "octopus_market_zone": candidate.get("market_zone"), "octopus_market_space_atr": candidate.get("market_space_atr"),
             "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(target_uid),
-            "note": f"octopus_sr_retest_v8_prearm_commit_v137_team | target={target_uid} | user_account_amount_settings",
+            "note": f"octopus_sr_retest_v8_prearm_commit_v138_team_mobile | target={target_uid} | user_account_amount_settings",
         }
         return await publish_copy_trading_signal(payload, source="structure_edge")
     except Exception as exc:
@@ -16803,7 +16806,7 @@ async def publish_copy_octopus_signal(candidate: dict, target_user_id: int | Non
             "octopus_market_reason": candidate.get("market_reason"), "octopus_market_quality": candidate.get("market_quality"),
             "octopus_market_zone": candidate.get("market_zone"), "octopus_market_space_atr": candidate.get("market_space_atr"),
             "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(target_uid),
-            "note": f"octopus_sr_retest_v8_direct_open_v137_team | target={target_uid} | user_controls_account_amount",
+            "note": f"octopus_sr_retest_v8_direct_open_v138_team_mobile | target={target_uid} | user_controls_account_amount",
         }
         return await publish_copy_trading_signal(payload, source="structure_edge")
     except Exception as exc:
@@ -16812,12 +16815,28 @@ async def publish_copy_octopus_signal(candidate: dict, target_user_id: int | Non
 
 
 def _octopus_delivery_succeeded(result: dict, target_user_id: int) -> bool:
+    """True when at least one execution transport accepted the targeted packet.
+
+    v1.38: Octopus is available on both the Chrome extension and Android.  The
+    two transports remain independently authenticated and the packet is still
+    scoped by target_user_id.  Counting mobile delivery here is required so a
+    mobile-only user can become part of the committed team opportunity.
+    """
     if not isinstance(result, dict) or not result.get("ok"):
         return False
     if result.get("duplicate"):
         return False
     delivery = result.get("delivery") if isinstance(result.get("delivery"), dict) else {}
-    return int(delivery.get("delivered", 0) or 0) > 0
+    mobile_delivery = result.get("mobile_delivery") if isinstance(result.get("mobile_delivery"), dict) else {}
+    extension_delivered = int(delivery.get("delivered", 0) or 0)
+    mobile_delivered = int(mobile_delivery.get("delivered", 0) or 0)
+    return (extension_delivered + mobile_delivered) > 0
+
+
+def _octopus_user_has_execution_transport(user_id: int | str | None) -> bool:
+    """Octopus may execute through the user's extension OR Android app."""
+    state = _copy_execution_transport_state_for_user(user_id)
+    return bool(int(state.get("extension", 0) or 0) > 0 or state.get("mobile_online"))
 
 
 def _octopus_selector_decision_text(candidate: dict, prefix: str = "🐙 OCTOPUS S/R + RETEST — SIGNAL") -> str:
@@ -16902,11 +16921,12 @@ async def _octopus_adaptive_prearm(context: ContextTypes.DEFAULT_TYPE, now_ts: f
     _octopus_state["selector_last_decision"] = dict(candidate)
     _octopus_state["sr_prearm_selected_mode"] = str(candidate.get("prearm_mode") or "-")
 
-    # v1.37 team rollout: prepare the same market decision only for users who
-    # explicitly enabled Octopus and currently have their own authenticated extension online.
+    # v1.38 team rollout: prepare the same market decision only for users who
+    # explicitly enabled Octopus and currently have at least one authenticated
+    # execution transport online (Chrome extension or Android).
     prepared_user_ids = []
     prepare_results = {}
-    online_targets = [uid for uid in _octopus_live_enabled_user_ids() if _copy_online_clients_for_user(uid) > 0]
+    online_targets = [uid for uid in _octopus_live_enabled_user_ids() if _octopus_user_has_execution_transport(uid)]
     if online_targets:
         raw_results = await asyncio.gather(
             *(publish_copy_octopus_prepare_signal(candidate, target_bucket, target_user_id=uid) for uid in online_targets),
@@ -16928,7 +16948,7 @@ async def _octopus_adaptive_prearm(context: ContextTypes.DEFAULT_TYPE, now_ts: f
                         user_state["execution_direction_mode"] = candidate.get("execution_direction_mode")
                         _octopus_user_persist(int(target_uid), user_state)
     if not prepared_user_ids:
-        _octopus_state["selector_last_no_trade_reason"] = "PRE-ARM candidate exists; no enabled user extension accepted prepare"
+        _octopus_state["selector_last_no_trade_reason"] = "PRE-ARM candidate exists; no enabled user execution device accepted prepare"
         return
 
     candidate["prepared_user_ids"] = prepared_user_ids
@@ -17076,18 +17096,18 @@ async def _octopus_execute_prearmed_open(context: ContextTypes.DEFAULT_TYPE, now
     execution_user_ids = []
     active_now = set(_octopus_live_enabled_user_ids())
     for uid in prepared_user_ids:
-        if uid in active_now and _copy_online_clients_for_user(uid) > 0:
+        if uid in active_now and _octopus_user_has_execution_transport(uid):
             execution_user_ids.append(uid)
     if not execution_user_ids:
         if sec < max(0.5, OCTOPUS_SELECTOR_OPEN_EXECUTION_MAX_SECOND - 0.5):
             _octopus_state["sr_open_wait_snapshot"] = int(_octopus_state.get("sr_open_wait_snapshot",0) or 0) + 1
-            _octopus_state["selector_last_no_trade_reason"] = "OPEN WAIT: prepared user extensions temporarily offline"
+            _octopus_state["selector_last_no_trade_reason"] = "OPEN WAIT: prepared user execution devices temporarily offline"
             _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
             return
         _octopus_state["sr_open_blocked_offline"] = int(_octopus_state.get("sr_open_blocked_offline",0) or 0) + 1
         _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade",0) or 0) + 1
         _octopus_state["selector_prearm_cancelled"] = int(_octopus_state.get("selector_prearm_cancelled",0) or 0) + 1
-        _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: no prepared enabled user extension online during open window"
+        _octopus_state["selector_last_no_trade_reason"] = "NO TRADE: no prepared enabled user execution device online during open window"
         _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
         _octopus_state["selector_prearmed_candidate"] = None
         _octopus_state["selector_prearm_target_bucket"] = 0
@@ -17140,7 +17160,7 @@ async def _octopus_execute_prearmed_open(context: ContextTypes.DEFAULT_TYPE, now
         "reverse_mode": bool(candidate.get("reverse_mode")),
         "original_direction": str(candidate.get("original_direction") or candidate.get("analysis_direction") or candidate.get("direction") or "").upper(),
         "execution_direction_mode": str(candidate.get("execution_direction_mode") or ("REVERSE" if candidate.get("reverse_mode") else "NORMAL")),
-        "execution_commit_mode": "PREARM_DIRECT_OPEN_V1_37_TEAM",
+        "execution_commit_mode": "PREARM_DIRECT_OPEN_V1_38_TEAM_MOBILE",
         "market_signal_key": f"{current_bucket}|{candidate.get('pair')}|{candidate.get('direction')}",
     })
 
@@ -17445,7 +17465,7 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
             "execution_direction_mode": pick("execution_direction_mode", (pending or {}).get("execution_direction_mode", "NORMAL")),
             "setup": "OCTOPUS_SR_RETEST", "score": int(pick("score", 0) or 0),
             "payout": int((payload_event or {}).get("payout_percent") or (pending or {}).get("payout") or 0),
-            "result": outcome, "result_source": "extension_quotex_confirmed",
+            "result": outcome, "result_source": ("mobile_quotex_confirmed" if str(client.get("client_kind") or "").lower() == "mobile" else "extension_quotex_confirmed"),
             "account_mode": (payload_event or {}).get("account_mode") or (execution_record or {}).get("account_mode") or "unknown",
             "executed_at": (payload_event or {}).get("executed_at") or (execution_record or {}).get("executed_at"),
             "expires_at": (payload_event or {}).get("expires_at") or (execution_record or {}).get("expires_at") or ((datetime.fromtimestamp(entry_bucket, tz=UTC) + timedelta(seconds=60)).isoformat() if entry_bucket > 0 else None),
@@ -23030,7 +23050,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🐙 Octopus owner controls", reply_markup=structure_edge_admin_keyboard)
         else:
             await update.message.reply_text(
-                "🐙 Octopus\n\nRun or stop automated S/R + Retest execution on the extension linked to your Telegram ID.",
+                "🐙 Octopus\n\nRun or stop automated S/R + Retest execution on the TRADING TIME app or extension linked to your Telegram ID.",
                 reply_markup=octopus_user_keyboard_en,
             )
         return
@@ -24666,7 +24686,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         context.user_data["step"] = "otc_edge_user_watch_waiting_pair"
         await update.message.reply_text(
             "🎯 أرسل زوج OTC واحد فقط، مثال:\nGBP/NZD (OTC)\n\n"
-            "اترك منصة Quotex والإضافة مفتوحتين حتى يتم تجهيز الزوج مسبقًا والدخول عند وصول الإشارة.",
+            "اترك منصة Quotex وأداة TRADING TIME (التطبيق أو الإضافة) جاهزين حتى يتم تجهيز الزوج مسبقًا والدخول عند وصول الإشارة.",
             reply_markup=otc_edge_user_keyboard
         )
         return
@@ -26348,13 +26368,22 @@ def _copy_store_signal_if_allowed(
 
 
 def _copy_is_mobile_executable_signal(signal: dict) -> bool:
+    """Return whether a Copy packet is deliverable to authenticated Android.
+
+    Most mobile sections receive executable packets only.  Octopus/structure_edge
+    is the one intentional exception: Android also receives its targeted PREPARE
+    packet so it can preselect the pair before the M1 boundary.  PREPARE remains
+    non-executable in the app; only the later EXECUTE packet can open an order.
+    OTC Edge stays Chrome-extension-only.
+    """
     try:
-        # v1.12.1: OTC Edge is Chrome-extension-only again. Keep the signal in
-        # the shared Copy history so extension delivery is unchanged, but never
-        # expose it through Android push or REST replay.
-        if normalize_copy_source((signal or {}).get("source")) in {"otc_edge", "structure_edge"}:
+        source = normalize_copy_source((signal or {}).get("source"))
+        if source == "otc_edge":
             return False
-        return _copy_signal_contract_kind(signal) == "execute" and not bool((signal or {}).get("prepare_only"))
+        kind = _copy_signal_contract_kind(signal)
+        if source == "structure_edge":
+            return kind in {"prepare", "execute"}
+        return kind == "execute" and not bool((signal or {}).get("prepare_only"))
     except ValueError:
         return False
 
@@ -26808,7 +26837,7 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
         elif source == "otc_edge":
             reason = "otc_edge_extension_only"
         elif prepare_only:
-            reason = "prepare signals are not executable on mobile"
+            reason = "prepare_signal_not_mobile_deliverable"
         else:
             reason = "signal_not_executable_on_mobile"
         return {
@@ -27931,6 +27960,45 @@ def create_embedded_copy_api():
             raise HTTPException(status_code=400, detail="إجراء إداري غير معروف")
         return {"ok": True, "action": action, "message": message, "overview": _mobile_bot_stats_payload()}
 
+    @copy_api.post("/api/mobile/octopus/result")
+    async def mobile_octopus_result(request: Request, authorization: str | None = Header(default=None)):
+        """Accept one authoritative Android Octopus settlement.
+
+        Authentication supplies the Telegram identity; the client cannot report
+        a result for another user.  The existing Octopus recorder performs the
+        pending-signal match, canonical de-duplication and result-only channel post.
+        """
+        session = _mobile_bearer_session(authorization)
+        telegram_user_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
+        if not telegram_user_id:
+            raise HTTPException(status_code=401, detail="invalid mobile session")
+        try:
+            body = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid request body")
+        event = dict(body or {})
+        event["source"] = "structure_edge"
+        event["telegram_user_id"] = telegram_user_id
+        event["target_user_id"] = telegram_user_id
+        signal_id = str(event.get("signal_id") or "").strip()
+        outcome = str(event.get("outcome") or "").strip().lower()
+        if not signal_id or outcome not in {"win", "loss", "draw"}:
+            raise HTTPException(status_code=400, detail="signal_id and valid outcome are required")
+        accepted = await _copy_record_structure_edge_trade_result(
+            event,
+            {"telegram_user_id": telegram_user_id, "client_kind": "mobile"},
+        )
+        if not accepted:
+            raise HTTPException(status_code=409, detail="Octopus result not matched to a pending mobile trade")
+        target_kind = str(event.get("target_kind") or "").strip()
+        if target_kind in {"target_profit_reached", "target_loss_reached"}:
+            _octopus_user_note_target_event(
+                {"kind": target_kind, "source": "structure_edge", "telegram_user_id": telegram_user_id},
+                {"telegram_user_id": telegram_user_id, "client_kind": "mobile"},
+            )
+        return {"ok": True, "signal_id": signal_id, "outcome": outcome, "server_time": now_iso()}
+
+
     @copy_api.websocket("/ws/mobile-signals")
     async def mobile_signal_ws(websocket: WebSocket):
         # Android-only signal stream. Authentication uses the existing mobile
@@ -27966,6 +28034,7 @@ def create_embedded_copy_api():
             "connected_at": now_iso(),
             "last_seen_at": now_iso(),
             "last_sent_at": None,
+            "client_kind": "mobile",
         }
         await _copy_send_json_safe(websocket, {
             "type": "hello",
