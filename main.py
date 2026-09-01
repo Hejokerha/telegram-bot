@@ -22,7 +22,7 @@ try:
 except Exception:
     websocket = None
 
-# v1.39.2: owner full-system diagnostics center; v1.39 browser-compatible Quotex transport retained.
+# v1.39.3: owner full-system diagnostics center; v1.39 browser-compatible Quotex transport retained.
 # Diagnostic changes are observational only and do not alter strategy/execution decisions.
 try:
     from curl_cffi import AsyncSession as CurlAsyncSession
@@ -209,6 +209,13 @@ QUOTEX_RECONNECT_INITIAL_SECONDS = float(os.getenv("QUOTEX_RECONNECT_INITIAL_SEC
 QUOTEX_RECONNECT_MAX_SECONDS = float(os.getenv("QUOTEX_RECONNECT_MAX_SECONDS", "300"))
 QUOTEX_RECONNECT_JITTER_SECONDS = float(os.getenv("QUOTEX_RECONNECT_JITTER_SECONDS", "1"))
 QUOTEX_SUBSCRIBE_DELAY_SECONDS = float(os.getenv("QUOTEX_SUBSCRIBE_DELAY_SECONDS", "0.35"))
+# v1.39.3: stage the live-price bootstrap on the same long-lived production socket.
+# The live web app was observed sending the same instruments/update twice about
+# 0.33s apart; keep that exact bootstrap behavior before expanding the universe.
+QUOTEX_BOOTSTRAP_SYMBOL = os.getenv("QUOTEX_BOOTSTRAP_SYMBOL", "AUDNZD_otc").strip() or "AUDNZD_otc"
+QUOTEX_BOOTSTRAP_DUPLICATE_DELAY_SECONDS = float(os.getenv("QUOTEX_BOOTSTRAP_DUPLICATE_DELAY_SECONDS", "0.33"))
+QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS = float(os.getenv("QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS", "8"))
+QUOTEX_SYMBOL_FIRST_QUOTE_TIMEOUT_SECONDS = float(os.getenv("QUOTEX_SYMBOL_FIRST_QUOTE_TIMEOUT_SECONDS", "1.5"))
 QUOTEX_APP_HEARTBEAT_SECONDS = float(os.getenv("QUOTEX_APP_HEARTBEAT_SECONDS", "5"))
 QUOTEX_STREAM_STALE_SECONDS = float(os.getenv("QUOTEX_STREAM_STALE_SECONDS", "120"))
 QUOTEX_ACCOUNT_IS_DEMO = int(os.getenv("QUOTEX_ACCOUNT_IS_DEMO", "1"))
@@ -1081,7 +1088,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.39.2"
+COPY_SERVER_VERSION = "1.39.3"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -5164,6 +5171,9 @@ class QuotexOTCLiveFeed:
         self.subscribed_symbols = set()
         self._subscription_generation = 0
         self._send_lock = None
+        self.subscription_bootstrap_failed = False
+        self.bootstrap_symbol = None
+        self.bootstrap_quote_ok = False
 
     # ------------------------------------------------------------------
     # Public cache/universe contract
@@ -5435,6 +5445,9 @@ class QuotexOTCLiveFeed:
                 self._send_lock = asyncio.Lock()
                 self.pending_binary_event = None
                 self.last_message_monotonic = time_module.monotonic()
+                self.subscription_bootstrap_failed = False
+                self.bootstrap_symbol = None
+                self.bootstrap_quote_ok = False
 
                 # Engine.IO OPEN packet: 0{"sid":...,"pingInterval":25000,...}
                 data, is_text, _ = await self._recv_frame(ws, timeout=float(QUOTEX_AUTH_TIMEOUT_SECONDS))
@@ -5497,7 +5510,11 @@ class QuotexOTCLiveFeed:
                         try:
                             data, is_text, is_binary = await self._recv_frame(ws, timeout=10)
                             await self._handle_frame(ws, data, is_text, is_binary, pre_auth=False)
+                            if self.subscription_bootstrap_failed:
+                                raise RuntimeError("quotex_subscription_bootstrap_failed")
                         except asyncio.TimeoutError:
+                            if self.subscription_bootstrap_failed:
+                                raise RuntimeError("quotex_subscription_bootstrap_failed")
                             stale_for = time_module.monotonic() - float(self.last_message_monotonic or 0.0)
                             if stale_for >= float(QUOTEX_STREAM_STALE_SECONDS):
                                 self._set_failure("stream_stale", f"no inbound frames for {stale_for:.1f}s")
@@ -5550,68 +5567,145 @@ class QuotexOTCLiveFeed:
             except Exception:
                 break
 
-    async def _subscription_worker(self, ws):
-        """Subscribe desired symbols without blocking the receive loop.
+    async def _send_price_subscription(self, ws, symbol: str, duplicate: bool = True):
+        """Send the current Quotex realtime-price subscription packet.
 
-        Current Quotex clients use instruments/update + chart_notification/get +
-        depth/follow.  Sends are paced to avoid subscription spam/rate limiting.
+        Do not mix chart/depth subscriptions into the central quotes/stream path.
+        Those are separate UI/candle-depth concerns; the realtime-price path is
+        instruments/update.  The first production bootstrap deliberately mirrors
+        the observed web-client duplicate update.
+        """
+        payload = {"asset": symbol, "period": 60}
+        await self._send_event_async(ws, "instruments/update", payload)
+        if duplicate:
+            await asyncio.sleep(max(0.05, float(QUOTEX_BOOTSTRAP_DUPLICATE_DELAY_SECONDS)))
+            await self._send_event_async(ws, "instruments/update", payload)
+
+    async def _wait_first_quote(self, symbol: str, timeout_seconds: float) -> bool:
+        deadline = time_module.monotonic() + max(0.1, float(timeout_seconds))
+        while self.connected and time_module.monotonic() < deadline:
+            with self.lock:
+                tick = dict(self.last_tick.get(symbol) or {})
+            if tick and tick.get("price") is not None:
+                return True
+            await asyncio.sleep(0.10)
+        return False
+
+    async def _subscription_worker(self, ws):
+        """Bootstrap one verified live stream, then expand the OTC universe.
+
+        v1.39.2 could report 56/56 subscription packets sent while receiving zero
+        quotes because it blasted the full universe immediately and mixed
+        chart_notification/depth requests into the central price subscription.
+        v1.39.3 makes the socket prove one quotes/stream first, on the SAME
+        production connection, before expanding symbols.
         """
         try:
-            # Current client requests instrument metadata with instruments/get.
+            # Metadata request is independent of live-price subscription.
             await self._send_raw_async(ws, '42["instruments/get"]')
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(0.20)
 
-            sent = set()
+            with self.lock:
+                desired = list(self.symbols)
 
+            if not desired:
+                return
+
+            seed = QUOTEX_BOOTSTRAP_SYMBOL if QUOTEX_BOOTSTRAP_SYMBOL in desired else desired[0]
+            self.bootstrap_symbol = seed
+
+            # The known-good live-app sequence: same instruments/update twice,
+            # ~0.33 seconds apart, then wait for an actual quotes/stream payload.
+            logger.info("Quotex live bootstrap starting | symbol=%s | duplicate_update=yes", seed)
+            await self._send_price_subscription(ws, seed, duplicate=True)
+            with self.lock:
+                self.subscribed_symbols = {seed}
+
+            ok = await self._wait_first_quote(seed, QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS)
+            if not ok:
+                # One controlled retry only; do not flood 56 symbols on a silent socket.
+                logger.warning("Quotex live bootstrap retry | symbol=%s", seed)
+                await self._send_raw_async(ws, '42["instruments/get"]')
+                await asyncio.sleep(0.20)
+                await self._send_price_subscription(ws, seed, duplicate=True)
+                ok = await self._wait_first_quote(seed, QUOTEX_BOOTSTRAP_QUOTE_TIMEOUT_SECONDS)
+
+            if not ok:
+                self.bootstrap_quote_ok = False
+                self._set_failure("subscription_bootstrap_no_quotes", f"symbol={seed}")
+                self.subscription_bootstrap_failed = True
+                logger.error(
+                    "Quotex live bootstrap FAILED | symbol=%s | authorized=yes | no quotes/stream",
+                    seed,
+                )
+                return
+
+            self.bootstrap_quote_ok = True
+            logger.info("Quotex live bootstrap SUCCESS | symbol=%s", seed)
+
+            # Prefer the 22 production symbols first, then their reverse/dynamic
+            # candidates.  This gets strategy-critical data ready before extras.
+            production = []
+            try:
+                production = [
+                    str(x) for x in OTC_PAIR_TO_QUOTEX_SYMBOL.values()
+                    if str(x) in desired and str(x) != seed
+                ]
+            except Exception:
+                production = []
+            ordered = [seed] + list(dict.fromkeys(production + [x for x in desired if x != seed]))
+
+            sent = {seed}
+            live_verified = {seed}
+            for symbol in ordered[1:]:
+                if not self.connected:
+                    return
+                if symbol in sent:
+                    continue
+                try:
+                    await self._send_price_subscription(ws, symbol, duplicate=True)
+                    sent.add(symbol)
+                    with self.lock:
+                        self.subscribed_symbols = set(sent)
+
+                    quote_ok = await self._wait_first_quote(
+                        symbol, QUOTEX_SYMBOL_FIRST_QUOTE_TIMEOUT_SECONDS
+                    )
+                    if quote_ok:
+                        live_verified.add(symbol)
+                        logger.info(
+                            "Subscribed Quotex OTC symbol: %s | first_quote=YES | live_verified=%s/%s",
+                            symbol, len(live_verified), len(sent),
+                        )
+                    else:
+                        logger.warning(
+                            "Subscribed Quotex OTC symbol: %s | first_quote=NO | live_verified=%s/%s",
+                            symbol, len(live_verified), len(sent),
+                        )
+                except Exception as e:
+                    logger.warning(
+                        "Could not subscribe Quotex OTC symbol %s: %s",
+                        symbol, self._safe_exception_detail(e),
+                    )
+                    return
+
+                await asyncio.sleep(max(0.05, float(QUOTEX_SUBSCRIBE_DELAY_SECONDS)))
+
+            # Keep the worker alive so dynamically added symbols can be appended.
             while self.connected:
                 with self.lock:
-                    desired = list(self.symbols)
-                    instruments_ready = bool(self.instruments)
-                    instruments_snapshot = dict(self.instruments)
+                    desired_now = list(self.symbols)
+                missing = [x for x in desired_now if x not in sent]
+                for symbol in missing:
+                    if not self.connected:
+                        return
+                    await self._send_price_subscription(ws, symbol, duplicate=True)
+                    sent.add(symbol)
+                    with self.lock:
+                        self.subscribed_symbols = set(sent)
+                    await asyncio.sleep(max(0.05, float(QUOTEX_SUBSCRIBE_DELAY_SECONDS)))
+                await asyncio.sleep(2.0)
 
-                # Once instruments/list is known, do not subscribe symbols that are
-                # definitively unavailable.  Before it arrives, keep the configured set.
-                if instruments_ready:
-                    desired_now = [
-                        s for s in desired
-                        if bool((instruments_snapshot.get(s) or {}).get("is_otc", False))
-                    ]
-                    if not desired_now:
-                        desired_now = desired
-                else:
-                    desired_now = desired
-
-                missing = [s for s in desired_now if s not in sent]
-                if missing:
-                    for symbol in missing:
-                        if not self.connected:
-                            return
-                        try:
-                            await self._send_event_async(
-                                ws,
-                                "instruments/update",
-                                {"asset": symbol, "period": 60},
-                            )
-                            await self._send_event_async(
-                                ws,
-                                "chart_notification/get",
-                                {"asset": symbol, "version": "1.0.0"},
-                            )
-                            await self._send_event_async(ws, "depth/follow", symbol)
-                            sent.add(symbol)
-                            with self.lock:
-                                self.subscribed_symbols = set(sent)
-                            logger.info("Subscribed Quotex OTC symbol: %s", symbol)
-                        except Exception as e:
-                            logger.warning(
-                                "Could not subscribe Quotex OTC symbol %s: %s",
-                                symbol,
-                                self._safe_exception_detail(e),
-                            )
-                            return
-                        await asyncio.sleep(float(QUOTEX_SUBSCRIBE_DELAY_SECONDS))
-
-                await asyncio.sleep(1.5)
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -9284,7 +9378,7 @@ def build_otc_live_health_message() -> str:
     )
 
 
-# ===== v1.39.2 OWNER FULL-SYSTEM DIAGNOSTICS =====
+# ===== v1.39.3 OWNER FULL-SYSTEM DIAGNOSTICS =====
 def _diag_age_seconds(value) -> int | None:
     """Return age in seconds for ISO strings or unix timestamps without raising."""
     try:
@@ -24659,7 +24753,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_maintenance_message(update, context, lang)
         return
 
-    # v1.39.2: owner-wide diagnostic center. Keep this before any retired-button guards
+    # v1.39.3: owner-wide diagnostic center. Keep this before any retired-button guards
     # so cached keyboards cannot shadow the health request.
     if is_admin(user.id) and text in {
         "🩺 فحص النظام الكامل", "🩺 Full System Check",
