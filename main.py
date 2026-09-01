@@ -22,8 +22,8 @@ try:
 except Exception:
     websocket = None
 
-# v1.39: browser-compatible Quotex transport. websocket-client remains imported
-# because the separate TradingView helper still uses it.
+# v1.39.2: owner full-system diagnostics center; v1.39 browser-compatible Quotex transport retained.
+# Diagnostic changes are observational only and do not alter strategy/execution decisions.
 try:
     from curl_cffi import AsyncSession as CurlAsyncSession
     from curl_cffi.const import CurlWsFlag
@@ -478,6 +478,7 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["📥 الطلبات المعلقة", "📋 كافة المستخدمين"],
         ["🟢 المستخدمون النشطون", "🔍 تفاصيل مستخدم"],
         ["📊 إحصائيات البوت", "📤 تصدير المستخدمين"],
+        ["🩺 فحص النظام الكامل"],
         ["🔐 Copy Trading", "📡 حالة Copy"],
         ["🐙 Octopus S/R + Retest", "📡 قناة 3 شموع"],
         ["🌐 Public Three Candle"],
@@ -1080,7 +1081,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.39.0"
+COPY_SERVER_VERSION = "1.39.2"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -9281,6 +9282,424 @@ def build_otc_live_health_message() -> str:
         "━━━━━━━━━━━━━━\n"
         f"حد التنبيه: لا ticks لأكثر من {OTC_LIVE_NO_TICKS_ALERT_SECONDS} ثانية"
     )
+
+
+# ===== v1.39.2 OWNER FULL-SYSTEM DIAGNOSTICS =====
+def _diag_age_seconds(value) -> int | None:
+    """Return age in seconds for ISO strings or unix timestamps without raising."""
+    try:
+        if value in (None, ""):
+            return None
+        if isinstance(value, (int, float)):
+            ts = float(value)
+            if ts > 1e12:
+                ts /= 1000.0
+            return max(0, int(time_module.time() - ts)) if ts > 0 else None
+        dt = parse_iso(str(value))
+        if not dt:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=UTC)
+        return max(0, int((now_utc() - dt.astimezone(UTC)).total_seconds()))
+    except Exception:
+        return None
+
+
+def _diag_age_text(seconds: int | None) -> str:
+    if seconds is None:
+        return "لا يوجد"
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}ث"
+    if seconds < 3600:
+        return f"{seconds // 60}د {seconds % 60}ث"
+    return f"{seconds // 3600}س {(seconds % 3600) // 60}د"
+
+
+def _diag_quotex_cookie_configured() -> bool:
+    try:
+        if os.getenv("QUOTEX_COOKIES", "").strip():
+            return True
+        path = os.path.abspath(QUOTEX_COOKIE_FILE)
+        return bool(os.path.exists(path) and os.path.getsize(path) > 0)
+    except Exception:
+        return False
+
+
+def _diag_probe_firebase() -> dict:
+    """One tiny direct read. This intentionally bypasses RAM cache for a real connectivity test."""
+    started = time_module.monotonic()
+    try:
+        value = system_ref().child("bot_enabled").get()
+        return {
+            "ok": True,
+            "latency_ms": int((time_module.monotonic() - started) * 1000),
+            "value": True if value is None else bool(value),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "latency_ms": int((time_module.monotonic() - started) * 1000),
+            "error": type(exc).__name__,
+        }
+
+
+def _diag_probe_copy_api() -> dict:
+    """Probe the same HTTP API used by bot -> extension/mobile delivery, without secrets."""
+    started = time_module.monotonic()
+    try:
+        url = str(COPY_SERVER_URL or "").rstrip("/") + "/health"
+        response = requests.get(url, timeout=2.5)
+        payload = {}
+        try:
+            payload = response.json() if response.content else {}
+        except Exception:
+            payload = {}
+        return {
+            "ok": int(response.status_code) == 200 and bool((payload or {}).get("ok", True)),
+            "status": int(response.status_code),
+            "latency_ms": int((time_module.monotonic() - started) * 1000),
+            "version": str((payload or {}).get("version") or ""),
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": None,
+            "latency_ms": int((time_module.monotonic() - started) * 1000),
+            "error": type(exc).__name__,
+        }
+
+
+def _diag_execution_clients(owner_user_id: int) -> dict:
+    owner_uid = normalize_copy_telegram_user_id(owner_user_id)
+    now_ts = time_module.time()
+
+    ext_clients = [
+        dict(row) for row in list((globals().get("_copy_clients") or {}).values())
+        if isinstance(row, dict) and row.get("ws") is not None
+    ]
+    mobile_clients = [
+        dict(row) for row in list((globals().get("_mobile_signal_clients") or {}).values())
+        if isinstance(row, dict) and row.get("ws") is not None
+    ]
+
+    owner_ext = [row for row in ext_clients if normalize_copy_telegram_user_id(row.get("telegram_user_id")) == owner_uid]
+    owner_mobile = [row for row in mobile_clients if normalize_copy_telegram_user_id(row.get("telegram_user_id")) == owner_uid]
+    owner_poll = _copy_mobile_poll_is_fresh_for_user(owner_uid, now_ts=now_ts)
+
+    def newest_age(rows):
+        ages = [_diag_age_seconds(row.get("last_seen_at")) for row in rows]
+        ages = [x for x in ages if x is not None]
+        return min(ages) if ages else None
+
+    poll_age = None
+    try:
+        poll_ts = float((globals().get("_copy_mobile_recent_activity") or {}).get(owner_uid) or 0)
+        poll_age = max(0, int(now_ts - poll_ts)) if poll_ts > 0 else None
+    except Exception:
+        pass
+
+    return {
+        "extensions_total": len(ext_clients),
+        "extension_owner": len(owner_ext),
+        "extension_owner_age": newest_age(owner_ext),
+        "mobile_ws_total": len(mobile_clients),
+        "mobile_ws_owner": len(owner_mobile),
+        "mobile_owner_age": newest_age(owner_mobile),
+        "mobile_poll_owner": bool(owner_poll),
+        "mobile_poll_age": poll_age,
+    }
+
+
+def _diag_quotex_market_state() -> dict:
+    feed = globals().get("quotex_otc_feed")
+    if feed is None:
+        return {"exists": False}
+
+    now_ts = time_module.time()
+    live_limit = 15
+    try:
+        with feed.lock:
+            desired = list(dict.fromkeys(list(getattr(feed, "symbols", []) or [])))
+            subscribed = set(getattr(feed, "subscribed_symbols", set()) or set())
+            ticks = {str(k): dict(v) for k, v in dict(getattr(feed, "last_tick", {}) or {}).items() if isinstance(v, dict)}
+            instruments = {str(k): dict(v) for k, v in dict(getattr(feed, "instruments", {}) or {}).items() if isinstance(v, dict)}
+            candle_counts = {
+                str(symbol): len((getattr(feed, "candles", {}) or {}).get(symbol) or {})
+                for symbol in desired
+            }
+    except Exception as exc:
+        return {"exists": True, "snapshot_error": type(exc).__name__}
+
+    ages = {}
+    for symbol, tick in ticks.items():
+        try:
+            ts = float(tick.get("time") or tick.get("ts") or tick.get("timestamp") or 0)
+            if ts > 1e12:
+                ts /= 1000.0
+            if ts > 0:
+                ages[symbol] = max(0, int(now_ts - ts))
+            else:
+                age = _diag_age_seconds(tick.get("received_at"))
+                if age is not None:
+                    ages[symbol] = age
+        except Exception:
+            continue
+
+    live_symbols = sorted([s for s in subscribed if ages.get(s) is not None and ages.get(s) <= live_limit])
+    stale_symbols = sorted([s for s in subscribed if ages.get(s) is not None and ages.get(s) > live_limit])
+    no_tick_symbols = sorted([s for s in subscribed if s not in ticks])
+    latest_symbol = min(ages, key=ages.get) if ages else None
+    latest_age = ages.get(latest_symbol) if latest_symbol else None
+
+    candles_3 = sum(1 for s in subscribed if int(candle_counts.get(s, 0)) >= 3)
+    candles_18 = sum(1 for s in subscribed if int(candle_counts.get(s, 0)) >= 18)
+    candles_30 = sum(1 for s in subscribed if int(candle_counts.get(s, 0)) >= 30)
+
+    # Strategy-facing pair readiness: either natural/reversed symbol may satisfy one allowed currency pair.
+    pair_total = 0
+    pair_live = 0
+    pair_ready_18 = 0
+    pair_ready_30 = 0
+    pair_ready_85 = 0
+    pair_not_live = []
+    try:
+        allowed_pairs = sorted(set(OTC_CURRENCIES_ALLOWED_PAIRS))
+        for pair in allowed_pairs:
+            candidates = possible_symbols_for_currency_pair(pair)
+            if not candidates:
+                continue
+            pair_total += 1
+            live_candidates = [s for s in candidates if s in live_symbols]
+            if live_candidates:
+                pair_live += 1
+            else:
+                pair_not_live.append(str(pair).replace(" (OTC)", ""))
+
+            ready18 = [s for s in live_candidates if int(candle_counts.get(s, 0)) >= 18]
+            ready30 = [s for s in live_candidates if int(candle_counts.get(s, 0)) >= 30]
+            if ready18:
+                pair_ready_18 += 1
+            if ready30:
+                pair_ready_30 += 1
+            if any(int((instruments.get(s) or {}).get("payout") or 0) >= 85 for s in ready18):
+                pair_ready_85 += 1
+    except Exception:
+        pass
+
+    return {
+        "exists": True,
+        "started": bool(getattr(feed, "started", False)),
+        "connected": bool(getattr(feed, "connected", False)),
+        "authorized": bool(getattr(feed, "authorized", False)),
+        "transport": str(getattr(feed, "transport", "") or "-"),
+        "engine_io": str(getattr(feed, "engine_io", "") or "-"),
+        "desired": len(desired),
+        "subscribed": len(subscribed),
+        "instruments": len(instruments),
+        "ticks_any": len(ticks),
+        "live_symbols": len(live_symbols),
+        "stale_symbols": len(stale_symbols),
+        "no_tick_symbols": len(no_tick_symbols),
+        "latest_symbol": latest_symbol,
+        "latest_age": latest_age,
+        "candles_3": candles_3,
+        "candles_18": candles_18,
+        "candles_30": candles_30,
+        "pair_total": pair_total,
+        "pair_live": pair_live,
+        "pair_ready_18": pair_ready_18,
+        "pair_ready_30": pair_ready_30,
+        "pair_ready_85": pair_ready_85,
+        "sample_no_tick": no_tick_symbols[:5],
+        "sample_stale": stale_symbols[:5],
+        "sample_pair_not_live": pair_not_live[:5],
+        "last_failure_category": str(getattr(feed, "last_failure_category", "") or ""),
+        "last_failure_detail": str(getattr(feed, "last_failure_detail", "") or ""),
+        "last_failure_at": getattr(feed, "last_failure_at", None),
+        "authorized_age": _diag_age_seconds(getattr(feed, "last_authorized_at", None)),
+    }
+
+
+def build_full_system_diagnostics(owner_user_id: int) -> str:
+    """Owner-only observational diagnostic. Never sends a trade or changes runtime state."""
+    issues = []
+
+    # Telegram process/loop.
+    tg_app = globals().get("TRADING_TIME_TELEGRAM_APP")
+    tg_loop = globals().get("TRADING_TIME_TELEGRAM_LOOP")
+    tg_loop_running = False
+    try:
+        tg_loop_running = bool(tg_loop and tg_loop.is_running())
+    except Exception:
+        pass
+    bot_enabled = bool(get_bot_enabled())
+
+    # Real dependency probes.
+    firebase = _diag_probe_firebase()
+    api = _diag_probe_copy_api()
+    clients = _diag_execution_clients(owner_user_id)
+    market = _diag_quotex_market_state()
+
+    if not firebase.get("ok"):
+        issues.append(("❌", f"Firebase غير قابل للقراءة ({firebase.get('error') or 'unknown'})."))
+    if not api.get("ok"):
+        issues.append(("❌", f"Copy/Mobile API لا يرد على /health ({api.get('status') or api.get('error') or 'unknown'})."))
+
+    if not COPY_TRADING_ENABLED:
+        issues.append(("❌", "COPY_TRADING_ENABLED=false: البوت لن يرسل إشارات التنفيذ إلى Copy API."))
+
+    copy_global = bool(is_copy_global_enabled())
+    if not copy_global:
+        issues.append(("⚠️", "Copy Trading موقوف من إعدادات الأدمن؛ لن تُرسل صفقات تنفيذ جديدة."))
+
+    session_ok = bool(os.getenv("QUOTEX_SESSION", "").strip())
+    cookies_ok = _diag_quotex_cookie_configured()
+    if not session_ok:
+        issues.append(("❌", "QUOTEX_SESSION غير موجود."))
+    if not cookies_ok:
+        issues.append(("❌", "QUOTEX_COOKIES/cookies.txt غير موجود."))
+
+    warmup = int(market.get("authorized_age") or 0) < 60 if market.get("authorized_age") is not None else False
+    if not market.get("exists"):
+        issues.append(("❌", "Quotex central feed object غير موجود."))
+    elif market.get("snapshot_error"):
+        issues.append(("❌", f"تعذر قراءة cache الخاص بـQuotex ({market.get('snapshot_error')})."))
+    else:
+        if not market.get("started"):
+            issues.append(("❌", "Quotex central feed لم يبدأ."))
+        if not market.get("connected"):
+            extra = market.get("last_failure_category") or "unknown"
+            issues.append(("❌", f"Quotex WebSocket مفصول؛ آخر تصنيف فشل: {extra}."))
+        elif not market.get("authorized"):
+            issues.append(("❌", "Quotex WebSocket متصل لكن authorization غير ناجح؛ افحص تطابق session/cookies."))
+        if market.get("authorized") and not warmup:
+            if int(market.get("live_symbols") or 0) == 0:
+                issues.append(("❌", "Quotex authorized لكن لا يوجد أي symbol يستقبل live quotes/stream."))
+            elif int(market.get("subscribed") or 0) >= 3 and int(market.get("live_symbols") or 0) <= 1:
+                issues.append(("⚠️", "الاشتراك أُرسل لعدة رموز لكن live quotes واصلة لرمز واحد فقط؛ افحص multi-pair subscription."))
+            if int(market.get("subscribed") or 0) < int(market.get("desired") or 0):
+                issues.append(("⚠️", f"اشتراك Quotex غير مكتمل: {market.get('subscribed')}/{market.get('desired')} symbols."))
+            if int(market.get("instruments") or 0) == 0:
+                issues.append(("❌", "instruments/list فارغة؛ لا توجد payouts/metadata من Quotex."))
+            if int(market.get("pair_ready_18") or 0) == 0:
+                issues.append(("⚠️", "لا يوجد زوج إنتاجي يملك live tick + 18 شمعة M1 حتى الآن."))
+
+    owner_exec_online = bool(
+        int(clients.get("extension_owner") or 0) > 0
+        or int(clients.get("mobile_ws_owner") or 0) > 0
+        or clients.get("mobile_poll_owner")
+    )
+    if copy_global and not owner_exec_online:
+        issues.append(("⚠️", "لا يوجد تطبيق أو إضافة متصلة الآن لحساب المالك؛ التحليل قد يعمل لكن التنفيذ على جهازك لن يصل."))
+
+    critical = sum(1 for sev, _ in issues if sev == "❌")
+    warnings = sum(1 for sev, _ in issues if sev == "⚠️")
+    if critical:
+        overall = f"❌ يوجد {critical} عطل" + (f" + {warnings} تنبيه" if warnings else "")
+    elif warnings:
+        overall = f"⚠️ لا يوجد عطل حرج، لكن يوجد {warnings} تنبيه"
+    else:
+        overall = "✅ كل الفحوص الأساسية سليمة"
+
+    api_status = f"HTTP {api.get('status')}" if api.get("status") else str(api.get("error") or "لا رد")
+    api_version = f" v{api.get('version')}" if api.get("version") else ""
+    firebase_text = f"✅ {firebase.get('latency_ms')}ms" if firebase.get("ok") else f"❌ {firebase.get('error') or 'error'}"
+
+    market_line = "غير متوفر"
+    market_counts = "-"
+    market_pairs = "-"
+    failure_line = "-"
+    if market.get("exists") and not market.get("snapshot_error"):
+        market_line = (
+            f"WS {'✅' if market.get('connected') else '❌'} • Auth {'✅' if market.get('authorized') else '❌'} • "
+            f"{market.get('transport')}/EIO{market.get('engine_io')}"
+        )
+        market_counts = (
+            f"symbols مطلوب/مشترك {market.get('desired', 0)}/{market.get('subscribed', 0)} • "
+            f"live≤15s {market.get('live_symbols', 0)} • بلا tick {market.get('no_tick_symbols', 0)} • stale {market.get('stale_symbols', 0)}"
+        )
+        market_pairs = (
+            f"أزواج إنتاجية live {market.get('pair_live', 0)}/{market.get('pair_total', 0)} • "
+            f"M1≥18 {market.get('pair_ready_18', 0)} • M1≥30 {market.get('pair_ready_30', 0)} • payout≥85+M1≥18 {market.get('pair_ready_85', 0)}"
+        )
+        failure_line = market.get("last_failure_category") or "-"
+
+    lines = [
+        "🩺 TRADING TIME — فحص النظام الكامل",
+        "━━━━━━━━━━━━━━",
+        f"الحالة العامة: {overall}",
+        f"الوقت: {now_iso()}",
+        "",
+        "🤖 البوت وFirebase",
+        f"Telegram handler: ✅ • loop: {'✅' if tg_loop_running else '❌'} • app: {'✅' if tg_app is not None else '❌'}",
+        f"وضع البوت للعامة: {'🟢 شغال' if bot_enabled else '🛠 صيانة'}",
+        f"Firebase read: {firebase_text}",
+        "",
+        "🌐 Copy / التطبيق / الإضافة",
+        f"Copy API /health: {'✅' if api.get('ok') else '❌'} {api_status}{api_version} • {api.get('latency_ms')}ms",
+        f"Producer ENV: {'✅' if COPY_TRADING_ENABLED else '❌'} • Copy Global: {'✅' if copy_global else '⛔'}",
+        f"الإضافات: online={clients.get('extensions_total', 0)} • حسابك={clients.get('extension_owner', 0)} • last={_diag_age_text(clients.get('extension_owner_age'))}",
+        f"Android WS: online={clients.get('mobile_ws_total', 0)} • حسابك={clients.get('mobile_ws_owner', 0)} • last={_diag_age_text(clients.get('mobile_owner_age'))}",
+        f"Android REST poll لحسابك: {'✅' if clients.get('mobile_poll_owner') else '—'} • last={_diag_age_text(clients.get('mobile_poll_age'))}",
+        "",
+        "📈 Quotex المركزي",
+        f"Credentials موجودة: session {'✅' if session_ok else '❌'} • cookies {'✅' if cookies_ok else '❌'}",
+        market_line,
+        f"آخر live tick: {_diag_age_text(market.get('latest_age'))} • {market.get('latest_symbol') or '-'}",
+        f"Instruments/payout cache: {market.get('instruments', 0) if market.get('exists') else 0}",
+        market_counts,
+        f"شموع symbols: ≥3={market.get('candles_3', 0)} • ≥18={market.get('candles_18', 0)} • ≥30={market.get('candles_30', 0)}",
+        market_pairs,
+        f"آخر فشل Quotex: {failure_line}",
+    ]
+
+    if market.get("sample_no_tick"):
+        lines.append("بلا tick مثال: " + ", ".join(market.get("sample_no_tick")[:5]))
+    if market.get("sample_stale"):
+        lines.append("stale مثال: " + ", ".join(market.get("sample_stale")[:5]))
+
+    lines.extend(["", "🚨 التشخيص"])
+    if issues:
+        for idx, (sev, msg) in enumerate(issues[:8], 1):
+            lines.append(f"{idx}. {sev} {msg}")
+        if len(issues) > 8:
+            lines.append(f"… ويوجد {len(issues) - 8} ملاحظات إضافية باللوج.")
+    else:
+        lines.append("✅ لم يكتشف الفحص مشكلة حالية.")
+
+    lines.extend([
+        "━━━━━━━━━━━━━━",
+        "الفحص للقراءة فقط: لا يرسل صفقة ولا يغيّر إعدادات أو استراتيجية.",
+    ])
+    return "\n".join(lines)[:3900]
+
+
+async def send_full_system_diagnostics(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        if getattr(update, "message", None):
+            await update.message.reply_text("⛔ هذا الفحص متاح للمالك فقط.")
+        return
+    if getattr(update, "message", None):
+        await update.message.reply_text("⏳ جاري فحص البوت وFirebase وCopy API والتطبيق والإضافة وQuotex والأزواج...")
+    report = await asyncio.to_thread(build_full_system_diagnostics, int(user.id))
+    if getattr(update, "message", None):
+        await update.message.reply_text(report, reply_markup=admin_main_keyboard)
+
+
+async def full_system_diagnostics_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await send_full_system_diagnostics(update, context)
+
+
+async def otc_health_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not user or not is_admin(user.id):
+        if getattr(update, "message", None):
+            await update.message.reply_text("⛔ هذا الفحص متاح للمالك فقط.")
+        return
+    diagnostics = build_otc_live_health_message() + "\n\n" + build_trading_room_market_data_status_message()
+    await update.message.reply_text(diagnostics[:3900], reply_markup=admin_main_keyboard)
 
 
 async def otc_live_feed_health_check_job(context: ContextTypes.DEFAULT_TYPE):
@@ -24240,6 +24659,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await send_maintenance_message(update, context, lang)
         return
 
+    # v1.39.2: owner-wide diagnostic center. Keep this before any retired-button guards
+    # so cached keyboards cannot shadow the health request.
+    if is_admin(user.id) and text in {
+        "🩺 فحص النظام الكامل", "🩺 Full System Check",
+        "فحص النظام الكامل", "system check",
+    }:
+        await send_full_system_diagnostics(update, context)
+        return
+
+    # v1.39.1: admin-only OTC central-feed diagnostics must run BEFORE the
+    # retired Trading Room text guard. The legacy health label is still present
+    # in TRADING_ROOM_RETIRED_TEXTS, so without this early route the diagnostic
+    # request is incorrectly rejected as an old Trading Room button.
+    if is_admin(user.id) and text in {
+        "🩺 فحص بيانات OTC Live", "🩺 OTC Live Check",
+        "🩺 فحص OTC المركزي", "🩺 OTC Central Check",
+        "/otchealth", "otchealth",
+    }:
+        diagnostics = build_otc_live_health_message() + "\n\n" + build_trading_room_market_data_status_message()
+        await update.message.reply_text(
+            diagnostics,
+            reply_markup=build_main_menu_for_user(user.id, lang),
+        )
+        return
+
     # v1.37: Trading Room was fully retired from the user product. Old cached buttons are rejected.
     if text in TRADING_ROOM_RETIRED_TEXTS:
         reset_signal_state(context)
@@ -29279,6 +29723,8 @@ def run_telegram_bot_only():
     install_firebase_24h_monitor()
 
     app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("syscheck", full_system_diagnostics_command))
+    app.add_handler(CommandHandler("otchealth", otc_health_command))
     app.add_handler(CallbackQueryHandler(handle_admin_buttons))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     app.add_error_handler(telegram_error_handler)
