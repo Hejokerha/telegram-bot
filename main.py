@@ -22,6 +22,7 @@ try:
 except Exception:
     websocket = None
 
+# v1.41.0: Octopus global execution guard + client-aware sleep/resume; Quotex cookie-only transport unchanged.
 # v1.40.0: production Quotex cookie-only central feed over curl_cffi/EIO3.
 # Live compatibility was proven on Render without sending QUOTEX_SESSION.
 # The session-token authorization path is retained only as inert rollback code and is not used by production.
@@ -544,6 +545,7 @@ admin_otc_edge_keyboard = ReplyKeyboardMarkup(
 structure_edge_admin_keyboard = ReplyKeyboardMarkup(
     [
         ["🟢 تشغيل Octopus", "🔴 إيقاف Octopus"],
+        ["🌍 تشغيل تنفيذ Octopus للجميع", "🚨 إيقاف تنفيذ Octopus للجميع"],
         ["📋 حالة Octopus", "📊 ملخص Octopus"],
         ["📊 وضع السوق ساعتين"],
         ["🟢 تنفيذ NORMAL", "🔄 تنفيذ REVERSE"],
@@ -1101,7 +1103,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.40.0"
+COPY_SERVER_VERSION = "1.41.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -14130,6 +14132,7 @@ _structure_edge_state = {
     "round_levels_found": 0,
     "family_setups_found": {},
     "enabled_cache": bool(STRUCTURE_EDGE_DEFAULT_ENABLED),
+    "global_execution_enabled_cache": True,
     "enabled_cache_loaded": False,
     "enabled_cache_last_refresh_ts": 0.0,
     "settings_reads": 0,
@@ -14177,10 +14180,14 @@ def _structure_edge_get_settings(force_refresh: bool = False) -> dict:
             if not isinstance(data, dict):
                 data = {}
             enabled = bool(data.get("enabled", default_enabled))
+            # v1.41: separate owner toggle from the global service guard. Existing installs
+            # have no key yet, so default TRUE preserves current team execution behavior.
+            global_execution_enabled = bool(data.get("global_execution_enabled", True))
             mode = str(data.get("execution_direction_mode") or default_mode).strip().upper()
             if mode not in {"NORMAL", "REVERSE"}:
                 mode = default_mode
             _structure_edge_state["enabled_cache"] = enabled
+            _structure_edge_state["global_execution_enabled_cache"] = global_execution_enabled
             _structure_edge_state["execution_direction_mode_cache"] = mode
             _structure_edge_state["enabled_cache_loaded"] = True
             _structure_edge_state["enabled_cache_last_refresh_ts"] = now_ts
@@ -14189,6 +14196,7 @@ def _structure_edge_get_settings(force_refresh: bool = False) -> dict:
             logger.debug("Octopus settings refresh failed: %s", exc)
             if not loaded:
                 _structure_edge_state["enabled_cache"] = default_enabled
+                _structure_edge_state["global_execution_enabled_cache"] = True
                 _structure_edge_state["execution_direction_mode_cache"] = default_mode
                 _structure_edge_state["enabled_cache_loaded"] = True
                 _structure_edge_state["enabled_cache_last_refresh_ts"] = now_ts
@@ -14197,12 +14205,17 @@ def _structure_edge_get_settings(force_refresh: bool = False) -> dict:
         mode = default_mode
     return {
         "enabled": bool(_structure_edge_state.get("enabled_cache", default_enabled)),
+        "global_execution_enabled": bool(_structure_edge_state.get("global_execution_enabled_cache", True)),
         "execution_direction_mode": mode,
     }
 
 
 def _structure_edge_set_enabled(enabled: bool) -> bool:
     try:
+        # Preserve the separately-persisted global guard if this is the first owner action
+        # after a Render restart. A personal toggle must never implicitly reopen the team.
+        if not bool(_structure_edge_state.get("enabled_cache_loaded")):
+            _structure_edge_get_settings(force_refresh=True)
         value = bool(enabled)
         _structure_edge_settings_ref().update({"enabled": value, "updated_at": now_iso(), "engine": "octopus_market_intelligence_v1"})
         # Immediate in-RAM update: the 0.5s scheduler never needs a Firebase read to notice the toggle.
@@ -14214,6 +14227,47 @@ def _structure_edge_set_enabled(enabled: bool) -> bool:
         _structure_edge_state["last_error"] = str(exc)
         logger.exception("Round Number Edge enabled update failed: %s", exc)
         return False
+
+
+def _structure_edge_set_global_execution_enabled(enabled: bool) -> bool:
+    """Owner-only master guard for every real Octopus execution target.
+
+    This does not erase users' personal ON/OFF choices. When OFF, all real PRE-ARM
+    preparation/execution sleeps. Turning it back ON lets previously-enabled users
+    resume automatically when their own app/extension is online. Shadow/paper market
+    research remains independent and continues in the background.
+    """
+    try:
+        # Load the owner's personal state too when this is the first settings action after
+        # restart, so the global switch cannot overwrite the RAM view with defaults.
+        if not bool(_structure_edge_state.get("enabled_cache_loaded")):
+            _structure_edge_get_settings(force_refresh=True)
+        value = bool(enabled)
+        _structure_edge_settings_ref().update({
+            "global_execution_enabled": value,
+            "global_execution_updated_at": now_iso(),
+        })
+        _structure_edge_state["global_execution_enabled_cache"] = value
+        _structure_edge_state["enabled_cache_loaded"] = True
+        _structure_edge_state["enabled_cache_last_refresh_ts"] = time_module.time()
+        if not value:
+            # A globally-stopped service must never retain a prepared next-candle order
+            # that could execute if the owner re-enables during the same open window.
+            if isinstance(_octopus_state.get("selector_prearmed_candidate"), dict):
+                _octopus_state["selector_prearm_cancelled"] = int(_octopus_state.get("selector_prearm_cancelled", 0) or 0) + 1
+            _octopus_state["selector_prearmed_candidate"] = None
+            _octopus_state["selector_prearm_target_bucket"] = 0
+            _octopus_state["selector_last_no_trade_reason"] = "GLOBAL PAUSE: Octopus execution disabled by owner"
+            _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
+        return True
+    except Exception as exc:
+        _structure_edge_state["last_error"] = str(exc)
+        logger.exception("Octopus global execution guard update failed: %s", exc)
+        return False
+
+
+def _octopus_global_execution_enabled() -> bool:
+    return bool(_structure_edge_get_settings(force_refresh=False).get("global_execution_enabled", True))
 
 
 def _structure_edge_set_execution_direction_mode(mode: str) -> bool:
@@ -14333,14 +14387,30 @@ def _octopus_public_enabled_user_ids() -> list[int]:
 
 
 def _octopus_live_enabled_user_ids() -> list[int]:
+    # v1.41 global master guard: personal ON states are preserved but produce no real
+    # targets while the owner has paused the service for everyone.
+    if not _octopus_global_execution_enabled():
+        return []
     ids = _octopus_public_enabled_user_ids()
     if _structure_edge_is_enabled():
         ids.insert(0, int(ADMIN_TELEGRAM_ID))
     return list(dict.fromkeys(int(x) for x in ids))
 
 
+def _octopus_online_enabled_user_ids() -> list[int]:
+    """Enabled Octopus users that currently have an authenticated execution client.
+
+    This is the v1.41 sleep/resume gate. User preference remains ON while offline, but
+    PRE-ARM/execution work sleeps until the same Telegram ID is reachable through the
+    Chrome extension or Android app. No Firebase toggle churn and no delayed orders.
+    """
+    return [uid for uid in _octopus_live_enabled_user_ids() if _octopus_user_has_execution_transport(uid)]
+
+
 def _octopus_any_live_execution_enabled() -> bool:
-    return bool(_structure_edge_is_enabled() or _octopus_public_enabled_user_ids())
+    # Do not spend executable PRE-ARM scans on users whose app/extension is offline.
+    # The always-on Shadow/paper detector is outside this gate and remains untouched.
+    return bool(_octopus_online_enabled_user_ids())
 
 
 def _octopus_user_set_enabled(user_id: int, enabled: bool) -> tuple[bool, str]:
@@ -14365,7 +14435,9 @@ def _octopus_user_set_enabled(user_id: int, enabled: bool) -> tuple[bool, str]:
         state["enabled"] = True
         state["execution_direction_mode"] = _structure_edge_execution_direction_mode()
         ok = _octopus_user_persist(uid, state)
-        return ok, "✅ تم تشغيل Octopus.\nاترك أداة TRADING TIME (الإضافة أو التطبيق) وQuotex جاهزين أثناء الجلسة."
+        if ok and not _octopus_global_execution_enabled():
+            return True, "✅ تم حفظ Octopus بوضع التشغيل، لكن التنفيذ موقوف مؤقتًا من الإدارة. سيعود تلقائيًا عند إعادة فتح الخدمة ووجود التطبيق/الإضافة متصلة."
+        return ok, "✅ تم تشغيل Octopus.\nإذا كانت أداة TRADING TIME غير متصلة، يدخل Octopus وضع انتظار تلقائيًا ويعود للعمل فور اتصال التطبيق أو الإضافة."
     state["enabled"] = False
     state["stopped_at"] = now_iso()
     state["prepared_signal"] = None
@@ -14447,10 +14519,24 @@ def build_octopus_user_status(user_id: int, lang: str = "ar") -> str:
     mobile_online = bool(transport.get("mobile_online"))
     execution_online = bool(extension_online or mobile_online)
     mode = _structure_edge_execution_direction_mode()
+    global_enabled = _octopus_global_execution_enabled()
+    if not enabled:
+        runtime_status_ar = "متوقف ⏸"
+        runtime_status_en = "Stopped ⏸"
+    elif not global_enabled:
+        runtime_status_ar = "موقوف مؤقتًا من الإدارة 🛑"
+        runtime_status_en = "Paused by admin 🛑"
+    elif not execution_online:
+        runtime_status_ar = "انتظار أداة التنفيذ 💤"
+        runtime_status_en = "Sleeping — waiting for executor 💤"
+    else:
+        runtime_status_ar = "شغال ✅"
+        runtime_status_en = "Running ✅"
     if lang == "en":
         return (
             "📋 Octopus Status\n━━━━━━━━━━━━━━\n"
-            f"Status: {'Running ✅' if enabled else 'Stopped ⏸'}\n"
+            f"Status: {runtime_status_en}\n"
+            f"Global execution: {'Enabled ✅' if global_enabled else 'Paused 🛑'}\n"
             f"Execution device: {'Online ✅' if execution_online else 'Offline ⚠️'} (App {'✅' if mobile_online else '—'} / Extension {'✅' if extension_online else '—'})\n"
             f"Execution mode: {mode}\n"
             f"Session trades: {trades}\n"
@@ -14461,7 +14547,8 @@ def build_octopus_user_status(user_id: int, lang: str = "ar") -> str:
         )[:3900]
     return (
         "📋 حالة Octopus\n━━━━━━━━━━━━━━\n"
-        f"الحالة: {'شغال ✅' if enabled else 'متوقف ⏸'}\n"
+        f"الحالة: {runtime_status_ar}\n"
+        f"تنفيذ الخدمة للجميع: {'مفعّل ✅' if global_enabled else 'موقوف من الإدارة 🛑'}\n"
         f"أداة التنفيذ: {'متصلة ✅' if execution_online else 'غير متصلة ⚠️'} • التطبيق {'✅' if mobile_online else '—'} • الإضافة {'✅' if extension_online else '—'}\n"
         f"وضع التنفيذ الحالي: {mode}\n"
         f"صفقات الجلسة: {trades}\n"
@@ -18390,7 +18477,7 @@ async def _octopus_adaptive_prearm(context: ContextTypes.DEFAULT_TYPE, now_ts: f
     # execution transport online (Chrome extension or Android).
     prepared_user_ids = []
     prepare_results = {}
-    online_targets = [uid for uid in _octopus_live_enabled_user_ids() if _octopus_user_has_execution_transport(uid)]
+    online_targets = _octopus_online_enabled_user_ids()
     if online_targets:
         raw_results = await asyncio.gather(
             *(publish_copy_octopus_prepare_signal(candidate, target_bucket, target_user_id=uid) for uid in online_targets),
@@ -18777,10 +18864,14 @@ def build_structure_edge_status() -> str:
     pending = _octopus_state.get("pending") or {}
     pending_obs = sum(len(v or []) for v in pending.values())
     pre = _octopus_state.get("selector_prearmed_candidate") if isinstance(_octopus_state.get("selector_prearmed_candidate"), dict) else None
+    enabled_targets = _octopus_live_enabled_user_ids()
+    online_targets = _octopus_online_enabled_user_ids()
+    sleeping_targets = max(0, len(enabled_targets) - len(online_targets))
     return (
         "📋 حالة Octopus S/R + Retest — TEST\n"
         "━━━━━━━━━━━━━━\n"
-        f"الحالة: {'شغال ✅' if settings.get('enabled') else 'متوقف ⏸'}\n"
+        f"حساب المالك: {'شغال ✅' if settings.get('enabled') else 'متوقف ⏸'}\n"
+        f"🌍 تنفيذ Octopus للجميع: {'مفعّل ✅' if settings.get('global_execution_enabled', True) else 'موقوف 🛑'} | enabled targets={len(enabled_targets)} | online={len(online_targets)} | sleeping={sleeping_targets}\n"
         f"🎛 Execution mode: {settings.get('execution_direction_mode') or 'NORMAL'}\n"
         f"🧪 Mode detector: شغال دائمًا بالخلفية | session committed/settled/skipped: {int(_octopus_mode_detector_state.get('virtual_committed',0) or 0)} / {int(_octopus_mode_detector_state.get('virtual_settled',0) or 0)} / {int(_octopus_mode_detector_state.get('virtual_skipped',0) or 0)}\n"
         f"Shadow library: {len(OCTOPUS_MODEL_FAMILY)} نموذج / {len(set(OCTOPUS_MODEL_FAMILY.values()))} مدارس | التنفيذ: 3 Theses فقط\n"
@@ -19027,6 +19118,9 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
         # NORMAL-vs-REVERSE report available before real execution is turned on.
         _octopus_mode_detector_tick(now_ts, current_bucket, sec)
 
+        # v1.41: real execution sleeps when the global guard is OFF or when every
+        # enabled user's app/extension is offline. Their ON preference is preserved,
+        # and PRE-ARM resumes automatically on the next eligible window after reconnect.
         if not _octopus_any_live_execution_enabled():
             return
 
@@ -26966,7 +27060,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "التنفيذ الآن محصور بثلاث حالات فقط: ارتداد من دعم، ارتداد من مقاومة، وإعادة اختبار المنطقة بعد تبدّل دورها.\n"
                 "المنطقة نفسها هي التي تولّد الاتجاه؛ باقي النماذج تبقى Shadow فقط ولا تصنع قرار التنفيذ.\n"
                 "إذا توجد صفقة مفتوحة يتوقف فحص التنفيذ وPRE-ARM بالكامل حتى تنحسم، بينما Shadow يبقى شغال بالخلفية.\n"
-                "الحساب والمبلغ وإدارة الصفقة تبقى من إعدادات الإضافة.",
+                "الحساب والمبلغ وإدارة الصفقة تبقى من إعدادات الإضافة.\n"
+                "زر التشغيل/الإيقاف العادي يخص حساب المالك فقط؛ أزرار 🌍/🚨 تتحكم بتنفيذ Octopus على الجميع.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
@@ -26974,7 +27069,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "🟢 تشغيل Octopus":
             ok = _structure_edge_set_enabled(True)
             await update.message.reply_text(
-                "✅ تم تشغيل Octopus S/R + Retest. التنفيذ محصور بالدعم/المقاومة/إعادة الاختبار، وExecution Lock شغال أثناء الصفقة المفتوحة." if ok else "❌ تعذر تشغيل Octopus. راجع اللوج.",
+                (("✅ تم تشغيل Octopus لحساب المالك فقط. " + ("تنفيذ الفريق العام مفعّل." if _octopus_global_execution_enabled() else "⚠️ تنفيذ الفريق العام موقوف حاليًا من زر الإدارة.")) if ok else "❌ تعذر تشغيل Octopus. راجع اللوج."),
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
@@ -26982,9 +27077,39 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text == "🔴 إيقاف Octopus":
             ok = _structure_edge_set_enabled(False)
             await update.message.reply_text(
-                "⛔ تم إيقاف Octopus S/R + Retest." if ok else "❌ تعذر إيقاف Octopus. راجع اللوج.",
+                "⛔ تم إيقاف Octopus لحساب المالك فقط. المستخدمون الآخرون لا يتأثرون." if ok else "❌ تعذر إيقاف Octopus. راجع اللوج.",
                 reply_markup=structure_edge_admin_keyboard,
             )
+            return
+
+        if text == "🌍 تشغيل تنفيذ Octopus للجميع":
+            ok = _structure_edge_set_global_execution_enabled(True)
+            await update.message.reply_text(
+                "🌍✅ تم فتح تنفيذ Octopus للجميع. كل مستخدم كان Octopus عنده ON سيعود تلقائيًا فقط عندما يكون تطبيقه أو إضافته متصلة." if ok else "❌ تعذر فتح تنفيذ Octopus للجميع. راجع اللوج.",
+                reply_markup=structure_edge_admin_keyboard,
+            )
+            return
+
+        if text == "🚨 إيقاف تنفيذ Octopus للجميع":
+            context.user_data["step"] = "octopus_confirm_global_stop"
+            await update.message.reply_text(
+                "🚨 تأكيد إيقاف تنفيذ Octopus للجميع؟\n\n"
+                "سيتم منع أي PRE-ARM/صفقة جديدة لكل المستخدمين فورًا، مع إبقاء اختياراتهم الشخصية ON/OFF محفوظة. الصفقات المفتوحة تبقى فقط لتسجيل نتيجتها.\n\n"
+                "اضغط ✅ نعم، تأكيد للمتابعة أو ❌ إلغاء.",
+                reply_markup=admin_confirm_keyboard,
+            )
+            return
+
+        if step == "octopus_confirm_global_stop":
+            context.user_data["step"] = None
+            if is_admin_confirm_text(text):
+                ok = _structure_edge_set_global_execution_enabled(False)
+                await update.message.reply_text(
+                    "🚨 تم إيقاف تنفيذ Octopus للجميع. لا PRE-ARM ولا صفقات جديدة حتى تضغط 🌍 تشغيل تنفيذ Octopus للجميع." if ok else "❌ تعذر إيقاف التنفيذ العام. راجع اللوج.",
+                    reply_markup=structure_edge_admin_keyboard,
+                )
+            else:
+                await update.message.reply_text("تم إلغاء الإيقاف العام.", reply_markup=structure_edge_admin_keyboard)
             return
 
         if text == "📋 حالة Octopus":
