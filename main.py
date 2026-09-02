@@ -22,7 +22,9 @@ try:
 except Exception:
     websocket = None
 
-# v1.39.10: legacy cookie-only compatibility probe over curl_cffi/EIO3; session-auth fallback retained.
+# v1.40.0: production Quotex cookie-only central feed over curl_cffi/EIO3.
+# Live compatibility was proven on Render without sending QUOTEX_SESSION.
+# The session-token authorization path is retained only as inert rollback code and is not used by production.
 # Strategy/execution decisions are unchanged. The only functional change is decoding
 # Socket.IO binary attachment payloads that can carry a small Engine.IO prefix before JSON.
 try:
@@ -196,8 +198,8 @@ CHANNEL_SIGNAL_INTERVAL_MINUTES = 3
 # The removed OTC Live/global channels remain disabled by their dedicated flags.
 
 # ===== Quotex OTC live websocket settings =====
-# v1.39: central OTC feed verified against the live Quotex web app.
-# QUOTEX_SESSION and QUOTEX_COOKIES MUST come from the same Quotex login session.
+# v1.40: central OTC feed uses the proven cookie-only contract over curl_cffi/EIO3.
+# QUOTEX_SESSION is not required and is not sent by the production feed.
 QUOTEX_COOKIE_FILE = os.getenv("QUOTEX_COOKIE_FILE", "cookies.txt")
 QUOTEX_WS_URL = os.getenv(
     "QUOTEX_WS_URL",
@@ -1099,7 +1101,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.39.10"
+COPY_SERVER_VERSION = "1.40.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -5140,16 +5142,14 @@ def can_autopublish_timeframe(timeframe_minutes: int, check_dt: datetime | None 
 class QuotexOTCLiveFeed:
     """Central Quotex OTC market-data feed.
 
-    v1.39.10 transport contract: legacy cookie-only compatibility is probed first over curl_cffi/EIO3;
-    the proven v1.39.9 QUOTEX_SESSION authorization path remains an automatic fallback.
+    v1.40.0 production transport contract: cookie-only over curl_cffi/EIO3.
       * Engine.IO v3 websocket endpoint.
       * Browser-compatible TLS/HTTP fingerprint via curl_cffi.
-      * Socket.IO default namespace (``40``), browser-style pre-auth bootstrap,
-        then ``authorization`` using ``QUOTEX_SESSION`` from the same browser
-        session as ``QUOTEX_COOKIES``.
-      * ``instruments/get`` / ``instruments/list`` for instrument metadata/payout.
-      * ``instruments/update`` + chart/depth bootstrap for subscribed OTC symbols.
-      * binary ``history/list/v2`` and ``quotes/stream`` payloads.
+      * Socket.IO default namespace (``40``).
+      * No ``authorization`` event and no ``QUOTEX_SESSION`` dependency.
+      * ``instruments/list`` for instrument metadata/payout.
+      * ``instruments/follow`` for the OTC symbol universe.
+      * binary ``history/list/v2`` / ``quotes/stream`` payload normalization retained.
 
     Trading logic does not live here.  The object keeps the legacy public cache
     contract (``prices``, ``last_tick``, ``candles``, ``instruments``) so OTC
@@ -5367,6 +5367,7 @@ class QuotexOTCLiveFeed:
         self.thread.start()
 
     def _run_forever(self):
+        """Production lifecycle: cookie-only Quotex feed, no session token authorization."""
         if CurlAsyncSession is None or CurlWsFlag is None:
             logger.error(
                 "curl_cffi is not installed; Quotex OTC central live feed cannot start. "
@@ -5380,8 +5381,6 @@ class QuotexOTCLiveFeed:
 
         while True:
             cookies = self._load_cookies()
-            session_token = os.getenv("QUOTEX_SESSION", "").strip()
-
             if not cookies:
                 self._set_failure("missing_cookies", "QUOTEX_COOKIES is empty")
                 time_module.sleep(30)
@@ -5395,42 +5394,29 @@ class QuotexOTCLiveFeed:
             try:
                 logger.info(
                     "Starting Quotex OTC central feed | transport=curl_cffi | eio=3 | host=%s | "
-                    "cookie_names=%s | attempt=%s | legacy_cookie_probe=%s",
+                    "cookie_names=%s | attempt=%s | auth_mode=cookie_only",
                     urlparse(QUOTEX_WS_URL).netloc,
                     ",".join(self._cookie_names(cookies)) or "none",
                     self.reconnect_attempt,
-                    "on" if QUOTEX_LEGACY_COOKIE_ONLY_PROBE else "off",
                 )
 
-                legacy_used = False
-                if QUOTEX_LEGACY_COOKIE_ONLY_PROBE:
-                    legacy_used = bool(asyncio.run(self._legacy_cookie_only_connection_main(cookies)))
-
-                # A successful legacy connection is long-lived and normally exits only
-                # by raising when the socket drops. A False return means the cookie-only
-                # probe did not produce a real quote, so use the proven session-auth path.
-                if not legacy_used:
-                    if not session_token:
-                        self._set_failure(
-                            "legacy_cookie_only_failed_and_no_session",
-                            "cookie-only probe produced no live quote and QUOTEX_SESSION is empty",
-                        )
-                        raise RuntimeError("quotex_no_usable_auth_mode")
-                    logger.info("Quotex legacy cookie-only probe unavailable; falling back to QUOTEX_SESSION authorization")
-                    asyncio.run(self._connection_main(cookies, session_token))
+                ready = bool(asyncio.run(self._legacy_cookie_only_connection_main(cookies)))
+                if not ready:
+                    # No session-auth fallback in v1.40. A failed cookie-only bootstrap
+                    # is diagnosed and retried with bounded backoff.
+                    if not self.last_failure_category:
+                        self._set_failure("cookie_only_no_quotes", "cookie-only bootstrap did not become feed-ready")
+                    raise RuntimeError("quotex_cookie_only_not_ready")
 
             except Exception as e:
                 detail = self._safe_exception_detail(e)
                 preserve_categories = {
-                    "authorization_rejected",
-                    "session_disconnected",
-                    "subscription_bootstrap_no_quotes",
+                    "cookie_only_no_quotes",
+                    "cookie_only_no_quotes",
                     "stream_stale",
-                    "authorization_timeout",
                     "socketio_namespace_timeout",
-                    "legacy_cookie_only_no_quotes",
-                    "legacy_cookie_only_disconnected",
-                    "legacy_cookie_only_failed_and_no_session",
+                    "cloudflare_rejection",
+                    "missing_cookies",
                 }
                 if self.last_failure_category not in preserve_categories:
                     status = getattr(e, "status_code", None)
@@ -5458,21 +5444,17 @@ class QuotexOTCLiveFeed:
             else:
                 backoff = min(max_backoff, max(backoff * 2.0, float(QUOTEX_RECONNECT_INITIAL_SECONDS)))
 
-            if self.last_failure_category in {"authorization_rejected", "session_disconnected"}:
-                wait_seconds = max(backoff, 30.0)
-            else:
-                jitter = random.uniform(0.0, max(0.0, float(QUOTEX_RECONNECT_JITTER_SECONDS)))
-                wait_seconds = backoff + jitter
-
+            jitter = random.uniform(0.0, max(0.0, float(QUOTEX_RECONNECT_JITTER_SECONDS)))
+            wait_seconds = backoff + jitter
             logger.info("Quotex OTC reconnect in %.1fs", wait_seconds)
             time_module.sleep(wait_seconds)
 
     async def _legacy_keepalive_worker(self, ws):
         """Mirror the legacy feed's explicit Engine.IO pong cadence after namespace open."""
         try:
-            while self.connected and self.auth_mode.startswith("legacy_cookie_only"):
+            while self.connected and self.auth_mode.startswith("cookie_only"):
                 await asyncio.sleep(max(1.0, float(QUOTEX_LEGACY_KEEPALIVE_SECONDS)))
-                if self.connected and self.auth_mode.startswith("legacy_cookie_only"):
+                if self.connected and self.auth_mode.startswith("cookie_only"):
                     await self._send_raw_async(ws, "3")
         except asyncio.CancelledError:
             raise
@@ -5490,20 +5472,20 @@ class QuotexOTCLiveFeed:
                 self.subscribed_symbols = set(sent)
 
             for symbol in ordered[1:]:
-                if not self.connected or self.auth_mode != "legacy_cookie_only":
+                if not self.connected or self.auth_mode != "cookie_only":
                     return
                 await self._send_event_async(ws, "instruments/follow", symbol)
                 sent.add(symbol)
                 with self.lock:
                     self.subscribed_symbols = set(sent)
-                logger.info("Legacy Quotex follow sent: %s | subscribed=%s/%s", symbol, len(sent), len(ordered))
+                logger.info("Quotex cookie-only follow sent: %s | subscribed=%s/%s", symbol, len(sent), len(ordered))
                 await asyncio.sleep(max(0.05, float(QUOTEX_LEGACY_FOLLOW_DELAY_SECONDS)))
 
-            while self.connected and self.auth_mode == "legacy_cookie_only":
+            while self.connected and self.auth_mode == "cookie_only":
                 with self.lock:
                     desired_now = list(self.symbols)
                 for symbol in [x for x in desired_now if x not in sent]:
-                    if not self.connected or self.auth_mode != "legacy_cookie_only":
+                    if not self.connected or self.auth_mode != "cookie_only":
                         return
                     await self._send_event_async(ws, "instruments/follow", symbol)
                     sent.add(symbol)
@@ -5529,7 +5511,7 @@ class QuotexOTCLiveFeed:
         self.legacy_probe_attempted = True
         self.legacy_probe_success = False
         self.last_legacy_probe_at = now_iso()
-        self.auth_mode = "legacy_cookie_only_probe"
+        self.auth_mode = "cookie_only_bootstrap"
         self.pending_binary_event = None
 
         cookie_jar = self._cookie_dict(raw_cookies)
@@ -5540,12 +5522,12 @@ class QuotexOTCLiveFeed:
         if seed not in desired and desired:
             seed = desired[0]
         if not seed:
-            self._set_failure("legacy_cookie_only_no_quotes", "no seed symbol configured")
+            self._set_failure("cookie_only_no_quotes", "no seed symbol configured")
             self.auth_mode = "none"
             return False
 
         logger.warning(
-            "Quotex LEGACY COOKIE-ONLY probe START | no_session_token=yes | sequence=40>instruments/list>instruments/follow | seed=%s",
+            "Quotex COOKIE-ONLY bootstrap START | no_session_token=yes | sequence=40>instruments/list>instruments/follow | seed=%s",
             seed,
         )
 
@@ -5592,18 +5574,18 @@ class QuotexOTCLiveFeed:
 
                     self.connected = True
                     keepalive_task = asyncio.create_task(self._legacy_keepalive_worker(ws))
-                    logger.info("Quotex legacy cookie-only namespace connected")
+                    logger.info("Quotex cookie-only namespace connected")
 
                     await asyncio.sleep(max(0.0, float(QUOTEX_LEGACY_LIST_DELAY_SECONDS)))
                     await self._send_event_async(ws, "instruments/list", [])
-                    logger.info("Quotex legacy request sent | instruments/list")
+                    logger.info("Quotex cookie-only request sent | instruments/list")
                     await asyncio.sleep(1.0)
 
                     quote_marker = float(self.last_quote_monotonic or 0.0)
                     await self._send_event_async(ws, "instruments/follow", seed)
                     with self.lock:
                         self.subscribed_symbols = {seed}
-                    logger.info("Quotex legacy follow probe sent | symbol=%s", seed)
+                    logger.info("Quotex cookie-only seed follow sent | symbol=%s", seed)
 
                     probe_deadline = time_module.monotonic() + max(1.0, float(QUOTEX_LEGACY_PROBE_TIMEOUT_SECONDS))
                     while time_module.monotonic() < probe_deadline:
@@ -5612,7 +5594,7 @@ class QuotexOTCLiveFeed:
                                 tick = dict(self.last_tick.get(seed) or {})
                             if tick and tick.get("price") is not None:
                                 self.authorized = True  # feed-ready semantic for shared diagnostics
-                                self.auth_mode = "legacy_cookie_only"
+                                self.auth_mode = "cookie_only"
                                 self.legacy_probe_success = True
                                 self.legacy_supported_once = True
                                 self.connection_was_ready = True
@@ -5621,7 +5603,7 @@ class QuotexOTCLiveFeed:
                                 self.last_failure_category = None
                                 self.last_failure_detail = None
                                 logger.warning(
-                                    "Quotex LEGACY COOKIE-ONLY probe SUCCESS | seed=%s | session_token_used=NO | live_price=%s",
+                                    "Quotex COOKIE-ONLY bootstrap SUCCESS | seed=%s | session_token_used=NO | live_price=%s",
                                     seed, tick.get("price"),
                                 )
                                 break
@@ -5638,11 +5620,11 @@ class QuotexOTCLiveFeed:
                         self.authorized = False
                         self.auth_mode = "none"
                         self._set_failure(
-                            "legacy_cookie_only_no_quotes",
+                            "cookie_only_no_quotes",
                             f"no live quotes/stream for seed={seed} without authorization event",
                         )
                         logger.warning(
-                            "Quotex LEGACY COOKIE-ONLY probe FAILED | seed=%s | session_token_used=NO | fallback=session_auth",
+                            "Quotex COOKIE-ONLY bootstrap FAILED | seed=%s | session_token_used=NO | retry=cookie_only",
                             seed,
                         )
                         return False
@@ -5656,7 +5638,7 @@ class QuotexOTCLiveFeed:
                         except asyncio.TimeoutError:
                             stale_for = time_module.monotonic() - float(self.last_message_monotonic or 0.0)
                             if stale_for >= float(QUOTEX_STREAM_STALE_SECONDS):
-                                self._set_failure("stream_stale", f"legacy cookie-only: no inbound frames for {stale_for:.1f}s")
+                                self._set_failure("stream_stale", f"cookie-only: no inbound frames for {stale_for:.1f}s")
                                 raise RuntimeError("quotex_legacy_stream_stale")
                             continue
 
@@ -10121,11 +10103,8 @@ def build_full_system_diagnostics(owner_user_id: int) -> str:
     if not copy_global:
         issues.append(("⚠️", "Copy Trading موقوف من إعدادات الأدمن؛ لن تُرسل صفقات تنفيذ جديدة."))
 
-    session_ok = bool(os.getenv("QUOTEX_SESSION", "").strip())
+    session_ok = bool(os.getenv("QUOTEX_SESSION", "").strip())  # ignored by v1.40 production feed
     cookies_ok = _diag_quotex_cookie_configured()
-    legacy_active = str(market.get("auth_mode") or "") == "legacy_cookie_only"
-    if not session_ok and not legacy_active:
-        issues.append(("⚠️", "QUOTEX_SESSION غير موجود؛ سيعتمد النظام على cookie-only إذا كان مدعومًا."))
     if not cookies_ok:
         issues.append(("❌", "QUOTEX_COOKIES/cookies.txt غير موجود."))
 
@@ -10141,7 +10120,7 @@ def build_full_system_diagnostics(owner_user_id: int) -> str:
             extra = market.get("last_failure_category") or "unknown"
             issues.append(("❌", f"Quotex WebSocket مفصول؛ آخر تصنيف فشل: {extra}."))
         elif not market.get("authorized"):
-            issues.append(("❌", "Quotex WebSocket متصل لكن authorization غير ناجح؛ افحص تطابق session/cookies."))
+            issues.append(("❌", "Quotex WebSocket متصل لكن feed-ready لم يثبت؛ افحص cookie-only bootstrap/quotes."))
         if market.get("authorized") and not warmup:
             if int(market.get("live_symbols") or 0) == 0:
                 issues.append(("❌", "Quotex authorized لكن لا يوجد أي symbol يستقبل live quotes/stream."))
@@ -10182,9 +10161,11 @@ def build_full_system_diagnostics(owner_user_id: int) -> str:
     if market.get("exists") and not market.get("snapshot_error"):
         _auth_mode = str(market.get('auth_mode') or 'none')
         _auth_label = {
+            'cookie_only': 'cookie-only',
+            'cookie_only_bootstrap': 'cookie-only bootstrap',
             'legacy_cookie_only': 'cookie-only legacy',
             'legacy_cookie_only_probe': 'cookie-only probe',
-            'session_authorization': 'session auth',
+            'session_authorization': 'session auth (rollback only)',
         }.get(_auth_mode, _auth_mode)
         market_line = (
             f"WS {'✅' if market.get('connected') else '❌'} • FeedAuth {'✅' if market.get('authorized') else '❌'} • "
@@ -10219,7 +10200,7 @@ def build_full_system_diagnostics(owner_user_id: int) -> str:
         f"Android REST poll لحسابك: {'✅' if clients.get('mobile_poll_owner') else '—'} • last={_diag_age_text(clients.get('mobile_poll_age'))}",
         "",
         "📈 Quotex المركزي",
-        f"Credentials: cookies {'✅' if cookies_ok else '❌'} • session fallback {'✅' if session_ok else '—'}",
+        f"Credentials: cookies {'✅' if cookies_ok else '❌'} • QUOTEX_SESSION غير مطلوب", 
         market_line,
         f"آخر live tick: {_diag_age_text(market.get('latest_age'))} • {market.get('latest_symbol') or '-'}",
         f"Instruments/payout cache: {market.get('instruments', 0) if market.get('exists') else 0}",
