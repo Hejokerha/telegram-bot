@@ -22,6 +22,8 @@ try:
 except Exception:
     websocket = None
 
+# v1.42.0: Octopus real execution = MI_ROLE_FLIP_RETEST only + fixed NORMAL direction.
+# Support/Resistance rejection remain Shadow/learning observations only; v1.41 sleep/global guard and Quotex cookie-only transport unchanged.
 # v1.41.0: Octopus global execution guard + client-aware sleep/resume; Quotex cookie-only transport unchanged.
 # v1.40.0: production Quotex cookie-only central feed over curl_cffi/EIO3.
 # Live compatibility was proven on Render without sending QUOTEX_SESSION.
@@ -548,7 +550,7 @@ structure_edge_admin_keyboard = ReplyKeyboardMarkup(
         ["🌍 تشغيل تنفيذ Octopus للجميع", "🚨 إيقاف تنفيذ Octopus للجميع"],
         ["📋 حالة Octopus", "📊 ملخص Octopus"],
         ["📊 وضع السوق ساعتين"],
-        ["🟢 تنفيذ NORMAL", "🔄 تنفيذ REVERSE"],
+        ["🧭 التنفيذ: Role Flip + NORMAL فقط"],
         ["🧠 أفضل النماذج", "🗺 الأزواج الآن"],
         ["🧹 تصفير Octopus"],
         ["⬅️ رجوع"],
@@ -1103,7 +1105,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.41.0"
+COPY_SERVER_VERSION = "1.42.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -14183,9 +14185,10 @@ def _structure_edge_get_settings(force_refresh: bool = False) -> dict:
             # v1.41: separate owner toggle from the global service guard. Existing installs
             # have no key yet, so default TRUE preserves current team execution behavior.
             global_execution_enabled = bool(data.get("global_execution_enabled", True))
-            mode = str(data.get("execution_direction_mode") or default_mode).strip().upper()
-            if mode not in {"NORMAL", "REVERSE"}:
-                mode = default_mode
+            # v1.42: real execution direction is fixed NORMAL. A legacy persisted
+            # REVERSE value may remain in Firebase for historical rollback, but runtime
+            # execution must never consume it.
+            mode = "NORMAL"
             _structure_edge_state["enabled_cache"] = enabled
             _structure_edge_state["global_execution_enabled_cache"] = global_execution_enabled
             _structure_edge_state["execution_direction_mode_cache"] = mode
@@ -14200,9 +14203,8 @@ def _structure_edge_get_settings(force_refresh: bool = False) -> dict:
                 _structure_edge_state["execution_direction_mode_cache"] = default_mode
                 _structure_edge_state["enabled_cache_loaded"] = True
                 _structure_edge_state["enabled_cache_last_refresh_ts"] = now_ts
-    mode = str(_structure_edge_state.get("execution_direction_mode_cache") or default_mode).upper()
-    if mode not in {"NORMAL", "REVERSE"}:
-        mode = default_mode
+    # v1.42 invariant: runtime execution is NORMAL-only.
+    mode = "NORMAL"
     return {
         "enabled": bool(_structure_edge_state.get("enabled_cache", default_enabled)),
         "global_execution_enabled": bool(_structure_edge_state.get("global_execution_enabled_cache", True)),
@@ -14271,15 +14273,20 @@ def _octopus_global_execution_enabled() -> bool:
 
 
 def _structure_edge_set_execution_direction_mode(mode: str) -> bool:
+    """v1.42 real-execution direction policy: NORMAL only.
+
+    Keeping this helper preserves compatibility with old admin keyboards/callers, but a
+    REVERSE request is deliberately rejected and can never change runtime execution.
+    """
     try:
-        value = str(mode or "NORMAL").strip().upper()
-        if value not in {"NORMAL", "REVERSE"}:
+        requested = str(mode or "NORMAL").strip().upper()
+        if requested != "NORMAL":
             return False
         _structure_edge_settings_ref().update({
-            "execution_direction_mode": value,
+            "execution_direction_mode": "NORMAL",
             "execution_direction_mode_updated_at": now_iso(),
         })
-        _structure_edge_state["execution_direction_mode_cache"] = value
+        _structure_edge_state["execution_direction_mode_cache"] = "NORMAL"
         # Do not mark the whole settings cache as loaded here: if this is the first owner
         # action after a restart, enabled-state must still be refreshed from Firebase.
         if bool(_structure_edge_state.get("enabled_cache_loaded")):
@@ -14292,8 +14299,8 @@ def _structure_edge_set_execution_direction_mode(mode: str) -> bool:
 
 
 def _structure_edge_execution_direction_mode() -> str:
-    mode = str(_structure_edge_get_settings(force_refresh=False).get("execution_direction_mode") or "NORMAL").upper()
-    return mode if mode in {"NORMAL", "REVERSE"} else "NORMAL"
+    # Hard invariant, independent of any legacy Firebase value.
+    return "NORMAL"
 
 
 def _structure_edge_is_enabled() -> bool:
@@ -16857,9 +16864,11 @@ OCTOPUS_SELECTOR_MAX_OPEN_DISPLACEMENT_ATR = max(0.01, min(0.25, float(os.getenv
 OCTOPUS_SELECTOR_MIN_PAYOUT = max(0, min(100, int(os.getenv("OCTOPUS_SELECTOR_MIN_PAYOUT", str(OCTOPUS_MIN_PAYOUT)))))
 OCTOPUS_SELECTOR_MAX_TRADES_PER_BUCKET = 1  # architectural invariant: rank the market, execute only the best opportunity.
 
-# v1.27 execution scope: ONLY classical support/resistance rejection and polarity retest.
-# All legacy models remain Shadow observers but cannot create/flip an execution thesis.
-OCTOPUS_EXECUTION_SETUPS = {"MI_SUPPORT_REJECTION", "MI_RESISTANCE_REJECTION", "MI_ROLE_FLIP_RETEST"}
+# v1.42 execution scope: ONLY Role-Flip Retest can create a real PRE-ARM/order.
+# Support/Resistance rejection remain observed in Shadow learning so their statistics keep
+# accumulating without being eligible for real execution.
+OCTOPUS_SHADOW_MARKET_SETUPS = {"MI_SUPPORT_REJECTION", "MI_RESISTANCE_REJECTION", "MI_ROLE_FLIP_RETEST"}
+OCTOPUS_EXECUTION_SETUPS = {"MI_ROLE_FLIP_RETEST"}
 OCTOPUS_EXECUTION_LOCK_GRACE_SECONDS = max(5.0, min(30.0, float(os.getenv("OCTOPUS_EXECUTION_LOCK_GRACE_SECONDS", "12"))))
 OCTOPUS_EXECUTION_LOCK_FALLBACK_SECONDS = max(65.0, min(180.0, float(os.getenv("OCTOPUS_EXECUTION_LOCK_FALLBACK_SECONDS", "90"))))
 
@@ -17494,15 +17503,21 @@ def _mi_zone_event(parts: list[dict], zone: dict, atr: float) -> dict | None:
             "confirm_mode": "PRACTICAL_SR_V1_32",
         })
 
-    events = [e for e in events if str(e.get("setup")) in OCTOPUS_EXECUTION_SETUPS]
+    events = [e for e in events if str(e.get("setup")) in OCTOPUS_SHADOW_MARKET_SETUPS]
     if not events:
         return None
-    best = max(events, key=lambda e: float(e.get("quality", 0)))
-    best = dict(best)
-    best["zone"] = zone
-    best["close_position"] = round(close_pos, 3)
-    best["touch_now"] = bool(touch_now)
-    best["touch_prev"] = bool(touch_prev)
+    enriched_events = []
+    for raw_event in events:
+        item = dict(raw_event)
+        item["zone"] = zone
+        item["close_position"] = round(close_pos, 3)
+        item["touch_now"] = bool(touch_now)
+        item["touch_prev"] = bool(touch_prev)
+        enriched_events.append(item)
+    best = dict(max(enriched_events, key=lambda e: float(e.get("quality", 0))))
+    # Internal shadow payload lets the scanner settle Support/Resistance outcomes even
+    # though only Role Flip is executable. It is removed before ranking/publishing.
+    best["_shadow_events"] = enriched_events
     return best
 
 def _mi_proxy_models(setup: str) -> list[str]:
@@ -17525,53 +17540,69 @@ def _octopus_market_intelligence(pair: str, closed: list[dict], regime: dict) ->
     price = float(parts[-1]["close"])
     candidates = []
     for zone in zones:
-        ev = _mi_zone_event(parts, zone, atr)
-        if not ev or str(ev.get("setup")) not in OCTOPUS_EXECUTION_SETUPS:
+        zone_best = _mi_zone_event(parts, zone, atr)
+        if not zone_best:
             continue
-        q = float(ev.get("quality",0))
-        obstacle_info = _mi_space_to_obstacle(str(ev.get("direction")), price, zones, ev.get("zone"), atr)
-        space = float(obstacle_info.get("space_atr", 99.0) or 99.0)
-        raw_space = float(obstacle_info.get("raw_space_atr", 99.0) or 99.0)
-        hard_block = bool(obstacle_info.get("hard_block"))
+        zone_events = zone_best.get("_shadow_events") if isinstance(zone_best.get("_shadow_events"), list) else [zone_best]
+        for raw_event in zone_events:
+            ev = dict(raw_event)
+            ev.pop("_shadow_events", None)
+            if str(ev.get("setup")) not in OCTOPUS_SHADOW_MARKET_SETUPS:
+                continue
+            q = float(ev.get("quality",0))
+            obstacle_info = _mi_space_to_obstacle(str(ev.get("direction")), price, zones, ev.get("zone"), atr)
+            space = float(obstacle_info.get("space_atr", 99.0) or 99.0)
+            raw_space = float(obstacle_info.get("raw_space_atr", 99.0) or 99.0)
+            hard_block = bool(obstacle_info.get("hard_block"))
 
-        # Only a strong, technically meaningful opposing level can hard-block. A weak
-        # or stale geometric zone may slightly reduce quality, but must not erase a
-        # clean S/R opportunity.
-        if hard_block:
-            q -= 8.0
-        elif space < 0.34:
-            q -= 1.5
-        elif space >= 0.75:
-            q += 2.0
-        elif space >= 0.45:
-            q += 0.8
-        if raw_space < 0.12 and space >= 0.34:
-            q -= 0.5  # nearby weak clutter: informational only, never a hard veto
+            # Same technical calibration for executable and Shadow-only market theses.
+            if hard_block:
+                q -= 8.0
+            elif space < 0.34:
+                q -= 1.5
+            elif space >= 0.75:
+                q += 2.0
+            elif space >= 0.45:
+                q += 0.8
+            if raw_space < 0.12 and space >= 0.34:
+                q -= 0.5
 
-        ev.update({
-            "quality": round(max(1.0,min(99.0,q)),2),
-            "space_atr": round(float(space),3), "raw_space_atr": round(float(raw_space),3),
-            "space_blocked": hard_block, "opposing_obstacle": obstacle_info.get("obstacle"),
-            "opposing_obstacle_strength": obstacle_info.get("obstacle_strength"), "atr":atr,
-            "structure_bias":"DISABLED", "structure_strength":0.0,
-            "m5_bias":"DISABLED", "m5_strength":0.0,
-            "pressure_bias":"DISABLED", "pressure_strength":0.0,
-            "pressure_meta":{},
-        })
-        candidates.append(ev)
+            ev.update({
+                "quality": round(max(1.0,min(99.0,q)),2),
+                "space_atr": round(float(space),3), "raw_space_atr": round(float(raw_space),3),
+                "space_blocked": hard_block, "opposing_obstacle": obstacle_info.get("obstacle"),
+                "opposing_obstacle_strength": obstacle_info.get("obstacle_strength"), "atr":atr,
+                "structure_bias":"DISABLED", "structure_strength":0.0,
+                "m5_bias":"DISABLED", "m5_strength":0.0,
+                "pressure_bias":"DISABLED", "pressure_strength":0.0,
+                "pressure_meta":{},
+            })
+            candidates.append(ev)
 
-    # v1.30 selector behavior: if the highest raw-quality thesis is blocked by a *real*
-    # opposing level, do not throw away another technically valid thesis on the same
-    # pair. Prefer the best unblocked thesis first; keep blocked ones for diagnostics.
     candidates.sort(key=lambda x: float(x.get("quality",0)), reverse=True)
-    valid_candidates = [x for x in candidates if not bool(x.get("space_blocked")) and float(x.get("quality",0)) >= OCTOPUS_MI_MIN_THESIS_QUALITY]
-    best = dict(valid_candidates[0]) if valid_candidates else (dict(candidates[0]) if candidates else None)
-    blocked_count = sum(1 for x in candidates if bool(x.get("space_blocked")))
-    raw_count = len(candidates)
-    quality_count = sum(1 for x in candidates if float(x.get("quality",0)) >= OCTOPUS_MI_MIN_THESIS_QUALITY)
+
+    # Shadow learning: retain the best qualifying observation for EACH of the three
+    # S/R market theses on this pair/minute. Only Role Flip can flow into execution.
+    shadow_best_by_setup = {}
+    for row in candidates:
+        setup = str(row.get("setup") or "")
+        if setup not in OCTOPUS_SHADOW_MARKET_SETUPS:
+            continue
+        if float(row.get("quality",0) or 0) < OCTOPUS_MI_MIN_THESIS_QUALITY:
+            continue
+        if setup not in shadow_best_by_setup:
+            shadow_best_by_setup[setup] = dict(row)
+    shadow_theses = list(shadow_best_by_setup.values())
+
+    execution_candidates = [x for x in candidates if str(x.get("setup") or "") in OCTOPUS_EXECUTION_SETUPS]
+    valid_candidates = [x for x in execution_candidates if not bool(x.get("space_blocked")) and float(x.get("quality",0)) >= OCTOPUS_MI_MIN_THESIS_QUALITY]
+    best = dict(valid_candidates[0]) if valid_candidates else (dict(execution_candidates[0]) if execution_candidates else None)
+    blocked_count = sum(1 for x in execution_candidates if bool(x.get("space_blocked")))
+    raw_count = len(execution_candidates)
+    quality_count = sum(1 for x in execution_candidates if float(x.get("quality",0)) >= OCTOPUS_MI_MIN_THESIS_QUALITY)
     return {
         "ok": bool(valid_candidates),
-        "thesis": best, "candidates": candidates[:4], "zones": zones,
+        "thesis": best, "candidates": execution_candidates[:4], "shadow_theses": shadow_theses, "zones": zones,
         "raw_candidate_count": raw_count,
         "quality_candidate_count": quality_count,
         "valid_candidate_count": len(valid_candidates),
@@ -17723,6 +17754,7 @@ def _octopus_scan_market_for_target(target_bucket: int, provisional: bool = Fals
             obstacle_blocked_count += int((intelligence or {}).get("blocked_candidate_count", 0) or 0)
             thesis_count += int((intelligence or {}).get("valid_candidate_count", 0) or 0)
             thesis = (intelligence or {}).get("thesis") if isinstance(intelligence, dict) else None
+            shadow_theses = list((intelligence or {}).get("shadow_theses") or []) if isinstance(intelligence, dict) else []
             groups = _octopus_rank_pair(pair, symbol, payout, regime, syria_hour, sigs, intelligence) if execution_ranking else []
             for g in groups:
                 if g.get("eligible"):
@@ -17734,16 +17766,27 @@ def _octopus_scan_market_for_target(target_bucket: int, provisional: bool = Fals
                 if not provisional:
                     pred = dict(s); pred.update({"pair":pair,"symbol":symbol,"payout":payout,"regime":rname,"hour":syria_hour,"target_bucket":int(target_bucket),"created_at":now_iso()})
                     pending_rows.append(pred)
-            # Benchmark the raw technical thesis independently from execution/selective gates.
-            if isinstance(thesis, dict) and str(thesis.get("direction") or "") in {"CALL","PUT"} and float(thesis.get("quality",0) or 0) >= OCTOPUS_MI_MIN_THESIS_QUALITY:
-                compact.append({"model":"MARKET_THESIS","direction":thesis.get("direction"),"score":int(round(float(thesis.get("quality",0)))),"setup":thesis.get("setup")})
+            # Shadow-benchmark all three S/R market theses independently from execution.
+            # v1.42 execution is Role Flip only, but Support/Resistance rejection continue
+            # settling into market_setup_stats/recent_market_setup for future evidence.
+            shadow_prediction_count = 0
+            for shadow_thesis in shadow_theses:
+                if not isinstance(shadow_thesis, dict):
+                    continue
+                if str(shadow_thesis.get("direction") or "") not in {"CALL","PUT"}:
+                    continue
+                if float(shadow_thesis.get("quality",0) or 0) < OCTOPUS_MI_MIN_THESIS_QUALITY:
+                    continue
+                compact.append({"model":"MARKET_THESIS","direction":shadow_thesis.get("direction"),"score":int(round(float(shadow_thesis.get("quality",0)))),"setup":shadow_thesis.get("setup"),"shadow_only":str(shadow_thesis.get("setup") or "") not in OCTOPUS_EXECUTION_SETUPS})
                 if not provisional:
                     pending_rows.append({
-                        "model":"MARKET_THESIS","family":"MARKET_INTELLIGENCE","direction":thesis.get("direction"),
-                        "score":int(round(float(thesis.get("quality",0)))),"reason":thesis.get("reason"),"market_setup":thesis.get("setup"),
+                        "model":"MARKET_THESIS","family":"MARKET_INTELLIGENCE","direction":shadow_thesis.get("direction"),
+                        "score":int(round(float(shadow_thesis.get("quality",0)))),"reason":shadow_thesis.get("reason"),"market_setup":shadow_thesis.get("setup"),
                         "pair":pair,"symbol":symbol,"payout":payout,"regime":rname,"hour":syria_hour,"target_bucket":int(target_bucket),"created_at":now_iso(),
+                        "shadow_only": str(shadow_thesis.get("setup") or "") not in OCTOPUS_EXECUTION_SETUPS,
                     })
-            prediction_count += len(sigs) + (1 if isinstance(thesis, dict) and float(thesis.get("quality",0) or 0) >= OCTOPUS_MI_MIN_THESIS_QUALITY else 0)
+                shadow_prediction_count += 1
+            prediction_count += len(sigs) + shadow_prediction_count
             zbrief = []
             for z in ((intelligence or {}).get("zones") or [])[:4]:
                 zbrief.append({"role":z.get("role"),"center":z.get("center"),"quality":z.get("quality"),"distance_atr":z.get("distance_atr"),"role_flip":z.get("role_flip")})
@@ -17908,6 +17951,8 @@ def _octopus_sr_prearm_watch_scan(target_bucket: int) -> dict:
                     q += 1.5 if cl > center else 0.0
                     events.append(("CALL", "MI_SUPPORT_REJECTION", q, "forming support rejection"))
 
+                # v1.42 hard execution gate: FORMING PRE-ARM can only be Role Flip.
+                events = [e for e in events if str(e[1]) in OCTOPUS_EXECUTION_SETUPS]
                 if not events:
                     continue
                 direction, hint, projected_q, forming_reason = max(events, key=lambda e: float(e[2]))
@@ -18466,6 +18511,10 @@ async def _octopus_adaptive_prearm(context: ContextTypes.DEFAULT_TYPE, now_ts: f
         return
 
     candidate = dict(ranked[0])
+    if str(candidate.get("market_setup") or "") not in OCTOPUS_EXECUTION_SETUPS:
+        _octopus_state["selector_last_no_trade_reason"] = "EXECUTION POLICY: only MI_ROLE_FLIP_RETEST is allowed"
+        _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
+        return
     candidate["prearmed_at"] = now_iso()
     candidate["target_entry_bucket"] = target_bucket
     candidate = _octopus_apply_execution_direction_mode(candidate)
@@ -18558,6 +18607,13 @@ async def _octopus_execute_prearmed_open(context: ContextTypes.DEFAULT_TYPE, now
     prearmed = _octopus_state.get("selector_prearmed_candidate") if isinstance(_octopus_state.get("selector_prearmed_candidate"), dict) else None
     target = int(_octopus_state.get("selector_prearm_target_bucket", 0) or 0)
     current_prearm = prearmed if prearmed is not None and target == current_bucket else None
+    if current_prearm is not None and str(current_prearm.get("market_setup") or "") not in OCTOPUS_EXECUTION_SETUPS:
+        _octopus_state["selector_prearmed_candidate"] = None
+        _octopus_state["selector_prearm_target_bucket"] = 0
+        _octopus_state["selector_prearm_cancelled"] = int(_octopus_state.get("selector_prearm_cancelled",0) or 0) + 1
+        _octopus_state["selector_last_no_trade_reason"] = "EXECUTION POLICY: rejected non-Role-Flip PRE-ARM"
+        _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
+        return
 
     # Outside the direct-open execution window: resolve any still-prepared candidate as a
     # technical timing miss, then run one normal closed-candle diagnostic/Shadow scan.
@@ -18828,6 +18884,7 @@ def build_structure_edge_summary(limit: int | None = None) -> str:
     lines = [
         "📊 Octopus S/R + Retest — الملخص",
         "━━━━━━━━━━━━━━",
+        "🎯 سياسة التنفيذ الحالية: MI_ROLE_FLIP_RETEST فقط • NORMAL ثابت",
         f"🔬 Shadow observations: {int(_octopus_state.get('total_observations',0) or 0)}",
         f"🧩 Pair-minutes: {int(_octopus_state.get('total_pair_minutes',0) or 0)}",
         f"🎯 Selector minutes: {int(_octopus_state.get('selector_decisions',0) or 0)}",
@@ -18872,9 +18929,9 @@ def build_structure_edge_status() -> str:
         "━━━━━━━━━━━━━━\n"
         f"حساب المالك: {'شغال ✅' if settings.get('enabled') else 'متوقف ⏸'}\n"
         f"🌍 تنفيذ Octopus للجميع: {'مفعّل ✅' if settings.get('global_execution_enabled', True) else 'موقوف 🛑'} | enabled targets={len(enabled_targets)} | online={len(online_targets)} | sleeping={sleeping_targets}\n"
-        f"🎛 Execution mode: {settings.get('execution_direction_mode') or 'NORMAL'}\n"
-        f"🧪 Mode detector: شغال دائمًا بالخلفية | session committed/settled/skipped: {int(_octopus_mode_detector_state.get('virtual_committed',0) or 0)} / {int(_octopus_mode_detector_state.get('virtual_settled',0) or 0)} / {int(_octopus_mode_detector_state.get('virtual_skipped',0) or 0)}\n"
-        f"Shadow library: {len(OCTOPUS_MODEL_FAMILY)} نموذج / {len(set(OCTOPUS_MODEL_FAMILY.values()))} مدارس | التنفيذ: 3 Theses فقط\n"
+        f"🎛 Execution mode: NORMAL ثابت\n"
+        f"🧪 Mode detector: شغال دائمًا بالخلفية للمقارنة البحثية فقط | session committed/settled/skipped: {int(_octopus_mode_detector_state.get('virtual_committed',0) or 0)} / {int(_octopus_mode_detector_state.get('virtual_settled',0) or 0)} / {int(_octopus_mode_detector_state.get('virtual_skipped',0) or 0)}\n"
+        f"Shadow library: {len(OCTOPUS_MODEL_FAMILY)} نموذج / {len(set(OCTOPUS_MODEL_FAMILY.values()))} مدارس | التنفيذ الحقيقي: MI_ROLE_FLIP_RETEST فقط | Rejections=Shadow فقط\n"
         f"S/R execution warmup: {OCTOPUS_SR_EXEC_MIN_CLOSED_M1} M1 | Shadow full warmup: {OCTOPUS_MIN_CLOSED_M1} M1\n"
         f"Shadow settled: {int(_octopus_state.get('total_observations',0) or 0)} | pending: {pending_obs}\n"
         f"Pairs ready/scanned: {int(_octopus_state.get('pairs_ready',0) or 0)} / {int(_octopus_state.get('pairs_scanned',0) or 0)}\n"
@@ -18894,9 +18951,9 @@ def build_structure_edge_status() -> str:
         f"Firebase settings reads: {int(_structure_edge_state.get('settings_reads',0) or 0)} (RAM cache {STRUCTURE_EDGE_SETTINGS_CACHE_SECONDS}s)\n"
         f"آخر سبب: {_octopus_state.get('last_reject_reason') or _octopus_state.get('selector_last_no_trade_reason') or '-'}\n"
         f"آخر خطأ: {_octopus_state.get('last_error') or _structure_edge_state.get('last_error') or '-'}\n\n"
-        "🧠 القرار: لا يوجد FINAL تداول. PRE-ARM هو قرار الصفقة؛ إذا اجتاز S/R + الجودة + obstacle قبل الإغلاق، يُنفّذ نفس الزوج/الاتجاه عند Open الشمعة التالية مباشرة.\n"
-        "🛡️ بعد PRE-ARM تبقى فقط حراس التنفيذ: payout الحالي، اتصال الإضافة، توفر Open/live price، displacement، وExecution Lock.\n"
-        "🔄 NORMAL/REVERSE يغيّر اتجاه التنفيذ فقط بعد اختيار الفرصة؛ التحليل والـThesis الأصليان يبقيان محفوظين."
+        "🧠 القرار: لا يوجد FINAL تداول. PRE-ARM هو قرار الصفقة؛ التنفيذ الحقيقي يقبل Role Flip Retest فقط، ثم يُنفّذ بنفس اتجاه التحليل NORMAL عند Open الشمعة التالية.\n"
+        "🛡️ بعد PRE-ARM تبقى فقط حراس التنفيذ: payout الحالي، اتصال أداة التنفيذ، توفر Open/live price، displacement، وExecution Lock.\n"
+        "🔬 Support/Resistance Rejection يبقيان Shadow/learning فقط ولا يمكنهما إنشاء PRE-ARM أو صفقة حقيقية."
     )[:3900]
 
 
@@ -27124,18 +27181,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(build_octopus_market_mode_report(2), reply_markup=structure_edge_admin_keyboard)
             return
 
-        if text == "🟢 تنفيذ NORMAL":
+        if text in {"🧭 التنفيذ: Role Flip + NORMAL فقط", "🟢 تنفيذ NORMAL"}:
             ok = _structure_edge_set_execution_direction_mode("NORMAL")
             await update.message.reply_text(
-                "✅ نمط تنفيذ Octopus صار NORMAL. الصفقات الجديدة ستنفذ بنفس اتجاه التحليل الأصلي." if ok else "❌ تعذر تغيير نمط التنفيذ.",
+                "🎯 سياسة التنفيذ الحالية ثابتة: MI_ROLE_FLIP_RETEST فقط + NORMAL. Support/Resistance Rejection يبقيان Shadow للتعلم ولا ينفذان صفقات." if ok else "❌ تعذر تثبيت NORMAL في الإعدادات.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
 
         if text == "🔄 تنفيذ REVERSE":
-            ok = _structure_edge_set_execution_direction_mode("REVERSE")
+            # Compatibility with an old Telegram keyboard still cached on the owner's device.
+            _structure_edge_set_execution_direction_mode("NORMAL")
             await update.message.reply_text(
-                "🔄 نمط تنفيذ Octopus صار REVERSE. كل صفقة جديدة ستنفذ بعكس اتجاه التحليل الأصلي؛ الـThesis الأصلي يبقى محفوظًا للتدقيق." if ok else "❌ تعذر تغيير نمط التنفيذ.",
+                "⛔ REVERSE غير متاح للتنفيذ من v1.42. التنفيذ الحقيقي ثابت NORMAL وRole Flip فقط. المقارنة NORMAL/REVERSE تبقى بحثية داخل التقرير.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
