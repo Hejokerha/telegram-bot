@@ -22,7 +22,7 @@ try:
 except Exception:
     websocket = None
 
-# v1.42.0: Octopus real execution = MI_ROLE_FLIP_RETEST only + fixed NORMAL direction.
+# v1.42.1: Octopus real execution remains MI_ROLE_FLIP_RETEST only; owner can select NORMAL or REVERSE direction.
 # Support/Resistance rejection remain Shadow/learning observations only; v1.41 sleep/global guard and Quotex cookie-only transport unchanged.
 # v1.41.0: Octopus global execution guard + client-aware sleep/resume; Quotex cookie-only transport unchanged.
 # v1.40.0: production Quotex cookie-only central feed over curl_cffi/EIO3.
@@ -550,7 +550,7 @@ structure_edge_admin_keyboard = ReplyKeyboardMarkup(
         ["🌍 تشغيل تنفيذ Octopus للجميع", "🚨 إيقاف تنفيذ Octopus للجميع"],
         ["📋 حالة Octopus", "📊 ملخص Octopus"],
         ["📊 وضع السوق ساعتين"],
-        ["🧭 التنفيذ: Role Flip + NORMAL فقط"],
+        ["🟢 تنفيذ NORMAL", "🔄 تنفيذ REVERSE"],
         ["🧠 أفضل النماذج", "🗺 الأزواج الآن"],
         ["🧹 تصفير Octopus"],
         ["⬅️ رجوع"],
@@ -1105,7 +1105,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.42.0"
+COPY_SERVER_VERSION = "1.42.1"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -14185,10 +14185,11 @@ def _structure_edge_get_settings(force_refresh: bool = False) -> dict:
             # v1.41: separate owner toggle from the global service guard. Existing installs
             # have no key yet, so default TRUE preserves current team execution behavior.
             global_execution_enabled = bool(data.get("global_execution_enabled", True))
-            # v1.42: real execution direction is fixed NORMAL. A legacy persisted
-            # REVERSE value may remain in Firebase for historical rollback, but runtime
-            # execution must never consume it.
-            mode = "NORMAL"
+            # v1.42.1: Role Flip remains the only executable thesis, while the owner may
+            # select whether that thesis executes in its original NORMAL direction or reversed.
+            mode = str(data.get("execution_direction_mode") or default_mode).strip().upper()
+            if mode not in {"NORMAL", "REVERSE"}:
+                mode = default_mode
             _structure_edge_state["enabled_cache"] = enabled
             _structure_edge_state["global_execution_enabled_cache"] = global_execution_enabled
             _structure_edge_state["execution_direction_mode_cache"] = mode
@@ -14203,8 +14204,9 @@ def _structure_edge_get_settings(force_refresh: bool = False) -> dict:
                 _structure_edge_state["execution_direction_mode_cache"] = default_mode
                 _structure_edge_state["enabled_cache_loaded"] = True
                 _structure_edge_state["enabled_cache_last_refresh_ts"] = now_ts
-    # v1.42 invariant: runtime execution is NORMAL-only.
-    mode = "NORMAL"
+    mode = str(_structure_edge_state.get("execution_direction_mode_cache") or default_mode).upper()
+    if mode not in {"NORMAL", "REVERSE"}:
+        mode = default_mode
     return {
         "enabled": bool(_structure_edge_state.get("enabled_cache", default_enabled)),
         "global_execution_enabled": bool(_structure_edge_state.get("global_execution_enabled_cache", True)),
@@ -14273,20 +14275,16 @@ def _octopus_global_execution_enabled() -> bool:
 
 
 def _structure_edge_set_execution_direction_mode(mode: str) -> bool:
-    """v1.42 real-execution direction policy: NORMAL only.
-
-    Keeping this helper preserves compatibility with old admin keyboards/callers, but a
-    REVERSE request is deliberately rejected and can never change runtime execution.
-    """
+    """Owner-selected direction for the single executable Role Flip thesis."""
     try:
-        requested = str(mode or "NORMAL").strip().upper()
-        if requested != "NORMAL":
+        value = str(mode or "NORMAL").strip().upper()
+        if value not in {"NORMAL", "REVERSE"}:
             return False
         _structure_edge_settings_ref().update({
-            "execution_direction_mode": "NORMAL",
+            "execution_direction_mode": value,
             "execution_direction_mode_updated_at": now_iso(),
         })
-        _structure_edge_state["execution_direction_mode_cache"] = "NORMAL"
+        _structure_edge_state["execution_direction_mode_cache"] = value
         # Do not mark the whole settings cache as loaded here: if this is the first owner
         # action after a restart, enabled-state must still be refreshed from Firebase.
         if bool(_structure_edge_state.get("enabled_cache_loaded")):
@@ -14299,8 +14297,8 @@ def _structure_edge_set_execution_direction_mode(mode: str) -> bool:
 
 
 def _structure_edge_execution_direction_mode() -> str:
-    # Hard invariant, independent of any legacy Firebase value.
-    return "NORMAL"
+    mode = str(_structure_edge_get_settings(force_refresh=False).get("execution_direction_mode") or "NORMAL").upper()
+    return mode if mode in {"NORMAL", "REVERSE"} else "NORMAL"
 
 
 def _structure_edge_is_enabled() -> bool:
@@ -27184,16 +27182,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if text in {"🧭 التنفيذ: Role Flip + NORMAL فقط", "🟢 تنفيذ NORMAL"}:
             ok = _structure_edge_set_execution_direction_mode("NORMAL")
             await update.message.reply_text(
-                "🎯 سياسة التنفيذ الحالية ثابتة: MI_ROLE_FLIP_RETEST فقط + NORMAL. Support/Resistance Rejection يبقيان Shadow للتعلم ولا ينفذان صفقات." if ok else "❌ تعذر تثبيت NORMAL في الإعدادات.",
+                "✅ نمط تنفيذ Octopus صار NORMAL. التنفيذ الحقيقي يبقى MI_ROLE_FLIP_RETEST فقط، وبنفس اتجاه التحليل الأصلي." if ok else "❌ تعذر تغيير نمط التنفيذ.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
 
         if text == "🔄 تنفيذ REVERSE":
-            # Compatibility with an old Telegram keyboard still cached on the owner's device.
-            _structure_edge_set_execution_direction_mode("NORMAL")
+            ok = _structure_edge_set_execution_direction_mode("REVERSE")
             await update.message.reply_text(
-                "⛔ REVERSE غير متاح للتنفيذ من v1.42. التنفيذ الحقيقي ثابت NORMAL وRole Flip فقط. المقارنة NORMAL/REVERSE تبقى بحثية داخل التقرير.",
+                "🔄 نمط تنفيذ Octopus صار REVERSE. التنفيذ الحقيقي يبقى MI_ROLE_FLIP_RETEST فقط، لكن كل صفقة جديدة ستنفذ بعكس اتجاه التحليل الأصلي؛ الـThesis الأصلي يبقى محفوظًا للتدقيق." if ok else "❌ تعذر تغيير نمط التنفيذ.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
