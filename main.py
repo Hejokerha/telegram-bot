@@ -11,6 +11,7 @@ import secrets
 import asyncio
 import random
 import re
+import math
 import requests
 import threading
 import time as time_module
@@ -22,10 +23,11 @@ try:
 except Exception:
     websocket = None
 
-# v1.44.0 AUTO mode: owner may choose NORMAL, REVERSE, or AUTO.
-# AUTO is PER-OPPORTUNITY: every fresh executable Role Flip is scored independently as NORMAL / REVERSE / WAIT.
-# It uses clean Role-Flip-only virtual history, recency, same-pair evidence and similarity to the current setup shape.
-# The old global rolling NORMAL/REVERSE detector remains research telemetry only; it no longer drives real AUTO execution.
+# v1.45.0 AUTO mode: owner may choose NORMAL, REVERSE, or AUTO.
+# AUTO is PER-OPPORTUNITY but now fail-closed: each Role Flip is matched to discrete hard context,
+# each historical opportunity is counted once, and real execution is allowed only after the paper
+# decisions made before outcomes existed prove positive out-of-sample net edge. Pair loss streaks quarantine locally.
+# The old global rolling NORMAL/REVERSE detector remains research telemetry only; it never drives real AUTO execution.
 # v1.42.2: restore the proven three-thesis S/R competition for selection, while real execution remains MI_ROLE_FLIP_RETEST only.
 # If Support/Resistance Rejection wins the market ranking, real execution is NO TRADE; NORMAL/REVERSE still applies only after a Role Flip wins.
 # v1.41 sleep/global guard and Quotex cookie-only transport remain unchanged.
@@ -1110,7 +1112,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.44.0"
+COPY_SERVER_VERSION = "1.45.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -15628,6 +15630,22 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
             "auto_required_score": float(pick("auto_required_score", (pending or {}).get("auto_required_score", 0)) or 0),
             "auto_score_gap_pp": float(pick("auto_score_gap_pp", (pending or {}).get("auto_score_gap_pp", 0)) or 0),
             "auto_reason": pick("auto_reason", (pending or {}).get("auto_reason")),
+            "auto_raw_mode": pick("auto_raw_mode", (pending or {}).get("auto_raw_mode")),
+            "auto_normal_conservative": float(pick("auto_normal_conservative", (pending or {}).get("auto_normal_conservative", 0)) or 0),
+            "auto_reverse_conservative": float(pick("auto_reverse_conservative", (pending or {}).get("auto_reverse_conservative", 0)) or 0),
+            "auto_hard_context_key": pick("auto_hard_context_key", (pending or {}).get("auto_hard_context_key")),
+            "auto_evidence_pool": pick("auto_evidence_pool", (pending or {}).get("auto_evidence_pool")),
+            "auto_walkforward_allowed": bool(pick("auto_walkforward_allowed", (pending or {}).get("auto_walkforward_allowed", False))),
+            "auto_walkforward_sample": int(pick("auto_walkforward_sample", (pending or {}).get("auto_walkforward_sample", 0)) or 0),
+            "auto_walkforward_wr": float(pick("auto_walkforward_wr", (pending or {}).get("auto_walkforward_wr", 0)) or 0),
+            "auto_walkforward_net": float(pick("auto_walkforward_net", (pending or {}).get("auto_walkforward_net", 0)) or 0),
+            "auto_walkforward_normal_net": float(pick("auto_walkforward_normal_net", (pending or {}).get("auto_walkforward_normal_net", 0)) or 0),
+            "auto_walkforward_reverse_net": float(pick("auto_walkforward_reverse_net", (pending or {}).get("auto_walkforward_reverse_net", 0)) or 0),
+            "auto_walkforward_value_add": float(pick("auto_walkforward_value_add", (pending or {}).get("auto_walkforward_value_add", 0)) or 0),
+            "auto_pair_loss_streak": int(pick("auto_pair_loss_streak", (pending or {}).get("auto_pair_loss_streak", 0)) or 0),
+            "auto_pair_quarantine_active": bool(pick("auto_pair_quarantine_active", (pending or {}).get("auto_pair_quarantine_active", False))),
+            "auto_pair_quarantine_until_bucket": int(pick("auto_pair_quarantine_until_bucket", (pending or {}).get("auto_pair_quarantine_until_bucket", 0)) or 0),
+            "auto_result": outcome if str(pick("owner_direction_mode", (pending or {}).get("owner_direction_mode")) or "").upper() == "AUTO" else None,
         }
 
         if uid != int(ADMIN_TELEGRAM_ID):
@@ -16965,18 +16983,38 @@ _octopus_auto_mode_state = {
     "metrics": {},
 }
 
-# v1.44.0 per-opportunity AUTO. These settings affect AUTO only; manual NORMAL/REVERSE
-# and the Role Flip / Competition / PRE-ARM / Open guards remain unchanged.
-OCTOPUS_AUTO_TRADE_LOOKBACK_HOURS = max(4.0, min(48.0, float(os.getenv("OCTOPUS_AUTO_TRADE_LOOKBACK_HOURS", "18"))))
-OCTOPUS_AUTO_TRADE_MAX_ROWS = max(40, min(400, int(os.getenv("OCTOPUS_AUTO_TRADE_MAX_ROWS", "180"))))
-OCTOPUS_AUTO_TRADE_MIN_ROWS = max(4, min(12, int(os.getenv("OCTOPUS_AUTO_TRADE_MIN_ROWS", "5"))))
-OCTOPUS_AUTO_TRADE_MIN_EFFECTIVE_SAMPLE = max(2.5, min(12.0, float(os.getenv("OCTOPUS_AUTO_TRADE_MIN_EFFECTIVE_SAMPLE", "3.5"))))
-OCTOPUS_AUTO_TRADE_HALF_LIFE_MINUTES = max(20.0, min(360.0, float(os.getenv("OCTOPUS_AUTO_TRADE_HALF_LIFE_MINUTES", "90"))))
-OCTOPUS_AUTO_TRADE_BASE_BUFFER_PP = max(0.5, min(6.0, float(os.getenv("OCTOPUS_AUTO_TRADE_BASE_BUFFER_PP", "1.2"))))
-OCTOPUS_AUTO_TRADE_SMALL_SAMPLE_BUFFER_PP = max(0.0, min(6.0, float(os.getenv("OCTOPUS_AUTO_TRADE_SMALL_SAMPLE_BUFFER_PP", "2.4"))))
-OCTOPUS_AUTO_TRADE_MIN_SCORE_GAP_PP = max(3.0, min(20.0, float(os.getenv("OCTOPUS_AUTO_TRADE_MIN_SCORE_GAP_PP", "6.0"))))
-OCTOPUS_AUTO_TRADE_CONTEXT_MIN_SIMILARITY = max(0.25, min(0.85, float(os.getenv("OCTOPUS_AUTO_TRADE_CONTEXT_MIN_SIMILARITY", "0.48"))))
-OCTOPUS_AUTO_TRADE_CACHE_SECONDS = max(15.0, min(180.0, float(os.getenv("OCTOPUS_AUTO_TRADE_CACHE_SECONDS", "45"))))
+# v1.45.0 WALK-FORWARD AUTO.
+# Design goals:
+# - one historical opportunity can contribute only once to a decision (no burst/global/pair/context duplication),
+# - context matching is discrete/hard rather than a loose similarity soup,
+# - every paper Role Flip stores the AUTO decision it would have taken before the result existed,
+# - real AUTO is fail-closed until those out-of-sample decisions prove positive net edge,
+# - repeated losses on one pair quarantine that pair temporarily while paper learning continues.
+# Manual NORMAL/REVERSE and every S/R/PRE-ARM/Open/Quotex guard remain unchanged.
+OCTOPUS_AUTO_V145_LOOKBACK_HOURS = max(6.0, min(72.0, float(os.getenv("OCTOPUS_AUTO_V145_LOOKBACK_HOURS", "36"))))
+OCTOPUS_AUTO_V145_MAX_ROWS = max(60, min(600, int(os.getenv("OCTOPUS_AUTO_V145_MAX_ROWS", "240"))))
+OCTOPUS_AUTO_V145_HALF_LIFE_MINUTES = max(30.0, min(480.0, float(os.getenv("OCTOPUS_AUTO_V145_HALF_LIFE_MINUTES", "120"))))
+OCTOPUS_AUTO_V145_MIN_CONTEXT_ROWS = max(4, min(20, int(os.getenv("OCTOPUS_AUTO_V145_MIN_CONTEXT_ROWS", "6"))))
+OCTOPUS_AUTO_V145_MIN_PAIR_CONTEXT_ROWS = max(2, min(10, int(os.getenv("OCTOPUS_AUTO_V145_MIN_PAIR_CONTEXT_ROWS", "3"))))
+OCTOPUS_AUTO_V145_MIN_EFFECTIVE_SAMPLE = max(2.5, min(20.0, float(os.getenv("OCTOPUS_AUTO_V145_MIN_EFFECTIVE_SAMPLE", "4.0"))))
+OCTOPUS_AUTO_V145_PRIOR_STRENGTH = max(4.0, min(30.0, float(os.getenv("OCTOPUS_AUTO_V145_PRIOR_STRENGTH", "8.0"))))
+OCTOPUS_AUTO_V145_CONFIDENCE_Z = max(0.5, min(2.0, float(os.getenv("OCTOPUS_AUTO_V145_CONFIDENCE_Z", "1.0"))))
+OCTOPUS_AUTO_V145_MIN_SCORE_GAP_PP = max(4.0, min(25.0, float(os.getenv("OCTOPUS_AUTO_V145_MIN_SCORE_GAP_PP", "7.0"))))
+OCTOPUS_AUTO_V145_BREAK_EVEN_BUFFER_PP = max(0.0, min(6.0, float(os.getenv("OCTOPUS_AUTO_V145_BREAK_EVEN_BUFFER_PP", "0.8"))))
+OCTOPUS_AUTO_V145_WF_MIN_DECISIONS = max(4, min(30, int(os.getenv("OCTOPUS_AUTO_V145_WF_MIN_DECISIONS", "8"))))
+OCTOPUS_AUTO_V145_WF_WINDOW = max(OCTOPUS_AUTO_V145_WF_MIN_DECISIONS, min(80, int(os.getenv("OCTOPUS_AUTO_V145_WF_WINDOW", "24"))))
+OCTOPUS_AUTO_V145_WF_MIN_NET = max(0.0, min(8.0, float(os.getenv("OCTOPUS_AUTO_V145_WF_MIN_NET", "0.25"))))
+OCTOPUS_AUTO_V145_WF_RECENT_WINDOW = max(4, min(12, int(os.getenv("OCTOPUS_AUTO_V145_WF_RECENT_WINDOW", "6"))))
+OCTOPUS_AUTO_V145_WF_RECENT_MIN_NET = max(-3.0, min(2.0, float(os.getenv("OCTOPUS_AUTO_V145_WF_RECENT_MIN_NET", "-0.75"))))
+OCTOPUS_AUTO_V145_PAIR_LOSS_STREAK = max(2, min(5, int(os.getenv("OCTOPUS_AUTO_V145_PAIR_LOSS_STREAK", "2"))))
+OCTOPUS_AUTO_V145_PAIR_QUARANTINE_MINUTES = max(10, min(180, int(os.getenv("OCTOPUS_AUTO_V145_PAIR_QUARANTINE_MINUTES", "30"))))
+OCTOPUS_AUTO_V145_CACHE_SECONDS = max(10.0, min(120.0, float(os.getenv("OCTOPUS_AUTO_V145_CACHE_SECONDS", "30"))))
+
+# Keep v1.44 environment names as inert compatibility knobs. They are intentionally no longer
+# used by the real AUTO decision so an old Render env cannot silently restore the overlapping model.
+OCTOPUS_AUTO_TRADE_LOOKBACK_HOURS = OCTOPUS_AUTO_V145_LOOKBACK_HOURS
+OCTOPUS_AUTO_TRADE_MAX_ROWS = OCTOPUS_AUTO_V145_MAX_ROWS
+OCTOPUS_AUTO_TRADE_CACHE_SECONDS = OCTOPUS_AUTO_V145_CACHE_SECONDS
 
 _octopus_auto_trade_state = {
     "history_cache": [],
@@ -16986,6 +17024,10 @@ _octopus_auto_trade_state = {
     "normal": 0,
     "reverse": 0,
     "wait": 0,
+    "wf_allowed": 0,
+    "wf_blocked": 0,
+    "quarantine_blocked": 0,
+    "last_walkforward": {},
     "last_error": None,
 }
 
@@ -18181,6 +18223,24 @@ def _octopus_apply_execution_direction_mode(candidate: dict) -> dict:
         item["auto_score_gap_pp"] = float(decision.get("score_gap_pp", 0.0) or 0.0)
         item["auto_reason"] = str(decision.get("reason") or "")[:500]
         item["auto_components"] = dict(decision.get("components") or {})
+        item["auto_raw_mode"] = str(decision.get("raw_mode") or mode).upper()
+        item["auto_normal_conservative"] = float(decision.get("normal_conservative", 0.0) or 0.0)
+        item["auto_reverse_conservative"] = float(decision.get("reverse_conservative", 0.0) or 0.0)
+        item["auto_hard_context_key"] = decision.get("hard_context_key")
+        item["auto_hard_context_family"] = decision.get("hard_context_family")
+        item["auto_evidence_pool"] = decision.get("evidence_pool")
+        wf = decision.get("walkforward") if isinstance(decision.get("walkforward"), dict) else {}
+        item["auto_walkforward_allowed"] = bool(wf.get("allowed"))
+        item["auto_walkforward_sample"] = int(wf.get("sample", 0) or 0)
+        item["auto_walkforward_wr"] = float(wf.get("wr", 0.0) or 0.0)
+        item["auto_walkforward_net"] = float(wf.get("auto_net", 0.0) or 0.0)
+        item["auto_walkforward_normal_net"] = float(wf.get("normal_net", 0.0) or 0.0)
+        item["auto_walkforward_reverse_net"] = float(wf.get("reverse_net", 0.0) or 0.0)
+        item["auto_walkforward_value_add"] = float(wf.get("value_add_vs_best_static", 0.0) or 0.0)
+        quarantine = decision.get("pair_quarantine") if isinstance(decision.get("pair_quarantine"), dict) else {}
+        item["auto_pair_loss_streak"] = int(quarantine.get("loss_streak", 0) or 0)
+        item["auto_pair_quarantine_active"] = bool(quarantine.get("active"))
+        item["auto_pair_quarantine_until_bucket"] = int(quarantine.get("until_bucket", 0) or 0)
     else:
         mode = selected
         item["auto_decision_mode"] = None
@@ -18218,6 +18278,14 @@ def _octopus_mode_detector_store_result(trade: dict, close_price: float) -> None
     normal_result = _octopus_mode_result(original_direction, float(trade.get("entry_price") or 0), float(close_price))
     reverse_result = _octopus_mode_result(reverse_direction, float(trade.get("entry_price") or 0), float(close_price))
     entry_bucket = int(trade.get("entry_bucket") or 0)
+    auto_mode = str(trade.get("auto_decision_mode") or trade.get("auto_shadow_mode") or "WAIT").upper()
+    if auto_mode == "NORMAL":
+        auto_result = normal_result
+    elif auto_mode == "REVERSE":
+        auto_result = reverse_result
+    else:
+        auto_result = "wait"
+    auto_net = _octopus_auto_net_for_result(auto_result, float(trade.get("payout",0) or 0)) if auto_result in {"win","loss","draw"} else 0.0
     record = {
         "entry_bucket": entry_bucket,
         "created_at": trade.get("created_at") or now_iso(),
@@ -18249,13 +18317,29 @@ def _octopus_mode_detector_store_result(trade: dict, close_price: float) -> None
         "displacement_atr": float(trade.get("trendline_entry_displacement_atr", 0) or 0),
         "normal_result": normal_result,
         "reverse_result": reverse_result,
-        "source": "INTERNAL_PREARM_OPEN_SIM_V1_36",
+        # v1.45 true walk-forward audit: these fields were fixed BEFORE this candle's result existed.
+        "auto_decision_mode": auto_mode,
+        "auto_result": auto_result,
+        "auto_net": round(float(auto_net), 6),
+        "auto_normal_score": float(trade.get("auto_normal_score", 50.0) or 50.0),
+        "auto_reverse_score": float(trade.get("auto_reverse_score", 50.0) or 50.0),
+        "auto_normal_conservative": float(trade.get("auto_normal_conservative", 0.0) or 0.0),
+        "auto_reverse_conservative": float(trade.get("auto_reverse_conservative", 0.0) or 0.0),
+        "auto_evidence_rows": int(trade.get("auto_evidence_rows", 0) or 0),
+        "auto_effective_sample": float(trade.get("auto_effective_sample", 0.0) or 0.0),
+        "auto_required_score": float(trade.get("auto_required_score", 0.0) or 0.0),
+        "auto_score_gap_pp": float(trade.get("auto_score_gap_pp", 0.0) or 0.0),
+        "auto_reason": str(trade.get("auto_reason") or "")[:500],
+        "auto_hard_context_key": trade.get("auto_hard_context_key") or _octopus_auto_hard_context_key(trade, include_pair=True),
+        "auto_hard_context_family": trade.get("auto_hard_context_family") or _octopus_auto_hard_context_key(trade, include_pair=False),
+        "auto_evidence_pool": trade.get("auto_evidence_pool"),
+        "source": "INTERNAL_PREARM_OPEN_SIM_V1_45_WALK_FORWARD",
     }
     _octopus_mode_detector_results_ref().child(str(entry_bucket)).set(record)
     _octopus_mode_detector_state["virtual_settled"] = int(_octopus_mode_detector_state.get("virtual_settled", 0) or 0) + 1
     _octopus_mode_detector_state["last_result"] = dict(record)
     _octopus_auto_mode_note_result(record)
-
+    _octopus_auto_note_settled_result(record)
 
 def _octopus_mode_detector_settle(current_bucket: int) -> None:
     pending = _octopus_mode_detector_state.get("pending_trade") if isinstance(_octopus_mode_detector_state.get("pending_trade"), dict) else None
@@ -18310,7 +18394,7 @@ def _octopus_mode_detector_prearm(now_ts: float, current_bucket: int, sec: float
     if not ranked:
         return
     candidate = dict(ranked[0])
-    # v1.44: AUTO learns only from the exact executable thesis. In v1.43 the paper
+    # v1.45: AUTO learns only from the exact executable thesis. In v1.43 the paper
     # detector could accidentally settle Support/Resistance rejection winners even
     # though live execution converted those winners to NO TRADE, contaminating AUTO.
     if str(candidate.get("market_setup") or "") not in OCTOPUS_EXECUTION_SETUPS:
@@ -18357,6 +18441,24 @@ def _octopus_mode_detector_open(now_ts: float, current_bucket: int, sec: float) 
             "trendline_candle_open": float(open_price),
             "trendline_entry_displacement_atr": round(float(displacement), 6),
         })
+        # v1.45: freeze the paper AUTO decision now, BEFORE the target candle outcome exists.
+        # Walk-forward/quarantine are NOT applied to the paper learner, otherwise it could stop
+        # producing the very out-of-sample evidence required to decide whether real AUTO is safe.
+        paper_decision = _octopus_auto_trade_decision(trade, apply_walkforward_gate=False, record_state=False)
+        trade["auto_decision_mode"] = str(paper_decision.get("raw_mode") or paper_decision.get("mode") or "WAIT").upper()
+        trade["auto_shadow_mode"] = trade["auto_decision_mode"]
+        trade["auto_normal_score"] = float(paper_decision.get("normal_score",50.0) or 50.0)
+        trade["auto_reverse_score"] = float(paper_decision.get("reverse_score",50.0) or 50.0)
+        trade["auto_normal_conservative"] = float(paper_decision.get("normal_conservative",0.0) or 0.0)
+        trade["auto_reverse_conservative"] = float(paper_decision.get("reverse_conservative",0.0) or 0.0)
+        trade["auto_evidence_rows"] = int(paper_decision.get("evidence_rows",0) or 0)
+        trade["auto_effective_sample"] = float(paper_decision.get("effective_sample",0.0) or 0.0)
+        trade["auto_required_score"] = float(paper_decision.get("required_score",0.0) or 0.0)
+        trade["auto_score_gap_pp"] = float(paper_decision.get("score_gap_pp",0.0) or 0.0)
+        trade["auto_reason"] = str(paper_decision.get("raw_reason") or paper_decision.get("reason") or "")[:500]
+        trade["auto_hard_context_key"] = paper_decision.get("hard_context_key")
+        trade["auto_hard_context_family"] = paper_decision.get("hard_context_family")
+        trade["auto_evidence_pool"] = paper_decision.get("evidence_pool")
         _octopus_mode_detector_state["pending_trade"] = trade
         _octopus_mode_detector_state["prearmed_candidate"] = None
         _octopus_mode_detector_state["prearm_target_bucket"] = 0
@@ -18417,7 +18519,7 @@ def _octopus_mode_stats(rows: list[dict], field: str) -> dict:
 
 
 def _octopus_auto_role_flip_rows(rows: list[dict]) -> list[dict]:
-    """Return settled virtual rows that match the only executable thesis exactly."""
+    """Settled virtual rows for the only executable thesis, sorted chronologically."""
     clean = []
     for raw in (rows or []):
         if not isinstance(raw, dict):
@@ -18435,164 +18537,330 @@ def _octopus_auto_role_flip_rows(rows: list[dict]) -> list[dict]:
             item["entry_bucket"] = 0
         clean.append(item)
     clean.sort(key=lambda r: int(r.get("entry_bucket", 0) or 0))
-    return clean[-OCTOPUS_AUTO_TRADE_MAX_ROWS:]
+    return clean[-OCTOPUS_AUTO_V145_MAX_ROWS:]
 
 
 def _octopus_auto_trade_history(force: bool = False) -> list[dict]:
-    """Cached Role-Flip-only virtual history. No per-scan Firebase hammering."""
+    """Cached Role-Flip-only virtual history. Results are already out-of-sample paper outcomes."""
     now_ts = time_module.time()
     state = _octopus_auto_trade_state
     cached = state.get("history_cache") if isinstance(state.get("history_cache"), list) else []
-    if cached and not force and now_ts - float(state.get("history_cache_ts", 0.0) or 0.0) <= OCTOPUS_AUTO_TRADE_CACHE_SECONDS:
+    if cached and not force and now_ts - float(state.get("history_cache_ts", 0.0) or 0.0) <= OCTOPUS_AUTO_V145_CACHE_SECONDS:
         return [dict(r) for r in cached]
     try:
         source = _octopus_auto_mode_state.get("rows") if isinstance(_octopus_auto_mode_state.get("rows"), list) and _octopus_auto_mode_state.get("rows") else None
         if source is None or force:
-            source = _octopus_mode_detector_fetch(OCTOPUS_AUTO_TRADE_LOOKBACK_HOURS)
+            source = _octopus_mode_detector_fetch(OCTOPUS_AUTO_V145_LOOKBACK_HOURS)
         clean = _octopus_auto_role_flip_rows(source or [])
         state["history_cache"] = clean
         state["history_cache_ts"] = now_ts
         return [dict(r) for r in clean]
     except Exception as exc:
         state["last_error"] = str(exc)
-        logger.debug("Octopus per-trade AUTO history read failed: %s", exc)
+        logger.debug("Octopus v1.45 AUTO history read failed: %s", exc)
         return [dict(r) for r in cached]
 
 
-def _octopus_auto_row_value(row: dict) -> float | None:
-    result = str((row or {}).get("normal_result") or "").lower()
+def _octopus_auto_note_settled_result(record: dict) -> None:
+    """Put a freshly settled paper result into the RAM cache immediately."""
+    try:
+        rows = list(_octopus_auto_trade_state.get("history_cache") or [])
+        key = int((record or {}).get("entry_bucket", 0) or 0)
+        rows = [r for r in rows if int((r or {}).get("entry_bucket", 0) or 0) != key]
+        rows.append(dict(record or {}))
+        rows = _octopus_auto_role_flip_rows(rows)
+        _octopus_auto_trade_state["history_cache"] = rows
+        _octopus_auto_trade_state["history_cache_ts"] = time_module.time()
+    except Exception as exc:
+        _octopus_auto_trade_state["last_error"] = str(exc)
+
+
+def _octopus_auto_bucket_quality(value) -> int:
+    try:
+        q = max(0.0, min(100.0, float(value)))
+        return int(q // 5.0) * 5
+    except Exception:
+        return -1
+
+
+def _octopus_auto_bucket_close(value) -> int:
+    try:
+        x = max(0.0, min(1.0, float(value)))
+        return min(4, int(x * 5.0))
+    except Exception:
+        return -1
+
+
+def _octopus_auto_bucket_break_age(value) -> int:
+    try:
+        a = int(value)
+    except Exception:
+        return -1
+    if a <= 2: return 0
+    if a <= 4: return 1
+    if a <= 8: return 2
+    return 3
+
+
+def _octopus_auto_bucket_space(value) -> int:
+    try:
+        s = float(value)
+    except Exception:
+        return -1
+    if s < 0.34: return 0
+    if s < 0.55: return 1
+    if s < 0.85: return 2
+    return 3
+
+
+def _octopus_auto_hard_context(obj: dict) -> dict:
+    x = obj or {}
+    zone = x.get("market_zone") if isinstance(x.get("market_zone"), dict) else {}
+    side = str(x.get("analysis_direction") or x.get("original_direction") or x.get("direction") or "").upper()
+    role = str(zone.get("role") or x.get("market_zone_role") or "").upper()
+    close_pos = x.get("market_close_position")
+    if close_pos is None:
+        close_pos = x.get("prearm_close_position")
+    break_age = zone.get("break_age") if isinstance(zone, dict) else None
+    if break_age is None:
+        break_age = x.get("market_zone_break_age")
+    return {
+        "pair": str(x.get("pair") or ""),
+        "side": side,
+        "zone_role": role,
+        "quality_bucket": _octopus_auto_bucket_quality(x.get("market_quality")),
+        "close_bucket": _octopus_auto_bucket_close(close_pos),
+        "break_age_bucket": _octopus_auto_bucket_break_age(break_age),
+        "space_bucket": _octopus_auto_bucket_space(x.get("market_space_atr")),
+    }
+
+
+def _octopus_auto_hard_context_key(obj: dict, *, include_pair: bool = True) -> str:
+    c = _octopus_auto_hard_context(obj)
+    bits = []
+    if include_pair:
+        bits.append(c.get("pair") or "-")
+    bits.extend([
+        c.get("side") or "-", c.get("zone_role") or "-",
+        f"Q{c.get('quality_bucket',-1)}", f"C{c.get('close_bucket',-1)}",
+        f"B{c.get('break_age_bucket',-1)}", f"S{c.get('space_bucket',-1)}",
+    ])
+    return "|".join(str(v) for v in bits)
+
+
+def _octopus_auto_context_compatible(candidate: dict, row: dict) -> bool:
+    """Hard context: direction/zone must agree; numeric buckets may differ by at most one."""
+    c = _octopus_auto_hard_context(candidate); r = _octopus_auto_hard_context(row)
+    if c["side"] and r["side"] and c["side"] != r["side"]:
+        return False
+    if c["zone_role"] and r["zone_role"] and c["zone_role"] != r["zone_role"]:
+        return False
+    for key in ("quality_bucket", "close_bucket", "break_age_bucket", "space_bucket"):
+        cv = int(c.get(key, -1)); rv = int(r.get(key, -1))
+        if cv >= 0 and rv >= 0 and abs(cv - rv) > 1:
+            return False
+    return True
+
+
+def _octopus_auto_row_context_weight(candidate: dict, row: dict, now_bucket: int) -> float:
+    """One row, one weight. This replaces v1.44's overlapping multi-component reuse."""
+    c = _octopus_auto_hard_context(candidate); r = _octopus_auto_hard_context(row)
+    bucket = int((row or {}).get("entry_bucket", 0) or 0)
+    age_min = max(0.0, (float(now_bucket) - float(bucket)) / 60.0) if bucket > 0 and now_bucket > 0 else 0.0
+    recency = 0.5 ** (age_min / max(1.0, OCTOPUS_AUTO_V145_HALF_LIFE_MINUTES))
+    context = 1.0
+    if c["pair"] and r["pair"] and c["pair"] == r["pair"]:
+        context *= 1.65
+    for key, bonus in (("quality_bucket",0.12),("close_bucket",0.10),("break_age_bucket",0.08),("space_bucket",0.10)):
+        cv = int(c.get(key,-1)); rv = int(r.get(key,-1))
+        if cv >= 0 and rv >= 0:
+            context *= (1.0 + bonus) if cv == rv else (1.0 + bonus*0.35)
+    return max(0.01, recency * context)
+
+
+def _octopus_auto_result_value(row: dict, field: str = "normal_result") -> float | None:
+    result = str((row or {}).get(field) or "").lower()
     if result == "win": return 1.0
     if result == "loss": return 0.0
     if result == "draw": return 0.5
     return None
 
 
-def _octopus_auto_weighted_rate(rows: list[dict], *, now_bucket: int, half_life_minutes: float | None = None, similarity_key: str | None = None) -> dict:
-    """Recency-weighted NORMAL success estimate, shrunk toward 50% for small samples."""
-    half_life = max(1.0, float(half_life_minutes or OCTOPUS_AUTO_TRADE_HALF_LIFE_MINUTES))
+def _octopus_auto_single_pool_estimate(candidate: dict, rows: list[dict], now_bucket: int) -> dict:
     weighted = []
     for row in (rows or []):
-        value = _octopus_auto_row_value(row)
-        if value is None: continue
-        bucket = int((row or {}).get("entry_bucket", 0) or 0)
-        age_min = max(0.0, (float(now_bucket) - float(bucket)) / 60.0) if bucket > 0 and now_bucket > 0 else 0.0
-        recency = 0.5 ** (age_min / half_life)
-        extra = 1.0
-        if similarity_key:
-            try: extra = max(0.05, min(1.5, float((row or {}).get(similarity_key, 1.0) or 1.0)))
-            except Exception: extra = 1.0
-        w = max(0.015, recency * extra)
+        value = _octopus_auto_result_value(row, "normal_result")
+        if value is None:
+            continue
+        w = _octopus_auto_row_context_weight(candidate, row, now_bucket)
         weighted.append((w, value))
     if not weighted:
-        return {"estimate":50.0,"raw":50.0,"ess":0.0,"n":0,"weight":0.0}
+        return {"normal_score":50.0,"reverse_score":50.0,"normal_conservative":0.0,"reverse_conservative":0.0,"ess":0.0,"weight":0.0,"n":0}
     sw = sum(w for w,_ in weighted); sw2 = sum(w*w for w,_ in weighted)
-    raw = 100.0 * sum(w*v for w,v in weighted) / max(sw,1e-12)
     ess = (sw*sw / max(sw2,1e-12)) if sw2 > 0 else 0.0
-    reliability = ess / (ess + 5.0)
-    estimate = 50.0 + (raw - 50.0) * reliability
-    return {"estimate":round(estimate,3),"raw":round(raw,3),"ess":round(ess,3),"n":len(weighted),"weight":round(sw,4)}
+    prior = float(OCTOPUS_AUTO_V145_PRIOR_STRENGTH)
+    successes = sum(w*v for w,v in weighted)
+    p_normal = (successes + 0.5*prior) / max(sw + prior, 1e-12)
+    p_reverse = 1.0 - p_normal
+    # Conservative one-sided probability. The same uncertainty is applied symmetrically.
+    denom = max(1.0, ess + prior)
+    sigma = math.sqrt(max(1e-9, p_normal*(1.0-p_normal)) / denom)
+    penalty = float(OCTOPUS_AUTO_V145_CONFIDENCE_Z) * sigma
+    n_cons = max(0.0, p_normal - penalty)
+    r_cons = max(0.0, p_reverse - penalty)
+    return {
+        "normal_score":round(p_normal*100.0,3), "reverse_score":round(p_reverse*100.0,3),
+        "normal_conservative":round(n_cons*100.0,3), "reverse_conservative":round(r_cons*100.0,3),
+        "ess":round(ess,3), "weight":round(sw,4), "n":len(weighted),
+    }
 
 
-def _octopus_auto_context_similarity(candidate: dict, row: dict) -> float:
-    """Similarity of one settled Role Flip to the current Role Flip shape/context."""
-    c=candidate or {}; r=row or {}; parts=[]
-    def add(weight,value): parts.append((float(weight),max(0.0,min(1.0,float(value)))))
-    cq=float(c.get("market_quality",0) or 0); rq=float(r.get("market_quality",0) or 0)
-    add(0.26,1.0-min(1.0,abs(cq-rq)/18.0) if cq>0 and rq>0 else 0.60)
-    add(0.14,1.0 if str(c.get("prearm_mode") or "")==str(r.get("prearm_mode") or "") and str(c.get("prearm_mode") or "") else 0.45)
-    add(0.12,1.0 if str(c.get("analysis_direction") or c.get("direction") or "")==str(r.get("analysis_direction") or "") and str(r.get("analysis_direction") or "") else 0.55)
-    cp=float(c.get("payout",0) or 0); rp=float(r.get("payout",0) or 0)
-    add(0.07,1.0-min(1.0,abs(cp-rp)/15.0) if cp>0 and rp>0 else 0.70)
-    cr=str(c.get("regime") or ""); rr=str(r.get("regime") or "")
-    add(0.09,1.0 if cr and rr and cr==rr else (0.70 if not cr or not rr else 0.42))
-    cs=float(c.get("market_space_atr",0) or 0); rs=float(r.get("market_space_atr",0) or 0)
-    add(0.11,1.0-min(1.0,abs(cs-rs)/0.65) if cs>0 and rs>0 else 0.65)
-    cz=c.get("market_zone") if isinstance(c.get("market_zone"),dict) else {}
-    crole=str(cz.get("role") or ""); rrole=str(r.get("market_zone_role") or "")
-    add(0.08,1.0 if crole and rrole and crole==rrole else (0.72 if not crole or not rrole else 0.40))
-    ccp=c.get("market_close_position") if c.get("market_close_position") is not None else c.get("prearm_close_position")
-    rcp=r.get("market_close_position") if r.get("market_close_position") is not None else r.get("prearm_close_position")
-    try: add(0.08,1.0-min(1.0,abs(float(ccp)-float(rcp))/0.45) if ccp is not None and rcp is not None else 0.65)
-    except Exception: add(0.08,0.65)
-    cba=cz.get("break_age") if isinstance(cz,dict) else None; rba=r.get("market_zone_break_age")
-    try: add(0.05,1.0-min(1.0,abs(float(cba)-float(rba))/6.0) if cba is not None and rba is not None else 0.68)
-    except Exception: add(0.05,0.68)
-    tw=sum(w for w,_ in parts)
-    return round(sum(w*v for w,v in parts)/max(tw,1e-12),4)
+def _octopus_auto_net_for_result(result: str, payout: float) -> float:
+    r = str(result or "").lower()
+    if r == "win": return max(0.0, float(payout or 0)) / 100.0
+    if r == "loss": return -1.0
+    return 0.0
 
 
-def _octopus_auto_component(rows: list[dict], *, now_bucket: int, base_weight: float, name: str, similarity: bool=False) -> dict:
-    prepared=[]
-    for raw in (rows or []):
-        item=dict(raw)
-        if similarity: item["_auto_similarity_weight"]=float(item.get("_auto_similarity",1.0) or 1.0)
-        prepared.append(item)
-    stats=_octopus_auto_weighted_rate(prepared,now_bucket=now_bucket,similarity_key=("_auto_similarity_weight" if similarity else None))
-    availability=min(1.0,float(stats.get("ess",0.0) or 0.0)/4.0)
-    return {"name":name,"base_weight":base_weight,"effective_weight":round(float(base_weight)*availability,4),**stats}
+def _octopus_auto_walkforward_stats(history: list[dict], now_bucket: int) -> dict:
+    rows = []
+    for raw in (history or []):
+        if int((raw or {}).get("entry_bucket",0) or 0) >= int(now_bucket):
+            continue
+        mode = str((raw or {}).get("auto_decision_mode") or (raw or {}).get("auto_shadow_mode") or "").upper()
+        result = str((raw or {}).get("auto_result") or (raw or {}).get("auto_shadow_result") or "").lower()
+        if mode not in {"NORMAL","REVERSE"} or result not in {"win","loss","draw"}:
+            continue
+        rows.append(dict(raw))
+    rows.sort(key=lambda r:int(r.get("entry_bucket",0) or 0))
+    rows = rows[-OCTOPUS_AUTO_V145_WF_WINDOW:]
+    decided = [r for r in rows if str(r.get("auto_result") or r.get("auto_shadow_result") or "").lower() in {"win","loss"}]
+    wins = sum(1 for r in decided if str(r.get("auto_result") or r.get("auto_shadow_result") or "").lower()=="win")
+    losses = len(decided)-wins
+    auto_net = sum(_octopus_auto_net_for_result(str(r.get("auto_result") or r.get("auto_shadow_result") or ""), float(r.get("payout",0) or 0)) for r in rows)
+    normal_net = sum(_octopus_auto_net_for_result(str(r.get("normal_result") or ""), float(r.get("payout",0) or 0)) for r in rows)
+    reverse_net = sum(_octopus_auto_net_for_result(str(r.get("reverse_result") or ""), float(r.get("payout",0) or 0)) for r in rows)
+    recent = rows[-OCTOPUS_AUTO_V145_WF_RECENT_WINDOW:]
+    recent_net = sum(_octopus_auto_net_for_result(str(r.get("auto_result") or r.get("auto_shadow_result") or ""), float(r.get("payout",0) or 0)) for r in recent)
+    wr = wins / max(1, wins+losses) * 100.0 if (wins+losses) else 0.0
+    sample_ok = len(decided) >= OCTOPUS_AUTO_V145_WF_MIN_DECISIONS
+    net_ok = auto_net >= OCTOPUS_AUTO_V145_WF_MIN_NET
+    recent_ok = (len(recent) < 4) or (recent_net >= OCTOPUS_AUTO_V145_WF_RECENT_MIN_NET)
+    allowed = bool(sample_ok and net_ok and recent_ok)
+    if not sample_ok:
+        reason = f"walk-forward warmup {len(decided)}/{OCTOPUS_AUTO_V145_WF_MIN_DECISIONS}"
+    elif not net_ok:
+        reason = f"walk-forward AUTO net {auto_net:+.2f}u < +{OCTOPUS_AUTO_V145_WF_MIN_NET:.2f}u"
+    elif not recent_ok:
+        reason = f"walk-forward recent net {recent_net:+.2f}u < {OCTOPUS_AUTO_V145_WF_RECENT_MIN_NET:+.2f}u"
+    else:
+        reason = f"walk-forward PASS n={len(decided)} net={auto_net:+.2f}u WR={wr:.1f}%"
+    return {
+        "allowed":allowed,"reason":reason,"sample":len(decided),"wins":wins,"losses":losses,"wr":round(wr,2),
+        "auto_net":round(auto_net,4),"normal_net":round(normal_net,4),"reverse_net":round(reverse_net,4),
+        "value_add_vs_best_static":round(auto_net-max(normal_net,reverse_net),4),
+        "recent_n":len(recent),"recent_net":round(recent_net,4),
+    }
 
 
-def _octopus_auto_trade_decision(candidate: dict) -> dict:
-    """Choose NORMAL / REVERSE / WAIT for this specific executable Role Flip."""
+def _octopus_auto_pair_quarantine(history: list[dict], pair: str, now_bucket: int) -> dict:
+    rows=[]
+    for raw in (history or []):
+        if str((raw or {}).get("pair") or "") != str(pair or ""):
+            continue
+        mode=str((raw or {}).get("auto_decision_mode") or (raw or {}).get("auto_shadow_mode") or "").upper()
+        result=str((raw or {}).get("auto_result") or (raw or {}).get("auto_shadow_result") or "").lower()
+        if mode in {"NORMAL","REVERSE"} and result in {"win","loss","draw"}:
+            rows.append(dict(raw))
+    rows.sort(key=lambda r:int(r.get("entry_bucket",0) or 0))
+    streak=0; last_loss_bucket=0
+    for row in reversed(rows):
+        result=str(row.get("auto_result") or row.get("auto_shadow_result") or "").lower()
+        if result == "loss":
+            streak += 1
+            last_loss_bucket = max(last_loss_bucket, int(row.get("entry_bucket",0) or 0))
+            continue
+        if result == "draw":
+            continue
+        break
+    until = last_loss_bucket + int(OCTOPUS_AUTO_V145_PAIR_QUARANTINE_MINUTES)*60 if streak >= OCTOPUS_AUTO_V145_PAIR_LOSS_STREAK and last_loss_bucket else 0
+    active = bool(until and int(now_bucket) < until)
+    return {"active":active,"loss_streak":streak,"until_bucket":until,"remaining_minutes":round(max(0,until-int(now_bucket))/60.0,1) if active else 0.0}
+
+
+def _octopus_auto_trade_decision(candidate: dict, *, apply_walkforward_gate: bool = True, record_state: bool = True) -> dict:
+    """v1.45: independent evidence + hard context + out-of-sample gate + pair quarantine."""
     item=dict(candidate or {})
     now_bucket=int(item.get("target_entry_bucket") or item.get("entry_bucket") or (int(time_module.time())//60)*60)
     pair=str(item.get("pair") or "")
     history=_octopus_auto_trade_history(force=False)
-    history=[r for r in history if int(r.get("entry_bucket",0) or 0)<now_bucket or int(r.get("entry_bucket",0) or 0)==0][-OCTOPUS_AUTO_TRADE_MAX_ROWS:]
-    context_rows=[]; pair_context_rows=[]
-    for row in history:
-        sim=_octopus_auto_context_similarity(item,row)
-        enriched=dict(row); enriched["_auto_similarity"]=sim
-        if sim>=OCTOPUS_AUTO_TRADE_CONTEXT_MIN_SIMILARITY:
-            context_rows.append(enriched)
-            if pair and str(row.get("pair") or "")==pair: pair_context_rows.append(enriched)
-    context_rows.sort(key=lambda r:(float(r.get("_auto_similarity",0) or 0),int(r.get("entry_bucket",0) or 0)),reverse=True)
-    pair_context_rows.sort(key=lambda r:(float(r.get("_auto_similarity",0) or 0),int(r.get("entry_bucket",0) or 0)),reverse=True)
-    burst_rows=history[-6:]; global_rows=history[-24:]
-    pair_rows=[r for r in history if pair and str(r.get("pair") or "")==pair][-14:]
-    context_rows=context_rows[:18]; pair_context_rows=pair_context_rows[:10]
-    components=[
-        _octopus_auto_component(burst_rows,now_bucket=now_bucket,base_weight=0.32,name="burst"),
-        _octopus_auto_component(global_rows,now_bucket=now_bucket,base_weight=0.20,name="global"),
-        _octopus_auto_component(pair_rows,now_bucket=now_bucket,base_weight=0.32,name="pair"),
-        _octopus_auto_component(context_rows,now_bucket=now_bucket,base_weight=0.30,name="context",similarity=True),
-        _octopus_auto_component(pair_context_rows,now_bucket=now_bucket,base_weight=0.24,name="pair_context",similarity=True),
-    ]
-    active=[c for c in components if float(c.get("effective_weight",0) or 0)>0 and int(c.get("n",0) or 0)>0]
-    tw=sum(float(c.get("effective_weight",0) or 0) for c in active)
-    normal_score=(sum(float(c.get("estimate",50) or 50)*float(c.get("effective_weight",0) or 0) for c in active)/tw) if tw>0 else 50.0
-    normal_score=max(1.0,min(99.0,normal_score)); reverse_score=100.0-normal_score
-    support=_octopus_auto_weighted_rate(global_rows,now_bucket=now_bucket)
-    ess=float(support.get("ess",0.0) or 0.0); evidence_rows=len(global_rows)
-    be=_octopus_break_even_wr(float(item.get("payout",0) or 0))
-    shortage=max(0.0,8.0-ess)/8.0
-    buffer_pp=OCTOPUS_AUTO_TRADE_BASE_BUFFER_PP+OCTOPUS_AUTO_TRADE_SMALL_SAMPLE_BUFFER_PP*shortage
-    required_score=be+buffer_pp; best_score=max(normal_score,reverse_score); score_gap=abs(normal_score-reverse_score)
-    if evidence_rows<OCTOPUS_AUTO_TRADE_MIN_ROWS:
-        mode="WAIT"; reason=f"clean Role Flip history {evidence_rows}/{OCTOPUS_AUTO_TRADE_MIN_ROWS}"
-    elif ess<OCTOPUS_AUTO_TRADE_MIN_EFFECTIVE_SAMPLE:
-        mode="WAIT"; reason=f"effective sample {ess:.1f}/{OCTOPUS_AUTO_TRADE_MIN_EFFECTIVE_SAMPLE:.1f}"
-    elif score_gap<OCTOPUS_AUTO_TRADE_MIN_SCORE_GAP_PP:
-        mode="WAIT"; reason=f"N/R gap {score_gap:.1f}pp < {OCTOPUS_AUTO_TRADE_MIN_SCORE_GAP_PP:.1f}pp"
-    elif best_score<required_score:
-        mode="WAIT"; reason=f"best {best_score:.1f}% < required {required_score:.1f}%"
-    else:
-        mode="NORMAL" if normal_score>reverse_score else "REVERSE"
-        reason=f"{mode} {best_score:.1f}% >= {required_score:.1f}% | gap {score_gap:.1f}pp"
-    confidence=max(0.0,min(99.0,28.0+min(12.0,ess)*3.5+max(0.0,score_gap-3.0)*1.6))
-    result={
-        "mode":mode,"normal_score":round(normal_score,2),"reverse_score":round(reverse_score,2),
-        "confidence":round(confidence,1),"evidence_rows":evidence_rows,"effective_sample":round(ess,2),
-        "break_even_wr":round(be,2),"buffer_pp":round(buffer_pp,2),"required_score":round(required_score,2),
-        "score_gap_pp":round(score_gap,2),"reason":reason,
-        "components":{c["name"]:{"estimate":round(float(c["estimate"]) if c.get("estimate") is not None else 50.0,2),"raw":round(float(c["raw"]) if c.get("raw") is not None else 50.0,2),"n":int(c.get("n",0) or 0),"ess":round(float(c.get("ess",0) or 0),2),"weight":round(float(c.get("effective_weight",0) or 0),3)} for c in components},
-    }
-    state=_octopus_auto_trade_state
-    state["last_decision"]={"pair":pair,"analysis_direction":str(item.get("analysis_direction") or item.get("direction") or ""),"at":now_iso(),**result}
-    state["decisions"]=int(state.get("decisions",0) or 0)+1
-    state[str(mode).lower()]=int(state.get(str(mode).lower(),0) or 0)+1
-    return result
+    history=[r for r in history if int(r.get("entry_bucket",0) or 0)<now_bucket or int(r.get("entry_bucket",0) or 0)==0][-OCTOPUS_AUTO_V145_MAX_ROWS:]
 
+    compatible=[r for r in history if _octopus_auto_context_compatible(item,r)]
+    pair_compatible=[r for r in compatible if pair and str(r.get("pair") or "")==pair]
+    if len(pair_compatible) >= OCTOPUS_AUTO_V145_MIN_PAIR_CONTEXT_ROWS:
+        evidence=pair_compatible
+        pool="PAIR_HARD_CONTEXT"
+        min_rows=OCTOPUS_AUTO_V145_MIN_PAIR_CONTEXT_ROWS
+    else:
+        evidence=compatible
+        pool="HARD_CONTEXT"
+        min_rows=OCTOPUS_AUTO_V145_MIN_CONTEXT_ROWS
+    evidence=evidence[-60:]
+    est=_octopus_auto_single_pool_estimate(item,evidence,now_bucket)
+    normal_score=float(est.get("normal_score",50.0) or 50.0); reverse_score=float(est.get("reverse_score",50.0) or 50.0)
+    normal_cons=float(est.get("normal_conservative",0.0) or 0.0); reverse_cons=float(est.get("reverse_conservative",0.0) or 0.0)
+    ess=float(est.get("ess",0.0) or 0.0); evidence_rows=int(est.get("n",0) or 0)
+    score_gap=abs(normal_score-reverse_score)
+    be=_octopus_break_even_wr(float(item.get("payout",0) or 0))
+    required=be+OCTOPUS_AUTO_V145_BREAK_EVEN_BUFFER_PP
+    best_mode="NORMAL" if normal_score>reverse_score else "REVERSE"
+    best_cons=normal_cons if best_mode=="NORMAL" else reverse_cons
+
+    if evidence_rows < min_rows:
+        raw_mode="WAIT"; raw_reason=f"{pool} rows {evidence_rows}/{min_rows}"
+    elif ess < OCTOPUS_AUTO_V145_MIN_EFFECTIVE_SAMPLE:
+        raw_mode="WAIT"; raw_reason=f"independent ESS {ess:.1f}/{OCTOPUS_AUTO_V145_MIN_EFFECTIVE_SAMPLE:.1f}"
+    elif score_gap < OCTOPUS_AUTO_V145_MIN_SCORE_GAP_PP:
+        raw_mode="WAIT"; raw_reason=f"N/R posterior gap {score_gap:.1f}pp < {OCTOPUS_AUTO_V145_MIN_SCORE_GAP_PP:.1f}pp"
+    elif best_cons < required:
+        raw_mode="WAIT"; raw_reason=f"{best_mode} conservative {best_cons:.1f}% < required {required:.1f}%"
+    else:
+        raw_mode=best_mode; raw_reason=f"{best_mode} conservative {best_cons:.1f}% >= {required:.1f}% | gap {score_gap:.1f}pp"
+
+    wf=_octopus_auto_walkforward_stats(history,now_bucket)
+    quarantine=_octopus_auto_pair_quarantine(history,pair,now_bucket)
+    mode=raw_mode; reason=raw_reason; wf_blocked=False; quarantine_blocked=False
+    if apply_walkforward_gate and raw_mode in {"NORMAL","REVERSE"}:
+        if quarantine.get("active"):
+            mode="WAIT"; quarantine_blocked=True
+            reason=f"PAIR QUARANTINE {pair}: {int(quarantine.get('loss_streak',0))} consecutive AUTO losses; {float(quarantine.get('remaining_minutes',0)):.1f}m left"
+        elif not bool(wf.get("allowed")):
+            mode="WAIT"; wf_blocked=True
+            reason=f"{wf.get('reason')} | raw={raw_mode}"
+
+    confidence=max(0.0,min(99.0,20.0+min(16.0,ess)*3.0+max(0.0,score_gap-4.0)*1.5+(8.0 if wf.get("allowed") else 0.0)))
+    result={
+        "mode":mode,"raw_mode":raw_mode,"normal_score":round(normal_score,2),"reverse_score":round(reverse_score,2),
+        "normal_conservative":round(normal_cons,2),"reverse_conservative":round(reverse_cons,2),
+        "confidence":round(confidence,1),"evidence_rows":evidence_rows,"effective_sample":round(ess,2),
+        "break_even_wr":round(be,2),"required_score":round(required,2),"score_gap_pp":round(score_gap,2),
+        "reason":reason,"raw_reason":raw_reason,"evidence_pool":pool,
+        "hard_context_key":_octopus_auto_hard_context_key(item,include_pair=True),
+        "hard_context_family":_octopus_auto_hard_context_key(item,include_pair=False),
+        "walkforward":wf,"walkforward_blocked":wf_blocked,"pair_quarantine":quarantine,"quarantine_blocked":quarantine_blocked,
+        "components":{"independent_pool":{"n":evidence_rows,"ess":round(ess,2),"weight":float(est.get('weight',0) or 0),"pool":pool}},
+    }
+    if record_state:
+        state=_octopus_auto_trade_state
+        state["last_decision"]={"pair":pair,"analysis_direction":str(item.get("analysis_direction") or item.get("direction") or ""),"at":now_iso(),**result}
+        state["last_walkforward"]=dict(wf)
+        state["decisions"]=int(state.get("decisions",0) or 0)+1
+        state[str(mode).lower()]=int(state.get(str(mode).lower(),0) or 0)+1
+        if wf_blocked: state["wf_blocked"]=int(state.get("wf_blocked",0) or 0)+1
+        elif apply_walkforward_gate and raw_mode in {"NORMAL","REVERSE"}: state["wf_allowed"]=int(state.get("wf_allowed",0) or 0)+1
+        if quarantine_blocked: state["quarantine_blocked"]=int(state.get("quarantine_blocked",0) or 0)+1
+    return result
 
 def _octopus_auto_mode_metrics(rows: list[dict]) -> dict:
     usable = [dict(r) for r in (rows or []) if str(r.get("normal_result") or "") in {"win", "loss", "draw"} and str(r.get("reverse_result") or "") in {"win", "loss", "draw"}]
@@ -18718,20 +18986,22 @@ def _octopus_auto_mode_effective() -> str:
 def _octopus_auto_mode_status_text() -> str:
     state = _octopus_auto_trade_state
     last = state.get("last_decision") if isinstance(state.get("last_decision"), dict) else None
+    history = _octopus_auto_trade_history(force=False)
+    now_bucket=(int(time_module.time())//60)*60
+    wf=_octopus_auto_walkforward_stats(history,now_bucket)
+    gate="PASS" if wf.get("allowed") else "BLOCK"
     counts = f"N/R/W {int(state.get('normal',0) or 0)}/{int(state.get('reverse',0) or 0)}/{int(state.get('wait',0) or 0)}"
+    base=(f"AUTO v1.45 WALK-FORWARD {gate} | OOS {int(wf.get('sample',0) or 0)} "
+          f"AUTO {float(wf.get('auto_net',0) or 0):+.2f}u vs N {float(wf.get('normal_net',0) or 0):+.2f}u / R {float(wf.get('reverse_net',0) or 0):+.2f}u | {counts}")
     if not last:
-        clean_n = len(_octopus_auto_trade_history(force=False))
-        return f"AUTO PER-TRADE | clean Role Flip history {clean_n} | {counts} | بانتظار أول فرصة جديدة"
-    return (
-        f"AUTO PER-TRADE | {counts} | last {last.get('pair')}: {last.get('mode')} "
-        f"N {float(last.get('normal_score',50) or 50):.1f}% / R {float(last.get('reverse_score',50) or 50):.1f}% "
-        f"| evidence {int(last.get('evidence_rows',0) or 0)} / ESS {float(last.get('effective_sample',0) or 0):.1f}"
-    )
-
+        return base + " | بانتظار أول فرصة جديدة"
+    return (base + f" | last {last.get('pair')}: {last.get('mode')} (raw {last.get('raw_mode')}) "
+            f"N {float(last.get('normal_score',50) or 50):.1f}% / R {float(last.get('reverse_score',50) or 50):.1f}% "
+            f"| pool {last.get('evidence_pool')} n={int(last.get('evidence_rows',0) or 0)} ESS={float(last.get('effective_sample',0) or 0):.1f}")
 
 def build_octopus_market_mode_report(hours: float | None = None) -> str:
     lookback = float(hours if hours is not None else OCTOPUS_MODE_DETECTOR_REPORT_HOURS)
-    rows = _octopus_mode_detector_fetch(lookback)
+    rows = _octopus_auto_role_flip_rows(_octopus_mode_detector_fetch(lookback))
     settings = _structure_edge_get_settings(force_refresh=False)
     selected_mode = str(settings.get("execution_direction_mode") or "NORMAL").upper()
     effective_mode = _structure_edge_execution_direction_mode()
@@ -18740,32 +19010,29 @@ def build_octopus_market_mode_report(hours: float | None = None) -> str:
         return (
             f"📊 Octopus Market Mode — آخر {lookback:g} ساعات\n"
             "━━━━━━━━━━━━━━\n"
-            "لسا ما في صفقات افتراضية محسومة ضمن النافذة.\n"
+            "لسا ما في Role Flip افتراضي محسوم ضمن النافذة.\n"
             "المراقب الداخلي شغال بالخلفية حتى لو تنفيذ Octopus مطفّى.\n"
             f"🎛 نمط التنفيذ الحالي: {current_mode}"
         )
     normal = _octopus_mode_stats(rows, "normal_result")
     reverse = _octopus_mode_stats(rows, "reverse_result")
+    wf = _octopus_auto_walkforward_stats(rows, (int(time_module.time())//60)*60)
     avg_payout = sum(float(r.get("payout", 0) or 0) for r in rows) / max(1, len(rows))
-    best = "NORMAL" if normal["net"] > reverse["net"] else "REVERSE" if reverse["net"] > normal["net"] else "TIE"
-    best_icon = "🟢" if best == "NORMAL" else "🔄" if best == "REVERSE" else "⚖️"
-    enough = len(rows) >= OCTOPUS_MODE_DETECTOR_MIN_SAMPLE
-    sample_note = "العينة كافية مبدئيًا ✅" if enough else f"العينة صغيرة لسا ({len(rows)}/{OCTOPUS_MODE_DETECTOR_MIN_SAMPLE}) ⚠️"
-    best_net = normal["net"] if best == "NORMAL" else reverse["net"] if best == "REVERSE" else normal["net"]
-    profitability_note = "الأفضل رابح افتراضيًا ضمن النافذة ✅" if best_net > 0 else "الأفضل نسبيًا فقط؛ النمطين مو رابحين ضمن النافذة ⚠️"
+    gate = "PASS ✅" if wf.get("allowed") else "BLOCK 🛑"
+    value_add=float(wf.get("value_add_vs_best_static",0) or 0)
+    value_note="AUTO أضاف قيمة مقابل أفضل static" if value_add>0 else "AUTO لم يتفوق على أفضل static ضمن عينة OOS"
     return (
         f"📊 Octopus Market Mode — آخر {lookback:g} ساعات\n"
         "━━━━━━━━━━━━━━\n"
-        f"🧪 صفقات افتراضية مطابقة لمسار PRE-ARM/Open: {len(rows)}\n"
-        f"💹 متوسط Payout: {avg_payout:.1f}%\n\n"
+        f"🧪 Role Flip paper opportunities: {len(rows)} | Avg payout {avg_payout:.1f}%\n"
         f"🟢 NORMAL: {normal['w']}W/{normal['l']}L/{normal['d']}D | WR {normal['wr']:.1f}% | Net {normal['net']:+.2f}u\n"
         f"🔄 REVERSE: {reverse['w']}W/{reverse['l']}L/{reverse['d']}D | WR {reverse['wr']:.1f}% | Net {reverse['net']:+.2f}u\n\n"
-        f"{best_icon} الأفضل آخر {lookback:g} ساعات: {best}\n"
-        f"📏 فرق Net: {abs(normal['net'] - reverse['net']):.2f}u\n"
-        f"🧠 {sample_note}\n"
-        f"⚠️ {profitability_note}\n"
-        f"🎛 نمط التنفيذ المختار حاليًا: {current_mode}\n\n"
-        "ℹ️ AUTO v1.44 يقرر NORMAL / REVERSE / WAIT لكل Role Flip جديد بشكل مستقل حسب الزوج + شكل الفرصة + النتائج الحديثة. المقارنة العامة أعلاه Research فقط؛ NORMAL وREVERSE اليدويان يبقيان متاحين."
+        f"🤖 AUTO WALK-FORWARD: {int(wf.get('wins',0))}W/{int(wf.get('losses',0))}L | WR {float(wf.get('wr',0) or 0):.1f}% | Net {float(wf.get('auto_net',0) or 0):+.2f}u | n={int(wf.get('sample',0))}\n"
+        f"📐 AUTO value-add vs best static: {value_add:+.2f}u — {value_note}\n"
+        f"🕒 Recent AUTO net: {float(wf.get('recent_net',0) or 0):+.2f}u / {int(wf.get('recent_n',0))} decisions\n"
+        f"🛡️ Real AUTO gate: {gate} — {wf.get('reason')}\n"
+        f"🎛 النمط المختار: {current_mode}\n\n"
+        "ℹ️ v1.45: كل صفقة تاريخية تدخل مرة واحدة فقط. القرار يستخدم Hard Context، والـAUTO الحقيقي لا ينفذ قبل إثبات ربحية قراراته السابقة Out-of-Sample."
     )[:3900]
 
 
@@ -18793,6 +19060,13 @@ async def publish_copy_octopus_prepare_signal(candidate: dict, target_entry_buck
             "auto_confidence": candidate.get("auto_confidence"), "auto_evidence_rows": candidate.get("auto_evidence_rows"),
             "auto_effective_sample": candidate.get("auto_effective_sample"), "auto_required_score": candidate.get("auto_required_score"),
             "auto_score_gap_pp": candidate.get("auto_score_gap_pp"), "auto_reason": candidate.get("auto_reason"),
+            "auto_raw_mode": candidate.get("auto_raw_mode"), "auto_normal_conservative": candidate.get("auto_normal_conservative"), "auto_reverse_conservative": candidate.get("auto_reverse_conservative"),
+            "auto_hard_context_key": candidate.get("auto_hard_context_key"), "auto_evidence_pool": candidate.get("auto_evidence_pool"),
+            "auto_walkforward_allowed": candidate.get("auto_walkforward_allowed"), "auto_walkforward_sample": candidate.get("auto_walkforward_sample"),
+            "auto_walkforward_wr": candidate.get("auto_walkforward_wr"), "auto_walkforward_net": candidate.get("auto_walkforward_net"),
+            "auto_walkforward_normal_net": candidate.get("auto_walkforward_normal_net"), "auto_walkforward_reverse_net": candidate.get("auto_walkforward_reverse_net"),
+            "auto_walkforward_value_add": candidate.get("auto_walkforward_value_add"), "auto_pair_loss_streak": candidate.get("auto_pair_loss_streak"),
+            "auto_pair_quarantine_active": candidate.get("auto_pair_quarantine_active"), "auto_pair_quarantine_until_bucket": candidate.get("auto_pair_quarantine_until_bucket"),
             "timeframe": "M1", "duration_seconds": 60, "duration_minutes": 1,
             "entry_time": entry_dt.isoformat(), "expires_at": (entry_dt + timedelta(seconds=10)).isoformat(),
             "expiry_time": (entry_dt + timedelta(seconds=60)).isoformat(), "expiry_timestamp": int((entry_dt + timedelta(seconds=60)).timestamp()),
@@ -18845,6 +19119,13 @@ async def publish_copy_octopus_signal(candidate: dict, target_user_id: int | Non
             "auto_confidence": candidate.get("auto_confidence"), "auto_evidence_rows": candidate.get("auto_evidence_rows"),
             "auto_effective_sample": candidate.get("auto_effective_sample"), "auto_required_score": candidate.get("auto_required_score"),
             "auto_score_gap_pp": candidate.get("auto_score_gap_pp"), "auto_reason": candidate.get("auto_reason"),
+            "auto_raw_mode": candidate.get("auto_raw_mode"), "auto_normal_conservative": candidate.get("auto_normal_conservative"), "auto_reverse_conservative": candidate.get("auto_reverse_conservative"),
+            "auto_hard_context_key": candidate.get("auto_hard_context_key"), "auto_evidence_pool": candidate.get("auto_evidence_pool"),
+            "auto_walkforward_allowed": candidate.get("auto_walkforward_allowed"), "auto_walkforward_sample": candidate.get("auto_walkforward_sample"),
+            "auto_walkforward_wr": candidate.get("auto_walkforward_wr"), "auto_walkforward_net": candidate.get("auto_walkforward_net"),
+            "auto_walkforward_normal_net": candidate.get("auto_walkforward_normal_net"), "auto_walkforward_reverse_net": candidate.get("auto_walkforward_reverse_net"),
+            "auto_walkforward_value_add": candidate.get("auto_walkforward_value_add"), "auto_pair_loss_streak": candidate.get("auto_pair_loss_streak"),
+            "auto_pair_quarantine_active": candidate.get("auto_pair_quarantine_active"), "auto_pair_quarantine_until_bucket": candidate.get("auto_pair_quarantine_until_bucket"),
             "timeframe": "M1", "duration_seconds": 60, "duration_minutes": 1,
             "entry_time": entry_dt.isoformat(), "expires_at": (entry_dt + timedelta(seconds=TRENDLINE_EXECUTION_MAX_DELAY_SECONDS)).isoformat(),
             "expiry_time": expiry_dt.isoformat(), "expiry_timestamp": int(expiry_dt.timestamp()),
@@ -18912,7 +19193,9 @@ def _octopus_selector_decision_text(candidate: dict, prefix: str = "🐙 OCTOPUS
     execution_mode = str(candidate.get("execution_direction_mode") or ("REVERSE" if candidate.get("reverse_mode") else "NORMAL"))
     original_direction = str(candidate.get("original_direction") or candidate.get("analysis_direction") or candidate.get("direction") or "-")
     if str(candidate.get("owner_direction_mode") or "") == "AUTO":
-        mode_line = (f"🤖 AUTO → {execution_mode} | N {float(candidate.get('auto_normal_score',50) or 50):.1f}% / R {float(candidate.get('auto_reverse_score',50) or 50):.1f}% | الأصل {original_direction} → التنفيذ {candidate.get('direction')}\n")
+        mode_line = (f"🤖 AUTO → {execution_mode} | N {float(candidate.get('auto_normal_score',50) or 50):.1f}% / R {float(candidate.get('auto_reverse_score',50) or 50):.1f}% | "
+                     f"C-N {float(candidate.get('auto_normal_conservative',0) or 0):.1f}% / C-R {float(candidate.get('auto_reverse_conservative',0) or 0):.1f}% | "
+                     f"WF {'PASS' if candidate.get('auto_walkforward_allowed') else 'BLOCK'} n={int(candidate.get('auto_walkforward_sample',0) or 0)} | الأصل {original_direction} → التنفيذ {candidate.get('direction')}\n")
     else:
         mode_line = f"🔄 Mode: REVERSE | الأصل {original_direction} → التنفيذ {candidate.get('direction')}\n" if execution_mode == "REVERSE" else "🟢 Mode: NORMAL\n"
     return (
@@ -18990,7 +19273,7 @@ async def _octopus_adaptive_prearm(context: ContextTypes.DEFAULT_TYPE, now_ts: f
     candidate = _octopus_apply_execution_direction_mode(candidate)
     if bool(candidate.get("auto_wait")):
         _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade", 0) or 0) + 1
-        _octopus_state["selector_last_no_trade_reason"] = (f"AUTO WAIT: {candidate.get('auto_reason') or 'per-trade edge not clear'} | N={float(candidate.get('auto_normal_score',50) or 50):.1f} R={float(candidate.get('auto_reverse_score',50) or 50):.1f}")
+        _octopus_state["selector_last_no_trade_reason"] = (f"AUTO WAIT: {candidate.get('auto_reason') or 'walk-forward edge not verified'} | N={float(candidate.get('auto_normal_score',50) or 50):.1f} R={float(candidate.get('auto_reverse_score',50) or 50):.1f}")
         _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
         return
     _octopus_state["selector_last_decision"] = dict(candidate)
@@ -19592,6 +19875,22 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
             "auto_required_score": float(pick("auto_required_score", (pending or {}).get("auto_required_score", 0)) or 0),
             "auto_score_gap_pp": float(pick("auto_score_gap_pp", (pending or {}).get("auto_score_gap_pp", 0)) or 0),
             "auto_reason": pick("auto_reason", (pending or {}).get("auto_reason")),
+            "auto_raw_mode": pick("auto_raw_mode", (pending or {}).get("auto_raw_mode")),
+            "auto_normal_conservative": float(pick("auto_normal_conservative", (pending or {}).get("auto_normal_conservative", 0)) or 0),
+            "auto_reverse_conservative": float(pick("auto_reverse_conservative", (pending or {}).get("auto_reverse_conservative", 0)) or 0),
+            "auto_hard_context_key": pick("auto_hard_context_key", (pending or {}).get("auto_hard_context_key")),
+            "auto_evidence_pool": pick("auto_evidence_pool", (pending or {}).get("auto_evidence_pool")),
+            "auto_walkforward_allowed": bool(pick("auto_walkforward_allowed", (pending or {}).get("auto_walkforward_allowed", False))),
+            "auto_walkforward_sample": int(pick("auto_walkforward_sample", (pending or {}).get("auto_walkforward_sample", 0)) or 0),
+            "auto_walkforward_wr": float(pick("auto_walkforward_wr", (pending or {}).get("auto_walkforward_wr", 0)) or 0),
+            "auto_walkforward_net": float(pick("auto_walkforward_net", (pending or {}).get("auto_walkforward_net", 0)) or 0),
+            "auto_walkforward_normal_net": float(pick("auto_walkforward_normal_net", (pending or {}).get("auto_walkforward_normal_net", 0)) or 0),
+            "auto_walkforward_reverse_net": float(pick("auto_walkforward_reverse_net", (pending or {}).get("auto_walkforward_reverse_net", 0)) or 0),
+            "auto_walkforward_value_add": float(pick("auto_walkforward_value_add", (pending or {}).get("auto_walkforward_value_add", 0)) or 0),
+            "auto_pair_loss_streak": int(pick("auto_pair_loss_streak", (pending or {}).get("auto_pair_loss_streak", 0)) or 0),
+            "auto_pair_quarantine_active": bool(pick("auto_pair_quarantine_active", (pending or {}).get("auto_pair_quarantine_active", False))),
+            "auto_pair_quarantine_until_bucket": int(pick("auto_pair_quarantine_until_bucket", (pending or {}).get("auto_pair_quarantine_until_bucket", 0)) or 0),
+            "auto_result": outcome if str(pick("owner_direction_mode", (pending or {}).get("owner_direction_mode")) or "").upper() == "AUTO" else None,
         }
 
         if uid != int(ADMIN_TELEGRAM_ID):
@@ -27697,7 +27996,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if ok:
                 _octopus_auto_trade_history(force=True)
             await update.message.reply_text(
-                ("🤖 نمط تنفيذ Octopus صار AUTO PER-TRADE. كل Role Flip جديد يأخذ قرار NORMAL / REVERSE / WAIT مستقل حسب الزوج + شكل الفرصة + النتائج الحديثة.\n" + _octopus_auto_mode_status_text() + "\nNORMAL وREVERSE اليدويان ما زالوا متاحين بأي وقت.") if ok else "❌ تعذر تغيير نمط التنفيذ.",
+                ("🤖 نمط تنفيذ Octopus صار AUTO WALK-FORWARD v1.45. كل Role Flip يُقيّم بسياق صلب ومستقل، لكن التنفيذ الحقيقي يبقى WAIT حتى تثبت قرارات AUTO الورقية ربحية Out-of-Sample. أي زوج يدخل بسلسلة خسارتين AUTO يُحجر مؤقتًا 30 دقيقة افتراضيًا.\n" + _octopus_auto_mode_status_text() + "\nNORMAL وREVERSE اليدويان ما زالوا متاحين بأي وقت.") if ok else "❌ تعذر تغيير نمط التنفيذ.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
