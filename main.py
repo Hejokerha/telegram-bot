@@ -22,6 +22,8 @@ try:
 except Exception:
     websocket = None
 
+# v1.43.0 AUTO mode: owner may choose NORMAL, REVERSE, or AUTO.
+# AUTO uses the always-on virtual Role Flip NORMAL/REVERSE detector with rolling hysteresis.
 # v1.42.2: restore the proven three-thesis S/R competition for selection, while real execution remains MI_ROLE_FLIP_RETEST only.
 # If Support/Resistance Rejection wins the market ranking, real execution is NO TRADE; NORMAL/REVERSE still applies only after a Role Flip wins.
 # v1.41 sleep/global guard and Quotex cookie-only transport remain unchanged.
@@ -551,7 +553,7 @@ structure_edge_admin_keyboard = ReplyKeyboardMarkup(
         ["🌍 تشغيل تنفيذ Octopus للجميع", "🚨 إيقاف تنفيذ Octopus للجميع"],
         ["📋 حالة Octopus", "📊 ملخص Octopus"],
         ["📊 وضع السوق ساعتين"],
-        ["🟢 تنفيذ NORMAL", "🔄 تنفيذ REVERSE"],
+        ["🟢 تنفيذ NORMAL", "🔄 تنفيذ REVERSE", "🤖 تنفيذ AUTO"],
         ["🧠 أفضل النماذج", "🗺 الأزواج الآن"],
         ["🧹 تصفير Octopus"],
         ["⬅️ رجوع"],
@@ -1106,7 +1108,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.42.2"
+COPY_SERVER_VERSION = "1.43.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -14189,7 +14191,7 @@ def _structure_edge_get_settings(force_refresh: bool = False) -> dict:
             # v1.42.2: Role Flip remains the only executable thesis, while the owner may
             # select whether that thesis executes in its original NORMAL direction or reversed.
             mode = str(data.get("execution_direction_mode") or default_mode).strip().upper()
-            if mode not in {"NORMAL", "REVERSE"}:
+            if mode not in {"NORMAL", "REVERSE", "AUTO"}:
                 mode = default_mode
             _structure_edge_state["enabled_cache"] = enabled
             _structure_edge_state["global_execution_enabled_cache"] = global_execution_enabled
@@ -14206,7 +14208,7 @@ def _structure_edge_get_settings(force_refresh: bool = False) -> dict:
                 _structure_edge_state["enabled_cache_loaded"] = True
                 _structure_edge_state["enabled_cache_last_refresh_ts"] = now_ts
     mode = str(_structure_edge_state.get("execution_direction_mode_cache") or default_mode).upper()
-    if mode not in {"NORMAL", "REVERSE"}:
+    if mode not in {"NORMAL", "REVERSE", "AUTO"}:
         mode = default_mode
     return {
         "enabled": bool(_structure_edge_state.get("enabled_cache", default_enabled)),
@@ -14279,7 +14281,7 @@ def _structure_edge_set_execution_direction_mode(mode: str) -> bool:
     """Owner-selected direction for the single executable Role Flip thesis."""
     try:
         value = str(mode or "NORMAL").strip().upper()
-        if value not in {"NORMAL", "REVERSE"}:
+        if value not in {"NORMAL", "REVERSE", "AUTO"}:
             return False
         _structure_edge_settings_ref().update({
             "execution_direction_mode": value,
@@ -14297,9 +14299,21 @@ def _structure_edge_set_execution_direction_mode(mode: str) -> bool:
         return False
 
 
-def _structure_edge_execution_direction_mode() -> str:
+def _structure_edge_selected_execution_direction_mode() -> str:
     mode = str(_structure_edge_get_settings(force_refresh=False).get("execution_direction_mode") or "NORMAL").upper()
-    return mode if mode in {"NORMAL", "REVERSE"} else "NORMAL"
+    return mode if mode in {"NORMAL", "REVERSE", "AUTO"} else "NORMAL"
+
+
+def _structure_edge_execution_direction_mode() -> str:
+    """Effective direction used for the next fresh PRE-ARM. AUTO may return WAIT."""
+    selected = _structure_edge_selected_execution_direction_mode()
+    if selected in {"NORMAL", "REVERSE"}:
+        return selected
+    try:
+        return _octopus_auto_mode_effective()
+    except Exception as exc:
+        logger.debug("Octopus AUTO effective mode fallback: %s", exc)
+        return "WAIT"
 
 
 def _structure_edge_is_enabled() -> bool:
@@ -16918,6 +16932,31 @@ _octopus_mode_detector_state = {
     "last_error": None,
 }
 
+# v1.43.0 owner-only AUTO direction manager. It does not change thesis selection,
+# PRE-ARM, competition gate, or execution guards; it only chooses NORMAL/REVERSE
+# for the next fresh Role Flip opportunity. Manual NORMAL/REVERSE remain available.
+OCTOPUS_AUTO_MODE_WINDOW = max(30, min(80, int(os.getenv("OCTOPUS_AUTO_MODE_WINDOW", "40"))))
+OCTOPUS_AUTO_MODE_RECENT_WINDOW = max(8, min(25, int(os.getenv("OCTOPUS_AUTO_MODE_RECENT_WINDOW", "12"))))
+OCTOPUS_AUTO_MODE_MIN_SAMPLE = max(20, min(OCTOPUS_AUTO_MODE_WINDOW, int(os.getenv("OCTOPUS_AUTO_MODE_MIN_SAMPLE", "30"))))
+OCTOPUS_AUTO_MODE_SWITCH_MARGIN_PP = max(3.0, min(20.0, float(os.getenv("OCTOPUS_AUTO_MODE_SWITCH_MARGIN_PP", "7.0"))))
+OCTOPUS_AUTO_MODE_RECENT_WEIGHT = max(0.35, min(0.80, float(os.getenv("OCTOPUS_AUTO_MODE_RECENT_WEIGHT", "0.55"))))
+OCTOPUS_AUTO_MODE_CONFIRMATIONS = max(2, min(8, int(os.getenv("OCTOPUS_AUTO_MODE_CONFIRMATIONS", "3"))))
+OCTOPUS_AUTO_MODE_COOLDOWN_SECONDS = max(300, min(3600, int(os.getenv("OCTOPUS_AUTO_MODE_COOLDOWN_SECONDS", "900"))))
+OCTOPUS_AUTO_MODE_LOOKBACK_HOURS = max(2.0, min(24.0, float(os.getenv("OCTOPUS_AUTO_MODE_LOOKBACK_HOURS", "12"))))
+
+_octopus_auto_mode_state = {
+    "initialized": False,
+    "effective_mode": "WAIT",
+    "pending_mode": None,
+    "pending_confirmations": 0,
+    "last_switch_ts": 0.0,
+    "last_directional_mode": None,
+    "last_directional_switch_ts": 0.0,
+    "last_eval_key": None,
+    "rows": [],
+    "metrics": {},
+}
+
 # Keep the historic v1.24 shadow snapshot namespace so the 7k+ observations collected
 # before this deploy remain useful as priors. Actual selector executions are isolated.
 def _octopus_base_ref():
@@ -18083,10 +18122,17 @@ def _octopus_apply_execution_direction_mode(candidate: dict) -> dict:
     if original not in {"CALL", "PUT"}:
         return item
     mode = _structure_edge_execution_direction_mode()
+    selected = _structure_edge_selected_execution_direction_mode()
     item["analysis_direction"] = original
     item["original_direction"] = original
+    item["owner_direction_mode"] = selected
     item["execution_direction_mode"] = mode
     item["reverse_mode"] = bool(mode == "REVERSE")
+    if mode == "WAIT":
+        item["auto_wait"] = True
+        item["direction"] = original
+        return item
+    item["auto_wait"] = False
     item["direction"] = _octopus_flip_direction(original) if mode == "REVERSE" else original
     return item
 
@@ -18133,6 +18179,7 @@ def _octopus_mode_detector_store_result(trade: dict, close_price: float) -> None
     _octopus_mode_detector_results_ref().child(str(entry_bucket)).set(record)
     _octopus_mode_detector_state["virtual_settled"] = int(_octopus_mode_detector_state.get("virtual_settled", 0) or 0) + 1
     _octopus_mode_detector_state["last_result"] = dict(record)
+    _octopus_auto_mode_note_result(record)
 
 
 def _octopus_mode_detector_settle(current_bucket: int) -> None:
@@ -18289,11 +18336,142 @@ def _octopus_mode_stats(rows: list[dict], field: str) -> dict:
     return {"w": w, "l": l, "d": d, "decided": decided, "wr": wr, "net": net}
 
 
+def _octopus_auto_mode_metrics(rows: list[dict]) -> dict:
+    usable = [dict(r) for r in (rows or []) if str(r.get("normal_result") or "") in {"win", "loss", "draw"} and str(r.get("reverse_result") or "") in {"win", "loss", "draw"}]
+    usable.sort(key=lambda r: int(r.get("entry_bucket", 0) or 0))
+    window = usable[-OCTOPUS_AUTO_MODE_WINDOW:]
+    recent = window[-min(OCTOPUS_AUTO_MODE_RECENT_WINDOW, len(window)):]
+    n_full = _octopus_mode_stats(window, "normal_result")
+    r_full = _octopus_mode_stats(window, "reverse_result")
+    n_recent = _octopus_mode_stats(recent, "normal_result")
+    r_recent = _octopus_mode_stats(recent, "reverse_result")
+    rw = float(OCTOPUS_AUTO_MODE_RECENT_WEIGHT)
+    fw = 1.0 - rw
+    n_score = n_full["wr"] * fw + n_recent["wr"] * rw if window else 0.0
+    r_score = r_full["wr"] * fw + r_recent["wr"] * rw if window else 0.0
+    diff = n_score - r_score
+    decided = min(int(n_full.get("decided", 0)), int(r_full.get("decided", 0)))
+    if decided < OCTOPUS_AUTO_MODE_MIN_SAMPLE:
+        candidate = "WAIT"
+        reason = f"sample {decided}/{OCTOPUS_AUTO_MODE_MIN_SAMPLE}"
+    elif abs(diff) < OCTOPUS_AUTO_MODE_SWITCH_MARGIN_PP:
+        candidate = "WAIT"
+        reason = f"edge gap {abs(diff):.1f}pp < {OCTOPUS_AUTO_MODE_SWITCH_MARGIN_PP:.1f}pp"
+    else:
+        candidate = "NORMAL" if diff > 0 else "REVERSE"
+        reason = f"weighted edge {abs(diff):.1f}pp"
+    return {
+        "candidate": candidate, "reason": reason, "sample": decided,
+        "normal_score": round(n_score, 2), "reverse_score": round(r_score, 2),
+        "normal_full_wr": round(n_full["wr"], 2), "reverse_full_wr": round(r_full["wr"], 2),
+        "normal_recent_wr": round(n_recent["wr"], 2), "reverse_recent_wr": round(r_recent["wr"], 2),
+        "normal_net": round(n_full["net"], 4), "reverse_net": round(r_full["net"], 4),
+        "window": len(window), "recent_window": len(recent),
+        "last_key": int(window[-1].get("entry_bucket", 0) or 0) if window else 0,
+    }
+
+
+def _octopus_auto_mode_evaluate(rows: list[dict] | None = None, *, bootstrap: bool = False) -> str:
+    state = _octopus_auto_mode_state
+    if rows is None:
+        rows = state.get("rows") if isinstance(state.get("rows"), list) and state.get("rows") else None
+    if rows is None:
+        rows = _octopus_mode_detector_fetch(OCTOPUS_AUTO_MODE_LOOKBACK_HOURS)
+    clean = [dict(r) for r in (rows or [])]
+    clean.sort(key=lambda r: int(r.get("entry_bucket", 0) or 0))
+    state["rows"] = clean[-max(OCTOPUS_AUTO_MODE_WINDOW * 2, 100):]
+    metrics = _octopus_auto_mode_metrics(state["rows"])
+    state["metrics"] = metrics
+    candidate = str(metrics.get("candidate") or "WAIT").upper()
+    eval_key = int(metrics.get("last_key", 0) or 0)
+
+    if not bool(state.get("initialized")) or bootstrap:
+        state["initialized"] = True
+        state["effective_mode"] = candidate
+        state["pending_mode"] = None
+        state["pending_confirmations"] = 0
+        state["last_eval_key"] = eval_key
+        now_ts = time_module.time()
+        state["last_switch_ts"] = now_ts
+        if candidate in {"NORMAL", "REVERSE"}:
+            state["last_directional_mode"] = candidate
+            state["last_directional_switch_ts"] = now_ts
+        return candidate
+
+    # Re-reading status/report must not count as another confirmation. Only a new settled
+    # virtual Role Flip result can advance the hysteresis counter.
+    if eval_key and eval_key == int(state.get("last_eval_key") or 0):
+        return str(state.get("effective_mode") or "WAIT")
+    state["last_eval_key"] = eval_key
+    current = str(state.get("effective_mode") or "WAIT").upper()
+    if candidate == current:
+        state["pending_mode"] = None
+        state["pending_confirmations"] = 0
+        return current
+    if str(state.get("pending_mode") or "") == candidate:
+        state["pending_confirmations"] = int(state.get("pending_confirmations", 0) or 0) + 1
+    else:
+        state["pending_mode"] = candidate
+        state["pending_confirmations"] = 1
+    if int(state.get("pending_confirmations", 0) or 0) < OCTOPUS_AUTO_MODE_CONFIRMATIONS:
+        return current
+    now_ts = time_module.time()
+    last_directional = str(state.get("last_directional_mode") or "").upper()
+    last_directional_ts = float(state.get("last_directional_switch_ts", 0.0) or 0.0)
+    directional_cooldown_left = OCTOPUS_AUTO_MODE_COOLDOWN_SECONDS - (now_ts - last_directional_ts)
+    # WAIT cannot be used as a shortcut around the NORMAL<->REVERSE cooldown.
+    if candidate in {"NORMAL", "REVERSE"} and last_directional in {"NORMAL", "REVERSE"} and candidate != last_directional and directional_cooldown_left > 0:
+        return current
+    state["effective_mode"] = candidate
+    state["last_switch_ts"] = now_ts
+    if candidate in {"NORMAL", "REVERSE"} and candidate != last_directional:
+        state["last_directional_mode"] = candidate
+        state["last_directional_switch_ts"] = now_ts
+    state["pending_mode"] = None
+    state["pending_confirmations"] = 0
+    return candidate
+
+
+def _octopus_auto_mode_note_result(record: dict) -> None:
+    try:
+        state = _octopus_auto_mode_state
+        rows = list(state.get("rows") or [])
+        key = int((record or {}).get("entry_bucket", 0) or 0)
+        rows = [r for r in rows if int((r or {}).get("entry_bucket", 0) or 0) != key]
+        rows.append(dict(record or {}))
+        rows.sort(key=lambda r: int(r.get("entry_bucket", 0) or 0))
+        _octopus_auto_mode_evaluate(rows[-max(OCTOPUS_AUTO_MODE_WINDOW * 2, 100):])
+    except Exception as exc:
+        _octopus_mode_detector_state["last_error"] = str(exc)
+        logger.debug("Octopus AUTO result update failed: %s", exc)
+
+
+def _octopus_auto_mode_effective() -> str:
+    state = _octopus_auto_mode_state
+    if not bool(state.get("initialized")):
+        _octopus_auto_mode_evaluate(bootstrap=True)
+    mode = str(state.get("effective_mode") or "WAIT").upper()
+    return mode if mode in {"NORMAL", "REVERSE", "WAIT"} else "WAIT"
+
+
+def _octopus_auto_mode_status_text() -> str:
+    effective = _octopus_auto_mode_effective()
+    m = _octopus_auto_mode_state.get("metrics") or {}
+    pending = str(_octopus_auto_mode_state.get("pending_mode") or "-")
+    confirms = int(_octopus_auto_mode_state.get("pending_confirmations", 0) or 0)
+    return (
+        f"AUTO → {effective} | weighted N {float(m.get('normal_score',0) or 0):.1f}% / R {float(m.get('reverse_score',0) or 0):.1f}% "
+        f"| sample {int(m.get('sample',0) or 0)} | pending {pending} {confirms}/{OCTOPUS_AUTO_MODE_CONFIRMATIONS}"
+    )
+
+
 def build_octopus_market_mode_report(hours: float | None = None) -> str:
     lookback = float(hours if hours is not None else OCTOPUS_MODE_DETECTOR_REPORT_HOURS)
     rows = _octopus_mode_detector_fetch(lookback)
     settings = _structure_edge_get_settings(force_refresh=False)
-    current_mode = str(settings.get("execution_direction_mode") or "NORMAL")
+    selected_mode = str(settings.get("execution_direction_mode") or "NORMAL").upper()
+    effective_mode = _structure_edge_execution_direction_mode()
+    current_mode = f"AUTO → {effective_mode}" if selected_mode == "AUTO" else selected_mode
     if not rows:
         return (
             f"📊 Octopus Market Mode — آخر {lookback:g} ساعات\n"
@@ -18323,7 +18501,7 @@ def build_octopus_market_mode_report(hours: float | None = None) -> str:
         f"🧠 {sample_note}\n"
         f"⚠️ {profitability_note}\n"
         f"🎛 نمط التنفيذ المختار حاليًا: {current_mode}\n\n"
-        "ملاحظة: التقرير لا يغيّر النمط تلقائيًا؛ أنت تختار NORMAL أو REVERSE من أزرار Octopus."
+        "ملاحظة: إذا اخترت AUTO، المدير يقرر للفرصة التالية فقط مع hysteresis + cooldown؛ NORMAL وREVERSE اليدويان يبقيان متاحين."
     )[:3900]
 
 
@@ -18533,6 +18711,11 @@ async def _octopus_adaptive_prearm(context: ContextTypes.DEFAULT_TYPE, now_ts: f
     candidate["prearmed_at"] = now_iso()
     candidate["target_entry_bucket"] = target_bucket
     candidate = _octopus_apply_execution_direction_mode(candidate)
+    if bool(candidate.get("auto_wait")):
+        _octopus_state["selector_no_trade"] = int(_octopus_state.get("selector_no_trade", 0) or 0) + 1
+        _octopus_state["selector_last_no_trade_reason"] = "AUTO WAIT: NORMAL/REVERSE edge is not clear enough yet"
+        _octopus_state["last_reject_reason"] = _octopus_state["selector_last_no_trade_reason"]
+        return
     _octopus_state["selector_last_decision"] = dict(candidate)
     _octopus_state["sr_prearm_selected_mode"] = str(candidate.get("prearm_mode") or "-")
 
@@ -18896,7 +19079,9 @@ def build_structure_edge_summary(limit: int | None = None) -> str:
         elif r == "loss": bucket["l"] += 1
         else: bucket["d"] += 1
     top_actual = sorted(model_actual.items(), key=lambda kv: (kv[1]["w"] / max(1, kv[1]["w"] + kv[1]["l"]), kv[1]["w"] + kv[1]["l"]), reverse=True)[:5]
-    current_mode = _structure_edge_execution_direction_mode()
+    selected_mode = _structure_edge_selected_execution_direction_mode()
+    effective_mode = _structure_edge_execution_direction_mode()
+    current_mode = f"AUTO → {effective_mode}" if selected_mode == "AUTO" else selected_mode
     lines = [
         "📊 Octopus S/R + Retest — الملخص",
         "━━━━━━━━━━━━━━",
@@ -18940,16 +19125,20 @@ def build_structure_edge_status() -> str:
     enabled_targets = _octopus_live_enabled_user_ids()
     online_targets = _octopus_online_enabled_user_ids()
     sleeping_targets = max(0, len(enabled_targets) - len(online_targets))
-    current_mode = str(settings.get("execution_direction_mode") or "NORMAL").upper()
-    if current_mode not in {"NORMAL", "REVERSE"}:
-        current_mode = "NORMAL"
+    selected_mode = str(settings.get("execution_direction_mode") or "NORMAL").upper()
+    if selected_mode not in {"NORMAL", "REVERSE", "AUTO"}:
+        selected_mode = "NORMAL"
+    effective_mode = _structure_edge_execution_direction_mode()
+    current_mode = f"AUTO → {effective_mode}" if selected_mode == "AUTO" else selected_mode
+    auto_status_line = f"🤖 {_octopus_auto_mode_status_text()}\n" if selected_mode == "AUTO" else ""
     return (
         "📋 حالة Octopus S/R + Retest — TEST\n"
         "━━━━━━━━━━━━━━\n"
         f"حساب المالك: {'شغال ✅' if settings.get('enabled') else 'متوقف ⏸'}\n"
         f"🌍 تنفيذ Octopus للجميع: {'مفعّل ✅' if settings.get('global_execution_enabled', True) else 'موقوف 🛑'} | enabled targets={len(enabled_targets)} | online={len(online_targets)} | sleeping={sleeping_targets}\n"
         f"🎛 Execution mode: {current_mode}\n"
-        f"🧪 Mode detector: شغال دائمًا بالخلفية للمقارنة البحثية فقط | session committed/settled/skipped: {int(_octopus_mode_detector_state.get('virtual_committed',0) or 0)} / {int(_octopus_mode_detector_state.get('virtual_settled',0) or 0)} / {int(_octopus_mode_detector_state.get('virtual_skipped',0) or 0)}\n"
+        f"🧪 Mode detector: شغال دائمًا بالخلفية | session committed/settled/skipped: {int(_octopus_mode_detector_state.get('virtual_committed',0) or 0)} / {int(_octopus_mode_detector_state.get('virtual_settled',0) or 0)} / {int(_octopus_mode_detector_state.get('virtual_skipped',0) or 0)}\n"
+        f"{auto_status_line}"
         f"Shadow library: {len(OCTOPUS_MODEL_FAMILY)} نموذج / {len(set(OCTOPUS_MODEL_FAMILY.values()))} مدارس | المنافسة: Role Flip + Support + Resistance | التنفيذ الحقيقي: MI_ROLE_FLIP_RETEST فقط\n"
         f"S/R execution warmup: {OCTOPUS_SR_EXEC_MIN_CLOSED_M1} M1 | Shadow full warmup: {OCTOPUS_MIN_CLOSED_M1} M1\n"
         f"Shadow settled: {int(_octopus_state.get('total_observations',0) or 0)} | pending: {pending_obs}\n"
@@ -27212,6 +27401,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             ok = _structure_edge_set_execution_direction_mode("REVERSE")
             await update.message.reply_text(
                 "🔄 نمط تنفيذ Octopus صار REVERSE. التنفيذ الحقيقي يبقى MI_ROLE_FLIP_RETEST فقط، لكن كل صفقة جديدة ستنفذ بعكس اتجاه التحليل الأصلي؛ الـThesis الأصلي يبقى محفوظًا للتدقيق." if ok else "❌ تعذر تغيير نمط التنفيذ.",
+                reply_markup=structure_edge_admin_keyboard,
+            )
+            return
+
+        if text == "🤖 تنفيذ AUTO":
+            ok = _structure_edge_set_execution_direction_mode("AUTO")
+            if ok:
+                _octopus_auto_mode_evaluate(bootstrap=True)
+            await update.message.reply_text(
+                ("🤖 نمط تنفيذ Octopus صار AUTO. " + _octopus_auto_mode_status_text() + "\nNORMAL وREVERSE اليدويان ما زالوا متاحين بأي وقت.") if ok else "❌ تعذر تغيير نمط التنفيذ.",
                 reply_markup=structure_edge_admin_keyboard,
             )
             return
