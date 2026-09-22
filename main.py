@@ -526,9 +526,9 @@ partners_owner_keyboard = ReplyKeyboardMarkup(
 
 partner_plan_keyboard = ReplyKeyboardMarkup(
     [
-        ["🟢 START — 50 — $300"],
-        ["🔵 PRO — 100 — $500"],
-        ["🟣 FULL — 500 — $1000"],
+        ["🟢 START — 25 — $300"],
+        ["🔵 PRO — 50 — $500"],
+        ["🟣 FULL — 200 — $1000"],
         ["❌ إلغاء", "⬅️ رجوع"],
     ],
     resize_keyboard=True,
@@ -547,6 +547,7 @@ partner_owner_actions_keyboard = ReplyKeyboardMarkup(
 partner_panel_keyboard = ReplyKeyboardMarkup(
     [
         ["📡 قناة الثغرة"],
+        ["🔗 رابط دعوة وكالتي"],
         ["📋 مستخدمو وكالتي", "📥 طلبات وكالتي"],
         ["🟢 النشطون في وكالتي", "🔍 تفاصيل مستخدم بالوكالة"],
         ["📊 إحصائيات وكالتي", "📦 خطتي"],
@@ -865,7 +866,6 @@ def build_trading_room_warning_message(lang: str = "ar") -> str:
 welcome_keyboard = ReplyKeyboardMarkup(
     [
         ["🎁 الحصول على تجربة مجانية"],
-        ["🏢 إدخال كود الوكالة"],
         ["✅ نعم، أنا منضم", "❌ لا، لست مشتركًا"],
         ["🎥 مشاهدة فيديو شرح البوت"],
         ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
@@ -904,7 +904,6 @@ main_keyboard_en = ReplyKeyboardMarkup(
 welcome_keyboard_en = ReplyKeyboardMarkup(
     [
         ["🎁 Get Free Trial"],
-        ["🏢 Enter Agency Code"],
         ["✅ Yes, I Joined", "❌ No, I Haven't Joined"],
         ["🎥 Watch Bot Tutorial"],
         ["📞 Contact Support", "🌐 Change Language"],
@@ -1159,7 +1158,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.48.0"
+COPY_SERVER_VERSION = "1.48.2"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -2100,20 +2099,20 @@ def system_ref():
     return db.reference("system")
 
 
-# ===== Partner System v1.48.0 =====
+# ===== Partner System v1.48.2 =====
 PARTNER_PLANS = {
     "start": {
-        "label": "START", "user_limit": 50, "monthly_price": 300,
+        "label": "START", "user_limit": 25, "monthly_price": 300,
         "bot_enabled": True, "extension_enabled": False, "app_enabled": False,
         "custom_branding": False,
     },
     "pro": {
-        "label": "PRO", "user_limit": 100, "monthly_price": 500,
+        "label": "PRO", "user_limit": 50, "monthly_price": 500,
         "bot_enabled": True, "extension_enabled": True, "app_enabled": False,
         "custom_branding": False,
     },
     "full": {
-        "label": "FULL", "user_limit": 500, "monthly_price": 1000,
+        "label": "FULL", "user_limit": 200, "monthly_price": 1000,
         "bot_enabled": True, "extension_enabled": True, "app_enabled": True,
         "custom_branding": True,
     },
@@ -2135,6 +2134,15 @@ def normalize_partner_code(value: str) -> str:
     elif raw.startswith("P") and raw[1:].isdigit():
         raw = f"TT-P{int(raw[1:]):03d}"
     return raw
+
+
+def build_partner_invite_link(bot_username: str, partner_code: str) -> str:
+    """Build the Telegram deep link that automatically assigns a new user to one agency."""
+    username = str(bot_username or "").strip().lstrip("@")
+    code = normalize_partner_code(partner_code)
+    if not username or not code:
+        return ""
+    return f"https://t.me/{username}?start={code}"
 
 
 def get_partner(partner_code: str) -> dict | None:
@@ -2317,6 +2325,7 @@ def get_partner_scoped_rows(partner_code: str, source: str = "users") -> dict:
 
 
 def count_partner_active_users(partner_code: str) -> int:
+    """Count only currently approved, non-expired users; historical rows never consume the plan limit."""
     count = 0
     for uid in get_partner_scoped_rows(partner_code, "approved"):
         try:
@@ -24706,6 +24715,28 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "last_seen": now_iso(),
     })
 
+    # v1.48.1: /start TT-P014 automatically binds the user to exactly one
+    # partner before the normal onboarding flow begins.
+    if not is_admin(user.id) and getattr(context, "args", None):
+        raw_payload = str(context.args[0] or "").strip()
+        invite_code = normalize_partner_code(raw_payload)
+        if re.fullmatch(r"TT-P\d+", invite_code or ""):
+            linked, link_message, linked_partner = bind_user_to_partner(user.id, invite_code)
+            if linked:
+                await update.message.reply_text(
+                    "✅ تم ربط طلبك تلقائيًا بالوكالة\n\n"
+                    f"🏢 {html.escape(str((linked_partner or {}).get('name') or invite_code))}\n"
+                    f"Partner Code: <code>{html.escape(invite_code)}</code>\n\n"
+                    "كمّل خطوات الانضمام بشكل طبيعي، وطلبك رح يوصل لهالوكالة فقط.",
+                    parse_mode="HTML",
+                )
+            else:
+                await update.message.reply_text(
+                    f"❌ تعذر استخدام رابط الوكالة: {html.escape(str(link_message))}\n"
+                    "تواصل مع صاحب الوكالة للحصول على رابط محدث.",
+                    parse_mode="HTML",
+                )
+
     if is_admin(user.id):
         await update.message.reply_text(
             f"👋 أهلًا {user.first_name}\n"
@@ -25165,29 +25196,6 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "⏳ Your activation request is already under review.\n\nYou cannot send a new request before the current one is accepted or rejected.",
                 reply_markup=welcome_keyboard_en
-            )
-            return
-        if text in {"🏢 Enter Agency Code", "Enter Agency Code"}:
-            context.user_data["step"] = "waiting_partner_code_en"
-            await update.message.reply_text(
-                "🏢 Send your agency code.\n\nExample: <code>TT-P014</code>",
-                parse_mode="HTML",
-                reply_markup=ReplyKeyboardMarkup([["🔙 Back"]], resize_keyboard=True),
-            )
-            return
-        if step == "waiting_partner_code_en":
-            ok, message, partner = bind_user_to_partner(user.id, text)
-            if not ok:
-                await update.message.reply_text(
-                    "❌ Invalid or inactive agency code. Please verify it with your agency owner.",
-                    reply_markup=ReplyKeyboardMarkup([["🔙 Back"]], resize_keyboard=True),
-                )
-                return
-            context.user_data["step"] = None
-            await update.message.reply_text(
-                f"✅ Your account is linked to {(partner or {}).get('partner_code')}.\n\n"
-                "Now press: ✅ Yes, I Joined to send your activation request to the agency.",
-                reply_markup=welcome_keyboard_en,
             )
             return
         if text in {"✅ Yes, I Joined", "Yes, I Joined"}:
@@ -26250,32 +26258,6 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("تم الرجوع.", reply_markup=welcome_keyboard)
             return
 
-        if text == "🏢 إدخال كود الوكالة":
-            context.user_data["step"] = "waiting_partner_code"
-            await update.message.reply_text(
-                "🏢 أرسل كود الوكالة الخاص بك.\n\nمثال: <code>TT-P014</code>",
-                parse_mode="HTML",
-                reply_markup=ReplyKeyboardMarkup([["🔙 رجوع"]], resize_keyboard=True),
-            )
-            return
-
-        if step == "waiting_partner_code":
-            ok, message, partner = bind_user_to_partner(user.id, text)
-            if not ok:
-                await update.message.reply_text(
-                    f"❌ {message}\n\nتأكد من الكود أو تواصل مع صاحب الوكالة.",
-                    reply_markup=ReplyKeyboardMarkup([["🔙 رجوع"]], resize_keyboard=True),
-                )
-                return
-            context.user_data["step"] = None
-            await update.message.reply_text(
-                f"✅ {message}\n"
-                f"الوكالة: {html.escape(str((partner or {}).get('name') or 'غير محدد'))}\n\n"
-                "اضغط الآن: ✅ نعم، أنا منضم لإرسال طلب التفعيل للوكالة.",
-                reply_markup=welcome_keyboard,
-            )
-            return
-
         # pending لا يرسل طلب ثاني قبل القرار
         if current_status == "pending":
             await update.message.reply_text(
@@ -27028,6 +27010,30 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("🏢 لوحة الشريك", reply_markup=partner_panel_keyboard)
             return
 
+        if text == "🔗 رابط دعوة وكالتي":
+            try:
+                me = await context.bot.get_me()
+                invite_link = build_partner_invite_link(getattr(me, "username", ""), partner_code)
+            except Exception:
+                invite_link = ""
+            if not invite_link:
+                await update.message.reply_text(
+                    "❌ تعذر تجهيز رابط الدعوة حالياً. حاول مرة ثانية بعد قليل.",
+                    reply_markup=partner_panel_keyboard,
+                )
+                return
+            await update.message.reply_text(
+                "🔗 رابط دعوة وكالتك\n"
+                "━━━━━━━━━━━━━━\n"
+                f"<code>{html.escape(invite_link)}</code>\n\n"
+                "أرسل هذا الرابط للمستخدم. بمجرد أن يفتحه ويضغط Start، "
+                "يرتبط طلبه بوكالتك تلقائياً بدون إدخال الكود يدويًا، "
+                "وأي طلب انضمام يرسله يظهر عندك أنت فقط.",
+                parse_mode="HTML",
+                reply_markup=partner_panel_keyboard,
+            )
+            return
+
         if text == "📡 قناة الثغرة":
             await update.message.reply_text(
                 build_partner_channel_status(partner),
@@ -27248,7 +27254,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
         if step in {"owner_partner_waiting_plan", "owner_partner_change_plan"} and text in {
-            "🟢 START — 50 — $300", "🔵 PRO — 100 — $500", "🟣 FULL — 500 — $1000"
+            "🟢 START — 25 — $300", "🔵 PRO — 50 — $500", "🟣 FULL — 200 — $1000"
         }:
             plan_key = "start" if "START" in text else "pro" if "PRO" in text else "full"
             if step == "owner_partner_waiting_plan":
@@ -27264,8 +27270,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["selected_partner_code"] = created.get("partner_code")
                 context.user_data["step"] = None
                 context.user_data.pop("partner_draft", None)
+                try:
+                    bot_identity = await context.bot.get_me()
+                    created_invite_link = build_partner_invite_link(
+                        getattr(bot_identity, "username", ""), str(created.get("partner_code") or "")
+                    )
+                except Exception:
+                    created_invite_link = ""
                 await update.message.reply_text(
-                    "✅ تم إنشاء الشريك وتفعيل ميزات الخطة تلقائيًا.\n\n" + build_partner_details_message(created),
+                    "✅ تم إنشاء الشريك وتفعيل ميزات الخطة تلقائيًا.\n\n"
+                    + build_partner_details_message(created)
+                    + (f"\n\n🔗 رابط دعوة الوكالة:\n<code>{html.escape(created_invite_link)}</code>" if created_invite_link else ""),
                     parse_mode="HTML",
                     reply_markup=partner_owner_actions_keyboard,
                 )
@@ -27277,7 +27292,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             f"Partner Code: {created.get('partner_code')}\n"
                             f"Plan: {str(created.get('plan') or '').upper()}\n"
                             f"User Limit: {created.get('user_limit')}\n\n"
-                            "اضغط /start لفتح لوحة الشريك."
+                            + (f"رابط دعوة المستخدمين:\n{created_invite_link}\n\n" if created_invite_link else "")
+                            + "اضغط /start لفتح لوحة الشريك."
                         ),
                     )
                 except Exception:
