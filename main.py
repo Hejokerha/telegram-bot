@@ -1158,7 +1158,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.48.2"
+COPY_SERVER_VERSION = "1.48.3"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -24715,27 +24715,13 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "last_seen": now_iso(),
     })
 
-    # v1.48.1: /start TT-P014 automatically binds the user to exactly one
-    # partner before the normal onboarding flow begins.
+    # v1.48.3: /start TT-P014 binds silently. The user sees only the normal
+    # onboarding flow; agency codes and routing internals are never exposed.
     if not is_admin(user.id) and getattr(context, "args", None):
         raw_payload = str(context.args[0] or "").strip()
         invite_code = normalize_partner_code(raw_payload)
         if re.fullmatch(r"TT-P\d+", invite_code or ""):
-            linked, link_message, linked_partner = bind_user_to_partner(user.id, invite_code)
-            if linked:
-                await update.message.reply_text(
-                    "✅ تم ربط طلبك تلقائيًا بالوكالة\n\n"
-                    f"🏢 {html.escape(str((linked_partner or {}).get('name') or invite_code))}\n"
-                    f"Partner Code: <code>{html.escape(invite_code)}</code>\n\n"
-                    "كمّل خطوات الانضمام بشكل طبيعي، وطلبك رح يوصل لهالوكالة فقط.",
-                    parse_mode="HTML",
-                )
-            else:
-                await update.message.reply_text(
-                    f"❌ تعذر استخدام رابط الوكالة: {html.escape(str(link_message))}\n"
-                    "تواصل مع صاحب الوكالة للحصول على رابط محدث.",
-                    parse_mode="HTML",
-                )
+            bind_user_to_partner(user.id, invite_code)
 
     if is_admin(user.id):
         await update.message.reply_text(
