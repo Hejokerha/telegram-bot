@@ -1,3 +1,4 @@
+# v1.47.0: VIP Team Copy — owner manual Quotex orders -> VIP follower extensions; mobile unchanged.
 from urllib.parse import urlparse
 import os
 import html
@@ -506,9 +507,61 @@ admin_main_keyboard = ReplyKeyboardMarkup(
         ["🧾 فحص ليستة OTC", "📋 عرض نتائج الليستة"],
         ["🟢 تشغيل البوت", "🔴 إيقاف البوت"],
         ["📢 رسالة جماعية"],
+        ["🤝 الشركاء"],
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
+)
+
+# v1.48.0: Owner-managed Partner System.  Bulk bot control and broadcasts stay
+# owner-only and are intentionally absent from every partner keyboard.
+partners_owner_keyboard = ReplyKeyboardMarkup(
+    [
+        ["➕ شريك جديد", "📋 قائمة الشركاء"],
+        ["🔍 بحث عن شريك", "📊 إحصائيات الشركاء"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True,
+)
+
+partner_plan_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🟢 START — 50 — $300"],
+        ["🔵 PRO — 100 — $500"],
+        ["🟣 FULL — 500 — $1000"],
+        ["❌ إلغاء", "⬅️ رجوع"],
+    ],
+    resize_keyboard=True,
+)
+
+partner_owner_actions_keyboard = ReplyKeyboardMarkup(
+    [
+        ["📡 تعيين قناة الشريك", "📦 تغيير خطة الشريك"],
+        ["🔢 تعديل حد المستخدمين", "📅 تمديد شهر"],
+        ["🔒 إيقاف الشريك", "✅ تفعيل الشريك"],
+        ["⬅️ الشركاء"],
+    ],
+    resize_keyboard=True,
+)
+
+partner_panel_keyboard = ReplyKeyboardMarkup(
+    [
+        ["📡 قناة الثغرة"],
+        ["📋 مستخدمو وكالتي", "📥 طلبات وكالتي"],
+        ["🟢 النشطون في وكالتي", "🔍 تفاصيل مستخدم بالوكالة"],
+        ["📊 إحصائيات وكالتي", "📦 خطتي"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True,
+)
+
+partner_channel_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🟢 تشغيل قناة الثغرة", "🔴 إيقاف قناة الثغرة"],
+        ["🎯 حد صفقات قناة الثغرة", "📋 حالة قناة الثغرة"],
+        ["⬅️ لوحة الشريك"],
+    ],
+    resize_keyboard=True,
 )
 
 # بقي هذا الكيبورد فقط كمرجع داخلي لقسم فحص الليستات، وليس لقنوات نشر تلقائي.
@@ -624,6 +677,7 @@ three_candle_public_admin_keyboard = ReplyKeyboardMarkup(
 copy_admin_keyboard = ReplyKeyboardMarkup(
     [
         ["🟢 تشغيل Copy", "🔴 إيقاف Copy"],
+        ["🟢 تشغيل نسخ للفريق", "🔴 إيقاف نسخ للفريق"],
         ["🔎 فحص اشتراك Telegram", "📱 تصفير جهاز Telegram"],
         ["📡 حالة Copy", "📌 رسالة تحديث"],
         ["⬅️ رجوع"],
@@ -811,6 +865,7 @@ def build_trading_room_warning_message(lang: str = "ar") -> str:
 welcome_keyboard = ReplyKeyboardMarkup(
     [
         ["🎁 الحصول على تجربة مجانية"],
+        ["🏢 إدخال كود الوكالة"],
         ["✅ نعم، أنا منضم", "❌ لا، لست مشتركًا"],
         ["🎥 مشاهدة فيديو شرح البوت"],
         ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
@@ -849,6 +904,7 @@ main_keyboard_en = ReplyKeyboardMarkup(
 welcome_keyboard_en = ReplyKeyboardMarkup(
     [
         ["🎁 Get Free Trial"],
+        ["🏢 Enter Agency Code"],
         ["✅ Yes, I Joined", "❌ No, I Haven't Joined"],
         ["🎥 Watch Bot Tutorial"],
         ["📞 Contact Support", "🌐 Change Language"],
@@ -1103,7 +1159,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.41.0"
+COPY_SERVER_VERSION = "1.48.0"
 MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
 MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
@@ -1116,7 +1172,7 @@ MOBILE_APP_RELEASE_NOTES = os.getenv(
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
 TRADING_TIME_TELEGRAM_LOOP = None
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.14.1").strip() or "v1.14.1"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.15.0").strip() or "v1.15.0"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -1134,7 +1190,7 @@ COPY_SIGNAL_MAX_ENTRY_DELAY_MIN_SECONDS = 1
 COPY_SIGNAL_MAX_ENTRY_DELAY_MAX_SECONDS = 15
 COPY_SIGNAL_DEDUPE_LIMIT = max(200, int(os.getenv("COPY_SIGNAL_DEDUPE_LIMIT", "2000")))
 COPY_EXECUTABLE_SOURCES = frozenset({
-    "three_candle", "timed_list", "otc_live", "otc_live_auto", "real_market", "trading_room", "otc_edge", "structure_edge",
+    "three_candle", "timed_list", "otc_live", "otc_live_auto", "real_market", "trading_room", "otc_edge", "structure_edge", "vip_copy",
 })
 COPY_ALLOWED_SIGNAL_SOURCES = frozenset({*COPY_EXECUTABLE_SOURCES, "admin_manual"})
 COPY_REQUEST_TIMEOUT_SECONDS = int(os.getenv("COPY_REQUEST_TIMEOUT_SECONDS", "6"))
@@ -1160,6 +1216,8 @@ COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS = {
     # Structure Edge predicts the CURRENT M1 candle immediately after the prior candle closes.
     # A packet that arrives after this tiny window is intentionally discarded.
     "structure_edge": 6,
+    # v1.47 VIP is a live owner click; keep its execution admission window intentionally tiny.
+    "vip_copy": 3,
 }
 # v0.67: عند مراقبة زوج واحد نرسل أمر تجهيز مسبق للإضافة قبل السماح بأي إشارة Edge.
 COPY_OTC_EDGE_PREPARE_ENABLED = os.getenv("COPY_OTC_EDGE_PREPARE_ENABLED", "true").lower() in {"1", "true", "yes", "on"}
@@ -2042,6 +2100,292 @@ def system_ref():
     return db.reference("system")
 
 
+# ===== Partner System v1.48.0 =====
+PARTNER_PLANS = {
+    "start": {
+        "label": "START", "user_limit": 50, "monthly_price": 300,
+        "bot_enabled": True, "extension_enabled": False, "app_enabled": False,
+        "custom_branding": False,
+    },
+    "pro": {
+        "label": "PRO", "user_limit": 100, "monthly_price": 500,
+        "bot_enabled": True, "extension_enabled": True, "app_enabled": False,
+        "custom_branding": False,
+    },
+    "full": {
+        "label": "FULL", "user_limit": 500, "monthly_price": 1000,
+        "bot_enabled": True, "extension_enabled": True, "app_enabled": True,
+        "custom_branding": True,
+    },
+}
+
+
+def partners_ref():
+    return db.reference("partners")
+
+
+def partner_sequence_ref():
+    return system_ref().child("partner_sequence")
+
+
+def normalize_partner_code(value: str) -> str:
+    raw = str(value or "").strip().upper().replace(" ", "")
+    if raw.startswith("TTP") and raw[3:].isdigit():
+        raw = f"TT-P{int(raw[3:]):03d}"
+    elif raw.startswith("P") and raw[1:].isdigit():
+        raw = f"TT-P{int(raw[1:]):03d}"
+    return raw
+
+
+def get_partner(partner_code: str) -> dict | None:
+    code = normalize_partner_code(partner_code)
+    if not code:
+        return None
+    try:
+        row = partners_ref().child(code).get()
+        if not isinstance(row, dict):
+            return None
+        row = dict(row)
+        row["partner_code"] = code
+        return row
+    except Exception as exc:
+        logger.warning("Could not read partner %s: %s", code, exc)
+        return None
+
+
+def get_all_partners() -> dict:
+    try:
+        rows = partners_ref().get() or {}
+        return rows if isinstance(rows, dict) else {}
+    except Exception as exc:
+        logger.warning("Could not list partners: %s", exc)
+        return {}
+
+
+def get_partner_by_telegram_id(telegram_id: int) -> dict | None:
+    tid = int(telegram_id)
+    try:
+        user_row = get_user_record(tid) or {}
+        if str(user_row.get("role") or "").lower() == "partner" and user_row.get("partner_id"):
+            direct = get_partner(str(user_row.get("partner_id")))
+            if direct and int(direct.get("telegram_id")) == tid:
+                return direct
+    except Exception:
+        pass
+    for code, row in get_all_partners().items():
+        if not isinstance(row, dict):
+            continue
+        try:
+            if int(row.get("telegram_id")) == tid:
+                item = dict(row)
+                item["partner_code"] = str(code)
+                return item
+        except Exception:
+            continue
+    return None
+
+
+def partner_is_active_record(record: dict | None) -> bool:
+    if not isinstance(record, dict) or str(record.get("status") or "").lower() != "active":
+        return False
+    expires_at = record.get("expiry_date") or record.get("expires_at")
+    if not expires_at or expires_at == "forever":
+        return True
+    exp = parse_iso(str(expires_at).replace("Z", "+00:00"))
+    if not exp:
+        return False
+    if exp.tzinfo is None:
+        exp = exp.replace(tzinfo=timezone.utc)
+    return now_utc() <= exp
+
+
+def is_partner(user_id: int, require_active: bool = True) -> bool:
+    row = get_partner_by_telegram_id(int(user_id))
+    return bool(row and (partner_is_active_record(row) if require_active else True))
+
+
+def partner_plan_config(plan: str) -> dict:
+    return dict(PARTNER_PLANS.get(str(plan or "").lower()) or PARTNER_PLANS["start"])
+
+
+def create_or_update_partner(telegram_id: int, plan: str, name: str = "", username: str = "") -> dict:
+    tid = int(telegram_id)
+    plan_key = str(plan or "start").lower()
+    if plan_key not in PARTNER_PLANS:
+        raise ValueError("invalid partner plan")
+    existing = get_partner_by_telegram_id(tid)
+    code = str((existing or {}).get("partner_code") or "")
+    if not code:
+        seq = partner_sequence_ref().transaction(lambda current: int(current or 0) + 1)
+        code = f"TT-P{int(seq):03d}"
+    cfg = partner_plan_config(plan_key)
+    now_value = now_iso()
+    expiry = (now_utc() + timedelta(days=30)).isoformat()
+    old = get_partner(code) or {}
+    row = {
+        **old,
+        "partner_code": code,
+        "telegram_id": tid,
+        "name": str(name or old.get("name") or f"Partner {code}"),
+        "username": str(username or old.get("username") or ""),
+        "status": "active",
+        "plan": plan_key,
+        "monthly_price": int(cfg["monthly_price"]),
+        "user_limit": int(cfg["user_limit"]),
+        "start_date": old.get("start_date") or now_value,
+        "expiry_date": expiry,
+        "bot_enabled": bool(cfg["bot_enabled"]),
+        "extension_enabled": bool(cfg["extension_enabled"]),
+        "app_enabled": bool(cfg["app_enabled"]),
+        "custom_branding": bool(cfg["custom_branding"]),
+        "exploit_enabled": bool(old.get("exploit_enabled", False)),
+        "exploit_max_trades": int(old.get("exploit_max_trades", 0) or 0),
+        "created_at": old.get("created_at") or now_value,
+        "updated_at": now_value,
+    }
+    partners_ref().child(code).set(row)
+    save_user_record(tid, {
+        "telegram_id": tid, "name": row["name"], "username": row["username"],
+        "role": "partner", "partner_id": code, "status": "approved",
+        "plan": "partner", "expires_at": expiry, "updated_at": now_value,
+    })
+    set_approved_user(tid, {
+        "telegram_id": tid, "status": "approved", "role": "partner",
+        "partner_id": code, "mode": "partner", "plan": "partner",
+        "approved_at": now_value, "expires_at": expiry,
+    })
+    return row
+
+
+def update_partner_plan(partner_code: str, plan: str) -> dict | None:
+    row = get_partner(partner_code)
+    plan_key = str(plan or "").lower()
+    if not row or plan_key not in PARTNER_PLANS:
+        return None
+    cfg = partner_plan_config(plan_key)
+    updates = {
+        "plan": plan_key,
+        "monthly_price": int(cfg["monthly_price"]),
+        "user_limit": int(cfg["user_limit"]),
+        "bot_enabled": bool(cfg["bot_enabled"]),
+        "extension_enabled": bool(cfg["extension_enabled"]),
+        "app_enabled": bool(cfg["app_enabled"]),
+        "custom_branding": bool(cfg["custom_branding"]),
+        "updated_at": now_iso(),
+    }
+    partners_ref().child(normalize_partner_code(partner_code)).update(updates)
+    clear_partner_user_access_caches(partner_code)
+    return get_partner(partner_code)
+
+
+def partner_user_record(user_id: int) -> tuple[str | None, dict | None]:
+    uid = int(user_id)
+    for row in (get_user_record(uid), get_approved_user(uid)):
+        if isinstance(row, dict) and row.get("partner_id"):
+            code = normalize_partner_code(row.get("partner_id"))
+            return code, get_partner(code)
+    return None, None
+
+
+def bind_user_to_partner(user_id: int, partner_code: str) -> tuple[bool, str, dict | None]:
+    code = normalize_partner_code(partner_code)
+    partner = get_partner(code)
+    if not partner:
+        return False, "كود الوكالة غير موجود.", None
+    if not partner_is_active_record(partner):
+        return False, "هذه الوكالة غير مفعّلة حاليًا.", partner
+    current_code, _current = partner_user_record(user_id)
+    if current_code and current_code != code and is_approved(user_id):
+        return False, "الحساب مفعّل حاليًا ضمن وكالة أخرى. تواصل مع الإدارة لنقله.", partner
+    save_user_record(int(user_id), {"partner_id": code, "owner_type": "partner", "updated_at": now_iso()})
+    return True, f"تم ربط حسابك بالوكالة {code}.", partner
+
+
+def get_partner_scoped_rows(partner_code: str, source: str = "users") -> dict:
+    code = normalize_partner_code(partner_code)
+    if source == "pending":
+        rows = get_all_pending_users()
+    elif source == "approved":
+        rows = get_all_approved_users()
+    else:
+        rows = get_all_users()
+    return {
+        str(uid): dict(row)
+        for uid, row in (rows or {}).items()
+        if isinstance(row, dict) and normalize_partner_code(row.get("partner_id")) == code
+    }
+
+
+def count_partner_active_users(partner_code: str) -> int:
+    count = 0
+    for uid in get_partner_scoped_rows(partner_code, "approved"):
+        try:
+            if is_approved(int(uid)):
+                count += 1
+        except Exception:
+            continue
+    return count
+
+
+def clear_partner_user_access_caches(partner_code: str) -> None:
+    for source in ("users", "approved"):
+        for uid in get_partner_scoped_rows(partner_code, source):
+            try:
+                clear_user_cache(int(uid))
+            except Exception:
+                continue
+
+
+def partner_can_manage_user(partner_user_id: int, target_user_id: int) -> bool:
+    if is_admin(int(partner_user_id)):
+        return True
+    partner = get_partner_by_telegram_id(int(partner_user_id))
+    if not partner or not partner_is_active_record(partner):
+        return False
+    code, _ = partner_user_record(int(target_user_id))
+    return bool(code and code == partner.get("partner_code"))
+
+
+def partner_day_ref(partner_code: str, day_key: str | None = None):
+    return partners_ref().child(normalize_partner_code(partner_code)).child("exploit_daily").child(day_key or get_utc3_day_key())
+
+
+def partner_today_trade_count(partner_code: str) -> int:
+    try:
+        return int((partner_day_ref(partner_code).get() or {}).get("signals", 0) or 0)
+    except Exception:
+        return 0
+
+
+def increment_partner_trade_count(partner_code: str) -> None:
+    ref = partner_day_ref(partner_code)
+    ref.child("signals").transaction(lambda current: int(current or 0) + 1)
+    ref.update({"day": get_utc3_day_key(), "updated_at": now_iso()})
+
+
+def partner_channel_is_eligible(record: dict | None) -> bool:
+    if not partner_is_active_record(record) or not bool((record or {}).get("exploit_enabled")):
+        return False
+    if not (record or {}).get("exploit_channel_id"):
+        return False
+    limit = int((record or {}).get("exploit_max_trades", 0) or 0)
+    if limit > 0 and partner_today_trade_count(str(record.get("partner_code"))) >= limit:
+        return False
+    return True
+
+
+def eligible_partner_channels() -> list[dict]:
+    rows = []
+    for code, raw in get_all_partners().items():
+        if not isinstance(raw, dict):
+            continue
+        row = dict(raw)
+        row["partner_code"] = str(code)
+        if partner_channel_is_eligible(row):
+            rows.append(row)
+    return rows
+
+
 def channel_publish_ref():
     return system_ref().child("channel_publish")
 
@@ -2122,6 +2466,8 @@ def get_copy_settings() -> dict:
     default = {
         # Fail closed: a Firebase outage must not silently enable copying.
         "global_enabled": False,
+        # v1.47 owner-only master gate for manual VIP rebroadcast.
+        "vip_team_copy_enabled": False,
         "latest_version": COPY_EXTENSION_VERSION,
         "update_notice": "",
         "updated_at": None,
@@ -2132,6 +2478,7 @@ def get_copy_settings() -> dict:
             data = {}
         result = {**default, **data}
         result["global_enabled"] = bool(result.get("global_enabled", False))
+        result["vip_team_copy_enabled"] = bool(result.get("vip_team_copy_enabled", False))
         # Never expose a stale version left in Firebase by an older release.
         result["latest_version"] = COPY_EXTENSION_VERSION
         return _cache_set("copy_trading:settings", result)
@@ -2173,6 +2520,25 @@ def set_copy_global_enabled(enabled: bool, admin_id: int | None = None) -> bool:
         return False
 
 
+def is_vip_team_copy_enabled() -> bool:
+    """Owner-side master gate for VIP manual copy. Fail closed by default."""
+    return bool(get_copy_settings().get("vip_team_copy_enabled", False))
+
+
+def set_vip_team_copy_enabled(enabled: bool, admin_id: int | None = None) -> bool:
+    try:
+        copy_settings_ref().update({
+            "vip_team_copy_enabled": bool(enabled),
+            "vip_team_copy_updated_at": now_iso(),
+            "vip_team_copy_updated_by": int(admin_id) if admin_id else None,
+        })
+        clear_copy_settings_cache()
+        return True
+    except Exception as e:
+        logger.warning("Could not update VIP team copy enabled: %s", e)
+        return False
+
+
 def set_copy_update_notice(message: str, admin_id: int | None = None) -> bool:
     try:
         text = str(message or "").strip()[:600]
@@ -2193,6 +2559,7 @@ def copy_public_settings_payload() -> dict:
     settings = get_copy_settings()
     return {
         "global_enabled": bool(settings.get("global_enabled", False)),
+        "vip_team_copy_enabled": bool(settings.get("vip_team_copy_enabled", False)),
         "latest_version": settings.get("latest_version") or COPY_EXTENSION_VERSION,
         "update_notice": settings.get("update_notice") or "",
         "updated_at": settings.get("updated_at"),
@@ -3259,6 +3626,7 @@ def build_copy_status_message() -> str:
     lines = [
         "📡 حالة Copy Trading", "━━━━━━━━━━━━━━",
         f"الحالة العامة: {'🟢 شغال' if enabled else '🔴 موقوف للجميع'}",
+        f"👑 نسخ للفريق: {'🟢 مفعّل' if bool(settings.get('vip_team_copy_enabled', False)) else '🔴 موقوف'}",
         f"آخر نسخة: {html.escape(str(latest_version))}", "",
         f"👤 اشتراكات البوت الفعالة: {active_subscriptions}",
         f"⏳ منتهي/موقوف: {expired_or_inactive}",
@@ -3466,6 +3834,8 @@ def normalize_copy_source(source: str | None) -> str:
     raw = str(source or "bot").strip().lower()
     compact = raw.replace("-", "_").replace(" ", "_")
 
+    if any(x in compact for x in ["vip_copy", "copy_vip", "vipcopy", "vip"]):
+        return "vip_copy"
     if any(x in compact for x in ["three_candle", "3_candle", "threecandle"]) or ("3" in compact and "candle" in compact):
         return "three_candle"
     if any(x in compact for x in ["structure_edge", "structureedge", "structure_liquidity"]):
@@ -4563,6 +4933,12 @@ def is_approved(user_id: int) -> bool:
         if status != "approved":
             return _cache_set(f"approved:{uid}", False)
 
+        partner_code = normalize_partner_code(data.get("partner_id")) if isinstance(data, dict) and data.get("partner_id") else ""
+        if partner_code:
+            partner = get_partner(partner_code)
+            if not partner_is_active_record(partner) or not bool((partner or {}).get("bot_enabled", True)):
+                return _cache_set(f"approved:{uid}", False)
+
         expires_at = data.get("expires_at") if isinstance(data, dict) else None
         if expires_at and expires_at != "forever":
             try:
@@ -4782,6 +5158,17 @@ def copy_bot_subscription_record(telegram_user_id) -> tuple[bool, str, dict]:
             if now_utc() > exp:
                 return False, "bot subscription expired", approved
     record = dict(approved)
+    partner_code = normalize_partner_code(record.get("partner_id")) if record.get("partner_id") else ""
+    if partner_code:
+        partner = get_partner(partner_code)
+        if not partner_is_active_record(partner):
+            return False, "partner subscription inactive", record
+        record.update({
+            "partner_id": partner_code,
+            "partner_plan": str((partner or {}).get("plan") or "start"),
+            "extension_enabled": bool((partner or {}).get("extension_enabled")),
+            "app_enabled": bool((partner or {}).get("app_enabled")),
+        })
     record.update({
         "telegram_user_id": tid,
         "status": "active",
@@ -4812,6 +5199,10 @@ def copy_validate_telegram_subscription_device(telegram_user_id, device_id: str,
         return False, reason, subscription
     tid = normalize_copy_telegram_user_id(telegram_user_id)
     client_kind = _copy_telegram_client_kind(client_kind)
+    if subscription.get("partner_id"):
+        feature_key = "app_enabled" if client_kind == "mobile" else "extension_enabled"
+        if not bool(subscription.get(feature_key)):
+            return False, f"{client_kind} not included in partner plan", subscription
     device_id = str(device_id or "").strip()[:120]
     proof_key = str(device_proof_key or "").strip()[:128]
     if not device_id or not proof_key:
@@ -19680,6 +20071,43 @@ def _three_candle_is_enabled() -> bool:
     return bool(settings.get("enabled") and _three_candle_channel_id())
 
 
+def _three_candle_any_target_enabled() -> bool:
+    """The engine stays alive when either the owner channel or a partner channel needs it."""
+    return bool(_three_candle_is_enabled() or eligible_partner_channels())
+
+
+async def _three_candle_publish_to_partner_channels(context: ContextTypes.DEFAULT_TYPE, trade: dict) -> list[str]:
+    published_codes: list[str] = []
+    message = _three_candle_signal_message(trade)
+    for partner in eligible_partner_channels():
+        code = str(partner.get("partner_code") or "")
+        channel_id = partner.get("exploit_channel_id")
+        if not code or not channel_id:
+            continue
+        try:
+            sent = await safe_send_message(context.bot, chat_id=channel_id, text=message)
+            if sent:
+                increment_partner_trade_count(code)
+                published_codes.append(code)
+        except Exception as exc:
+            logger.warning("Partner channel signal failed | partner=%s | error=%s", code, exc)
+    return published_codes
+
+
+async def _three_candle_publish_result_to_partners(context: ContextTypes.DEFAULT_TYPE, trade: dict, result_text: str) -> None:
+    # Results follow the exact channels that received the signal, even if a partner
+    # pauses new entries before the result arrives.
+    for code in list(trade.get("partner_channel_codes") or []):
+        partner = get_partner(str(code))
+        channel_id = (partner or {}).get("exploit_channel_id")
+        if not channel_id:
+            continue
+        try:
+            await safe_send_message(context.bot, chat_id=channel_id, text=result_text)
+        except Exception as exc:
+            logger.warning("Partner channel result failed | partner=%s | error=%s", code, exc)
+
+
 def _three_candle_direction_icon(direction: str) -> str:
     direction = str(direction or "").upper()
     if direction == "CALL":
@@ -20727,7 +21155,8 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
     try:
         now_ts = time_module.time()
         channel_id = _three_candle_channel_id()
-        if not channel_id:
+        partner_codes = list(trade.get("partner_channel_codes") or [])
+        if not channel_id and not partner_codes:
             return True
 
         symbol = trade.get("symbol")
@@ -20768,8 +21197,11 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
         final_result = result
         martingale = (step == 1)
         result_text = _three_candle_result_message(trade, final_result, martingale=martingale, candle=candle)
-        await safe_send_message(context.bot, chat_id=channel_id, text=result_text)
-        _three_candle_channel_state["results_sent"] = int(_three_candle_channel_state.get("results_sent", 0) or 0) + 1
+        if bool(trade.get("owner_three_candle_published")) and channel_id:
+            owner_result_sent = await safe_send_message(context.bot, chat_id=channel_id, text=result_text)
+            if owner_result_sent:
+                _three_candle_channel_state["results_sent"] = int(_three_candle_channel_state.get("results_sent", 0) or 0) + 1
+        await _three_candle_publish_result_to_partners(context, trade, result_text)
         _three_candle_register_final_result(str(trade.get("pair")), final_result)
 
         if final_result == "win" and martingale:
@@ -20805,7 +21237,7 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
 
 async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        if not _three_candle_is_enabled():
+        if not _three_candle_any_target_enabled():
             return
         _three_candle_channel_state["last_scan_at"] = now_iso()
 
@@ -20814,7 +21246,9 @@ async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
         if has_pending:
             return
 
-        if _three_candle_daily_limit_reached():
+        owner_target_available = bool(_three_candle_is_enabled() and not _three_candle_daily_limit_reached())
+        partner_targets_available = bool(eligible_partner_channels())
+        if not owner_target_available and not partner_targets_available:
             return
 
         candidates = _three_candle_collect_candidates()
@@ -20823,8 +21257,6 @@ async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
 
         item = candidates[0]
         channel_id = _three_candle_channel_id()
-        if not channel_id:
-            return
 
         # نحجز الصفقة قبل الإرسال حتى لا تتكرر بنفس الدورة.
         trade = dict(item)
@@ -20835,13 +21267,21 @@ async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
         _three_candle_channel_state.setdefault("last_signal_buckets", {})[trade.get("symbol")] = int(trade.get("current_bucket"))
         _three_candle_channel_state["pending_trade"] = trade
 
-        sent = await safe_send_message(context.bot, chat_id=channel_id, text=_three_candle_signal_message(trade))
-        if sent:
+        owner_sent = False
+        if owner_target_available and channel_id:
+            owner_sent = bool(await safe_send_message(context.bot, chat_id=channel_id, text=_three_candle_signal_message(trade)))
+        partner_codes = await _three_candle_publish_to_partner_channels(context, trade)
+        trade["owner_three_candle_published"] = owner_sent
+        trade["partner_channel_codes"] = partner_codes
+        _three_candle_channel_state["pending_trade"] = trade
+        if owner_sent or partner_codes:
             _three_candle_channel_state["signals_sent"] = int(_three_candle_channel_state.get("signals_sent", 0) or 0) + 1
-            _three_candle_increment_today_signal_count()
+            if owner_sent:
+                _three_candle_increment_today_signal_count()
             _three_candle_note_published_pair(str(trade.get("pair") or ""))
             # Public channel is a Telegram-only mirror. No second Copy Trading command is generated.
-            await _three_candle_public_publish_signal(context, trade)
+            if owner_sent:
+                await _three_candle_public_publish_signal(context, trade)
             await publish_copy_three_candle_signal(trade)
         else:
             _three_candle_channel_state["pending_trade"] = None
@@ -23251,6 +23691,12 @@ ADMIN_PENDING_STEPS = {
     "three_candle_public_waiting_limit",
     "three_candle_public_waiting_summary_count",
     "three_candle_public_confirm_reset_results",
+    "owner_partner_waiting_id",
+    "owner_partner_waiting_plan",
+    "owner_partner_change_plan",
+    "owner_partner_search",
+    "owner_partner_waiting_channel",
+    "owner_partner_waiting_limit",
 }
 
 
@@ -23264,6 +23710,8 @@ def is_admin_confirm_text(value: str) -> bool:
 
 def admin_pending_keyboard(step: str):
     step = str(step or "")
+    if step.startswith("owner_partner_"):
+        return partners_owner_keyboard
     if step.startswith("copy_"):
         return copy_admin_keyboard
     if step.startswith("three_candle_public_"):
@@ -23310,6 +23758,13 @@ def build_pending_request_keyboard(user_id: int) -> InlineKeyboardMarkup:
             InlineKeyboardButton("❌ رفض", callback_data=f"reject:{user_id}"),
             InlineKeyboardButton("💬 إرسال رسالة", callback_data=f"message_user:{user_id}"),
         ],
+    ])
+
+
+def build_partner_pending_request_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ تفعيل المستخدم", callback_data=f"partner_approve:{int(user_id)}")],
+        [InlineKeyboardButton("❌ رفض الطلب", callback_data=f"partner_reject:{int(user_id)}")],
     ])
 
 
@@ -23418,6 +23873,16 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
                 ["🌐 تغيير اللغة", "🛠 لوحة الأدمن"],
             ],
             resize_keyboard=True
+        )
+    if is_partner(user_id):
+        return ReplyKeyboardMarkup(
+            [
+                ["📊 توليد إشارات"],
+                ["🐙 Octopus", "⚡ OTC Edge"],
+                ["👤 حالة حسابي", "🏢 وكالتي"],
+                ["📞 تواصل مع المسؤول", "🌐 تغيير اللغة"],
+            ],
+            resize_keyboard=True,
         )
     return main_keyboard_en if lang == "en" else main_keyboard
 
@@ -23625,6 +24090,93 @@ async def send_user_details(update: Update, target_id: int, show_admin_actions: 
         await update.message.reply_text(msg, parse_mode="HTML", reply_markup=admin_duration_keyboard)
     else:
         await update.message.reply_text(msg, parse_mode="HTML")
+
+
+def build_partner_details_message(partner: dict) -> str:
+    code = str(partner.get("partner_code") or "غير محدد")
+    active_users = count_partner_active_users(code)
+    limit = int(partner.get("user_limit", 0) or 0)
+    channel_title = partner.get("exploit_channel_title") or "غير محددة"
+    channel_id = partner.get("exploit_channel_id") or "غير محدد"
+    expiry = partner.get("expiry_date") or "غير محدد"
+    expiry_text = "دائم" if expiry == "forever" else format_dt_ar(str(expiry))
+    return (
+        f"🏢 {html.escape(str(partner.get('name') or code))}\n"
+        "━━━━━━━━━━━━━━\n"
+        f"Partner Code: <code>{html.escape(code)}</code>\n"
+        f"Telegram ID: <code>{partner.get('telegram_id')}</code>\n"
+        f"Username: @{html.escape(str(partner.get('username') or 'بدون username').lstrip('@'))}\n"
+        f"الخطة: {str(partner.get('plan') or 'start').upper()} — ${int(partner.get('monthly_price', 0) or 0)}\n"
+        f"الحالة: {'🟢 فعال' if partner_is_active_record(partner) else '🔴 متوقف/منتهي'}\n"
+        f"المستخدمون: {active_users}/{limit if limit > 0 else '∞'}\n"
+        f"انتهاء الاشتراك: {expiry_text}\n"
+        f"قناة الثغرة: {html.escape(str(channel_title))}\n"
+        f"Channel ID: <code>{html.escape(str(channel_id))}</code>\n"
+        f"النشر: {'🟢 يعمل' if partner.get('exploit_enabled') else '🔴 متوقف'}\n"
+        f"صفقات اليوم: {partner_today_trade_count(code)}/{int(partner.get('exploit_max_trades', 0) or 0) or '∞'}"
+    )
+
+
+def build_partner_plan_message(partner: dict) -> str:
+    plan = str(partner.get("plan") or "start").upper()
+    code = str(partner.get("partner_code") or "")
+    active = count_partner_active_users(code)
+    limit = int(partner.get("user_limit", 0) or 0)
+    expiry = partner.get("expiry_date") or "غير محدد"
+    expiry_text = "دائم" if expiry == "forever" else format_dt_ar(str(expiry))
+    features = ["Bot"]
+    if partner.get("extension_enabled"):
+        features.append("Extension")
+    if partner.get("app_enabled"):
+        features.append("Mobile App")
+    if partner.get("custom_branding"):
+        features.append("White Label")
+    return (
+        "📦 خطة الشريك\n"
+        "━━━━━━━━━━━━━━\n"
+        f"الكود: <code>{code}</code>\n"
+        f"الخطة: {plan}\n"
+        f"السعر الشهري: ${int(partner.get('monthly_price', 0) or 0)}\n"
+        f"المستخدمون: {active}/{limit if limit > 0 else '∞'}\n"
+        f"التجديد: {expiry_text}\n"
+        f"الخدمات: {', '.join(features)}"
+    )
+
+
+def build_partner_channel_status(partner: dict) -> str:
+    code = str(partner.get("partner_code") or "")
+    limit = int(partner.get("exploit_max_trades", 0) or 0)
+    count = partner_today_trade_count(code)
+    configured = bool(partner.get("exploit_channel_id"))
+    return (
+        "📡 قناة الثغرة\n"
+        "━━━━━━━━━━━━━━\n"
+        f"الحالة: {'🟢 تعمل' if partner_channel_is_eligible(partner) else '🔴 متوقفة'}\n"
+        f"القناة: {html.escape(str(partner.get('exploit_channel_title') or 'غير محددة'))}\n"
+        f"Channel ID: <code>{html.escape(str(partner.get('exploit_channel_id') or 'غير محدد'))}</code>\n"
+        f"حد الصفقات اليومي: {limit or 'مفتوح'}\n"
+        f"تم نشر اليوم: {count}\n"
+        f"إعداد القناة: {'✅ مكتمل' if configured else '❌ يحتاج ضبط من المالك'}"
+    )
+
+
+def partner_scoped_active_users(partner_code: str, minutes: int = ONLINE_MINUTES_WINDOW) -> list[tuple[str, dict]]:
+    scoped = get_partner_scoped_rows(partner_code, "users")
+    cutoff = now_utc() - timedelta(minutes=minutes)
+    rows = []
+    for uid, row in scoped.items():
+        try:
+            if not is_approved(int(uid)):
+                continue
+            last_seen = parse_iso(str(row.get("last_seen") or ""))
+            if last_seen and last_seen.tzinfo is None:
+                last_seen = last_seen.replace(tzinfo=timezone.utc)
+            if last_seen and last_seen >= cutoff:
+                rows.append((str(uid), row))
+        except Exception:
+            continue
+    rows.sort(key=lambda item: str(item[1].get("last_seen") or ""), reverse=True)
+    return rows
 
 
 async def send_maintenance_message(update: Update, context: ContextTypes.DEFAULT_TYPE | None = None, lang: str | None = None):
@@ -23956,6 +24508,77 @@ async def handle_admin_buttons(update: Update, context: ContextTypes.DEFAULT_TYP
         if handled:
             return
 
+    if data.startswith("partner_approve:") or data.startswith("partner_reject:"):
+        try:
+            action, target_id_text = data.split(":", 1)
+            target_id = int(target_id_text)
+        except Exception:
+            await query.answer("بيانات الطلب غير صالحة", show_alert=True)
+            return
+        if not partner_can_manage_user(user.id, target_id):
+            await query.answer("لا تملك صلاحية إدارة هذا المستخدم", show_alert=True)
+            return
+        partner = get_partner_by_telegram_id(user.id)
+        if not partner and is_admin(user.id):
+            code, partner = partner_user_record(target_id)
+        if not partner or not partner_is_active_record(partner):
+            await query.answer("حساب الشريك غير فعال", show_alert=True)
+            return
+        code = str(partner.get("partner_code") or "")
+        if action == "partner_approve":
+            limit = int(partner.get("user_limit", 0) or 0)
+            active_count = count_partner_active_users(code)
+            if limit > 0 and active_count >= limit and not is_approved(target_id):
+                await query.answer(f"وصلت للحد الأقصى: {active_count}/{limit}", show_alert=True)
+                return
+            # End-user access follows the agency state dynamically.  Keeping the
+            # user row permanent prevents hundreds of per-user writes on renewal.
+            expiry = "forever"
+            pending = (pending_ref().child(str(target_id)).get() or {})
+            approved = {
+                **(pending if isinstance(pending, dict) else {}),
+                "telegram_id": target_id,
+                "status": "approved",
+                "mode": "partner",
+                "plan": str(partner.get("plan") or "start"),
+                "partner_id": code,
+                "owner_type": "partner",
+                "approved_at": now_iso(),
+                "approved_by_partner": int(user.id),
+                "expires_at": expiry,
+            }
+            set_approved_user(target_id, approved)
+            save_user_record(target_id, {
+                "status": "approved", "partner_id": code, "owner_type": "partner",
+                "plan": str(partner.get("plan") or "start"), "expires_at": expiry,
+                "updated_at": now_iso(),
+            })
+            remove_pending_user(target_id)
+            await query.answer("تم التفعيل")
+            await query.edit_message_text(
+                f"✅ تم تفعيل المستخدم ضمن {code}\n🆔 Telegram ID: <code>{target_id}</code>",
+                parse_mode="HTML",
+            )
+            try:
+                await safe_send_message(
+                    context.bot, chat_id=target_id,
+                    text=f"✅ تم تفعيل حسابك ضمن الوكالة {code}.\n\nاضغط /start للدخول إلى البوت.",
+                )
+            except Exception:
+                logger.debug("Partner activation notification failed", exc_info=True)
+            return
+        force_reject_pending_user(target_id)
+        await query.answer("تم رفض الطلب")
+        await query.edit_message_text(
+            f"❌ تم رفض طلب المستخدم\n🆔 Telegram ID: <code>{target_id}</code>",
+            parse_mode="HTML",
+        )
+        try:
+            await safe_send_message(context.bot, chat_id=target_id, text="❌ تم رفض طلب التفعيل. تواصل مع صاحب الوكالة للمزيد من التفاصيل.")
+        except Exception:
+            logger.debug("Partner rejection notification failed", exc_info=True)
+        return
+
     if not is_admin(user.id):
         await query.answer("هذا الزر للأدمن فقط", show_alert=True)
         return
@@ -24088,6 +24711,24 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"👋 أهلًا {user.first_name}\n"
             "مرحبًا بك في وضع الأدمن.",
             reply_markup=build_main_menu_for_user(user.id)
+        )
+        return
+
+    partner = get_partner_by_telegram_id(user.id)
+    if partner:
+        if not get_bot_enabled():
+            await send_maintenance_message(update, context, get_user_language(user.id, context))
+            return
+        if not partner_is_active_record(partner):
+            await update.message.reply_text(
+                "⛔ حساب الشريك متوقف أو منتهي الصلاحية. تواصل مع مالك TRADING TIME.",
+                reply_markup=welcome_keyboard,
+            )
+            return
+        await update.message.reply_text(
+            f"👋 أهلًا {user.first_name}\n"
+            f"حساب الشريك فعال: {partner.get('partner_code')} — {str(partner.get('plan') or '').upper()}",
+            reply_markup=build_main_menu_for_user(user.id),
         )
         return
 
@@ -24526,6 +25167,29 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 reply_markup=welcome_keyboard_en
             )
             return
+        if text in {"🏢 Enter Agency Code", "Enter Agency Code"}:
+            context.user_data["step"] = "waiting_partner_code_en"
+            await update.message.reply_text(
+                "🏢 Send your agency code.\n\nExample: <code>TT-P014</code>",
+                parse_mode="HTML",
+                reply_markup=ReplyKeyboardMarkup([["🔙 Back"]], resize_keyboard=True),
+            )
+            return
+        if step == "waiting_partner_code_en":
+            ok, message, partner = bind_user_to_partner(user.id, text)
+            if not ok:
+                await update.message.reply_text(
+                    "❌ Invalid or inactive agency code. Please verify it with your agency owner.",
+                    reply_markup=ReplyKeyboardMarkup([["🔙 Back"]], resize_keyboard=True),
+                )
+                return
+            context.user_data["step"] = None
+            await update.message.reply_text(
+                f"✅ Your account is linked to {(partner or {}).get('partner_code')}.\n\n"
+                "Now press: ✅ Yes, I Joined to send your activation request to the agency.",
+                reply_markup=welcome_keyboard_en,
+            )
+            return
         if text in {"✅ Yes, I Joined", "Yes, I Joined"}:
             context.user_data["step"] = "waiting_quotex_id_en"
             await update.message.reply_text(
@@ -24552,6 +25216,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     reply_markup=ReplyKeyboardMarkup([["🔙 Back"]], resize_keyboard=True)
                 )
                 return
+            partner_code, partner = partner_user_record(user.id)
             pending_data = {
                 "telegram_id": user.id,
                 "name": user.full_name,
@@ -24561,6 +25226,8 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "created_at": now_iso(),
                 "language": "en",
             }
+            if partner_code:
+                pending_data.update({"partner_id": partner_code, "owner_type": "partner"})
             save_pending_user(user.id, pending_data)
             save_user_record(user.id, {
                 "quotex_id": quotex_id,
@@ -24569,6 +25236,7 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "username": user.username or "",
                 "language": "en",
                 "updated_at": now_iso(),
+                **({"partner_id": partner_code, "owner_type": "partner"} if partner_code else {}),
             })
             await update.message.reply_text(
                 "📩 Your request has been received successfully.\n\n"
@@ -24583,15 +25251,17 @@ async def handle_message_en(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🔗 Username: {username_text}\n"
                 f"🆔 Telegram ID: <code>{user.id}</code>\n"
                 f"💱 Quotex ID: <code>{quotex_id}</code>\n"
+                f"🏢 Agency: <code>{partner_code or 'TRADING TIME'}</code>\n"
                 "🌐 Language: English\n\n"
                 "──────────────"
             )
             try:
+                review_chat_id = int((partner or {}).get("telegram_id")) if partner_code and partner_is_active_record(partner) else ADMIN_TELEGRAM_ID
                 await safe_send_message(context.bot,
-                    chat_id=ADMIN_TELEGRAM_ID,
+                    chat_id=review_chat_id,
                     text=admin_message,
                     parse_mode="HTML",
-                    reply_markup=build_pending_request_keyboard(user.id)
+                    reply_markup=build_partner_pending_request_keyboard(user.id) if partner_code else build_pending_request_keyboard(user.id)
                 )
             except Exception as e:
                 logger.exception("Could not notify admin about pending user: %s", e)
@@ -25353,6 +26023,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 context.user_data["admin_panel_active"] = False
             else:
                 pass  # continue into the complete admin handler below
+        elif is_partner(user.id) and (context.user_data.get("partner_panel_active") or text in {"🏢 وكالتي", "🏢 My Agency"}):
+            pass  # Partner control panel is Arabic-first in phase 1.
         else:
             await handle_message_en(update, context)
             return
@@ -25578,6 +26250,32 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("تم الرجوع.", reply_markup=welcome_keyboard)
             return
 
+        if text == "🏢 إدخال كود الوكالة":
+            context.user_data["step"] = "waiting_partner_code"
+            await update.message.reply_text(
+                "🏢 أرسل كود الوكالة الخاص بك.\n\nمثال: <code>TT-P014</code>",
+                parse_mode="HTML",
+                reply_markup=ReplyKeyboardMarkup([["🔙 رجوع"]], resize_keyboard=True),
+            )
+            return
+
+        if step == "waiting_partner_code":
+            ok, message, partner = bind_user_to_partner(user.id, text)
+            if not ok:
+                await update.message.reply_text(
+                    f"❌ {message}\n\nتأكد من الكود أو تواصل مع صاحب الوكالة.",
+                    reply_markup=ReplyKeyboardMarkup([["🔙 رجوع"]], resize_keyboard=True),
+                )
+                return
+            context.user_data["step"] = None
+            await update.message.reply_text(
+                f"✅ {message}\n"
+                f"الوكالة: {html.escape(str((partner or {}).get('name') or 'غير محدد'))}\n\n"
+                "اضغط الآن: ✅ نعم، أنا منضم لإرسال طلب التفعيل للوكالة.",
+                reply_markup=welcome_keyboard,
+            )
+            return
+
         # pending لا يرسل طلب ثاني قبل القرار
         if current_status == "pending":
             await update.message.reply_text(
@@ -25611,6 +26309,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
                 return
 
+            partner_code, partner = partner_user_record(user.id)
             pending_data = {
                 "telegram_id": user.id,
                 "name": user.full_name,
@@ -25619,6 +26318,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "status": "pending",
                 "created_at": now_iso(),
             }
+            if partner_code:
+                pending_data.update({"partner_id": partner_code, "owner_type": "partner"})
 
             save_pending_user(user.id, pending_data)
             save_user_record(user.id, {
@@ -25627,11 +26328,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "name": user.full_name,
                 "username": user.username or "",
                 "updated_at": now_iso(),
+                **({"partner_id": partner_code, "owner_type": "partner"} if partner_code else {}),
             })
 
             await update.message.reply_text(
                 "📩 تم استلام طلبك بنجاح\n\n"
-                "تم حفظ Quotex ID الخاص بك وإرساله للإدارة للمراجعة.\n"
+                f"تم حفظ Quotex ID الخاص بك وإرساله إلى {'الوكالة' if partner_code else 'الإدارة'} للمراجعة.\n"
                 "بعد التأكد، سيتم تفعيل البوت لك مجانًا.\n\n"
                 "يرجى انتظار موافقة الأدمن ✅",
                 reply_markup=welcome_keyboard
@@ -25644,14 +26346,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"🔗 اليوزر: {username_text}\n"
                 f"🆔 Telegram ID: <code>{user.id}</code>\n"
                 f"💱 Quotex ID: <code>{quotex_id}</code>\n\n"
+                f"🏢 الوكالة: <code>{partner_code or 'TRADING TIME'}</code>\n\n"
                 "──────────────"
             )
             try:
+                review_chat_id = int((partner or {}).get("telegram_id")) if partner_code and partner_is_active_record(partner) else ADMIN_TELEGRAM_ID
                 await safe_send_message(context.bot,
-                    chat_id=ADMIN_TELEGRAM_ID,
+                    chat_id=review_chat_id,
                     text=admin_message,
                     parse_mode="HTML",
-                    reply_markup=build_pending_request_keyboard(user.id)
+                    reply_markup=build_partner_pending_request_keyboard(user.id) if partner_code else build_pending_request_keyboard(user.id)
                 )
             except Exception:
                 logger.debug("Suppressed exception at line 16293", exc_info=True)
@@ -26303,8 +27007,455 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ===== Partner panel v1.48.0 =====
+    partner = get_partner_by_telegram_id(user.id)
+    if partner and partner_is_active_record(partner):
+        partner_code = str(partner.get("partner_code") or "")
+
+        if text in {"🏢 وكالتي", "🏢 My Agency"}:
+            reset_signal_state(context)
+            context.user_data["partner_panel_active"] = True
+            await update.message.reply_text(
+                f"🏢 لوحة الشريك — {partner_code}\n\n"
+                "يمكنك إدارة قناتك ومستخدمي وكالتك فقط.\n"
+                "التشغيل الجماعي للبوت والرسائل الجماعية غير متاحين ضمن خطط الشركاء.",
+                reply_markup=partner_panel_keyboard,
+            )
+            return
+
+        if text == "⬅️ لوحة الشريك":
+            context.user_data["step"] = None
+            await update.message.reply_text("🏢 لوحة الشريك", reply_markup=partner_panel_keyboard)
+            return
+
+        if text == "📡 قناة الثغرة":
+            await update.message.reply_text(
+                build_partner_channel_status(partner),
+                parse_mode="HTML",
+                reply_markup=partner_channel_keyboard,
+            )
+            return
+
+        if text == "🟢 تشغيل قناة الثغرة":
+            if not partner.get("exploit_channel_id"):
+                await update.message.reply_text(
+                    "❌ لا توجد قناة مضبوطة بعد. اطلب من المالك تعيين Channel ID لوكالتك.",
+                    reply_markup=partner_channel_keyboard,
+                )
+                return
+            partners_ref().child(partner_code).update({"exploit_enabled": True, "updated_at": now_iso()})
+            partner = get_partner(partner_code) or partner
+            await update.message.reply_text("✅ تم تشغيل قناة الثغرة لوكالتك.", reply_markup=partner_channel_keyboard)
+            return
+
+        if text == "🔴 إيقاف قناة الثغرة":
+            partners_ref().child(partner_code).update({"exploit_enabled": False, "updated_at": now_iso()})
+            await update.message.reply_text("🔴 تم إيقاف قناة الثغرة لوكالتك.", reply_markup=partner_channel_keyboard)
+            return
+
+        if text == "🎯 حد صفقات قناة الثغرة":
+            context.user_data["step"] = "partner_waiting_channel_limit"
+            await update.message.reply_text(
+                "🎯 أرسل حد الصفقات اليومي كرقم.\n\nمثال: 3 أو 5 أو 10\nأرسل 0 لجعل النشر مفتوحًا.",
+                reply_markup=partner_channel_keyboard,
+            )
+            return
+
+        if step == "partner_waiting_channel_limit":
+            try:
+                limit = int(text.strip())
+                if limit < 0 or limit > 100:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ أرسل رقمًا من 0 إلى 100.", reply_markup=partner_channel_keyboard)
+                return
+            partners_ref().child(partner_code).update({"exploit_max_trades": limit, "updated_at": now_iso()})
+            context.user_data["step"] = None
+            await update.message.reply_text(
+                f"✅ تم ضبط حد الصفقات على: {limit or 'مفتوح'}",
+                reply_markup=partner_channel_keyboard,
+            )
+            return
+
+        if text == "📋 حالة قناة الثغرة":
+            await update.message.reply_text(
+                build_partner_channel_status(get_partner(partner_code) or partner),
+                parse_mode="HTML",
+                reply_markup=partner_channel_keyboard,
+            )
+            return
+
+        if text == "📋 مستخدمو وكالتي":
+            approved_rows = get_partner_scoped_rows(partner_code, "approved")
+            active_rows = []
+            for uid, row in approved_rows.items():
+                try:
+                    if is_approved(int(uid)):
+                        merged = dict(get_user_record(int(uid)) or {})
+                        merged.update(row)
+                        active_rows.append((uid, merged))
+                except Exception:
+                    continue
+            if not active_rows:
+                await update.message.reply_text("📭 لا يوجد مستخدمون مفعّلون في وكالتك.", reply_markup=partner_panel_keyboard)
+                return
+            lines = [f"📋 مستخدمو الوكالة: {len(active_rows)}/{int(partner.get('user_limit', 0) or 0)}", ""]
+            for uid, row in active_rows[:30]:
+                username = f"@{row.get('username')}" if row.get("username") else "بدون username"
+                lines.append(f"👤 {row.get('name') or 'غير معروف'} | {username}\n🆔 <code>{uid}</code>")
+            await update.message.reply_text("\n──────────────\n".join(lines), parse_mode="HTML", reply_markup=partner_panel_keyboard)
+            return
+
+        if text == "📥 طلبات وكالتي":
+            pending_rows = get_partner_scoped_rows(partner_code, "pending")
+            if not pending_rows:
+                await update.message.reply_text("📭 لا توجد طلبات معلقة لوكالتك.", reply_markup=partner_panel_keyboard)
+                return
+            await update.message.reply_text(f"📥 الطلبات المعلقة: {len(pending_rows)}", reply_markup=partner_panel_keyboard)
+            for uid, row in list(pending_rows.items())[:50]:
+                username = f"@{row.get('username')}" if row.get("username") else "بدون username"
+                await update.message.reply_text(
+                    "📥 طلب تفعيل للوكالة\n\n"
+                    f"👤 {html.escape(str(row.get('name') or 'غير معروف'))}\n"
+                    f"🔗 {html.escape(username)}\n"
+                    f"🆔 Telegram ID: <code>{uid}</code>\n"
+                    f"💱 Quotex ID: <code>{html.escape(str(row.get('quotex_id') or 'غير موجود'))}</code>",
+                    parse_mode="HTML",
+                    reply_markup=build_partner_pending_request_keyboard(int(uid)),
+                )
+            return
+
+        if text == "🟢 النشطون في وكالتي":
+            rows = partner_scoped_active_users(partner_code)
+            if not rows:
+                await update.message.reply_text("🕒 لا يوجد مستخدمون نشطون خلال آخر 15 دقيقة.", reply_markup=partner_panel_keyboard)
+                return
+            lines = ["🟢 المستخدمون النشطون:", ""]
+            for uid, row in rows[:30]:
+                lines.append(
+                    f"👤 {html.escape(str(row.get('name') or 'غير معروف'))}\n"
+                    f"🆔 <code>{uid}</code>\n"
+                    f"⏰ {format_dt_ar(str(row.get('last_seen') or ''))}"
+                )
+            await update.message.reply_text("\n──────────────\n".join(lines), parse_mode="HTML", reply_markup=partner_panel_keyboard)
+            return
+
+        if text == "🔍 تفاصيل مستخدم بالوكالة":
+            context.user_data["step"] = "partner_waiting_user_id"
+            await update.message.reply_text("🔍 أرسل Telegram ID لمستخدم تابع لوكالتك.", reply_markup=partner_panel_keyboard)
+            return
+
+        if step == "partner_waiting_user_id":
+            try:
+                target_id = int(text.strip())
+            except ValueError:
+                await update.message.reply_text("❌ أرسل Telegram ID صحيحًا.", reply_markup=partner_panel_keyboard)
+                return
+            if not partner_can_manage_user(user.id, target_id):
+                await update.message.reply_text("⛔ هذا المستخدم غير تابع لوكالتك.", reply_markup=partner_panel_keyboard)
+                return
+            context.user_data["step"] = None
+            await send_user_details(update, target_id, show_admin_actions=False)
+            await update.message.reply_text("🏢 لوحة الشريك", reply_markup=partner_panel_keyboard)
+            return
+
+        if text == "📊 إحصائيات وكالتي":
+            total = len(get_partner_scoped_rows(partner_code, "users"))
+            active = count_partner_active_users(partner_code)
+            pending_count = len(get_partner_scoped_rows(partner_code, "pending"))
+            online = len(partner_scoped_active_users(partner_code))
+            await update.message.reply_text(
+                "📊 إحصائيات الوكالة\n"
+                "━━━━━━━━━━━━━━\n"
+                f"👥 إجمالي المسجلين: {total}\n"
+                f"✅ المفعّلون: {active}/{int(partner.get('user_limit', 0) or 0)}\n"
+                f"📥 الطلبات المعلقة: {pending_count}\n"
+                f"🟢 النشطون الآن: {online}\n"
+                f"📡 صفقات القناة اليوم: {partner_today_trade_count(partner_code)}",
+                reply_markup=partner_panel_keyboard,
+            )
+            return
+
+        if text == "📦 خطتي":
+            await update.message.reply_text(
+                build_partner_plan_message(partner),
+                parse_mode="HTML",
+                reply_markup=partner_panel_keyboard,
+            )
+            return
+
     # ===== Admin panel =====
     if is_admin(user.id):
+        if text == "🤝 الشركاء":
+            reset_signal_state(context)
+            context.user_data["admin_panel_active"] = True
+            await update.message.reply_text("🤝 إدارة الشركاء", reply_markup=partners_owner_keyboard)
+            return
+
+        if text == "⬅️ الشركاء":
+            context.user_data["step"] = None
+            await update.message.reply_text("🤝 إدارة الشركاء", reply_markup=partners_owner_keyboard)
+            return
+
+        if text == "➕ شريك جديد":
+            context.user_data["step"] = "owner_partner_waiting_id"
+            context.user_data.pop("partner_draft", None)
+            await update.message.reply_text(
+                "➕ أرسل Telegram ID للشريك الجديد.",
+                reply_markup=partners_owner_keyboard,
+            )
+            return
+
+        if step == "owner_partner_waiting_id":
+            try:
+                partner_tid = int(text.strip())
+            except ValueError:
+                await update.message.reply_text("❌ أرسل Telegram ID صحيحًا.", reply_markup=partners_owner_keyboard)
+                return
+            existing_partner = get_partner_by_telegram_id(partner_tid)
+            if existing_partner:
+                context.user_data["selected_partner_code"] = existing_partner.get("partner_code")
+                context.user_data["step"] = None
+                await update.message.reply_text(
+                    "ℹ️ هذا الحساب شريك موجود مسبقًا.\n\n" + build_partner_details_message(existing_partner),
+                    parse_mode="HTML",
+                    reply_markup=partner_owner_actions_keyboard,
+                )
+                return
+            user_row = get_user_record(partner_tid) or {}
+            try:
+                if not user_row:
+                    chat = await context.bot.get_chat(partner_tid)
+                    user_row = {
+                        "name": getattr(chat, "full_name", None) or getattr(chat, "first_name", None) or "",
+                        "username": getattr(chat, "username", None) or "",
+                    }
+            except Exception:
+                pass
+            context.user_data["partner_draft"] = {
+                "telegram_id": partner_tid,
+                "name": user_row.get("name") or f"Partner {partner_tid}",
+                "username": user_row.get("username") or "",
+            }
+            context.user_data["step"] = "owner_partner_waiting_plan"
+            await update.message.reply_text(
+                f"👤 Telegram ID: <code>{partner_tid}</code>\n"
+                f"الاسم: {html.escape(str(context.user_data['partner_draft']['name']))}\n\n"
+                "اختر خطة الشريك:",
+                parse_mode="HTML",
+                reply_markup=partner_plan_keyboard,
+            )
+            return
+
+        if step in {"owner_partner_waiting_plan", "owner_partner_change_plan"} and text in {
+            "🟢 START — 50 — $300", "🔵 PRO — 100 — $500", "🟣 FULL — 500 — $1000"
+        }:
+            plan_key = "start" if "START" in text else "pro" if "PRO" in text else "full"
+            if step == "owner_partner_waiting_plan":
+                draft = context.user_data.get("partner_draft") or {}
+                if not draft.get("telegram_id"):
+                    context.user_data["step"] = None
+                    await update.message.reply_text("❌ انتهت جلسة الإضافة. ابدأ من جديد.", reply_markup=partners_owner_keyboard)
+                    return
+                created = create_or_update_partner(
+                    int(draft["telegram_id"]), plan_key,
+                    name=str(draft.get("name") or ""), username=str(draft.get("username") or ""),
+                )
+                context.user_data["selected_partner_code"] = created.get("partner_code")
+                context.user_data["step"] = None
+                context.user_data.pop("partner_draft", None)
+                await update.message.reply_text(
+                    "✅ تم إنشاء الشريك وتفعيل ميزات الخطة تلقائيًا.\n\n" + build_partner_details_message(created),
+                    parse_mode="HTML",
+                    reply_markup=partner_owner_actions_keyboard,
+                )
+                try:
+                    await safe_send_message(
+                        context.bot, chat_id=int(created["telegram_id"]),
+                        text=(
+                            "✅ تم تفعيل حساب الشريك الخاص بك في TRADING TIME.\n\n"
+                            f"Partner Code: {created.get('partner_code')}\n"
+                            f"Plan: {str(created.get('plan') or '').upper()}\n"
+                            f"User Limit: {created.get('user_limit')}\n\n"
+                            "اضغط /start لفتح لوحة الشريك."
+                        ),
+                    )
+                except Exception:
+                    logger.debug("Could not notify new partner", exc_info=True)
+                return
+            selected_code = context.user_data.get("selected_partner_code")
+            updated = update_partner_plan(selected_code, plan_key) if selected_code else None
+            context.user_data["step"] = None
+            if not updated:
+                await update.message.reply_text("❌ تعذر تغيير الخطة.", reply_markup=partners_owner_keyboard)
+                return
+            await update.message.reply_text(
+                "✅ تم تغيير الخطة وتحديث ميزاتها وحدها الافتراضي.\n\n" + build_partner_details_message(updated),
+                parse_mode="HTML", reply_markup=partner_owner_actions_keyboard,
+            )
+            return
+
+        if text == "📋 قائمة الشركاء":
+            rows = get_all_partners()
+            if not rows:
+                await update.message.reply_text("📭 لا يوجد شركاء حتى الآن.", reply_markup=partners_owner_keyboard)
+                return
+            lines = [f"📋 الشركاء: {len(rows)}", ""]
+            for code, row in sorted(rows.items()):
+                if not isinstance(row, dict):
+                    continue
+                active_count = count_partner_active_users(code)
+                lines.append(
+                    f"{'🟢' if partner_is_active_record(row) else '🔴'} <code>{code}</code> — "
+                    f"{html.escape(str(row.get('name') or 'بدون اسم'))}\n"
+                    f"{str(row.get('plan') or 'start').upper()} • {active_count}/{int(row.get('user_limit', 0) or 0)}"
+                )
+            await update.message.reply_text("\n──────────────\n".join(lines[:32]), parse_mode="HTML", reply_markup=partners_owner_keyboard)
+            return
+
+        if text == "🔍 بحث عن شريك":
+            context.user_data["step"] = "owner_partner_search"
+            await update.message.reply_text(
+                "🔍 أرسل Partner Code أو Telegram ID للشريك.",
+                reply_markup=partners_owner_keyboard,
+            )
+            return
+
+        if step == "owner_partner_search":
+            query_value = text.strip()
+            found = get_partner(normalize_partner_code(query_value))
+            if not found and query_value.lstrip("-").isdigit():
+                found = get_partner_by_telegram_id(int(query_value))
+            if not found:
+                await update.message.reply_text("❌ لم يتم العثور على الشريك.", reply_markup=partners_owner_keyboard)
+                return
+            context.user_data["selected_partner_code"] = found.get("partner_code")
+            context.user_data["step"] = None
+            await update.message.reply_text(
+                build_partner_details_message(found),
+                parse_mode="HTML",
+                reply_markup=partner_owner_actions_keyboard,
+            )
+            return
+
+        if text == "📊 إحصائيات الشركاء":
+            rows = get_all_partners()
+            active_partners = 0
+            total_active_users = 0
+            pending_total = 0
+            for code, row in rows.items():
+                if isinstance(row, dict) and partner_is_active_record(row):
+                    active_partners += 1
+                total_active_users += count_partner_active_users(code)
+                pending_total += len(get_partner_scoped_rows(code, "pending"))
+            await update.message.reply_text(
+                "📊 إحصائيات الشركاء\n"
+                "━━━━━━━━━━━━━━\n"
+                f"🤝 إجمالي الشركاء: {len(rows)}\n"
+                f"🟢 الشركاء الفعالون: {active_partners}\n"
+                f"👥 المستخدمون الفعالون: {total_active_users}\n"
+                f"📥 الطلبات المعلقة: {pending_total}",
+                reply_markup=partners_owner_keyboard,
+            )
+            return
+
+        if text in {"📡 تعيين قناة الشريك", "📦 تغيير خطة الشريك", "🔢 تعديل حد المستخدمين", "📅 تمديد شهر", "🔒 إيقاف الشريك", "✅ تفعيل الشريك"}:
+            selected_code = context.user_data.get("selected_partner_code")
+            selected = get_partner(selected_code) if selected_code else None
+            if not selected:
+                await update.message.reply_text("❌ اختر شريكًا أولًا من البحث أو القائمة.", reply_markup=partners_owner_keyboard)
+                return
+            if text == "📡 تعيين قناة الشريك":
+                context.user_data["step"] = "owner_partner_waiting_channel"
+                await update.message.reply_text(
+                    "📡 أرسل Channel ID لقناة الشريك.\n\nمثال: <code>-1001234567890</code>\n"
+                    "يجب أن يكون البوت Admin ويملك صلاحية النشر.",
+                    parse_mode="HTML", reply_markup=partner_owner_actions_keyboard,
+                )
+                return
+            if text == "📦 تغيير خطة الشريك":
+                context.user_data["step"] = "owner_partner_change_plan"
+                await update.message.reply_text("📦 اختر الخطة الجديدة:", reply_markup=partner_plan_keyboard)
+                return
+            if text == "🔢 تعديل حد المستخدمين":
+                context.user_data["step"] = "owner_partner_waiting_limit"
+                await update.message.reply_text("🔢 أرسل الحد الجديد للمستخدمين.", reply_markup=partner_owner_actions_keyboard)
+                return
+            if text == "📅 تمديد شهر":
+                old_exp = parse_iso(str(selected.get("expiry_date") or ""))
+                base = old_exp if old_exp and old_exp > now_utc() else now_utc()
+                if base.tzinfo is None:
+                    base = base.replace(tzinfo=timezone.utc)
+                new_exp = (base + timedelta(days=30)).isoformat()
+                partners_ref().child(selected_code).update({"expiry_date": new_exp, "status": "active", "updated_at": now_iso()})
+                partner_tid = int(selected["telegram_id"])
+                owner_subscription = get_approved_user(partner_tid) or {"telegram_id": partner_tid}
+                owner_subscription.update({
+                    "status": "approved", "role": "partner", "partner_id": selected_code,
+                    "mode": "partner", "plan": "partner", "expires_at": new_exp,
+                    "approved_at": owner_subscription.get("approved_at") or now_iso(),
+                })
+                set_approved_user(partner_tid, owner_subscription)
+                save_user_record(partner_tid, {"status": "approved", "expires_at": new_exp, "updated_at": now_iso()})
+                clear_partner_user_access_caches(selected_code)
+                refreshed = get_partner(selected_code) or selected
+                await update.message.reply_text("✅ تم تمديد اشتراك الشريك 30 يومًا.\n\n" + build_partner_details_message(refreshed), parse_mode="HTML", reply_markup=partner_owner_actions_keyboard)
+                return
+            new_status = "suspended" if text == "🔒 إيقاف الشريك" else "active"
+            partners_ref().child(selected_code).update({"status": new_status, "updated_at": now_iso()})
+            clear_partner_user_access_caches(selected_code)
+            refreshed = get_partner(selected_code) or selected
+            await update.message.reply_text(
+                ("🔒 تم إيقاف الشريك." if new_status == "suspended" else "✅ تم تفعيل الشريك.") + "\n\n" + build_partner_details_message(refreshed),
+                parse_mode="HTML", reply_markup=partner_owner_actions_keyboard,
+            )
+            return
+
+        if step == "owner_partner_waiting_limit":
+            selected_code = context.user_data.get("selected_partner_code")
+            try:
+                new_limit = int(text.strip())
+                if new_limit < 1 or new_limit > 100000:
+                    raise ValueError
+            except ValueError:
+                await update.message.reply_text("❌ أرسل رقمًا صحيحًا من 1 إلى 100000.", reply_markup=partner_owner_actions_keyboard)
+                return
+            partners_ref().child(selected_code).update({"user_limit": new_limit, "updated_at": now_iso()})
+            context.user_data["step"] = None
+            await update.message.reply_text(f"✅ تم تعديل الحد إلى {new_limit} مستخدم.", reply_markup=partner_owner_actions_keyboard)
+            return
+
+        if step == "owner_partner_waiting_channel":
+            selected_code = context.user_data.get("selected_partner_code")
+            try:
+                channel_id = int(text.strip()) if text.strip().lstrip("-").isdigit() else text.strip()
+                channel = await context.bot.get_chat(channel_id)
+                me = await context.bot.get_me()
+                member = await context.bot.get_chat_member(channel_id, me.id)
+                status = str(getattr(member, "status", "") or "").lower()
+                can_post = getattr(member, "can_post_messages", None)
+                if status not in {"administrator", "creator"} or can_post is False:
+                    raise PermissionError("bot cannot post")
+            except Exception:
+                await update.message.reply_text(
+                    "❌ تعذر اعتماد القناة. تأكد من Channel ID وأن البوت Admin ويملك صلاحية نشر الرسائل.",
+                    reply_markup=partner_owner_actions_keyboard,
+                )
+                return
+            partners_ref().child(selected_code).update({
+                "exploit_channel_id": channel_id,
+                "exploit_channel_title": getattr(channel, "title", None) or str(channel_id),
+                "exploit_enabled": True,
+                "updated_at": now_iso(),
+            })
+            context.user_data["step"] = None
+            refreshed = get_partner(selected_code) or {}
+            await update.message.reply_text(
+                "✅ تم ربط قناة الشريك وتشغيلها.\n\n" + build_partner_channel_status(refreshed),
+                parse_mode="HTML", reply_markup=partner_owner_actions_keyboard,
+            )
+            return
+
         if text == "🛠 لوحة الأدمن":
             reset_signal_state(context)
             context.user_data["admin_panel_active"] = True
@@ -26352,6 +27503,26 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("🔴 تم إيقاف Copy Trading للجميع. الإضافات تبقى متصلة لكن لن تستقبل صفقات جديدة.", reply_markup=copy_admin_keyboard)
             else:
                 await update.message.reply_text("❌ تعذر إيقاف Copy Trading. راجع لوج Render.", reply_markup=copy_admin_keyboard)
+            return
+
+        if text == "🟢 تشغيل نسخ للفريق":
+            if set_vip_team_copy_enabled(True, user.id):
+                await update.message.reply_text(
+                    "👑 تم تشغيل نسخ للفريق. عند تفعيله أيضًا من إضافة المالك، أي صفقة Quotex يدوية جديدة ستُرسل فورًا لمستخدمي قسم نسخ VIP.",
+                    reply_markup=copy_admin_keyboard,
+                )
+            else:
+                await update.message.reply_text("❌ تعذر تشغيل نسخ للفريق. راجع لوج Render.", reply_markup=copy_admin_keyboard)
+            return
+
+        if text == "🔴 إيقاف نسخ للفريق":
+            if set_vip_team_copy_enabled(False, user.id):
+                await update.message.reply_text(
+                    "🔴 تم إيقاف نسخ للفريق. صفقاتك اليدوية لن تُبث إلى نسخ VIP.",
+                    reply_markup=copy_admin_keyboard,
+                )
+            else:
+                await update.message.reply_text("❌ تعذر إيقاف نسخ للفريق. راجع لوج Render.", reply_markup=copy_admin_keyboard)
             return
 
         if text == "📡 حالة Copy":
@@ -27988,11 +29159,11 @@ def _copy_is_mobile_executable_signal(signal: dict) -> bool:
     is the one intentional exception: Android also receives its targeted PREPARE
     packet so it can preselect the pair before the M1 boundary.  PREPARE remains
     non-executable in the app; only the later EXECUTE packet can open an order.
-    OTC Edge stays Chrome-extension-only.
+    OTC Edge and v1.47 VIP Copy stay Chrome-extension-only.
     """
     try:
         source = normalize_copy_source((signal or {}).get("source"))
-        if source == "otc_edge":
+        if source in {"otc_edge", "vip_copy"}:
             return False
         kind = _copy_signal_contract_kind(signal)
         if source == "structure_edge":
@@ -28110,7 +29281,21 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         if abs((trade_expiry_dt - expected_expiry_dt).total_seconds()) > 2:
             raise ValueError("duration_seconds does not match trade expiry")
 
-    pair_display, platform_symbol, otc_market = _copy_server_normalize_pair_contract(payload)
+    if source == "vip_copy":
+        # VIP manual copy must preserve the exact Quotex asset string. FX pairs still use
+        # the strict canonical contract; non-FX assets (crypto/stocks/commodities) keep
+        # their platform symbol instead of being rejected by the six-letter FX parser.
+        vip_asset = str(payload.get("execution_asset") or payload.get("platform_symbol") or payload.get("pair") or "").strip()
+        try:
+            pair_display, platform_symbol, otc_market = _copy_server_normalize_pair_contract(payload)
+        except ValueError:
+            if not re.fullmatch(r"[A-Za-z0-9_.:-]{2,48}", vip_asset):
+                raise ValueError("invalid VIP execution asset")
+            otc_market = bool(re.search(r"(?:_otc$|\botc\b)", vip_asset, flags=re.IGNORECASE))
+            platform_symbol = vip_asset
+            pair_display = vip_asset
+    else:
+        pair_display, platform_symbol, otc_market = _copy_server_normalize_pair_contract(payload)
     if source in {"otc_live", "otc_live_auto", "otc_edge", "structure_edge"} and not otc_market:
         raise ValueError(f"{source} requires an OTC market")
     if source == "real_market" and otc_market:
@@ -28135,6 +29320,7 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         "pair": pair_display or platform_symbol,
         "pair_display": pair_display or platform_symbol,
         "platform_symbol": platform_symbol or pair_display,
+        "execution_asset": str(payload.get("execution_asset") or "")[:48] or None,
         "otc": otc_market,
         "direction": direction,
         "timeframe": timeframe,
@@ -28295,7 +29481,7 @@ async def disconnect_all_copy_clients(code: int = 4412, reason: str = "device bi
     return disconnected
 
 
-async def _copy_broadcast_signal(signal: dict) -> dict:
+async def _copy_broadcast_signal(signal: dict, exclude_client_id: str | None = None) -> dict:
     global_enabled = is_copy_global_enabled()
     if not _copy_signal_delivery_allowed(global_enabled, signal, mobile=False):
         return {
@@ -28312,6 +29498,9 @@ async def _copy_broadcast_signal(signal: dict) -> dict:
     dead = []
     inactive = []
     for client_id, client in list(_copy_clients.items()):
+        if exclude_client_id and str(client_id) == str(exclude_client_id):
+            skipped_scope += 1
+            continue
         client_user_id = normalize_copy_telegram_user_id(client.get("telegram_user_id"))
         if str((client or {}).get("auth_mode") or "") == "telegram":
             sub_ok, _sub_reason, _sub_record = copy_bot_subscription_record(client_user_id)
@@ -28346,6 +29535,131 @@ async def _copy_broadcast_signal(signal: dict) -> dict:
         "scope": "user" if target_user_id else "broadcast",
     }
 
+
+
+def _copy_vip_owner_identity_ok(client: dict) -> bool:
+    """Server-authoritative owner check. Never trust a client-provided role flag."""
+    try:
+        client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
+        return bool(client_uid and client_uid == normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID))
+    except Exception:
+        return False
+
+
+async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: dict) -> dict:
+    """Turn one authenticated owner manual Quotex orders/open event into a VIP broadcast.
+
+    The owner's amount/account type is deliberately NOT copied. Followers execute the
+    packet through their own extension settings. Android is excluded in v1.47 phase 1.
+    """
+    if not _copy_vip_owner_identity_ok(client):
+        return {"ok": False, "reason": "owner_only"}
+    if not is_copy_global_enabled():
+        return {"ok": False, "reason": "copy_global_disabled"}
+    if not is_vip_team_copy_enabled():
+        return {"ok": False, "reason": "vip_team_copy_disabled"}
+
+    trade = (event or {}).get("trade")
+    if not isinstance(trade, dict):
+        return {"ok": False, "reason": "invalid_trade"}
+    asset = str(trade.get("asset") or "").strip()
+    if not asset or len(asset) > 48:
+        return {"ok": False, "reason": "invalid_asset"}
+    action = str(trade.get("action") or "").strip().lower()
+    if action not in {"call", "put", "up", "down", "buy", "sell"}:
+        return {"ok": False, "reason": "invalid_direction"}
+    direction = "CALL" if action in {"call", "up", "buy"} else "PUT"
+
+    try:
+        expiry_epoch = float(trade.get("time") or 0)
+        if expiry_epoch > 1e12:
+            expiry_epoch /= 1000.0
+    except (TypeError, ValueError):
+        return {"ok": False, "reason": "invalid_expiry"}
+
+    now_dt = now_utc()
+    now_epoch = now_dt.timestamp()
+    remaining = expiry_epoch - now_epoch
+    if remaining < COPY_SIGNAL_DURATION_MIN_SECONDS - 1:
+        return {"ok": False, "reason": "expiry_too_close"}
+    if remaining > COPY_SIGNAL_DURATION_MAX_SECONDS + 2:
+        return {"ok": False, "reason": "expiry_too_far"}
+    duration_seconds = max(COPY_SIGNAL_DURATION_MIN_SECONDS, min(COPY_SIGNAL_DURATION_MAX_SECONDS, int(round(remaining))))
+    expiry_dt = datetime.fromtimestamp(expiry_epoch, tz=UTC)
+    event_id = re.sub(r"[^A-Za-z0-9_.:-]", "_", str((event or {}).get("event_id") or ""))[:80]
+    if not event_id:
+        event_id = secrets.token_hex(8)
+    signal_id = f"vip:{int(now_epoch * 1000)}:{event_id}"
+    max_delay = int(COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["vip_copy"])
+
+    raw_signal = {
+        "id": signal_id,
+        "source": "vip_copy",
+        "mode": "vip_copy",
+        "pair": asset,
+        "platform_symbol": asset,
+        "execution_asset": asset,
+        "direction": direction,
+        "duration_seconds": duration_seconds,
+        "entry_time": now_dt.isoformat(),
+        "created_at": now_dt.isoformat(),
+        "expires_at": (now_dt + timedelta(seconds=max_delay)).isoformat(),
+        "expiry_time": expiry_dt.isoformat(),
+        "expiry_timestamp": int(expiry_epoch),
+        "trade_expiry_mode": "timer",
+        "entry_mode": "instant",
+        "copy_entry_mode": "instant",
+        "execution_mode": "instant_user_selected_account_amount",
+        "immediate_entry": True,
+        "direct_entry": True,
+        "instant_entry": True,
+        "allow_background_entry": True,
+        "max_entry_delay_seconds": max_delay,
+        "creator_user_id": int(ADMIN_TELEGRAM_ID),
+        "note": "VIP Team Copy — owner manual Quotex order",
+    }
+    try:
+        normalized = _copy_server_sanitize_signal(raw_signal)
+    except Exception as exc:
+        logger.warning("VIP manual signal rejected during normalization: %s", exc)
+        return {"ok": False, "reason": f"invalid_signal:{exc}"}
+
+    store_result = _copy_store_signal_if_allowed(
+        _copy_signal_history,
+        _copy_signal_id_registry,
+        normalized,
+        is_copy_global_enabled(),
+        COPY_SIGNAL_HISTORY_LIMIT,
+        COPY_SIGNAL_DEDUPE_LIMIT,
+        _copy_signal_store_lock,
+    )
+    if not store_result.get("accepted"):
+        return {
+            "ok": False,
+            "reason": str(store_result.get("status") or "not_accepted"),
+            "signal_id": normalized.get("id"),
+        }
+
+    delivery = await _copy_broadcast_signal(normalized, exclude_client_id=client_id)
+    if delivery.get("global_enabled") is False:
+        with _copy_signal_store_lock:
+            _copy_signal_history[:] = [
+                row for row in _copy_signal_history
+                if str((row or {}).get("id") or "") != str(normalized.get("id") or "")
+            ]
+        return {"ok": False, "reason": "copy_global_disabled", "signal_id": normalized.get("id")}
+
+    logger.info(
+        "VIP Team Copy broadcast | asset=%s | direction=%s | expiry=%s | followers=%s | leader_client=%s",
+        normalized.get("platform_symbol"), direction, normalized.get("expiry_timestamp"),
+        delivery.get("delivered", 0), client_id,
+    )
+    return {
+        "ok": True,
+        "signal_id": normalized.get("id"),
+        "delivery": delivery,
+        "mobile_delivery": {"delivered": 0, "reason": "vip_copy_extension_only"},
+    }
 
 def _mobile_notification_visible_to_user(notification: dict, telegram_user_id: int | str | None) -> bool:
     target = normalize_copy_telegram_user_id((notification or {}).get("target_user_id"))
@@ -30009,6 +31323,19 @@ def create_embedded_copy_api():
                             "type": "pong",
                             "server_time": now_iso(),
                             "copy_settings": copy_public_settings_payload(),
+                        })
+                    elif event.get("type") == "vip_manual_trade":
+                        vip_result = await _copy_publish_vip_manual_trade(
+                            event, client_id, _copy_clients.get(client_id) or {}
+                        )
+                        await _copy_send_json_safe(websocket, {
+                            "type": "vip_manual_trade_saved",
+                            "ok": bool(vip_result.get("ok")),
+                            "event_id": event.get("event_id"),
+                            "signal_id": vip_result.get("signal_id"),
+                            "reason": vip_result.get("reason"),
+                            "delivery": vip_result.get("delivery") or {},
+                            "server_time": now_iso(),
                         })
                     elif event.get("type") == "ack":
                         if str(event.get("source_key") or "") == "structure_edge" and str(event.get("status") or "") in {"source_disabled", "risk_stopped", "expired"}:
