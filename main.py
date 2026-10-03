@@ -5618,6 +5618,13 @@ class QuotexOTCLiveFeed:
         self.legacy_supported_once = False
         self.last_legacy_probe_at = None
         self.connection_was_ready = False
+        # Historical M1 snapshots are requested on demand by strategies that need
+        # completed candles (DS).  Quotes remain the sole source of ``last_tick``;
+        # history only backfills ``prices`` / ``candles`` for analysis.
+        self.history_hydration_requested = set()
+        self.history_hydration_requested_at = {}
+        self.history_hydration_received_at = {}
+        self.history_hydration_sent = 0
 
     # ------------------------------------------------------------------
     # Public cache/universe contract
@@ -5646,6 +5653,41 @@ class QuotexOTCLiveFeed:
                 logger.info("Dynamic OTC symbol queued for Quotex subscription: %s", symbol)
         except Exception as e:
             logger.exception("Could not add dynamic OTC symbol: %s", e)
+
+    def request_m1_history(self, symbol: str, min_candles: int = 30) -> bool:
+        """Queue a standard Quotex M1-history snapshot without treating it as live data.
+
+        Returns True when the central cache already contains the requested number
+        of M1 buckets.  The websocket subscription worker performs the actual
+        send, so this method is safe from bot-job threads.
+        """
+        try:
+            symbol = str(symbol or "").strip()
+            if not symbol:
+                return False
+            self.add_symbol(symbol)
+            with self.lock:
+                candle_count = len(self.candles.get(symbol) or {})
+                if candle_count < max(1, int(min_candles or 1)):
+                    self.history_hydration_requested.add(symbol)
+                    return False
+                return True
+        except Exception as e:
+            logger.debug("Could not queue M1 history for %s: %s", symbol, e)
+            return False
+
+    def m1_history_status(self, symbols: list[str], min_candles: int = 30) -> dict:
+        """Small, lock-safe readiness summary for strategy diagnostics."""
+        try:
+            wanted = [str(x or "").strip() for x in symbols if str(x or "").strip()]
+            required = max(1, int(min_candles or 1))
+            with self.lock:
+                ready = sum(1 for symbol in wanted if len(self.candles.get(symbol) or {}) >= required)
+                queued = sum(1 for symbol in wanted if symbol in self.history_hydration_requested)
+                received = sum(1 for symbol in wanted if self.history_hydration_received_at.get(symbol))
+            return {"requested": len(wanted), "ready": ready, "queued": queued, "received": received}
+        except Exception:
+            return {"requested": 0, "ready": 0, "queued": 0, "received": 0}
 
     def get_dynamic_otc_pairs(self, min_payout: int | None = None) -> dict:
         """Return currently available OTC currency pairs from instruments/list."""
@@ -6268,6 +6310,43 @@ class QuotexOTCLiveFeed:
             await asyncio.sleep(max(0.05, float(QUOTEX_BOOTSTRAP_DUPLICATE_DELAY_SECONDS)))
             await self._send_event_async(ws, "instruments/update", payload)
 
+    async def _send_m1_history_hydration(self, ws, symbol: str):
+        """Ask Quotex for the existing M1 chart snapshot of one subscribed asset.
+
+        ``settings/apply`` is the normal chart-selection packet that causes the
+        server to emit ``history/list/v2``.  It does not place, modify or cancel
+        any order; the received history is merged by the central cache parser.
+        """
+        payload = {
+            "chartId": "graph",
+            "settings": {
+                "chartId": "graph",
+                "chartType": 2,
+                "currentExpirationTime": int(time_module.time()),
+                "isFastOption": False,
+                "isFastAmountOption": False,
+                "isIndicatorsMinimized": False,
+                "isIndicatorsShowing": True,
+                "isShortBetElement": False,
+                "chartPeriod": 4,
+                "currentAsset": {"symbol": symbol},
+                "dealValue": 5,
+                "dealPercentValue": 1,
+                "isVisible": True,
+                "timePeriod": 60,
+                "gridOpacity": 8,
+                "isAutoScrolling": 1,
+                "isOneClickTrade": True,
+                "upColor": "#0FAF59",
+                "downColor": "#FF6251",
+            },
+        }
+        await self._send_event_async(ws, "settings/apply", payload)
+        with self.lock:
+            self.history_hydration_requested_at[symbol] = time_module.monotonic()
+            self.history_hydration_sent += 1
+        logger.info("Requested Quotex M1 history hydration | symbol=%s", symbol)
+
     async def _wait_first_quote(self, symbol: str, timeout_seconds: float) -> bool:
         deadline = time_module.monotonic() + max(0.1, float(timeout_seconds))
         while self.connected and time_module.monotonic() < deadline:
@@ -6565,6 +6644,27 @@ class QuotexOTCLiveFeed:
                     with self.lock:
                         self.subscribed_symbols = set(sent)
                     await asyncio.sleep(max(0.05, float(QUOTEX_SUBSCRIBE_DELAY_SECONDS)))
+
+                # DS asks for completed M1 candles immediately after it is
+                # enabled.  Hydrate a few symbols per cycle, then wait for the
+                # normal binary history/list/v2 response.  Retries are bounded;
+                # a silent history response can never block quote subscriptions.
+                now_mono = time_module.monotonic()
+                with self.lock:
+                    pending_history = [
+                        symbol for symbol in self.history_hydration_requested
+                        if symbol in sent
+                        and len(self.candles.get(symbol) or {}) < 30
+                        and now_mono - float(self.history_hydration_requested_at.get(symbol, 0.0) or 0.0) >= 15.0
+                    ]
+                for symbol in pending_history[:3]:
+                    if not self.connected:
+                        return
+                    try:
+                        await self._send_m1_history_hydration(ws, symbol)
+                    except Exception as e:
+                        logger.warning("Could not request Quotex M1 history | symbol=%s | %s", symbol, self._safe_exception_detail(e))
+                    await asyncio.sleep(0.15)
                 await asyncio.sleep(2.0)
 
         except asyncio.CancelledError:
@@ -6735,6 +6835,8 @@ class QuotexOTCLiveFeed:
             ordered = sorted(merged.values(), key=lambda item: item[0])[-3000:]
             self.prices[symbol] = deque(ordered, maxlen=3000)
             self._rebuild_candles_from_prices_locked(symbol)
+            self.history_hydration_received_at[symbol] = now_iso()
+            self.history_hydration_requested.discard(symbol)
             # Do not populate last_tick from history.  last_tick is intentionally
             # reserved for quotes/stream so execution/health checks cannot mistake
             # a freshly received historical snapshot for a live market tick.
@@ -19581,6 +19683,7 @@ DS_EXECUTION_MAX_DELAY_SECONDS = max(1, min(3, int(os.getenv("DS_EXECUTION_MAX_D
 DS_ENTRY_MAX_DISPLACEMENT_ATR = max(0.01, min(0.18, float(os.getenv("DS_ENTRY_MAX_DISPLACEMENT_ATR", "0.055"))))
 DS_MIN_WAVE_ATR = max(0.35, min(3.0, float(os.getenv("DS_MIN_WAVE_ATR", "0.80"))))
 DS_SETTINGS_CACHE_SECONDS = max(15, int(os.getenv("DS_SETTINGS_CACHE_SECONDS", "30")))
+DS_HISTORY_PRIME_SECONDS = max(2.0, min(15.0, float(os.getenv("DS_HISTORY_PRIME_SECONDS", "4"))))
 DS_DEFAULT_ENABLED = os.getenv("DS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 
 _ds_state = {
@@ -19590,6 +19693,8 @@ _ds_state = {
     "pairs_ready": 0, "pairs_scanned": 0, "candidates": 0,
     "prearms": 0, "prearm_cancelled": 0, "signals_sent": 0,
     "last_candidate": None, "last_delivery": None,
+    "history_requested": 0, "history_ready": 0, "history_queued": 0,
+    "history_received": 0, "history_last_prime_at": None,
 }
 
 def _ds_settings_ref():
@@ -19618,11 +19723,46 @@ def _ds_set_enabled(enabled: bool) -> bool:
         _ds_state["last_settings_at"] = time_module.time()
         if not enabled:
             _ds_state["prearmed"] = None
+        else:
+            # A manual re-enable should immediately restart the history prime.
+            _ds_state["history_last_prime_monotonic"] = 0.0
         return True
     except Exception as exc:
         _ds_state["last_error"] = str(exc)
         logger.exception("DS settings update failed: %s", exc)
         return False
+
+def _ds_prime_m1_history() -> dict:
+    """Start DS history hydration immediately, not only in the PRE-ARM window."""
+    now_ts = time_module.time()
+    previous = float(_ds_state.get("history_last_prime_monotonic", 0.0) or 0.0)
+    if now_ts - previous < DS_HISTORY_PRIME_SECONDS:
+        return {
+            "requested": int(_ds_state.get("history_requested", 0) or 0),
+            "ready": int(_ds_state.get("history_ready", 0) or 0),
+            "queued": int(_ds_state.get("history_queued", 0) or 0),
+            "received": int(_ds_state.get("history_received", 0) or 0),
+        }
+
+    _ds_state["history_last_prime_monotonic"] = now_ts
+    try:
+        pair_map = get_otc_analysis_pair_map()
+        symbols = list(dict.fromkeys(str(symbol) for symbol in pair_map.values() if str(symbol)))
+        for symbol in symbols:
+            quotex_otc_feed.request_m1_history(symbol, DS_MIN_CLOSED_M1)
+        status = quotex_otc_feed.m1_history_status(symbols, DS_MIN_CLOSED_M1)
+        _ds_state.update({
+            "history_requested": int(status.get("requested", 0) or 0),
+            "history_ready": int(status.get("ready", 0) or 0),
+            "history_queued": int(status.get("queued", 0) or 0),
+            "history_received": int(status.get("received", 0) or 0),
+            "history_last_prime_at": now_iso(),
+        })
+        return status
+    except Exception as exc:
+        _ds_state["last_error"] = str(exc)
+        logger.exception("DS M1 history prime failed: %s", exc)
+        return {"requested": 0, "ready": 0, "queued": 0, "received": 0}
 
 def _ds_sar_sides(rows: list[dict]) -> list[str]:
     """Closed-candle Parabolic SAR state; no current-candle repainting."""
@@ -19773,7 +19913,8 @@ def build_ds_status() -> str:
         "📐 DS — SAR Wave Midpoint\n━━━━━━━━━━━━━━\n"
         f"الحالة: {'شغال ✅' if s.get('enabled') else 'متوقف ⏸'}\n"
         "الدخول: كسر + إغلاق شمعة M1 خلف 50% من موجة SAR المجمدة فقط.\n"
-        f"Payout الأدنى: {DS_MIN_PAYOUT}% | Warmup: {DS_MIN_CLOSED_M1} شمعة\n"
+        f"Payout الأدنى: {DS_MIN_PAYOUT}% | تاريخ M1 المطلوب: {DS_MIN_CLOSED_M1} شمعة\n"
+        f"تاريخ M1: {_ds_state.get('history_ready',0)}/{_ds_state.get('history_requested',0)} جاهز | بانتظار الرد: {_ds_state.get('history_queued',0)}\n"
         f"نافذة PRE-ARM: {DS_PREARM_MIN_SECOND:.1f}–{DS_PREARM_LAST_SECOND:.1f}ث | تنفيذ حتى {DS_EXECUTION_MAX_DELAY_SECONDS}ث من افتتاح الشمعة\n"
         f"آخر فحص: {_ds_state.get('last_scan_at') or '-'} | جاهز/مفحوص: {_ds_state.get('pairs_ready',0)}/{_ds_state.get('pairs_scanned',0)}\n"
         f"PRE-ARM: {p.get('pair') or '-'} {p.get('direction') or ''} | إشارات: {_ds_state.get('signals_sent',0)}\n"
@@ -19784,6 +19925,16 @@ async def ds_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         if not _ds_get_settings(False).get("enabled"):
             return
+        # Do this before the extension gate.  A Render restart can therefore
+        # hydrate the old platform candles while the owner opens the extension,
+        # instead of wasting the first 30 live minutes.
+        history_status = _ds_prime_m1_history()
+        if (
+            not _ds_state.get("prearmed")
+            and int(history_status.get("requested", 0) or 0)
+            and int(history_status.get("ready", 0) or 0) < int(history_status.get("requested", 0) or 0)
+        ):
+            _ds_state["last_reject_reason"] = "Loading DS M1 history from Quotex"
         if not _copy_online_clients_for_user(int(ADMIN_TELEGRAM_ID)):
             _ds_state["last_reject_reason"] = "Waiting for owner extension"
             return
@@ -19830,7 +19981,10 @@ async def ds_job(context: ContextTypes.DEFAULT_TYPE):
         _ds_state["prearm_bucket"] = current_bucket; _ds_state["last_scan_at"] = now_iso()
         candidates = _ds_prearm_candidates()
         if not candidates:
-            _ds_state["last_reject_reason"] = "No provisional DS close-break candidate"
+            if int(history_status.get("requested", 0) or 0) and int(history_status.get("ready", 0) or 0) < int(history_status.get("requested", 0) or 0):
+                _ds_state["last_reject_reason"] = "Loading DS M1 history from Quotex"
+            else:
+                _ds_state["last_reject_reason"] = "No provisional DS close-break candidate"
             return
         candidate = dict(candidates[0]); target_bucket = current_bucket + 60
         result = await _ds_publish_prepare(candidate, target_bucket)
