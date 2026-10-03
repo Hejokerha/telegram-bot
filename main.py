@@ -5994,6 +5994,7 @@ class QuotexOTCLiveFeed:
 
         keepalive_task = None
         follow_task = None
+        history_task = None
         try:
             async with CurlAsyncSession() as session:
                 async with session.ws_connect(
@@ -6091,6 +6092,8 @@ class QuotexOTCLiveFeed:
                         return False
 
                     follow_task = asyncio.create_task(self._legacy_follow_worker(ws, seed))
+                    # Keep DS history independent from the legacy follow queue.
+                    history_task = asyncio.create_task(self._history_hydration_worker(ws))
 
                     while True:
                         try:
@@ -6104,7 +6107,7 @@ class QuotexOTCLiveFeed:
                             continue
 
         finally:
-            for task in (follow_task, keepalive_task):
+            for task in (history_task, follow_task, keepalive_task):
                 if task is not None:
                     task.cancel()
                     try:
@@ -6222,6 +6225,10 @@ class QuotexOTCLiveFeed:
                 # worker to add the rest of the OTC universe. The main receive loop
                 # remains the sole websocket reader.
                 subscription_task = asyncio.create_task(self._subscription_worker(ws, seed))
+                # v1.49.2: history must not wait for the long per-symbol quote
+                # subscription queue.  DS can request its old M1 candles now,
+                # while that queue continues in parallel.
+                history_task = asyncio.create_task(self._history_hydration_worker(ws))
                 authorized_once = True
 
                 try:
@@ -6240,11 +6247,13 @@ class QuotexOTCLiveFeed:
                                 raise RuntimeError("quotex_stream_stale")
                             continue
                 finally:
-                    subscription_task.cancel()
-                    try:
-                        await subscription_task
-                    except BaseException:
-                        pass
+                    for task in (history_task, subscription_task):
+                        task.cancel()
+                    for task in (history_task, subscription_task):
+                        try:
+                            await task
+                        except BaseException:
+                            pass
 
                 return authorized_once
 
@@ -6346,6 +6355,43 @@ class QuotexOTCLiveFeed:
             self.history_hydration_requested_at[symbol] = time_module.monotonic()
             self.history_hydration_sent += 1
         logger.info("Requested Quotex M1 history hydration | symbol=%s", symbol)
+
+    async def _history_hydration_worker(self, ws):
+        """Dispatch requested DS snapshots without waiting for all subscriptions.
+
+        The regular subscription worker can spend time proving a first live quote
+        for every symbol.  Historical DS analysis must not sit behind that queue;
+        this sender uses the shared websocket send lock and never reads frames.
+        """
+        try:
+            while self.connected:
+                now_mono = time_module.monotonic()
+                with self.lock:
+                    pending = [
+                        symbol for symbol in self.history_hydration_requested
+                        if len(self.candles.get(symbol) or {}) < 30
+                        and now_mono - float(self.history_hydration_requested_at.get(symbol, 0.0) or 0.0) >= 15.0
+                    ]
+                if not pending:
+                    await asyncio.sleep(0.35)
+                    continue
+                for symbol in pending[:2]:
+                    if not self.connected:
+                        return
+                    try:
+                        # Request the normal live stream first; ``settings/apply``
+                        # then asks the same connection for its existing M1 chart.
+                        await self._send_price_subscription(ws, symbol, duplicate=False)
+                        await asyncio.sleep(0.08)
+                        await self._send_m1_history_hydration(ws, symbol)
+                    except Exception as e:
+                        logger.warning("Could not dispatch DS M1 history | symbol=%s | %s", symbol, self._safe_exception_detail(e))
+                    await asyncio.sleep(0.20)
+                await asyncio.sleep(0.25)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning("Quotex DS history worker ended: %s", self._safe_exception_detail(e))
 
     async def _wait_first_quote(self, symbol: str, timeout_seconds: float) -> bool:
         deadline = time_module.monotonic() + max(0.1, float(timeout_seconds))
@@ -6645,26 +6691,6 @@ class QuotexOTCLiveFeed:
                         self.subscribed_symbols = set(sent)
                     await asyncio.sleep(max(0.05, float(QUOTEX_SUBSCRIBE_DELAY_SECONDS)))
 
-                # DS asks for completed M1 candles immediately after it is
-                # enabled.  Hydrate a few symbols per cycle, then wait for the
-                # normal binary history/list/v2 response.  Retries are bounded;
-                # a silent history response can never block quote subscriptions.
-                now_mono = time_module.monotonic()
-                with self.lock:
-                    pending_history = [
-                        symbol for symbol in self.history_hydration_requested
-                        if symbol in sent
-                        and len(self.candles.get(symbol) or {}) < 30
-                        and now_mono - float(self.history_hydration_requested_at.get(symbol, 0.0) or 0.0) >= 15.0
-                    ]
-                for symbol in pending_history[:3]:
-                    if not self.connected:
-                        return
-                    try:
-                        await self._send_m1_history_hydration(ws, symbol)
-                    except Exception as e:
-                        logger.warning("Could not request Quotex M1 history | symbol=%s | %s", symbol, self._safe_exception_detail(e))
-                    await asyncio.sleep(0.15)
                 await asyncio.sleep(2.0)
 
         except asyncio.CancelledError:
