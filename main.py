@@ -610,6 +610,17 @@ structure_edge_admin_keyboard = ReplyKeyboardMarkup(
     resize_keyboard=True
 )
 
+# DS = Parabolic-SAR wave midpoint close-break continuation.  This menu is
+# reached only by the owner and never appears in the public bot UI.
+ds_admin_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🟢 تشغيل DS", "🔴 إيقاف DS"],
+        ["📋 حالة DS", "🧹 تصفير DS"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True,
+)
+
 # v1.37: public/team Octopus UI is intentionally minimal.
 # NORMAL/REVERSE selection and research diagnostics remain owner-only.
 octopus_user_keyboard = ReplyKeyboardMarkup(
@@ -893,8 +904,8 @@ language_keyboard = ReplyKeyboardMarkup(
 
 main_keyboard_en = ReplyKeyboardMarkup(
     [
-        ["📊 Generate Signals"],
-        ["🐙 Octopus", "⚡ OTC Edge"],
+                ["📊 Generate Signals"],
+                ["🐙 Octopus", "⚡ OTC Edge", "📐 DS"],
         ["👤 My Account", "🎥 Watch Bot Tutorial"],
         ["📞 Contact Support", "🌐 Change Language"],
     ],
@@ -1189,7 +1200,7 @@ COPY_SIGNAL_MAX_ENTRY_DELAY_MIN_SECONDS = 1
 COPY_SIGNAL_MAX_ENTRY_DELAY_MAX_SECONDS = 15
 COPY_SIGNAL_DEDUPE_LIMIT = max(200, int(os.getenv("COPY_SIGNAL_DEDUPE_LIMIT", "2000")))
 COPY_EXECUTABLE_SOURCES = frozenset({
-    "three_candle", "timed_list", "otc_live", "otc_live_auto", "real_market", "trading_room", "otc_edge", "structure_edge", "vip_copy",
+    "three_candle", "timed_list", "otc_live", "otc_live_auto", "real_market", "trading_room", "otc_edge", "structure_edge", "ds", "vip_copy",
 })
 COPY_ALLOWED_SIGNAL_SOURCES = frozenset({*COPY_EXECUTABLE_SOURCES, "admin_manual"})
 COPY_REQUEST_TIMEOUT_SECONDS = int(os.getenv("COPY_REQUEST_TIMEOUT_SECONDS", "6"))
@@ -1200,6 +1211,9 @@ COPY_SEND_THREE_CANDLE = os.getenv("COPY_SEND_THREE_CANDLE", "true").lower() in 
 COPY_SEND_TRADING_ROOM = os.getenv("COPY_SEND_TRADING_ROOM", "true").lower() in {"1", "true", "yes", "on"}
 COPY_SEND_OTC_EDGE = os.getenv("COPY_SEND_OTC_EDGE", "true").lower() in {"1", "true", "yes", "on"}
 COPY_SEND_STRUCTURE_EDGE = os.getenv("COPY_SEND_STRUCTURE_EDGE", "true").lower() in {"1", "true", "yes", "on"}
+# DS is a private owner strategy. It is deliberately separate from Octopus and
+# defaults to disabled until the owner enables it in the Telegram bot.
+COPY_SEND_DS = os.getenv("COPY_SEND_DS", "true").lower() in {"1", "true", "yes", "on"}
 COPY_OTC_EDGE_SIGNAL_VALID_SECONDS = int(os.getenv("COPY_OTC_EDGE_SIGNAL_VALID_SECONDS", str(max(10, int(os.getenv("OTC_EDGE_WATCHER_SIGNAL_VALID_SECONDS", "5")) * 2))))
 # A trade received late is a different trade. Keep every producer inside the
 # same bounded admission window used by the mobile executor; never preserve the
@@ -1215,6 +1229,7 @@ COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS = {
     # Structure Edge predicts the CURRENT M1 candle immediately after the prior candle closes.
     # A packet that arrives after this tiny window is intentionally discarded.
     "structure_edge": 6,
+    "ds": 2,
     # v1.47 VIP is a live owner click; keep its execution admission window intentionally tiny.
     "vip_copy": 3,
 }
@@ -3847,6 +3862,8 @@ def normalize_copy_source(source: str | None) -> str:
         return "vip_copy"
     if any(x in compact for x in ["three_candle", "3_candle", "threecandle"]) or ("3" in compact and "candle" in compact):
         return "three_candle"
+    if compact in {"ds", "ds_wave", "ds_midpoint", "sar_wave_midpoint"} or "ds_wave" in compact:
+        return "ds"
     if any(x in compact for x in ["structure_edge", "structureedge", "structure_liquidity"]):
         return "structure_edge"
     if any(x in compact for x in ["trading_room", "session_room", "room_session"]):
@@ -19549,6 +19566,286 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
         logger.exception("Octopus S/R + Retest PRE-ARM direct execution job failed: %s", exc)
 
 
+# ===== DS — SAR Wave Midpoint Close-Break (owner only) =====
+# A SAR wave is frozen when the SAR side flips.  The completed wave's wick-low
+# and wick-high define its midpoint.  DS NEVER trades a touch/wick: it requires
+# the closing price of the opposite move to be beyond that frozen midpoint.
+DS_SCAN_SECONDS = max(0.25, min(1.0, float(os.getenv("DS_SCAN_SECONDS", "0.5"))))
+DS_MIN_PAYOUT = max(0, min(100, int(os.getenv("DS_MIN_PAYOUT", "85"))))
+DS_MIN_CLOSED_M1 = max(24, int(os.getenv("DS_MIN_CLOSED_M1", "30")))
+DS_LOOKBACK = max(30, min(120, int(os.getenv("DS_LOOKBACK", "80"))))
+DS_PREARM_MIN_SECOND = max(45.0, min(58.0, float(os.getenv("DS_PREARM_MIN_SECOND", "54.5"))))
+DS_PREARM_LAST_SECOND = max(DS_PREARM_MIN_SECOND, min(59.65, float(os.getenv("DS_PREARM_LAST_SECOND", "59.15"))))
+DS_FINAL_MAX_SECOND = max(0.4, min(2.0, float(os.getenv("DS_FINAL_MAX_SECOND", "1.35"))))
+DS_EXECUTION_MAX_DELAY_SECONDS = max(1, min(3, int(os.getenv("DS_EXECUTION_MAX_DELAY_SECONDS", "2"))))
+DS_ENTRY_MAX_DISPLACEMENT_ATR = max(0.01, min(0.18, float(os.getenv("DS_ENTRY_MAX_DISPLACEMENT_ATR", "0.055"))))
+DS_MIN_WAVE_ATR = max(0.35, min(3.0, float(os.getenv("DS_MIN_WAVE_ATR", "0.80"))))
+DS_SETTINGS_CACHE_SECONDS = max(15, int(os.getenv("DS_SETTINGS_CACHE_SECONDS", "30")))
+DS_DEFAULT_ENABLED = os.getenv("DS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
+
+_ds_state = {
+    "enabled": bool(DS_DEFAULT_ENABLED), "loaded": False, "last_settings_at": 0.0,
+    "prearmed": None, "prearm_bucket": 0, "last_scan_at": None,
+    "last_signal_at": None, "last_reject_reason": None, "last_error": None,
+    "pairs_ready": 0, "pairs_scanned": 0, "candidates": 0,
+    "prearms": 0, "prearm_cancelled": 0, "signals_sent": 0,
+    "last_candidate": None, "last_delivery": None,
+}
+
+def _ds_settings_ref():
+    return system_ref().child("ds_wave_midpoint_v1").child("settings")
+
+def _ds_get_settings(force_refresh: bool = False) -> dict:
+    now_ts = time_module.time()
+    if force_refresh or not _ds_state.get("loaded") or now_ts - float(_ds_state.get("last_settings_at", 0) or 0) >= DS_SETTINGS_CACHE_SECONDS:
+        try:
+            row = _ds_settings_ref().get() or {}
+            _ds_state["enabled"] = bool(row.get("enabled", DS_DEFAULT_ENABLED)) if isinstance(row, dict) else bool(DS_DEFAULT_ENABLED)
+            _ds_state["loaded"] = True
+            _ds_state["last_settings_at"] = now_ts
+        except Exception as exc:
+            _ds_state["last_error"] = str(exc)
+            if not _ds_state.get("loaded"):
+                _ds_state["loaded"] = True
+                _ds_state["enabled"] = bool(DS_DEFAULT_ENABLED)
+    return {"enabled": bool(_ds_state.get("enabled"))}
+
+def _ds_set_enabled(enabled: bool) -> bool:
+    try:
+        _ds_settings_ref().update({"enabled": bool(enabled), "updated_at": now_iso(), "updated_by": int(ADMIN_TELEGRAM_ID)})
+        _ds_state["enabled"] = bool(enabled)
+        _ds_state["loaded"] = True
+        _ds_state["last_settings_at"] = time_module.time()
+        if not enabled:
+            _ds_state["prearmed"] = None
+        return True
+    except Exception as exc:
+        _ds_state["last_error"] = str(exc)
+        logger.exception("DS settings update failed: %s", exc)
+        return False
+
+def _ds_sar_sides(rows: list[dict]) -> list[str]:
+    """Closed-candle Parabolic SAR state; no current-candle repainting."""
+    if len(rows) < 3:
+        return []
+    high = [float(x.get("high")) for x in rows]
+    low = [float(x.get("low")) for x in rows]
+    close = [float(x.get("close")) for x in rows]
+    up = close[1] >= close[0]
+    sar = low[0] if up else high[0]
+    ep = max(high[0], high[1]) if up else min(low[0], low[1])
+    af = 0.02
+    sides = ["UP" if up else "DOWN", "UP" if up else "DOWN"]
+    for i in range(2, len(rows)):
+        next_sar = sar + af * (ep - sar)
+        if up:
+            next_sar = min(next_sar, low[i - 1], low[i - 2])
+            if low[i] < next_sar:
+                up = False; sar = ep; ep = low[i]; af = 0.02
+            else:
+                sar = next_sar
+                if high[i] > ep:
+                    ep = high[i]; af = min(0.20, af + 0.02)
+        else:
+            next_sar = max(next_sar, high[i - 1], high[i - 2])
+            if high[i] > next_sar:
+                up = True; sar = ep; ep = high[i]; af = 0.02
+            else:
+                sar = next_sar
+                if low[i] < ep:
+                    ep = low[i]; af = min(0.20, af + 0.02)
+        sides.append("UP" if up else "DOWN")
+    return sides[:len(rows)]
+
+def _ds_wave_from_closed(pair: str, symbol: str, closed: list[dict], payout: int, trigger_price: float | None = None) -> dict | None:
+    rows = list(closed[-DS_LOOKBACK:])
+    if len(rows) < DS_MIN_CLOSED_M1:
+        return None
+    sides = _ds_sar_sides(rows)
+    if len(sides) != len(rows):
+        return None
+    current_start = len(sides) - 1
+    while current_start > 0 and sides[current_start - 1] == sides[-1]:
+        current_start -= 1
+    if current_start < 2:
+        return None
+    previous_end = current_start - 1
+    previous_start = previous_end
+    while previous_start > 0 and sides[previous_start - 1] == sides[previous_end]:
+        previous_start -= 1
+    wave = rows[previous_start:previous_end + 1]
+    if len(wave) < 3:
+        return None
+    wave_low = min(float(x.get("low")) for x in wave)
+    wave_high = max(float(x.get("high")) for x in wave)
+    parts = [_otc_edge_candle_parts(x) for x in rows[-14:]]
+    atr = _trendline_avg_range(parts, min(14, len(parts)))
+    if atr <= 0 or (wave_high - wave_low) / atr < DS_MIN_WAVE_ATR:
+        return None
+    original = sides[previous_end]
+    direction = "PUT" if original == "UP" else "CALL"
+    midpoint = (wave_high + wave_low) / 2.0
+    price = float(trigger_price if trigger_price is not None else rows[-1].get("close"))
+    beyond = price < midpoint if direction == "PUT" else price > midpoint
+    if not beyond:
+        return None
+    return {
+        "pair": pair, "symbol": symbol, "direction": direction, "original_wave": original,
+        "wave_low": wave_low, "wave_high": wave_high, "midpoint": midpoint,
+        "atr": atr, "payout": payout, "trigger_price": price,
+        "wave_candles": len(wave), "reversal_candles": len(rows) - current_start,
+        "wave_start_bucket": _structure_edge_candle_bucket(wave[0]),
+        "wave_end_bucket": _structure_edge_candle_bucket(wave[-1]),
+        "score": min(96, int(68 + min(22, ((wave_high - wave_low) / atr) * 7) + min(6, len(wave)))),
+    }
+
+def _ds_prearm_candidates() -> list[dict]:
+    current_bucket = int(time_module.time() // 60) * 60
+    ready = scanned = 0
+    found = []
+    for pair, symbol in get_otc_analysis_pair_map().items():
+        try:
+            _, last_tick, candles = _get_otc_rows_and_candles(symbol)
+            if not last_tick:
+                continue
+            tick_time = float(last_tick.get("time") or 0)
+            if tick_time > 1e12: tick_time /= 1000.0
+            if not tick_time or time_module.time() - tick_time > 4:
+                continue
+            payout = int(float((quotex_otc_feed.instrument(symbol) if "quotex_otc_feed" in globals() else {}).get("payout", 0) or 0))
+            if payout < DS_MIN_PAYOUT:
+                continue
+            closed = sorted([dict(c) for c in candles if _structure_edge_candle_bucket(c) < current_bucket], key=_structure_edge_candle_bucket)
+            if len(closed) < DS_MIN_CLOSED_M1:
+                continue
+            ready += 1
+            if not _trendline_consecutive(closed[-12:]):
+                continue
+            scanned += 1
+            candidate = _ds_wave_from_closed(pair, symbol, closed, payout, float(last_tick.get("price")))
+            if candidate:
+                candidate["trigger_bucket"] = current_bucket
+                found.append(candidate)
+        except Exception:
+            logger.debug("DS pair skipped | %s", pair, exc_info=True)
+    _ds_state["pairs_ready"] = ready; _ds_state["pairs_scanned"] = scanned; _ds_state["candidates"] = len(found)
+    return sorted(found, key=lambda x: (int(x.get("score", 0)), int(x.get("payout", 0)), int(x.get("wave_candles", 0))), reverse=True)
+
+async def _ds_publish_prepare(item: dict, target_bucket: int) -> dict:
+    expiry_dt = datetime.fromtimestamp(int(target_bucket) + 60, tz=UTC)
+    entry_dt = datetime.fromtimestamp(int(target_bucket), tz=UTC)
+    payload = {
+        "id": f"ds_prepare_{safe_key(item['pair'])}_{target_bucket}_{item['direction']}", "pair": item["pair"],
+        "pair_display": item["pair"], "platform_symbol": item["symbol"], "direction": item["direction"],
+        "timeframe": "M1", "duration_seconds": 60, "entry_time": entry_dt.isoformat(),
+        "expires_at": (entry_dt + timedelta(seconds=10)).isoformat(), "expiry_time": expiry_dt.isoformat(),
+        "expiry_timestamp": int(expiry_dt.timestamp()), "trade_expiry_mode": "absolute_time",
+        "signal_kind": "prepare", "entry_mode": "prepare", "copy_entry_mode": "prepare", "execution_mode": "prepare_pair",
+        "prepare_only": True, "preselected_pair_mode": True, "watch_pair": item["pair"],
+        "quality": item["score"], "confidence": item["score"], "payout": item["payout"],
+        "creator_user_id": int(ADMIN_TELEGRAM_ID), "target_user_id": int(ADMIN_TELEGRAM_ID),
+        "note": "DS SAR-wave midpoint candidate; prepare only",
+    }
+    return await publish_copy_trading_signal(payload, source="ds")
+
+async def _ds_publish_execute(item: dict, entry_bucket: int, open_price: float, live_price: float) -> dict:
+    entry_dt = datetime.fromtimestamp(int(entry_bucket), tz=UTC)
+    expiry_dt = entry_dt + timedelta(seconds=60)
+    payload = {
+        "id": f"ds_{safe_key(item['pair'])}_{entry_bucket}_{item['direction']}", "pair": item["pair"],
+        "pair_display": item["pair"], "platform_symbol": item["symbol"], "direction": item["direction"],
+        "timeframe": "M1", "duration_seconds": 60, "entry_time": entry_dt.isoformat(),
+        "expires_at": (entry_dt + timedelta(seconds=DS_EXECUTION_MAX_DELAY_SECONDS)).isoformat(),
+        "expiry_time": expiry_dt.isoformat(), "expiry_timestamp": int(expiry_dt.timestamp()), "trade_expiry_mode": "absolute_time",
+        "entry_mode": "instant", "copy_entry_mode": "instant", "execution_mode": "ds_prearmed_open",
+        "immediate_entry": True, "direct_entry": True, "instant_entry": True, "allow_background_entry": True,
+        "max_entry_delay_seconds": DS_EXECUTION_MAX_DELAY_SECONDS, "quality": item["score"], "confidence": item["score"],
+        "entry_price": live_price, "payout": item["payout"], "creator_user_id": int(ADMIN_TELEGRAM_ID),
+        "target_user_id": int(ADMIN_TELEGRAM_ID),
+        "note": f"DS SAR wave midpoint close break | mid={item['midpoint']:.8f} | open={open_price:.8f}",
+    }
+    return await publish_copy_trading_signal(payload, source="ds")
+
+def build_ds_status() -> str:
+    s = _ds_get_settings(False)
+    p = _ds_state.get("prearmed") or {}
+    return (
+        "📐 DS — SAR Wave Midpoint\n━━━━━━━━━━━━━━\n"
+        f"الحالة: {'شغال ✅' if s.get('enabled') else 'متوقف ⏸'}\n"
+        "الدخول: كسر + إغلاق شمعة M1 خلف 50% من موجة SAR المجمدة فقط.\n"
+        f"Payout الأدنى: {DS_MIN_PAYOUT}% | Warmup: {DS_MIN_CLOSED_M1} شمعة\n"
+        f"نافذة PRE-ARM: {DS_PREARM_MIN_SECOND:.1f}–{DS_PREARM_LAST_SECOND:.1f}ث | تنفيذ حتى {DS_EXECUTION_MAX_DELAY_SECONDS}ث من افتتاح الشمعة\n"
+        f"آخر فحص: {_ds_state.get('last_scan_at') or '-'} | جاهز/مفحوص: {_ds_state.get('pairs_ready',0)}/{_ds_state.get('pairs_scanned',0)}\n"
+        f"PRE-ARM: {p.get('pair') or '-'} {p.get('direction') or ''} | إشارات: {_ds_state.get('signals_sent',0)}\n"
+        f"آخر سبب: {_ds_state.get('last_reject_reason') or '-'}\nآخر خطأ: {_ds_state.get('last_error') or '-'}"
+    )[:3900]
+
+async def ds_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not _ds_get_settings(False).get("enabled"):
+            return
+        if not _copy_online_clients_for_user(int(ADMIN_TELEGRAM_ID)):
+            _ds_state["last_reject_reason"] = "Waiting for owner extension"
+            return
+        now_ts = time_module.time(); current_bucket = int(now_ts // 60) * 60; sec = now_ts - current_bucket
+        prearmed = _ds_state.get("prearmed")
+        if prearmed and int(prearmed.get("target_bucket", 0)) == current_bucket:
+            if sec > DS_FINAL_MAX_SECOND:
+                _ds_state["prearmed"] = None; _ds_state["prearm_cancelled"] += 1; _ds_state["last_reject_reason"] = "DS final open window missed"
+                return
+            symbol = str(prearmed.get("symbol") or "")
+            _, tick, candles = _get_otc_rows_and_candles(symbol)
+            closed = sorted([dict(c) for c in candles if _structure_edge_candle_bucket(c) < current_bucket], key=_structure_edge_candle_bucket)
+            final_candle = next((c for c in reversed(closed) if _structure_edge_candle_bucket(c) == current_bucket - 60), None)
+            # The central feed can publish the new bucket a few hundred ms before
+            # it finalizes the prior candle object. Wait inside the strict open
+            # window instead of treating that transport ordering as a failed close.
+            if final_candle is None:
+                _ds_state["last_reject_reason"] = "Waiting for final DS candle close"
+                return
+            close_price = float((final_candle or {}).get("close")) if final_candle else None
+            midpoint = float(prearmed.get("midpoint"))
+            direction = str(prearmed.get("direction"))
+            confirmed = close_price is not None and ((direction == "PUT" and close_price < midpoint) or (direction == "CALL" and close_price > midpoint))
+            open_price, live_price, displacement = _trendline_final_open_snapshot(symbol, current_bucket, prearmed)
+            if not confirmed:
+                _ds_state["last_reject_reason"] = "DS cancelled: no M1 close beyond midpoint"
+            elif open_price is None or live_price is None or displacement is None or displacement > DS_ENTRY_MAX_DISPLACEMENT_ATR:
+                _ds_state["last_reject_reason"] = f"DS cancelled: late/open displacement {displacement if displacement is not None else '-'}"
+            else:
+                result = await _ds_publish_execute(prearmed, current_bucket, float(open_price), float(live_price))
+                _ds_state["last_delivery"] = result
+                if result.get("ok"):
+                    _ds_state["signals_sent"] += 1; _ds_state["last_signal_at"] = now_iso(); _ds_state["last_candidate"] = dict(prearmed); _ds_state["last_reject_reason"] = None
+                else:
+                    _ds_state["last_reject_reason"] = f"DS publish failed: {result}"
+            _ds_state["prearmed"] = None
+            return
+        if prearmed and current_bucket > int(prearmed.get("target_bucket", 0)):
+            _ds_state["prearmed"] = None; _ds_state["prearm_cancelled"] += 1
+        if not (DS_PREARM_MIN_SECOND <= sec <= DS_PREARM_LAST_SECOND):
+            return
+        if int(_ds_state.get("prearm_bucket", 0)) == current_bucket:
+            return
+        _ds_state["prearm_bucket"] = current_bucket; _ds_state["last_scan_at"] = now_iso()
+        candidates = _ds_prearm_candidates()
+        if not candidates:
+            _ds_state["last_reject_reason"] = "No provisional DS close-break candidate"
+            return
+        candidate = dict(candidates[0]); target_bucket = current_bucket + 60
+        result = await _ds_publish_prepare(candidate, target_bucket)
+        _ds_state["last_delivery"] = result
+        if not result.get("ok"):
+            _ds_state["last_reject_reason"] = f"DS PRE-ARM failed: {result}"
+            return
+        candidate["target_bucket"] = target_bucket; candidate["prearmed_at"] = now_iso()
+        _ds_state["prearmed"] = candidate; _ds_state["prearms"] += 1
+        _ds_state["last_reject_reason"] = "DS pair pre-armed; waiting for candle close"
+    except Exception as exc:
+        _ds_state["last_error"] = str(exc)
+        logger.exception("DS job failed: %s", exc)
+
+
 # v1.02: Three Candle timing/filter tuning only; Public remains a mirror of accepted private signals.
 # Set this to a public @username or numeric -100... Telegram channel ID.
 THREE_CANDLE_PUBLIC_CHANNEL_ID_RAW = os.getenv("THREE_CANDLE_PUBLIC_CHANNEL_ID", "").strip()
@@ -23877,7 +24174,7 @@ def build_main_menu_for_user(user_id: int, lang: str | None = None):
         return ReplyKeyboardMarkup(
             [
                 ["📊 توليد إشارات"],
-                ["🐙 Octopus", "⚡ OTC Edge"],
+                ["🐙 Octopus", "⚡ OTC Edge", "📐 DS"],
                 ["👤 حالة حسابي", "📞 تواصل مع المسؤول"],
                 ["🌐 تغيير اللغة", "🛠 لوحة الأدمن"],
             ],
@@ -26890,6 +27187,34 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         return
 
+    # ===== DS — owner-only SAR Wave Midpoint =====
+    if is_admin(user.id) and text in {"📐 DS", "📐 DS Strategy"}:
+        reset_signal_state(context)
+        await update.message.reply_text(
+            "📐 DS — SAR Wave Midpoint\n\n"
+            "الـSAR يحدد موجة مكتملة، وحدودها تنجمد من الذيل للذيل. "
+            "الدخول لا يحدث عند الملامسة: فقط عندما تغلق شمعة M1 خلف منتصف الموجة 50%.\n\n"
+            "الإضافة تجهز الزوج قبل الإغلاق المحتمل، ثم تنفذ عند افتتاح الشمعة التالية فقط إذا تأكد الإغلاق. "
+            "أي تأخير أو انزياح سعري زائد يلغي الصفقة بدل ملاحقتها.",
+            reply_markup=ds_admin_keyboard,
+        )
+        return
+    if is_admin(user.id) and text == "🟢 تشغيل DS":
+        ok = _ds_set_enabled(True)
+        await update.message.reply_text("✅ تم تشغيل DS للمالك فقط." if ok else "❌ تعذر تشغيل DS. راجع اللوج.", reply_markup=ds_admin_keyboard)
+        return
+    if is_admin(user.id) and text == "🔴 إيقاف DS":
+        ok = _ds_set_enabled(False)
+        await update.message.reply_text("⛔ تم إيقاف DS وإلغاء أي PRE-ARM قائم." if ok else "❌ تعذر إيقاف DS. راجع اللوج.", reply_markup=ds_admin_keyboard)
+        return
+    if is_admin(user.id) and text == "📋 حالة DS":
+        await update.message.reply_text(build_ds_status(), reply_markup=ds_admin_keyboard)
+        return
+    if is_admin(user.id) and text == "🧹 تصفير DS":
+        _ds_state.update({"prearmed": None, "last_candidate": None, "last_delivery": None, "signals_sent": 0, "prearms": 0, "prearm_cancelled": 0, "last_reject_reason": None, "last_error": None})
+        await update.message.reply_text("✅ تم تصفير عدادات DS فقط. حالة التشغيل بقيت كما هي.", reply_markup=ds_admin_keyboard)
+        return
+
     # ===== Public/team Octopus v1.37 =====
     if text in {"🐙 Octopus", "🐙 ميزة Octopus"}:
         reset_signal_state(context)
@@ -28993,8 +29318,8 @@ def _copy_signal_contract_kind(payload: dict) -> str:
     }:
         raise ValueError("signal_kind must be execute or prepare")
     kind = "prepare" if prepare_marked else "execute"
-    if kind == "prepare" and source not in {"otc_edge", "structure_edge"}:
-        raise ValueError("prepare signals are supported only for otc_edge/structure_edge")
+    if kind == "prepare" and source not in {"otc_edge", "structure_edge", "ds"}:
+        raise ValueError("prepare signals are supported only for otc_edge/structure_edge/ds")
     return kind
 
 
@@ -29298,7 +29623,7 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
             pair_display = vip_asset
     else:
         pair_display, platform_symbol, otc_market = _copy_server_normalize_pair_contract(payload)
-    if source in {"otc_live", "otc_live_auto", "otc_edge", "structure_edge"} and not otc_market:
+    if source in {"otc_live", "otc_live_auto", "otc_edge", "structure_edge", "ds"} and not otc_market:
         raise ValueError(f"{source} requires an OTC market")
     if source == "real_market" and otc_market:
         raise ValueError("real_market requires a regular market")
@@ -31694,6 +32019,15 @@ def run_telegram_bot_only():
         interval=OCTOPUS_SELECTOR_SCHEDULER_SECONDS,
         first=OCTOPUS_SELECTOR_SCHEDULER_SECONDS,
         name="octopus_sr_retest",
+    )
+
+    # DS is private to the owner and has its own PRE-ARM/final-close lifecycle.
+    # It never reuses or changes the Octopus execution state.
+    job_queue.run_repeating(
+        ds_job,
+        interval=DS_SCAN_SECONDS,
+        first=DS_SCAN_SECONDS,
+        name="ds_sar_wave_midpoint",
     )
 
     # قناة اختبار استراتيجية 3 شموع + ذاكرة تحليل v0.59. تعمل فقط عند ضبط THREE_CANDLE_CHANNEL_ID وتفعيلها من env.
