@@ -6320,41 +6320,27 @@ class QuotexOTCLiveFeed:
             await self._send_event_async(ws, "instruments/update", payload)
 
     async def _send_m1_history_hydration(self, ws, symbol: str):
-        """Ask Quotex for the existing M1 chart snapshot of one subscribed asset.
+        """Ask Quotex for the existing M1 OHLC candle window of one asset.
 
-        ``settings/apply`` is the normal chart-selection packet that causes the
-        server to emit ``history/list/v2``.  It does not place, modify or cancel
-        any order; the received history is merged by the central cache parser.
+        ``history/load`` is the dedicated market-data request.  Quotex returns
+        paged M1 candles under ``data`` (not the old tick ``history`` key), so no
+        chart preference or order/account setting is touched here.
         """
+        now_seconds = int(time_module.time())
         payload = {
-            "chartId": "graph",
-            "settings": {
-                "chartId": "graph",
-                "chartType": 2,
-                "currentExpirationTime": int(time_module.time()),
-                "isFastOption": False,
-                "isFastAmountOption": False,
-                "isIndicatorsMinimized": False,
-                "isIndicatorsShowing": True,
-                "isShortBetElement": False,
-                "chartPeriod": 4,
-                "currentAsset": {"symbol": symbol},
-                "dealValue": 5,
-                "dealPercentValue": 1,
-                "isVisible": True,
-                "timePeriod": 60,
-                "gridOpacity": 8,
-                "isAutoScrolling": 1,
-                "isOneClickTrade": True,
-                "upColor": "#0FAF59",
-                "downColor": "#FF6251",
-            },
+            "asset": symbol,
+            # Quotex expects a 12-digit chart-request index, not a Unix seconds
+            # timestamp.  A one-hour window returns far more than DS's 30 M1 bars.
+            "index": int(now_seconds * 100),
+            "time": now_seconds,
+            "offset": 3600,
+            "period": 60,
         }
-        await self._send_event_async(ws, "settings/apply", payload)
+        await self._send_event_async(ws, "history/load", payload)
         with self.lock:
             self.history_hydration_requested_at[symbol] = time_module.monotonic()
             self.history_hydration_sent += 1
-        logger.info("Requested Quotex M1 history hydration | symbol=%s", symbol)
+        logger.info("Requested Quotex M1 history/load | symbol=%s", symbol)
 
     async def _history_hydration_worker(self, ws):
         """Dispatch requested DS snapshots without waiting for all subscriptions.
@@ -6379,8 +6365,8 @@ class QuotexOTCLiveFeed:
                     if not self.connected:
                         return
                     try:
-                        # Request the normal live stream first; ``settings/apply``
-                        # then asks the same connection for its existing M1 chart.
+                        # Request the normal live stream first; ``history/load``
+                        # then asks the same connection for its existing M1 OHLC bars.
                         await self._send_price_subscription(ws, symbol, duplicate=False)
                         await asyncio.sleep(0.08)
                         await self._send_m1_history_hydration(ws, symbol)
@@ -6785,7 +6771,7 @@ class QuotexOTCLiveFeed:
         if event_name in {"instruments/list", "instruments/get"}:
             self._parse_instruments_payload(payload)
             return
-        if event_name == "history/list/v2":
+        if event_name in {"history/list/v2", "history/load", "history/load_line"}:
             self._parse_history_payload(payload)
             return
         if event_name == "quotes/stream":
@@ -6826,7 +6812,52 @@ class QuotexOTCLiveFeed:
     def _parse_history_payload(self, payload):
         if not isinstance(payload, dict):
             return
-        symbol = str(payload.get("asset") or "").strip()
+        data_object = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+        symbol = str(payload.get("asset") or data_object.get("asset") or "").strip()
+        # ``history/load`` returns full OHLC bars in ``data`` (occasionally under
+        # ``candles``); do not reduce them to synthetic ticks or drop the reply.
+        candle_rows = payload.get("data")
+        if isinstance(candle_rows, dict):
+            candle_rows = candle_rows.get("candles") or candle_rows.get("data")
+        if not isinstance(candle_rows, list):
+            candle_rows = payload.get("candles")
+        normalized_candles = {}
+        if symbol and isinstance(candle_rows, list):
+            for row in candle_rows:
+                try:
+                    if isinstance(row, dict):
+                        ts = float(row.get("time") or row.get("timestamp") or row.get("ts"))
+                        opened = float(row.get("open"))
+                        closed = float(row.get("close"))
+                        high = float(row.get("high"))
+                        low = float(row.get("low"))
+                    elif isinstance(row, list) and len(row) >= 5:
+                        ts = float(row[0]); opened = float(row[1]); closed = float(row[2]); high = float(row[3]); low = float(row[4])
+                    else:
+                        continue
+                    if ts > 1e12:
+                        ts /= 1000.0
+                    bucket = int(ts // 60) * 60
+                    if bucket <= 0 or high < low:
+                        continue
+                    normalized_candles[bucket] = {
+                        "symbol": symbol, "bucket_ts": bucket,
+                        "open": opened, "high": max(high, opened, closed),
+                        "low": min(low, opened, closed), "close": closed,
+                        "open_tick_ts": float(bucket), "close_tick_ts": float(bucket + 59.999),
+                        "ticks": 0, "source": "history/load",
+                    }
+                except Exception:
+                    continue
+        if normalized_candles:
+            with self.lock:
+                self._ensure_symbol_locked(symbol)
+                self.candles.setdefault(symbol, {}).update(normalized_candles)
+                self.history_hydration_received_at[symbol] = now_iso()
+                self.history_hydration_requested.discard(symbol)
+            logger.info("Quotex M1 history loaded | symbol=%s | candles=%s", symbol, len(normalized_candles))
+            return
+
         history = payload.get("history")
         if not symbol or not isinstance(history, list):
             return
