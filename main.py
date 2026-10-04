@@ -4004,6 +4004,11 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
         "preselected_pair_mode": bool(signal.get("preselected_pair_mode") or False),
         "watch_pair": signal.get("watch_pair"),
         "skip_asset_switch": bool(signal.get("skip_asset_switch") or False),
+        # DS carries the final execution identity inside its PRE-ARM command so
+        # the extension can prebuild the exact same orders/open payload.
+        "execution_signal_id": str(signal.get("execution_signal_id") or "")[:160] or None,
+        "execution_expires_at": signal.get("execution_expires_at"),
+        "ds_retrace_entry": bool(signal.get("ds_retrace_entry") or False),
         # v1.17 Structure Edge test metadata. Kept non-executable; execution still depends
         # only on the canonical pair/direction/time/expiry contract above.
         "structure_setup": signal.get("structure_setup") or signal.get("setup"),
@@ -19822,6 +19827,8 @@ DS_RETRACE_ENTRY_BONUS_ATR = max(0.0, min(0.05, float(os.getenv("DS_RETRACE_ENTR
 DS_MIN_WAVE_ATR = max(0.35, min(3.0, float(os.getenv("DS_MIN_WAVE_ATR", "0.80"))))
 DS_SETTINGS_CACHE_SECONDS = max(15, int(os.getenv("DS_SETTINGS_CACHE_SECONDS", "30")))
 DS_HISTORY_PRIME_SECONDS = max(2.0, min(15.0, float(os.getenv("DS_HISTORY_PRIME_SECONDS", "4"))))
+DS_LIVE_CACHE_WRITE_SECONDS = max(10.0, min(120.0, float(os.getenv("DS_LIVE_CACHE_WRITE_SECONDS", "20"))))
+DS_LIVE_CACHE_MAX_AGE_SECONDS = max(900.0, min(86400.0, float(os.getenv("DS_LIVE_CACHE_MAX_AGE_SECONDS", "21600"))))
 DS_DEFAULT_ENABLED = os.getenv("DS_ENABLED", "false").lower() in {"1", "true", "yes", "on"}
 
 _ds_state = {
@@ -19843,10 +19850,17 @@ _ds_state = {
     "history_received": 0, "history_last_prime_at": None,
     "history_source": "live_quotes", "history_last_upload_at": None,
     "history_min_closed": 0,
+    "live_cache_restore_attempted": False, "live_cache_restored": 0,
+    "live_cache_last_save_monotonic": 0.0, "live_cache_last_saved_at": None,
 }
 
 def _ds_settings_ref():
     return system_ref().child("ds_wave_midpoint_v1").child("settings")
+
+
+def _ds_live_m1_cache_ref():
+    """Small owner-only checkpoint so a deploy does not mean another 30-minute wait."""
+    return system_ref().child("ds_wave_midpoint_v1").child("live_m1_cache")
 
 def _ds_get_settings(force_refresh: bool = False) -> dict:
     now_ts = time_module.time()
@@ -19893,12 +19907,73 @@ def _ds_history_symbols() -> list[str]:
     return list(dict.fromkeys(symbols))[:10]
 
 
+def _ds_restore_live_m1_cache() -> int:
+    """Restore validated closed M1 bars once after process start.
+
+    This is only a warmup checkpoint. Live Quotex ticks remain mandatory for
+    detection and execution, so a saved cache cannot create a stale trade.
+    """
+    if _ds_state.get("live_cache_restore_attempted"):
+        return int(_ds_state.get("live_cache_restored", 0) or 0)
+    _ds_state["live_cache_restore_attempted"] = True
+    try:
+        raw = _ds_live_m1_cache_ref().get() or {}
+        saved_ts = float((raw or {}).get("saved_at_epoch", 0) or 0)
+        if not isinstance(raw, dict) or not saved_ts or time_module.time() - saved_ts > DS_LIVE_CACHE_MAX_AGE_SECONDS:
+            return 0
+        rows_by_symbol = raw.get("symbols") or {}
+        restored = 0
+        if isinstance(rows_by_symbol, dict):
+            for symbol, rows in rows_by_symbol.items():
+                if not isinstance(rows, list):
+                    continue
+                restored += int(quotex_otc_feed.merge_extension_m1_candles(str(symbol), rows) or 0)
+        _ds_state["live_cache_restored"] = restored
+        if restored:
+            _ds_state["history_source"] = "live_checkpoint"
+            logger.info("DS live M1 checkpoint restored | candles=%s", restored)
+        return restored
+    except Exception as exc:
+        logger.warning("DS live M1 checkpoint restore failed: %s", exc)
+        return 0
+
+
+def _ds_save_live_m1_cache(symbols: list[str]) -> None:
+    """Checkpoint only closed bars; throttled to keep Firebase and Render quiet."""
+    now_ts = time_module.time()
+    if now_ts - float(_ds_state.get("live_cache_last_save_monotonic", 0.0) or 0.0) < DS_LIVE_CACHE_WRITE_SECONDS:
+        return
+    try:
+        current_bucket = int(now_ts // 60) * 60
+        payload_symbols = {}
+        with quotex_otc_feed.lock:
+            for symbol in symbols:
+                rows = []
+                for bucket, candle in sorted((quotex_otc_feed.candles.get(symbol) or {}).items())[-(DS_MIN_CLOSED_M1 + 12):]:
+                    if int(bucket) >= current_bucket or not isinstance(candle, dict):
+                        continue
+                    rows.append({
+                        "time": int(bucket), "open": candle.get("open"), "high": candle.get("high"),
+                        "low": candle.get("low"), "close": candle.get("close"),
+                    })
+                if rows:
+                    payload_symbols[str(symbol)] = rows
+        if not payload_symbols:
+            return
+        _ds_live_m1_cache_ref().set({"saved_at_epoch": now_ts, "saved_at": now_iso(), "symbols": payload_symbols})
+        _ds_state["live_cache_last_save_monotonic"] = now_ts
+        _ds_state["live_cache_last_saved_at"] = now_iso()
+    except Exception as exc:
+        logger.warning("DS live M1 checkpoint save failed: %s", exc)
+
+
 def _ds_prime_m1_history() -> dict:
     """Warm DS from the normal live quote stream, like the other strategies.
 
     No extension upload and no Quotex history request is used.  DS simply waits
     until its own subscribed symbols have accumulated enough *closed* M1 bars.
     """
+    _ds_restore_live_m1_cache()
     now_ts = time_module.time()
     previous = float(_ds_state.get("history_last_prime_monotonic", 0.0) or 0.0)
     if now_ts - previous < DS_HISTORY_PRIME_SECONDS:
@@ -19933,10 +20008,11 @@ def _ds_prime_m1_history() -> dict:
             "history_queued": int(status.get("queued", 0) or 0),
             "history_received": int(status.get("received", 0) or 0),
             "history_last_prime_at": now_iso(),
-            "history_source": "live_quotes",
+            "history_source": "live_checkpoint+quotes" if _ds_state.get("live_cache_restored") else "live_quotes",
             "history_last_upload_at": None,
             "history_min_closed": int(minimum),
         })
+        _ds_save_live_m1_cache(symbols)
         return status
     except Exception as exc:
         _ds_state["last_error"] = str(exc)
@@ -20054,12 +20130,18 @@ def _ds_prearm_candidates() -> list[dict]:
 async def _ds_publish_prepare(item: dict, target_bucket: int) -> dict:
     expiry_dt = datetime.fromtimestamp(int(target_bucket) + 60, tz=UTC)
     entry_dt = datetime.fromtimestamp(int(target_bucket), tz=UTC)
+    execution_id = f"ds_{safe_key(item['pair'])}_{target_bucket}_{item['direction']}"
     payload = {
         "id": f"ds_prepare_{safe_key(item['pair'])}_{target_bucket}_{item['direction']}", "pair": item["pair"],
         "pair_display": item["pair"], "platform_symbol": item["symbol"], "direction": item["direction"],
         "timeframe": "M1", "duration_seconds": 60, "entry_time": entry_dt.isoformat(),
         "expires_at": (entry_dt + timedelta(seconds=10)).isoformat(), "expiry_time": expiry_dt.isoformat(),
         "expiry_timestamp": int(expiry_dt.timestamp()), "trade_expiry_mode": "absolute_time",
+        # The extension uses this exact future final ID to build the real
+        # orders/open payload during PRE-ARM. The final DS packet then only
+        # releases that prepared command; it does not rebuild or switch pair.
+        "execution_signal_id": execution_id,
+        "execution_expires_at": (entry_dt + timedelta(seconds=DS_EXECUTION_MAX_DELAY_SECONDS)).isoformat(),
         "signal_kind": "prepare", "entry_mode": "prepare", "copy_entry_mode": "prepare", "execution_mode": "prepare_pair",
         "prepare_only": True, "preselected_pair_mode": True, "watch_pair": item["pair"],
         "quality": item["score"], "confidence": item["score"], "payout": item["payout"],
@@ -20317,7 +20399,7 @@ def build_ds_status() -> str:
         f"الحالة: {'شغال ✅' if s.get('enabled') else 'متوقف ⏸'}\n"
         "الدخول: كسر + إغلاق شمعة M1 خلف 50% من موجة SAR المجمدة فقط.\n"
         f"Payout الأدنى: {DS_MIN_PAYOUT}% | تاريخ M1 المطلوب: {DS_MIN_CLOSED_M1} شمعة\n"
-        f"تهيئة M1 الحية: {_ds_state.get('history_ready',0)}/{_ds_state.get('history_requested',0)} أزواج جاهزة | الأقل: {_ds_state.get('history_min_closed',0)}/{DS_MIN_CLOSED_M1} شمعة مكتملة\n"
+        f"تهيئة M1: {_ds_state.get('history_ready',0)}/{_ds_state.get('history_requested',0)} أزواج جاهزة | الأقل: {_ds_state.get('history_min_closed',0)}/{DS_MIN_CLOSED_M1} شمعة | المصدر: {_ds_state.get('history_source') or 'live_quotes'}\n"
         f"نافذة PRE-ARM: {DS_PREARM_MIN_SECOND:.1f}–{DS_PREARM_LAST_SECOND:.1f}ث | تنفيذ حتى {DS_EXECUTION_MAX_DELAY_SECONDS}ث من افتتاح الشمعة\n"
         f"آخر فحص: {_ds_state.get('last_scan_at') or '-'} | جاهز/مفحوص: {_ds_state.get('pairs_ready',0)}/{_ds_state.get('pairs_scanned',0)}\n"
         f"PRE-ARM: {p.get('pair') or '-'} {p.get('direction') or ''} | أرسلت: {_ds_state.get('signals_sent',0)} | فتحت الإضافة: {_ds_state.get('extension_opened',0)} | رفضت: {_ds_state.get('extension_skipped',0)}\n"
@@ -30257,6 +30339,9 @@ def _copy_server_sanitize_signal(data: dict) -> dict:
         "preselected_pair_mode": bool(payload.get("preselected_pair_mode") or False),
         "watch_pair": payload.get("watch_pair"),
         "skip_asset_switch": bool(payload.get("skip_asset_switch") or False),
+        "execution_signal_id": str(payload.get("execution_signal_id") or "")[:160] or None,
+        "execution_expires_at": str(payload.get("execution_expires_at") or "")[:48] or None,
+        "ds_retrace_entry": bool(payload.get("ds_retrace_entry") or False),
         # v1.17: Structure Edge diagnostics/results metadata.
         "structure_setup": str(payload.get("structure_setup") or "")[:80] or None,
         "structure_score": int(payload.get("structure_score")) if str(payload.get("structure_score") or "").strip().isdigit() else payload.get("confidence"),
