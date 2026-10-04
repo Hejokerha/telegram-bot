@@ -5689,6 +5689,18 @@ class QuotexOTCLiveFeed:
         except Exception:
             return {"requested": 0, "ready": 0, "queued": 0, "received": 0}
 
+    def retain_m1_history_requests(self, symbols: list[str]) -> None:
+        """Drop stale DS backfill requests when the live eligible universe changes."""
+        try:
+            keep = {str(x or "").strip() for x in symbols if str(x or "").strip()}
+            with self.lock:
+                self.history_hydration_requested.intersection_update(keep)
+                for symbol in list(self.history_hydration_requested_at):
+                    if symbol not in keep:
+                        self.history_hydration_requested_at.pop(symbol, None)
+        except Exception:
+            logger.debug("Could not prune M1 history requests", exc_info=True)
+
     def get_dynamic_otc_pairs(self, min_payout: int | None = None) -> dict:
         """Return currently available OTC currency pairs from instruments/list."""
         min_payout = int(min_payout if min_payout is not None else OTC_LIVE_DYNAMIC_MIN_PAYOUT)
@@ -6336,6 +6348,10 @@ class QuotexOTCLiveFeed:
             "offset": 3600,
             "period": 60,
         }
+        # The chart-history subscription is required by this Quotex socket mode
+        # before it will answer a history/load request.
+        await self._send_event_async(ws, "history/subscribe_all", {"asset": symbol})
+        await asyncio.sleep(0.06)
         await self._send_event_async(ws, "history/load", payload)
         with self.lock:
             self.history_hydration_requested_at[symbol] = time_module.monotonic()
@@ -6356,12 +6372,12 @@ class QuotexOTCLiveFeed:
                     pending = [
                         symbol for symbol in self.history_hydration_requested
                         if len(self.candles.get(symbol) or {}) < 30
-                        and now_mono - float(self.history_hydration_requested_at.get(symbol, 0.0) or 0.0) >= 15.0
+                        and now_mono - float(self.history_hydration_requested_at.get(symbol, 0.0) or 0.0) >= 30.0
                     ]
                 if not pending:
                     await asyncio.sleep(0.35)
                     continue
-                for symbol in pending[:2]:
+                for symbol in pending[:1]:
                     if not self.connected:
                         return
                     try:
@@ -6772,6 +6788,15 @@ class QuotexOTCLiveFeed:
             self._parse_instruments_payload(payload)
             return
         if event_name in {"history/list/v2", "history/load", "history/load_line"}:
+            self._parse_history_payload(payload)
+            return
+        if ("history" in event_name or "candle" in event_name) and isinstance(payload, dict):
+            # Quotex variants can name the binary response differently.  Preserve
+            # an observable, non-secret summary and let the same parser attempt it.
+            logger.info(
+                "Observed Quotex history-like payload | event=%s | keys=%s",
+                event_name, ",".join(sorted(str(k) for k in payload.keys())[:12]),
+            )
             self._parse_history_payload(payload)
             return
         if event_name == "quotes/stream":
@@ -19804,7 +19829,16 @@ def _ds_prime_m1_history() -> dict:
     _ds_state["history_last_prime_monotonic"] = now_ts
     try:
         pair_map = get_otc_analysis_pair_map()
-        symbols = list(dict.fromkeys(str(symbol) for symbol in pair_map.values() if str(symbol)))
+        symbols = []
+        for _, symbol in pair_map.items():
+            symbol = str(symbol or "").strip()
+            payout = int(float(quotex_otc_feed.instrument(symbol).get("payout", 0) or 0)) if symbol else 0
+            if symbol and payout >= DS_MIN_PAYOUT:
+                symbols.append(symbol)
+        # DS needs only the currently eligible owner universe, never the stale
+        # symbols accumulated by another strategy's dynamic subscription.
+        symbols = list(dict.fromkeys(symbols))[:10]
+        quotex_otc_feed.retain_m1_history_requests(symbols)
         for symbol in symbols:
             quotex_otc_feed.request_m1_history(symbol, DS_MIN_CLOSED_M1)
         status = quotex_otc_feed.m1_history_status(symbols, DS_MIN_CLOSED_M1)
