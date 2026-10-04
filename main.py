@@ -19812,9 +19812,13 @@ DS_MIN_CLOSED_M1 = max(24, int(os.getenv("DS_MIN_CLOSED_M1", "30")))
 DS_LOOKBACK = max(30, min(120, int(os.getenv("DS_LOOKBACK", "80"))))
 DS_PREARM_MIN_SECOND = max(45.0, min(58.0, float(os.getenv("DS_PREARM_MIN_SECOND", "54.5"))))
 DS_PREARM_LAST_SECOND = max(DS_PREARM_MIN_SECOND, min(59.65, float(os.getenv("DS_PREARM_LAST_SECOND", "59.15"))))
-DS_FINAL_MAX_SECOND = max(0.4, min(2.0, float(os.getenv("DS_FINAL_MAX_SECOND", "1.35"))))
+DS_FINAL_MAX_SECOND = max(0.4, min(2.0, float(os.getenv("DS_FINAL_MAX_SECOND", "2.0"))))
 DS_EXECUTION_MAX_DELAY_SECONDS = max(1, min(3, int(os.getenv("DS_EXECUTION_MAX_DELAY_SECONDS", "2"))))
 DS_ENTRY_MAX_DISPLACEMENT_ATR = max(0.01, min(0.18, float(os.getenv("DS_ENTRY_MAX_DISPLACEMENT_ATR", "0.055"))))
+DS_RETRACE_ARM_AFTER_SECONDS = max(2.0, min(6.0, float(os.getenv("DS_RETRACE_ARM_AFTER_SECONDS", "3.0"))))
+DS_RETRACE_LAST_SECOND = max(12.0, min(52.0, float(os.getenv("DS_RETRACE_LAST_SECOND", "48.0"))))
+DS_RETRACE_MIN_FAVORABLE_ATR = max(0.0, min(0.12, float(os.getenv("DS_RETRACE_MIN_FAVORABLE_ATR", "0.015"))))
+DS_RETRACE_ENTRY_BONUS_ATR = max(0.0, min(0.05, float(os.getenv("DS_RETRACE_ENTRY_BONUS_ATR", "0.0"))))
 DS_MIN_WAVE_ATR = max(0.35, min(3.0, float(os.getenv("DS_MIN_WAVE_ATR", "0.80"))))
 DS_SETTINGS_CACHE_SECONDS = max(15, int(os.getenv("DS_SETTINGS_CACHE_SECONDS", "30")))
 DS_HISTORY_PRIME_SECONDS = max(2.0, min(15.0, float(os.getenv("DS_HISTORY_PRIME_SECONDS", "4"))))
@@ -19826,6 +19830,14 @@ _ds_state = {
     "last_signal_at": None, "last_reject_reason": None, "last_error": None,
     "pairs_ready": 0, "pairs_scanned": 0, "candidates": 0,
     "prearms": 0, "prearm_cancelled": 0, "signals_sent": 0,
+    # A published signal is not an opened trade. These two counters are filled
+    # only by a receipt emitted after the owner extension tries Quotex orders/open.
+    "extension_opened": 0, "extension_skipped": 0,
+    "last_execution_status": None, "last_execution_reason": None,
+    "last_execution_at": None, "last_execution_pair": None,
+    "last_execution_signal_id": None, "last_execution_detail": None,
+    "last_execution_sent_ts": 0.0,
+    "retrace_pending": None, "retrace_entries": 0, "retrace_cancelled": 0,
     "last_candidate": None, "last_delivery": None,
     "history_requested": 0, "history_ready": 0, "history_queued": 0,
     "history_received": 0, "history_last_prime_at": None,
@@ -19859,6 +19871,7 @@ def _ds_set_enabled(enabled: bool) -> bool:
         _ds_state["last_settings_at"] = time_module.time()
         if not enabled:
             _ds_state["prearmed"] = None
+            _ds_state["retrace_pending"] = None
         else:
             # A manual re-enable should immediately restart the history prime.
             _ds_state["history_last_prime_monotonic"] = 0.0
@@ -20055,6 +20068,19 @@ async def _ds_publish_prepare(item: dict, target_bucket: int) -> dict:
     }
     return await publish_copy_trading_signal(payload, source="ds")
 
+
+def _ds_mark_execution_pending(payload: dict, item: dict) -> None:
+    """Record that an executable DS command was published, not that it opened."""
+    _ds_state.update({
+        "last_execution_status": "pending",
+        "last_execution_reason": "Waiting for owner extension execution receipt",
+        "last_execution_at": now_iso(),
+        "last_execution_pair": str(item.get("pair") or "") or None,
+        "last_execution_signal_id": str(payload["id"]),
+        "last_execution_detail": {"signal_id": str(payload["id"]), "pair": str(item.get("pair") or "") or None},
+        "last_execution_sent_ts": time_module.time(),
+    })
+
 async def _ds_publish_execute(item: dict, entry_bucket: int, open_price: float, live_price: float) -> dict:
     entry_dt = datetime.fromtimestamp(int(entry_bucket), tz=UTC)
     expiry_dt = entry_dt + timedelta(seconds=60)
@@ -20071,11 +20097,221 @@ async def _ds_publish_execute(item: dict, entry_bucket: int, open_price: float, 
         "target_user_id": int(ADMIN_TELEGRAM_ID),
         "note": f"DS SAR wave midpoint close break | mid={item['midpoint']:.8f} | open={open_price:.8f}",
     }
-    return await publish_copy_trading_signal(payload, source="ds")
+    _ds_mark_execution_pending(payload, item)
+    result = await publish_copy_trading_signal(payload, source="ds")
+    if not result.get("ok") and _ds_state.get("last_execution_signal_id") == str(payload["id"]):
+        _ds_state["last_execution_status"] = "publish_failed"
+        _ds_state["last_execution_reason"] = f"DS publish failed: {result}"
+    return result
+
+
+async def _ds_publish_retrace(item: dict, entry_bucket: int, open_price: float, live_price: float) -> dict:
+    """Publish exactly one same-candle DS retrace entry after the initial window was missed."""
+    expiry_dt = datetime.fromtimestamp(int(entry_bucket) + 60, tz=UTC)
+    now_dt = datetime.now(tz=UTC)
+    payload = {
+        "id": f"ds_retrace_{safe_key(item['pair'])}_{entry_bucket}_{item['direction']}",
+        "pair": item["pair"], "pair_display": item["pair"], "platform_symbol": item["symbol"],
+        "direction": item["direction"], "timeframe": "M1", "duration_seconds": 60,
+        "entry_time": now_dt.isoformat(), "expires_at": expiry_dt.isoformat(),
+        "expiry_time": expiry_dt.isoformat(), "expiry_timestamp": int(expiry_dt.timestamp()),
+        "trade_expiry_mode": "absolute_time", "entry_mode": "instant", "copy_entry_mode": "instant",
+        "execution_mode": "ds_retrace_entry", "immediate_entry": True, "direct_entry": True,
+        "instant_entry": True, "allow_background_entry": True, "ds_retrace_entry": True,
+        "max_entry_delay_seconds": max(1, int(DS_RETRACE_LAST_SECOND)),
+        "quality": item["score"], "confidence": item["score"], "entry_price": live_price,
+        "payout": item["payout"], "creator_user_id": int(ADMIN_TELEGRAM_ID),
+        "target_user_id": int(ADMIN_TELEGRAM_ID),
+        "note": f"DS same-candle retrace | open={open_price:.8f} | retrace={live_price:.8f}",
+    }
+    _ds_mark_execution_pending(payload, item)
+    result = await publish_copy_trading_signal(payload, source="ds")
+    if not result.get("ok") and _ds_state.get("last_execution_signal_id") == str(payload["id"]):
+        _ds_state["last_execution_status"] = "publish_failed"
+        _ds_state["last_execution_reason"] = f"DS retrace publish failed: {result}"
+    return result
+
+
+def _ds_activate_retrace(item: dict, entry_bucket: int, open_price: float, initial_signal_id: str = "") -> None:
+    pending = dict(item)
+    pending.update({
+        "entry_bucket": int(entry_bucket), "open_price": float(open_price),
+        "initial_signal_id": str(initial_signal_id or ""), "created_at": now_iso(),
+        "favorable_seen": False, "favorable_extreme": None, "retrace_signal_id": "",
+    })
+    _ds_state["retrace_pending"] = pending
+    _ds_state["last_reject_reason"] = "DS initial window missed/late; waiting same-candle retrace"
+
+
+def _ds_retrace_can_continue(pending: dict) -> tuple[bool, str]:
+    initial_id = str(pending.get("initial_signal_id") or "")
+    if not initial_id or str(_ds_state.get("last_execution_signal_id") or "") != initial_id:
+        return True, ""
+    status = str(_ds_state.get("last_execution_status") or "")
+    if status == "opened":
+        return False, "DS initial entry opened"
+    if status == "skipped":
+        reason = str(_ds_state.get("last_execution_reason") or "").lower()
+        late_words = ("نافذة", "تأخر", "late", "delay", "open")
+        if not any(word in reason for word in late_words):
+            return False, f"DS retrace blocked by extension: {_ds_state.get('last_execution_reason') or '-'}"
+    return True, ""
+
+
+async def _ds_drive_retrace() -> None:
+    """Wait for a single better same-M1 price after a missed initial DS entry."""
+    pending = _ds_state.get("retrace_pending")
+    if not isinstance(pending, dict):
+        return
+    now_ts = time_module.time()
+    current_bucket = int(now_ts // 60) * 60
+    entry_bucket = int(pending.get("entry_bucket", 0) or 0)
+    sec = now_ts - current_bucket
+    if current_bucket != entry_bucket or sec > DS_RETRACE_LAST_SECOND:
+        _ds_state["retrace_pending"] = None
+        _ds_state["retrace_cancelled"] = int(_ds_state.get("retrace_cancelled", 0) or 0) + 1
+        _ds_state["last_reject_reason"] = "DS retrace cancelled: same M1 window ended"
+        return
+    retrace_signal_id = str(pending.get("retrace_signal_id") or "")
+    if retrace_signal_id:
+        if str(_ds_state.get("last_execution_signal_id") or "") == retrace_signal_id:
+            status = str(_ds_state.get("last_execution_status") or "")
+            if status == "opened":
+                _ds_state["retrace_pending"] = None
+                _ds_state["last_reject_reason"] = None
+            elif status in {"skipped", "unconfirmed", "publish_failed"}:
+                _ds_state["retrace_pending"] = None
+                _ds_state["retrace_cancelled"] = int(_ds_state.get("retrace_cancelled", 0) or 0) + 1
+                _ds_state["last_reject_reason"] = f"DS retrace ended: {_ds_state.get('last_execution_reason') or status}"
+        return
+
+    can_continue, stop_reason = _ds_retrace_can_continue(pending)
+    if not can_continue:
+        _ds_state["retrace_pending"] = None
+        _ds_state["retrace_cancelled"] = int(_ds_state.get("retrace_cancelled", 0) or 0) + 1
+        _ds_state["last_reject_reason"] = stop_reason
+        return
+    if sec < DS_RETRACE_ARM_AFTER_SECONDS:
+        return
+    symbol = str(pending.get("symbol") or "")
+    _, tick, _ = _get_otc_rows_and_candles(symbol)
+    try:
+        live_price = float((tick or {}).get("price"))
+        tick_time = float((tick or {}).get("time") or 0)
+        if tick_time > 10_000_000_000:
+            tick_time /= 1000.0
+        if not tick_time or now_ts - tick_time > 2.0:
+            return
+        open_price = float(pending.get("open_price"))
+        atr = max(1e-12, float(pending.get("atr") or 0))
+    except Exception:
+        return
+    direction = str(pending.get("direction") or "")
+    favorable_distance = max(atr * DS_RETRACE_MIN_FAVORABLE_ATR, 1e-12)
+    entry_bonus = atr * DS_RETRACE_ENTRY_BONUS_ATR
+    if direction == "PUT":
+        if live_price <= open_price - favorable_distance:
+            pending["favorable_seen"] = True
+            pending["favorable_extreme"] = min(float(pending.get("favorable_extreme") or live_price), live_price)
+        ready = bool(pending.get("favorable_seen")) and live_price >= open_price + entry_bonus
+    else:
+        if live_price >= open_price + favorable_distance:
+            pending["favorable_seen"] = True
+            pending["favorable_extreme"] = max(float(pending.get("favorable_extreme") or live_price), live_price)
+        ready = bool(pending.get("favorable_seen")) and live_price <= open_price - entry_bonus
+    _ds_state["retrace_pending"] = pending
+    if not ready:
+        _ds_state["last_reject_reason"] = "DS retrace armed; waiting for price back to candle open"
+        return
+    result = await _ds_publish_retrace(pending, entry_bucket, open_price, live_price)
+    _ds_state["last_delivery"] = result
+    if result.get("ok"):
+        pending["retrace_signal_id"] = str(_ds_state.get("last_execution_signal_id") or "")
+        _ds_state["retrace_pending"] = pending
+        _ds_state["signals_sent"] = int(_ds_state.get("signals_sent", 0) or 0) + 1
+        _ds_state["retrace_entries"] = int(_ds_state.get("retrace_entries", 0) or 0) + 1
+        _ds_state["last_signal_at"] = now_iso()
+        _ds_state["last_reject_reason"] = None
+    else:
+        _ds_state["retrace_pending"] = None
+        _ds_state["retrace_cancelled"] = int(_ds_state.get("retrace_cancelled", 0) or 0) + 1
+
+
+def _ds_expire_execution_receipt() -> None:
+    """Expose a missing extension receipt promptly; never silently call it a trade."""
+    if _ds_state.get("last_execution_status") != "pending":
+        return
+    sent_ts = float(_ds_state.get("last_execution_sent_ts", 0.0) or 0.0)
+    if sent_ts and time_module.time() - sent_ts > 8.0:
+        _ds_state["last_execution_status"] = "unconfirmed"
+        _ds_state["last_execution_reason"] = "No execution receipt from owner extension within 8 seconds"
+
+
+def _ds_record_extension_receipt(event: dict, client: dict | None = None, *, opened: bool) -> bool:
+    """Accept owner-only DS execution telemetry without confusing delivery with execution."""
+    try:
+        event = event or {}
+        client = client or {}
+        if not _copy_claim_extension_alert(event):
+            return True
+        user_id = normalize_copy_telegram_user_id(
+            event.get("telegram_user_id") or client.get("telegram_user_id") or event.get("target_user_id")
+        )
+        if str(user_id or "") != str(int(ADMIN_TELEGRAM_ID)):
+            logger.warning("Ignored DS execution receipt from non-owner | user=%s", user_id)
+            return False
+        signal_id = str(event.get("signal_id") or "")
+        if not signal_id.startswith("ds_") or str(event.get("source") or "").lower() != "ds":
+            logger.warning("Ignored invalid DS execution receipt | signal=%s", signal_id)
+            return False
+
+        detail = {
+            "signal_id": signal_id,
+            "pair": str(event.get("pair") or "")[:80] or None,
+            "direction": str(event.get("direction") or "")[:12] or None,
+            "asset": str(event.get("asset") or "")[:40] or None,
+            "amount": _copy_event_numeric(event.get("amount")) or None,
+            "account_mode": str(event.get("account_mode") or "")[:24] or None,
+            "prepare_mode": str(event.get("pair_prepare_mode") or "")[:32] or None,
+            "entry_offset_ms": event.get("entry_offset_from_candle_open_ms"),
+            "reason": str(event.get("reason") or "")[:300] or None,
+        }
+        _ds_state["last_execution_status"] = "opened" if opened else "skipped"
+        _ds_state["last_execution_reason"] = None if opened else detail["reason"]
+        _ds_state["last_execution_at"] = str(event.get("executed_at") or event.get("at") or now_iso())
+        _ds_state["last_execution_pair"] = detail["pair"]
+        _ds_state["last_execution_signal_id"] = signal_id
+        _ds_state["last_execution_detail"] = detail
+        if opened:
+            _ds_state["extension_opened"] = int(_ds_state.get("extension_opened", 0) or 0) + 1
+            logger.info("DS platform orders/open accepted | signal=%s | pair=%s | offset_ms=%s | prepare=%s",
+                        signal_id, detail["pair"], detail["entry_offset_ms"], detail["prepare_mode"])
+        else:
+            _ds_state["extension_skipped"] = int(_ds_state.get("extension_skipped", 0) or 0) + 1
+            logger.warning("DS platform entry skipped | signal=%s | pair=%s | reason=%s",
+                           signal_id, detail["pair"], detail["reason"])
+        return True
+    except Exception as exc:
+        logger.warning("Could not record DS execution receipt: %s", exc)
+        return False
 
 def build_ds_status() -> str:
     s = _ds_get_settings(False)
     p = _ds_state.get("prearmed") or {}
+    retrace = _ds_state.get("retrace_pending") or {}
+    execution = str(_ds_state.get("last_execution_status") or "")
+    if execution == "opened":
+        execution_text = f"فتحته الإضافة: {_ds_state.get('last_execution_pair') or '-'}"
+    elif execution == "skipped":
+        execution_text = f"رفضت الإضافة: {_ds_state.get('last_execution_reason') or '-'}"
+    elif execution == "pending":
+        execution_text = "بانتظار تأكيد الإضافة لفتح الصفقة"
+    elif execution == "unconfirmed":
+        execution_text = "لم يصل تأكيد فتح من الإضافة خلال 8 ثوانٍ"
+    elif execution == "publish_failed":
+        execution_text = f"فشل إرسال الباك‑إند: {_ds_state.get('last_execution_reason') or '-'}"
+    else:
+        execution_text = "-"
     return (
         "📐 DS — SAR Wave Midpoint\n━━━━━━━━━━━━━━\n"
         f"الحالة: {'شغال ✅' if s.get('enabled') else 'متوقف ⏸'}\n"
@@ -20084,12 +20320,15 @@ def build_ds_status() -> str:
         f"تهيئة M1 الحية: {_ds_state.get('history_ready',0)}/{_ds_state.get('history_requested',0)} أزواج جاهزة | الأقل: {_ds_state.get('history_min_closed',0)}/{DS_MIN_CLOSED_M1} شمعة مكتملة\n"
         f"نافذة PRE-ARM: {DS_PREARM_MIN_SECOND:.1f}–{DS_PREARM_LAST_SECOND:.1f}ث | تنفيذ حتى {DS_EXECUTION_MAX_DELAY_SECONDS}ث من افتتاح الشمعة\n"
         f"آخر فحص: {_ds_state.get('last_scan_at') or '-'} | جاهز/مفحوص: {_ds_state.get('pairs_ready',0)}/{_ds_state.get('pairs_scanned',0)}\n"
-        f"PRE-ARM: {p.get('pair') or '-'} {p.get('direction') or ''} | إشارات: {_ds_state.get('signals_sent',0)}\n"
+        f"PRE-ARM: {p.get('pair') or '-'} {p.get('direction') or ''} | أرسلت: {_ds_state.get('signals_sent',0)} | فتحت الإضافة: {_ds_state.get('extension_opened',0)} | رفضت: {_ds_state.get('extension_skipped',0)}\n"
+        f"Retrace: {retrace.get('pair') or '-'} {retrace.get('direction') or ''} | منفذ: {_ds_state.get('retrace_entries',0)} | ملغى: {_ds_state.get('retrace_cancelled',0)}\n"
+        f"آخر تنفيذ: {execution_text}\n"
         f"آخر سبب: {_ds_state.get('last_reject_reason') or '-'}\nآخر خطأ: {_ds_state.get('last_error') or '-'}"
     )[:3900]
 
 async def ds_job(context: ContextTypes.DEFAULT_TYPE):
     try:
+        _ds_expire_execution_receipt()
         if not _ds_get_settings(False).get("enabled"):
             return
         # Warm from central live candles only, matching the other live engines.
@@ -20104,11 +20343,11 @@ async def ds_job(context: ContextTypes.DEFAULT_TYPE):
             _ds_state["last_reject_reason"] = "Waiting for owner extension"
             return
         now_ts = time_module.time(); current_bucket = int(now_ts // 60) * 60; sec = now_ts - current_bucket
+        if _ds_state.get("retrace_pending"):
+            await _ds_drive_retrace()
+            return
         prearmed = _ds_state.get("prearmed")
         if prearmed and int(prearmed.get("target_bucket", 0)) == current_bucket:
-            if sec > DS_FINAL_MAX_SECOND:
-                _ds_state["prearmed"] = None; _ds_state["prearm_cancelled"] += 1; _ds_state["last_reject_reason"] = "DS final open window missed"
-                return
             symbol = str(prearmed.get("symbol") or "")
             _, tick, candles = _get_otc_rows_and_candles(symbol)
             closed = sorted([dict(c) for c in candles if _structure_edge_candle_bucket(c) < current_bucket], key=_structure_edge_candle_bucket)
@@ -20117,24 +20356,39 @@ async def ds_job(context: ContextTypes.DEFAULT_TYPE):
             # it finalizes the prior candle object. Wait inside the strict open
             # window instead of treating that transport ordering as a failed close.
             if final_candle is None:
-                _ds_state["last_reject_reason"] = "Waiting for final DS candle close"
+                if sec > DS_RETRACE_LAST_SECOND:
+                    _ds_state["prearmed"] = None; _ds_state["prearm_cancelled"] += 1; _ds_state["last_reject_reason"] = "DS cancelled: final candle close unavailable"
+                else:
+                    _ds_state["last_reject_reason"] = "Waiting for final DS candle close"
                 return
             close_price = float((final_candle or {}).get("close")) if final_candle else None
             midpoint = float(prearmed.get("midpoint"))
             direction = str(prearmed.get("direction"))
             confirmed = close_price is not None and ((direction == "PUT" and close_price < midpoint) or (direction == "CALL" and close_price > midpoint))
+            if sec > DS_RETRACE_LAST_SECOND:
+                _ds_state["prearmed"] = None; _ds_state["prearm_cancelled"] += 1; _ds_state["last_reject_reason"] = "DS cancelled: same M1 retrace window ended"
+                return
             open_price, live_price, displacement = _trendline_final_open_snapshot(symbol, current_bucket, prearmed)
             if not confirmed:
                 _ds_state["last_reject_reason"] = "DS cancelled: no M1 close beyond midpoint"
-            elif open_price is None or live_price is None or displacement is None or displacement > DS_ENTRY_MAX_DISPLACEMENT_ATR:
-                _ds_state["last_reject_reason"] = f"DS cancelled: late/open displacement {displacement if displacement is not None else '-'}"
+            elif open_price is None or live_price is None:
+                _ds_state["last_reject_reason"] = "DS waiting: current M1 open/live price unavailable"
+                return
             else:
-                result = await _ds_publish_execute(prearmed, current_bucket, float(open_price), float(live_price))
-                _ds_state["last_delivery"] = result
-                if result.get("ok"):
-                    _ds_state["signals_sent"] += 1; _ds_state["last_signal_at"] = now_iso(); _ds_state["last_candidate"] = dict(prearmed); _ds_state["last_reject_reason"] = None
+                # Always preserve the same M1 as a retrace candidate once the
+                # frozen-midpoint close has been confirmed. A fast initial move
+                # therefore waits for a return to candle-open rather than chasing.
+                if sec <= DS_FINAL_MAX_SECOND and displacement is not None and displacement <= DS_ENTRY_MAX_DISPLACEMENT_ATR:
+                    initial_id = f"ds_{safe_key(prearmed['pair'])}_{current_bucket}_{prearmed['direction']}"
+                    _ds_activate_retrace(prearmed, current_bucket, float(open_price), initial_id)
+                    result = await _ds_publish_execute(prearmed, current_bucket, float(open_price), float(live_price))
+                    _ds_state["last_delivery"] = result
+                    if result.get("ok"):
+                        _ds_state["signals_sent"] += 1; _ds_state["last_signal_at"] = now_iso(); _ds_state["last_candidate"] = dict(prearmed); _ds_state["last_reject_reason"] = None
+                    else:
+                        _ds_state["last_reject_reason"] = f"DS initial publish failed: {result}"
                 else:
-                    _ds_state["last_reject_reason"] = f"DS publish failed: {result}"
+                    _ds_activate_retrace(prearmed, current_bucket, float(open_price))
             _ds_state["prearmed"] = None
             return
         if prearmed and current_bucket > int(prearmed.get("target_bucket", 0)):
@@ -27530,7 +27784,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(build_ds_status(), reply_markup=ds_admin_keyboard)
         return
     if is_admin(user.id) and text == "🧹 تصفير DS":
-        _ds_state.update({"prearmed": None, "last_candidate": None, "last_delivery": None, "signals_sent": 0, "prearms": 0, "prearm_cancelled": 0, "last_reject_reason": None, "last_error": None})
+        _ds_state.update({"prearmed": None, "retrace_pending": None, "last_candidate": None, "last_delivery": None, "signals_sent": 0, "prearms": 0, "prearm_cancelled": 0, "retrace_entries": 0, "retrace_cancelled": 0, "extension_opened": 0, "extension_skipped": 0, "last_execution_status": None, "last_execution_reason": None, "last_execution_at": None, "last_execution_pair": None, "last_execution_signal_id": None, "last_execution_detail": None, "last_execution_sent_ts": 0.0, "last_reject_reason": None, "last_error": None})
         await update.message.reply_text("✅ تم تصفير عدادات DS فقط. حالة التشغيل بقيت كما هي.", reply_markup=ds_admin_keyboard)
         return
 
@@ -32017,6 +32271,10 @@ def create_embedded_copy_api():
                             event_kind = str(payload_event.get("kind") or "")
                             if event_kind == "structure_edge_trade_opened":
                                 sent = await _copy_record_structure_edge_trade_opened(payload_event, _copy_clients.get(client_id) or {})
+                            elif event_kind == "ds_trade_opened":
+                                sent = _ds_record_extension_receipt(payload_event, _copy_clients.get(client_id) or {}, opened=True)
+                            elif event_kind == "ds_trade_skipped":
+                                sent = _ds_record_extension_receipt(payload_event, _copy_clients.get(client_id) or {}, opened=False)
                             elif event_kind == "structure_edge_trade_lock":
                                 sent = await _copy_record_structure_edge_trade_lock(payload_event, _copy_clients.get(client_id) or {})
                             elif event_kind == "structure_edge_trade_result":
