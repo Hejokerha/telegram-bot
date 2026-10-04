@@ -12,6 +12,7 @@ import secrets
 import asyncio
 import random
 import re
+import math
 import requests
 import threading
 import time as time_module
@@ -5625,6 +5626,10 @@ class QuotexOTCLiveFeed:
         self.history_hydration_requested_at = {}
         self.history_hydration_received_at = {}
         self.history_hydration_sent = 0
+        # DS history is supplied by the authenticated owner extension.  Keep the
+        # source separate from live quotes: an uploaded candle must never make a
+        # disconnected market look executable.
+        self.extension_m1_history_received_at = {}
 
     # ------------------------------------------------------------------
     # Public cache/universe contract
@@ -5700,6 +5705,53 @@ class QuotexOTCLiveFeed:
                         self.history_hydration_requested_at.pop(symbol, None)
         except Exception:
             logger.debug("Could not prune M1 history requests", exc_info=True)
+
+    def merge_extension_m1_candles(self, symbol: str, rows: list) -> int:
+        """Merge validated M1 OHLC bars received from the owner extension.
+
+        This is analysis-only data from the user's already authenticated Quotex
+        page.  ``last_tick`` remains reserved for the direct quotes stream, so a
+        history upload cannot bypass the live-price execution guard.
+        """
+        symbol = str(symbol or "").strip()
+        if not symbol or not isinstance(rows, list):
+            return 0
+        now_ts = time_module.time()
+        normalized = {}
+        for row in rows[-300:]:
+            try:
+                if not isinstance(row, dict):
+                    continue
+                ts = float(row.get("time") or row.get("timestamp") or row.get("ts") or row.get("bucket_ts"))
+                if ts > 1e12:
+                    ts /= 1000.0
+                bucket = int(ts // 60) * 60
+                opened = float(row.get("open"))
+                closed = float(row.get("close"))
+                high = float(row.get("high"))
+                low = float(row.get("low"))
+                if bucket <= 0 or bucket > int(now_ts // 60) * 60 + 60 or bucket < int(now_ts) - 3 * 86400:
+                    continue
+                if not all(math.isfinite(v) for v in (opened, closed, high, low)) or high < low:
+                    continue
+                normalized[bucket] = {
+                    "symbol": symbol, "bucket_ts": bucket,
+                    "open": opened, "high": max(high, opened, closed),
+                    "low": min(low, opened, closed), "close": closed,
+                    "open_tick_ts": float(bucket), "close_tick_ts": float(bucket + 59.999),
+                    "ticks": 0, "source": "extension_m1_history",
+                }
+            except Exception:
+                continue
+        if not normalized:
+            return 0
+        with self.lock:
+            self._ensure_symbol_locked(symbol)
+            self.candles.setdefault(symbol, {}).update(normalized)
+            self.extension_m1_history_received_at[symbol] = now_iso()
+            self.history_hydration_received_at[symbol] = self.extension_m1_history_received_at[symbol]
+            self.history_hydration_requested.discard(symbol)
+        return len(normalized)
 
     def get_dynamic_otc_pairs(self, min_payout: int | None = None) -> dict:
         """Return currently available OTC currency pairs from instruments/list."""
@@ -19777,6 +19829,8 @@ _ds_state = {
     "last_candidate": None, "last_delivery": None,
     "history_requested": 0, "history_ready": 0, "history_queued": 0,
     "history_received": 0, "history_last_prime_at": None,
+    "history_source": "owner_extension", "history_last_upload_at": None,
+    "history_request_sent_at": 0.0,
 }
 
 def _ds_settings_ref():
@@ -19814,8 +19868,26 @@ def _ds_set_enabled(enabled: bool) -> bool:
         logger.exception("DS settings update failed: %s", exc)
         return False
 
+def _ds_history_symbols() -> list[str]:
+    """The currently eligible DS universe, bounded to protect the owner tab."""
+    pair_map = get_otc_analysis_pair_map()
+    symbols = []
+    for _, symbol in pair_map.items():
+        symbol = str(symbol or "").strip()
+        payout = int(float(quotex_otc_feed.instrument(symbol).get("payout", 0) or 0)) if symbol else 0
+        if symbol and payout >= DS_MIN_PAYOUT:
+            symbols.append(symbol)
+    return list(dict.fromkeys(symbols))[:10]
+
+
 def _ds_prime_m1_history() -> dict:
-    """Start DS history hydration immediately, not only in the PRE-ARM window."""
+    """Refresh DS readiness from owner-extension candle uploads only.
+
+    The backend Quotex socket reliably provides live quotes but does not reply to
+    its historical endpoint.  The logged-in owner extension is therefore the
+    authoritative source for the initial M1 window.  Clear the legacy queue so
+    no repeated ``history/load`` requests are sent from this process.
+    """
     now_ts = time_module.time()
     previous = float(_ds_state.get("history_last_prime_monotonic", 0.0) or 0.0)
     if now_ts - previous < DS_HISTORY_PRIME_SECONDS:
@@ -19828,32 +19900,54 @@ def _ds_prime_m1_history() -> dict:
 
     _ds_state["history_last_prime_monotonic"] = now_ts
     try:
-        pair_map = get_otc_analysis_pair_map()
-        symbols = []
-        for _, symbol in pair_map.items():
-            symbol = str(symbol or "").strip()
-            payout = int(float(quotex_otc_feed.instrument(symbol).get("payout", 0) or 0)) if symbol else 0
-            if symbol and payout >= DS_MIN_PAYOUT:
-                symbols.append(symbol)
-        # DS needs only the currently eligible owner universe, never the stale
-        # symbols accumulated by another strategy's dynamic subscription.
-        symbols = list(dict.fromkeys(symbols))[:10]
-        quotex_otc_feed.retain_m1_history_requests(symbols)
-        for symbol in symbols:
-            quotex_otc_feed.request_m1_history(symbol, DS_MIN_CLOSED_M1)
+        symbols = _ds_history_symbols()
+        # Stop v1.49.4's direct WebSocket hydration loop; extension uploads now
+        # fill the same candle cache without depending on that unsupported reply.
+        quotex_otc_feed.retain_m1_history_requests([])
         status = quotex_otc_feed.m1_history_status(symbols, DS_MIN_CLOSED_M1)
+        with quotex_otc_feed.lock:
+            uploads = [quotex_otc_feed.extension_m1_history_received_at.get(symbol) for symbol in symbols]
+        latest_upload = max((str(value) for value in uploads if value), default=None)
         _ds_state.update({
             "history_requested": int(status.get("requested", 0) or 0),
             "history_ready": int(status.get("ready", 0) or 0),
             "history_queued": int(status.get("queued", 0) or 0),
             "history_received": int(status.get("received", 0) or 0),
             "history_last_prime_at": now_iso(),
+            "history_source": "owner_extension",
+            "history_last_upload_at": latest_upload,
         })
         return status
     except Exception as exc:
         _ds_state["last_error"] = str(exc)
         logger.exception("DS M1 history prime failed: %s", exc)
         return {"requested": 0, "ready": 0, "queued": 0, "received": 0}
+
+
+async def _ds_request_owner_extension_history(status: dict) -> None:
+    """Ask the connected owner extension after the live instrument list exists."""
+    requested = int((status or {}).get("requested", 0) or 0)
+    ready = int((status or {}).get("ready", 0) or 0)
+    if not requested or ready >= requested:
+        return
+    now_ts = time_module.time()
+    if now_ts - float(_ds_state.get("history_request_sent_at", 0.0) or 0.0) < 30.0:
+        return
+    symbols = _ds_history_symbols()
+    if not symbols:
+        return
+    clients = globals().get("_copy_clients") or {}
+    payload = {"type": "ds_history_request", "enabled": True, "symbols": symbols,
+               "min_candles": int(DS_MIN_CLOSED_M1), "max_candles": 120}
+    sent = 0
+    for client in list(clients.values()):
+        if not isinstance(client, dict) or normalize_copy_telegram_user_id(client.get("telegram_user_id")) != str(int(ADMIN_TELEGRAM_ID)):
+            continue
+        if await _copy_send_json_safe(client.get("ws"), payload):
+            sent += 1
+    if sent:
+        _ds_state["history_request_sent_at"] = now_ts
+        logger.info("DS requested owner extension M1 history | symbols=%s", len(symbols))
 
 def _ds_sar_sides(rows: list[dict]) -> list[str]:
     """Closed-candle Parabolic SAR state; no current-candle repainting."""
@@ -20005,7 +20099,7 @@ def build_ds_status() -> str:
         f"الحالة: {'شغال ✅' if s.get('enabled') else 'متوقف ⏸'}\n"
         "الدخول: كسر + إغلاق شمعة M1 خلف 50% من موجة SAR المجمدة فقط.\n"
         f"Payout الأدنى: {DS_MIN_PAYOUT}% | تاريخ M1 المطلوب: {DS_MIN_CLOSED_M1} شمعة\n"
-        f"تاريخ M1: {_ds_state.get('history_ready',0)}/{_ds_state.get('history_requested',0)} جاهز | بانتظار الرد: {_ds_state.get('history_queued',0)}\n"
+        f"تاريخ M1: {_ds_state.get('history_ready',0)}/{_ds_state.get('history_requested',0)} جاهز | المصدر: الإضافة{' | آخر رفع: ' + str(_ds_state.get('history_last_upload_at')) if _ds_state.get('history_last_upload_at') else ' | بانتظار سجل الإضافة'}\n"
         f"نافذة PRE-ARM: {DS_PREARM_MIN_SECOND:.1f}–{DS_PREARM_LAST_SECOND:.1f}ث | تنفيذ حتى {DS_EXECUTION_MAX_DELAY_SECONDS}ث من افتتاح الشمعة\n"
         f"آخر فحص: {_ds_state.get('last_scan_at') or '-'} | جاهز/مفحوص: {_ds_state.get('pairs_ready',0)}/{_ds_state.get('pairs_scanned',0)}\n"
         f"PRE-ARM: {p.get('pair') or '-'} {p.get('direction') or ''} | إشارات: {_ds_state.get('signals_sent',0)}\n"
@@ -20016,16 +20110,17 @@ async def ds_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         if not _ds_get_settings(False).get("enabled"):
             return
-        # Do this before the extension gate.  A Render restart can therefore
-        # hydrate the old platform candles while the owner opens the extension,
-        # instead of wasting the first 30 live minutes.
+        # Refresh analysis readiness before the extension gate. Candle history
+        # arrives from the logged-in owner extension, while live quotes still
+        # arrive from the central feed.
         history_status = _ds_prime_m1_history()
+        await _ds_request_owner_extension_history(history_status)
         if (
             not _ds_state.get("prearmed")
             and int(history_status.get("requested", 0) or 0)
             and int(history_status.get("ready", 0) or 0) < int(history_status.get("requested", 0) or 0)
         ):
-            _ds_state["last_reject_reason"] = "Loading DS M1 history from Quotex"
+            _ds_state["last_reject_reason"] = "Waiting for owner extension M1 history"
         if not _copy_online_clients_for_user(int(ADMIN_TELEGRAM_ID)):
             _ds_state["last_reject_reason"] = "Waiting for owner extension"
             return
@@ -20073,7 +20168,7 @@ async def ds_job(context: ContextTypes.DEFAULT_TYPE):
         candidates = _ds_prearm_candidates()
         if not candidates:
             if int(history_status.get("requested", 0) or 0) and int(history_status.get("ready", 0) or 0) < int(history_status.get("requested", 0) or 0):
-                _ds_state["last_reject_reason"] = "Loading DS M1 history from Quotex"
+                _ds_state["last_reject_reason"] = "Waiting for owner extension M1 history"
             else:
                 _ds_state["last_reject_reason"] = "No provisional DS close-break candidate"
             return
@@ -31854,6 +31949,16 @@ def create_embedded_copy_api():
             }
             if auth_mode == "telegram":
                 hello["subscription"] = dict(hello["license"])
+            # Owner-only: tell the authenticated extension which currently
+            # eligible OTC windows it may request from its own Quotex page.
+            # This is data collection only; no order command is emitted here.
+            if is_admin_license and str(telegram_user_id) == str(int(ADMIN_TELEGRAM_ID)):
+                hello["ds_history_request"] = {
+                    "enabled": True,
+                    "symbols": _ds_history_symbols(),
+                    "min_candles": int(DS_MIN_CLOSED_M1),
+                    "max_candles": 120,
+                }
             if not legacy_auth:
                 hello["session_token"] = _copy_session_token_issue(token, device_id, telegram_user_id, device_proof_key)
                 hello["session_expires_in"] = int(COPY_SESSION_TOKEN_TTL_SECONDS)
@@ -31917,6 +32022,24 @@ def create_embedded_copy_api():
                                 _octopus_execution_lock_clear(signal_id=str(event.get("signal_id") or "") or None, reason=f"extension_ack:{event.get('status')}")
                                 _structure_edge_state["last_reject_reason"] = f"Extension ack: {event.get('status')}"
                         await _copy_send_json_safe(websocket, {"type": "ack_saved", "signal_id": event.get("signal_id")})
+                    elif event.get("type") == "ds_m1_history":
+                        # Never accept analysis data from a subscriber. The DS
+                        # bridge is limited to the authenticated owner identity.
+                        payload_history = event.get("payload") if isinstance(event.get("payload"), dict) else {}
+                        symbol = str(payload_history.get("symbol") or "").strip()
+                        rows = payload_history.get("candles") if isinstance(payload_history.get("candles"), list) else []
+                        is_owner = bool(is_admin_license and str(telegram_user_id) == str(int(ADMIN_TELEGRAM_ID)))
+                        accepted = quotex_otc_feed.merge_extension_m1_candles(symbol, rows) if is_owner else 0
+                        if accepted:
+                            _ds_state["history_last_upload_at"] = now_iso()
+                            _ds_state["history_source"] = "owner_extension"
+                            logger.info("DS owner extension M1 history accepted | symbol=%s | candles=%s", symbol, accepted)
+                        await _copy_send_json_safe(websocket, {
+                            "type": "ds_m1_history_saved", "ok": bool(accepted),
+                            "symbol": symbol, "candles": int(accepted),
+                            "reason": None if accepted else ("owner_only_or_invalid_history" if not is_owner else "no_valid_candles"),
+                            "server_time": now_iso(),
+                        })
                     elif event.get("type") == "extension_event":
                         payload_event = event.get("event") if isinstance(event.get("event"), dict) else {}
                         payload_event["telegram_user_id"] = payload_event.get("telegram_user_id") or telegram_user_id
