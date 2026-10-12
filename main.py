@@ -206,10 +206,10 @@ CHANNEL_SIGNAL_INTERVAL_MINUTES = 3
 QUOTEX_COOKIE_FILE = os.getenv("QUOTEX_COOKIE_FILE", "cookies.txt")
 QUOTEX_WS_URL = os.getenv(
     "QUOTEX_WS_URL",
-    "wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket",
-).strip() or "wss://ws2.qxbroker.com/socket.io/?EIO=3&transport=websocket"
-QUOTEX_ORIGIN = os.getenv("QUOTEX_ORIGIN", "https://qxbroker.com").strip() or "https://qxbroker.com"
-QUOTEX_REFERER = os.getenv("QUOTEX_REFERER", "https://qxbroker.com/en/trade").strip() or "https://qxbroker.com/en/trade"
+    "wss://ws2.quotex.com/socket.io/?EIO=3&transport=websocket",
+).strip() or "wss://ws2.quotex.com/socket.io/?EIO=3&transport=websocket"
+QUOTEX_ORIGIN = os.getenv("QUOTEX_ORIGIN", "https://quotex.com").strip() or "https://quotex.com"
+QUOTEX_REFERER = os.getenv("QUOTEX_REFERER", "https://quotex.com/en/trade").strip() or "https://quotex.com/en/trade"
 QUOTEX_IMPERSONATE = os.getenv("QUOTEX_IMPERSONATE", "chrome").strip() or "chrome"
 QUOTEX_CONNECT_TIMEOUT_SECONDS = float(os.getenv("QUOTEX_CONNECT_TIMEOUT_SECONDS", "15"))
 QUOTEX_AUTH_TIMEOUT_SECONDS = float(os.getenv("QUOTEX_AUTH_TIMEOUT_SECONDS", "15"))
@@ -1170,20 +1170,20 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.48.3"
-MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.11").strip() or "1.0.11"
-MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "111"))
+COPY_SERVER_VERSION = "1.49.0"
+MOBILE_APP_LATEST_VERSION = os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.13").strip() or "1.0.13"
+MOBILE_APP_LATEST_BUILD = int(os.getenv("MOBILE_APP_LATEST_BUILD", "113"))
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
 MOBILE_APP_FORCE_UPDATE = os.getenv("MOBILE_APP_FORCE_UPDATE", "false").lower() in {"1", "true", "yes", "on"}
 MOBILE_APP_RELEASE_URL = os.getenv("MOBILE_APP_RELEASE_URL", "https://trading-time-official.web.app/download").strip()
 MOBILE_APP_RELEASE_NOTES = os.getenv(
     "MOBILE_APP_RELEASE_NOTES",
-    "دعم Octopus على Android مع تحسينات التنفيذ بالخلفية وعزل Telegram ID.",
+    "إضافة نسخ VIP ونسخ للفريق إلى Android مع تتبع مستقل للصفقات المتداخلة.",
 ).strip()
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
 TRADING_TIME_TELEGRAM_LOOP = None
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.15.0").strip() or "v1.15.0"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.15.2").strip() or "v1.15.2"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -5600,11 +5600,14 @@ class QuotexOTCLiveFeed:
         self.pending_binary_event = None
         self.last_message_monotonic = 0.0
         self.last_quote_monotonic = 0.0
+        self._quote_generation_by_symbol = {}
         self.last_connected_at = None
         self.last_authorized_at = None
         self.last_failure_category = None
         self.last_failure_at = None
         self.last_failure_detail = None
+        self._failure_generation = 0
+        self.connection_stage = "idle"
         self.reconnect_attempt = 0
         self.subscribed_symbols = set()
         self._subscription_generation = 0
@@ -5867,17 +5870,37 @@ class QuotexOTCLiveFeed:
         return sorted(QuotexOTCLiveFeed._cookie_dict(raw).keys())
 
     @staticmethod
-    def _safe_exception_detail(exc: Exception) -> str:
-        """Return diagnostic metadata without echoing response cookies/secrets."""
-        status = getattr(exc, "status_code", None)
-        if status is None:
-            status = getattr(exc, "status", None)
+    def _exception_http_status(exc: Exception) -> int | None:
+        """Read only numeric HTTP metadata; never stringify a response."""
+        response = getattr(exc, "response", None)
+        for status in (
+            getattr(exc, "status_code", None),
+            getattr(exc, "status", None),
+            getattr(response, "status_code", None),
+        ):
+            if isinstance(status, int) and not isinstance(status, bool) and 100 <= status <= 599:
+                return int(status)
+        return None
+
+    @staticmethod
+    def _safe_exception_detail(exc: Exception, stage: str | None = None) -> str:
+        """Return allowlisted metadata without echoing messages/cookies/URLs."""
         parts = [type(exc).__name__]
+        status = QuotexOTCLiveFeed._exception_http_status(exc)
         if status is not None:
             parts.append(f"http_status={status}")
+        code = getattr(exc, "code", None)
+        if isinstance(code, int) and not isinstance(code, bool) and 0 <= code <= 999:
+            parts.append(f"curl_code={int(code)}")
+        if stage in {
+            "idle", "websocket_handshake", "engine_open", "socketio_namespace",
+            "instruments_list", "seed_follow", "seed_quote", "stream",
+        }:
+            parts.append(f"stage={stage}")
         return " ".join(parts)[:180]
 
     def _set_failure(self, category: str, detail: str | None = None):
+        self._failure_generation += 1
         self.last_failure_category = str(category or "unknown")[:80]
         self.last_failure_detail = str(detail or "")[:240]
         self.last_failure_at = now_iso()
@@ -5920,6 +5943,8 @@ class QuotexOTCLiveFeed:
             connected_started = time_module.monotonic()
             self.connection_was_ready = False
             self.auth_mode = "none"
+            self.connection_stage = "websocket_handshake"
+            failure_generation = self._failure_generation
 
             try:
                 logger.info(
@@ -5934,30 +5959,27 @@ class QuotexOTCLiveFeed:
                 if not ready:
                     # No session-auth fallback in v1.40. A failed cookie-only bootstrap
                     # is diagnosed and retried with bounded backoff.
-                    if not self.last_failure_category:
+                    if self._failure_generation == failure_generation:
                         self._set_failure("cookie_only_no_quotes", "cookie-only bootstrap did not become feed-ready")
                     raise RuntimeError("quotex_cookie_only_not_ready")
 
             except Exception as e:
-                detail = self._safe_exception_detail(e)
-                preserve_categories = {
-                    "cookie_only_no_quotes",
-                    "cookie_only_no_quotes",
-                    "stream_stale",
-                    "socketio_namespace_timeout",
-                    "cloudflare_rejection",
-                    "missing_cookies",
-                }
-                if self.last_failure_category not in preserve_categories:
-                    status = getattr(e, "status_code", None)
+                detail = self._safe_exception_detail(e, stage=self.connection_stage)
+                # Preserve every specific failure raised by this attempt, while
+                # allowing a new transport failure to replace an older diagnosis.
+                if self._failure_generation == failure_generation:
+                    status = self._exception_http_status(e)
                     if status == 403:
                         self._set_failure("cloudflare_rejection", detail)
+                    elif isinstance(getattr(e, "code", None), int) and getattr(e, "code", None) == 6:
+                        self._set_failure("dns_resolution_failed", detail)
                     else:
                         self._set_failure("transport_error", detail)
                 logger.warning(
-                    "Quotex OTC central feed connection ended | category=%s | detail=%s | auth_mode=%s",
+                    "Quotex OTC central feed connection ended | category=%s | detail=%s | exception=%s | auth_mode=%s",
                     self.last_failure_category or "transport_error",
                     self.last_failure_detail or detail,
+                    detail,
                     self.auth_mode,
                 )
             finally:
@@ -6065,6 +6087,7 @@ class QuotexOTCLiveFeed:
         follow_task = None
         history_task = None
         try:
+            self.connection_stage = "websocket_handshake"
             async with CurlAsyncSession() as session:
                 async with session.ws_connect(
                     QUOTEX_WS_URL,
@@ -6077,11 +6100,13 @@ class QuotexOTCLiveFeed:
                     self._send_lock = asyncio.Lock()
                     self.last_message_monotonic = time_module.monotonic()
 
+                    self.connection_stage = "engine_open"
                     data, is_text, _ = await self._recv_frame(ws, timeout=float(QUOTEX_AUTH_TIMEOUT_SECONDS))
                     engine_open = data.decode("utf-8", "ignore") if is_text else ""
                     if not engine_open.startswith("0"):
                         raise RuntimeError("legacy_unexpected_engine_open")
 
+                    self.connection_stage = "socketio_namespace"
                     await self._send_raw_async(ws, "40")
                     namespace_ok = False
                     deadline = time_module.monotonic() + float(QUOTEX_AUTH_TIMEOUT_SECONDS)
@@ -6107,22 +6132,27 @@ class QuotexOTCLiveFeed:
                     keepalive_task = asyncio.create_task(self._legacy_keepalive_worker(ws))
                     logger.info("Quotex cookie-only namespace connected")
 
+                    self.connection_stage = "instruments_list"
                     await asyncio.sleep(max(0.0, float(QUOTEX_LEGACY_LIST_DELAY_SECONDS)))
                     await self._send_event_async(ws, "instruments/list", [])
                     logger.info("Quotex cookie-only request sent | instruments/list")
                     await asyncio.sleep(1.0)
 
-                    quote_marker = float(self.last_quote_monotonic or 0.0)
+                    with self.lock:
+                        seed_quote_generation = self._quote_generation_by_symbol.get(seed, 0)
+                    self.connection_stage = "seed_follow"
                     await self._send_event_async(ws, "instruments/follow", seed)
                     with self.lock:
                         self.subscribed_symbols = {seed}
                     logger.info("Quotex cookie-only seed follow sent | symbol=%s", seed)
 
+                    self.connection_stage = "seed_quote"
                     probe_deadline = time_module.monotonic() + max(1.0, float(QUOTEX_LEGACY_PROBE_TIMEOUT_SECONDS))
                     while time_module.monotonic() < probe_deadline:
-                        if float(self.last_quote_monotonic or 0.0) > quote_marker:
-                            with self.lock:
-                                tick = dict(self.last_tick.get(seed) or {})
+                        with self.lock:
+                            seed_is_fresh = self._quote_generation_by_symbol.get(seed, 0) > seed_quote_generation
+                            tick = dict(self.last_tick.get(seed) or {})
+                        if seed_is_fresh:
                             if tick and tick.get("price") is not None:
                                 self.authorized = True  # feed-ready semantic for shared diagnostics
                                 self.auth_mode = "cookie_only"
@@ -6160,6 +6190,7 @@ class QuotexOTCLiveFeed:
                         )
                         return False
 
+                    self.connection_stage = "stream"
                     follow_task = asyncio.create_task(self._legacy_follow_worker(ws, seed))
                     # Keep DS history independent from the legacy follow queue.
                     history_task = asyncio.create_task(self._history_hydration_worker(ws))
@@ -6168,11 +6199,9 @@ class QuotexOTCLiveFeed:
                         try:
                             data, is_text, is_binary = await self._recv_frame(ws, timeout=10)
                             await self._handle_frame(ws, data, is_text, is_binary, pre_auth=False)
+                            self._check_stream_freshness()
                         except asyncio.TimeoutError:
-                            stale_for = time_module.monotonic() - float(self.last_message_monotonic or 0.0)
-                            if stale_for >= float(QUOTEX_STREAM_STALE_SECONDS):
-                                self._set_failure("stream_stale", f"cookie-only: no inbound frames for {stale_for:.1f}s")
-                                raise RuntimeError("quotex_legacy_stream_stale")
+                            self._check_stream_freshness()
                             continue
 
         finally:
@@ -6185,6 +6214,19 @@ class QuotexOTCLiveFeed:
                         pass
 
         return bool(self.legacy_probe_success)
+
+    def _check_stream_freshness(self):
+        """Heartbeats keep transport alive but cannot substitute for live quotes."""
+        now_mono = time_module.monotonic()
+        message_age = max(0.0, now_mono - float(self.last_message_monotonic or 0.0))
+        quote_age = max(0.0, now_mono - float(self.last_quote_monotonic or 0.0))
+        threshold = float(QUOTEX_STREAM_STALE_SECONDS)
+        if message_age >= threshold:
+            self._set_failure("stream_stale", f"no inbound frames for {message_age:.1f}s")
+            raise RuntimeError("quotex_stream_stale")
+        if quote_age >= threshold:
+            self._set_failure("stream_stale", f"no live quotes/stream for {quote_age:.1f}s")
+            raise RuntimeError("quotex_quote_stream_stale")
 
     async def _connection_main(self, raw_cookies: str, session_token: str) -> bool:
         cookie_jar = self._cookie_dict(raw_cookies)
@@ -6307,13 +6349,11 @@ class QuotexOTCLiveFeed:
                             await self._handle_frame(ws, data, is_text, is_binary, pre_auth=False)
                             if self.subscription_bootstrap_failed:
                                 raise RuntimeError("quotex_subscription_bootstrap_failed")
+                            self._check_stream_freshness()
                         except asyncio.TimeoutError:
                             if self.subscription_bootstrap_failed:
                                 raise RuntimeError("quotex_subscription_bootstrap_failed")
-                            stale_for = time_module.monotonic() - float(self.last_message_monotonic or 0.0)
-                            if stale_for >= float(QUOTEX_STREAM_STALE_SECONDS):
-                                self._set_failure("stream_stale", f"no inbound frames for {stale_for:.1f}s")
-                                raise RuntimeError("quotex_stream_stale")
+                            self._check_stream_freshness()
                             continue
                 finally:
                     for task in (history_task, subscription_task):
@@ -6779,7 +6819,7 @@ class QuotexOTCLiveFeed:
                 self.authorized = False
                 self._set_failure(
                     "authorization_rejected",
-                    "QUOTEX_SESSION and QUOTEX_COOKIES may be expired or from different login sessions",
+                    "server rejected feed authorization; refresh credentials for the active authentication mode",
                 )
                 raise RuntimeError("quotex_authorization_rejected")
 
@@ -7025,6 +7065,7 @@ class QuotexOTCLiveFeed:
                     "received_at": now_iso(),
                     "source": "quotes/stream",
                 }
+                self._quote_generation_by_symbol[symbol] = self._quote_generation_by_symbol.get(symbol, 0) + 1
                 accepted += 1
 
         if accepted:
@@ -30141,11 +30182,11 @@ def _copy_is_mobile_executable_signal(signal: dict) -> bool:
     is the one intentional exception: Android also receives its targeted PREPARE
     packet so it can preselect the pair before the M1 boundary.  PREPARE remains
     non-executable in the app; only the later EXECUTE packet can open an order.
-    OTC Edge and v1.47 VIP Copy stay Chrome-extension-only.
+    OTC Edge stays Chrome-extension-only. VIP Copy is executable on Android.
     """
     try:
         source = normalize_copy_source((signal or {}).get("source"))
-        if source in {"otc_edge", "vip_copy"}:
+        if source == "otc_edge":
             return False
         kind = _copy_signal_contract_kind(signal)
         if source == "structure_edge":
@@ -30179,6 +30220,8 @@ def _copy_filter_mobile_recent_signals(
             continue
         target_user_id = normalize_copy_telegram_user_id(signal.get("target_user_id"))
         if target_user_id and target_user_id != user_id:
+            continue
+        if normalize_copy_source(signal.get("source")) == "vip_copy" and user_id == normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
             continue
         visible.append(dict(signal))
     return visible[-max(1, int(limit)):]
@@ -30483,7 +30526,10 @@ async def _copy_broadcast_signal(signal: dict, exclude_client_id: str | None = N
     dead = []
     inactive = []
     for client_id, client in list(_copy_clients.items()):
-        if exclude_client_id and str(client_id) == str(exclude_client_id):
+        if (exclude_client_id and str(client_id) == str(exclude_client_id)) or (
+            normalize_copy_source(signal.get("source")) == "vip_copy"
+            and normalize_copy_telegram_user_id(client.get("telegram_user_id")) == normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID)
+        ):
             skipped_scope += 1
             continue
         client_user_id = normalize_copy_telegram_user_id(client.get("telegram_user_id"))
@@ -30534,8 +30580,8 @@ def _copy_vip_owner_identity_ok(client: dict) -> bool:
 async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: dict) -> dict:
     """Turn one authenticated owner manual Quotex orders/open event into a VIP broadcast.
 
-    The owner's amount/account type is deliberately NOT copied. Followers execute the
-    packet through their own extension settings. Android is excluded in v1.47 phase 1.
+    The owner's amount/account type is deliberately NOT copied. Followers execute
+    with their own extension or Android settings.
     """
     if not _copy_vip_owner_identity_ok(client):
         return {"ok": False, "reason": "owner_only"}
@@ -30574,7 +30620,8 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
     event_id = re.sub(r"[^A-Za-z0-9_.:-]", "_", str((event or {}).get("event_id") or ""))[:80]
     if not event_id:
         event_id = secrets.token_hex(8)
-    signal_id = f"vip:{int(now_epoch * 1000)}:{event_id}"
+    # Stable event identity makes retries idempotent across HTTP/WS transports.
+    signal_id = f"vip:{event_id}"
     max_delay = int(COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["vip_copy"])
 
     raw_signal = {
@@ -30634,6 +30681,7 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
             ]
         return {"ok": False, "reason": "copy_global_disabled", "signal_id": normalized.get("id")}
 
+    mobile_delivery = await _copy_broadcast_mobile_signal(normalized)
     logger.info(
         "VIP Team Copy broadcast | asset=%s | direction=%s | expiry=%s | followers=%s | leader_client=%s",
         normalized.get("platform_symbol"), direction, normalized.get("expiry_timestamp"),
@@ -30643,7 +30691,7 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
         "ok": True,
         "signal_id": normalized.get("id"),
         "delivery": delivery,
-        "mobile_delivery": {"delivered": 0, "reason": "vip_copy_extension_only"},
+        "mobile_delivery": mobile_delivery,
     }
 
 def _mobile_notification_visible_to_user(notification: dict, telegram_user_id: int | str | None) -> bool:
@@ -30770,6 +30818,9 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
     inactive = []
     for client_id, client in list(_mobile_signal_clients.items()):
         client_user_id = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
+        if normalize_copy_source(signal.get("source")) == "vip_copy" and client_user_id == normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
+            skipped_scope += 1
+            continue
         if target_user_id and client_user_id != target_user_id:
             skipped_scope += 1
             continue
@@ -31377,6 +31428,27 @@ def create_embedded_copy_api():
             "notifications": _mobile_recent_notifications_for_user(telegram_user_id, limit=30),
         }
 
+    @copy_api.post("/api/mobile/vip/manual-trade")
+    async def mobile_vip_manual_trade(request: Request, authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        owner_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
+        if owner_id != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
+            raise HTTPException(status_code=403, detail="owner_only")
+        try:
+            event = await request.json()
+        except Exception:
+            raise HTTPException(status_code=400, detail="invalid_json")
+        if not isinstance(event, dict) or not isinstance(event.get("trade"), dict):
+            raise HTTPException(status_code=400, detail="invalid_trade")
+        event_id = str(event.get("event_id") or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,80}", event_id):
+            raise HTTPException(status_code=400, detail="invalid_event_id")
+        if str(event.get("platform_event") or "") not in {"s_orders/open", "f_orders/open", "orders/opened", "successopenOrder", "successopen"}:
+            raise HTTPException(status_code=400, detail="platform_open_confirmation_required")
+        return await _copy_publish_vip_manual_trade(
+            event, "", {"telegram_user_id": owner_id, "client_kind": "mobile"}
+        )
+
     # ===== v1.13 Mobile Bot Features + Admin Control Plane =====
     # Flutter is only a UI/client. Signal generation and admin actions stay here,
     # reusing the exact Telegram-bot functions/state so there is one source of truth.
@@ -31502,6 +31574,7 @@ def create_embedded_copy_api():
             "server_version": COPY_SERVER_VERSION,
             "telegram_user_id": tid,
             "is_admin": tid == str(int(ADMIN_TELEGRAM_ID)),
+            "vip_team_copy_enabled": is_vip_team_copy_enabled() if tid == str(int(ADMIN_TELEGRAM_ID)) else False,
             # Owner-granted narrow permission: JavaScript injection + the same
             # internal DEMO sandbox lifecycle used by the owner. This does NOT
             # grant the mobile admin panel or any Telegram-bot admin action.
