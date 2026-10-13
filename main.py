@@ -125,6 +125,7 @@ VIDEO_TRIAL_DELAY_SECONDS = int(os.getenv("VIDEO_TRIAL_DELAY_SECONDS", "90"))
 VIDEO_TRIAL_DURATION_SECONDS = int(os.getenv("VIDEO_TRIAL_DURATION_SECONDS", "3600"))
 
 ADMIN_TELEGRAM_ID = 1582593617
+VIP_TEAM_LEADER_TELEGRAM_IDS = {int(ADMIN_TELEGRAM_ID), 6656949901}
 def parse_id_set_from_env(name: str) -> set[int]:
     ids = set()
     raw = os.getenv(name, "") or ""
@@ -1170,7 +1171,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.0"
+COPY_SERVER_VERSION = "1.49.1"
 # The published Firebase APK is build 113. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(113, int(os.getenv("MOBILE_APP_LATEST_BUILD", "113")))
@@ -1188,7 +1189,7 @@ MOBILE_APP_RELEASE_NOTES = (
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
 TRADING_TIME_TELEGRAM_LOOP = None
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.15.2").strip() or "v1.15.2"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.15.4").strip() or "v1.15.4"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -30226,7 +30227,7 @@ def _copy_filter_mobile_recent_signals(
         target_user_id = normalize_copy_telegram_user_id(signal.get("target_user_id"))
         if target_user_id and target_user_id != user_id:
             continue
-        if normalize_copy_source(signal.get("source")) == "vip_copy" and user_id == normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
+        if normalize_copy_source(signal.get("source")) == "vip_copy" and _copy_vip_leader_identity_ok(user_id):
             continue
         visible.append(dict(signal))
     return visible[-max(1, int(limit)):]
@@ -30533,7 +30534,7 @@ async def _copy_broadcast_signal(signal: dict, exclude_client_id: str | None = N
     for client_id, client in list(_copy_clients.items()):
         if (exclude_client_id and str(client_id) == str(exclude_client_id)) or (
             normalize_copy_source(signal.get("source")) == "vip_copy"
-            and normalize_copy_telegram_user_id(client.get("telegram_user_id")) == normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID)
+            and _copy_vip_leader_identity_ok(client.get("telegram_user_id"))
         ):
             skipped_scope += 1
             continue
@@ -30573,23 +30574,26 @@ async def _copy_broadcast_signal(signal: dict, exclude_client_id: str | None = N
 
 
 
-def _copy_vip_owner_identity_ok(client: dict) -> bool:
-    """Server-authoritative owner check. Never trust a client-provided role flag."""
+def _copy_vip_leader_identity_ok(identity) -> bool:
+    """Allow only the two explicitly designated Telegram identities to lead VIP."""
     try:
-        client_uid = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
-        return bool(client_uid and client_uid == normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID))
+        user_id = normalize_copy_telegram_user_id(
+            identity.get("telegram_user_id") if isinstance(identity, dict) else identity
+        )
+        return bool(user_id and user_id in {str(uid) for uid in VIP_TEAM_LEADER_TELEGRAM_IDS})
     except Exception:
         return False
 
 
 async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: dict) -> dict:
-    """Turn one authenticated owner manual Quotex orders/open event into a VIP broadcast.
+    """Turn one authenticated leader manual Quotex orders/open event into a VIP broadcast.
 
-    The owner's amount/account type is deliberately NOT copied. Followers execute
+    The leader's amount/account type is deliberately NOT copied. Followers execute
     with their own extension or Android settings.
     """
-    if not _copy_vip_owner_identity_ok(client):
-        return {"ok": False, "reason": "owner_only"}
+    if not _copy_vip_leader_identity_ok(client):
+        return {"ok": False, "reason": "leader_only"}
+    leader_id = normalize_copy_telegram_user_id(client.get("telegram_user_id"))
     if not is_copy_global_enabled():
         return {"ok": False, "reason": "copy_global_disabled"}
     if not is_vip_team_copy_enabled():
@@ -30652,8 +30656,8 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
         "instant_entry": True,
         "allow_background_entry": True,
         "max_entry_delay_seconds": max_delay,
-        "creator_user_id": int(ADMIN_TELEGRAM_ID),
-        "note": "VIP Team Copy — owner manual Quotex order",
+        "creator_user_id": int(leader_id),
+        "note": "VIP Team Copy — leader manual Quotex order",
     }
     try:
         normalized = _copy_server_sanitize_signal(raw_signal)
@@ -30823,7 +30827,7 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
     inactive = []
     for client_id, client in list(_mobile_signal_clients.items()):
         client_user_id = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
-        if normalize_copy_source(signal.get("source")) == "vip_copy" and client_user_id == normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
+        if normalize_copy_source(signal.get("source")) == "vip_copy" and _copy_vip_leader_identity_ok(client_user_id):
             skipped_scope += 1
             continue
         if target_user_id and client_user_id != target_user_id:
@@ -31436,9 +31440,9 @@ def create_embedded_copy_api():
     @copy_api.post("/api/mobile/vip/manual-trade")
     async def mobile_vip_manual_trade(request: Request, authorization: str | None = Header(default=None)):
         session = _mobile_bearer_session(authorization)
-        owner_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
-        if owner_id != normalize_copy_telegram_user_id(ADMIN_TELEGRAM_ID):
-            raise HTTPException(status_code=403, detail="owner_only")
+        leader_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
+        if not _copy_vip_leader_identity_ok(leader_id):
+            raise HTTPException(status_code=403, detail="leader_only")
         try:
             event = await request.json()
         except Exception:
@@ -31451,7 +31455,7 @@ def create_embedded_copy_api():
         if str(event.get("platform_event") or "") not in {"s_orders/open", "f_orders/open", "orders/opened", "successopenOrder", "successopen"}:
             raise HTTPException(status_code=400, detail="platform_open_confirmation_required")
         return await _copy_publish_vip_manual_trade(
-            event, "", {"telegram_user_id": owner_id, "client_kind": "mobile"}
+            event, "", {"telegram_user_id": leader_id, "client_kind": "mobile"}
         )
 
     # ===== v1.13 Mobile Bot Features + Admin Control Plane =====
@@ -31579,7 +31583,8 @@ def create_embedded_copy_api():
             "server_version": COPY_SERVER_VERSION,
             "telegram_user_id": tid,
             "is_admin": tid == str(int(ADMIN_TELEGRAM_ID)),
-            "vip_team_copy_enabled": is_vip_team_copy_enabled() if tid == str(int(ADMIN_TELEGRAM_ID)) else False,
+            "can_vip_lead": _copy_vip_leader_identity_ok(tid),
+            "vip_team_copy_enabled": is_vip_team_copy_enabled() if _copy_vip_leader_identity_ok(tid) else False,
             # Owner-granted narrow permission: JavaScript injection + the same
             # internal DEMO sandbox lifecycle used by the owner. This does NOT
             # grant the mobile admin panel or any Telegram-bot admin action.
@@ -32339,6 +32344,7 @@ def create_embedded_copy_api():
                     "telegram_user_id": normalize_copy_telegram_user_id((license_record or {}).get("telegram_user_id") or telegram_user_id),
                     "route_mode": "personal",
                     "is_admin_license": is_admin_license,
+                    "can_vip_lead": _copy_vip_leader_identity_ok(telegram_user_id),
                     "role": (license_record or {}).get("role") or ("admin" if is_admin_license else "user"),
                     "source": "telegram_bot_subscription" if auth_mode == "telegram" else "legacy_copy_license",
                 },

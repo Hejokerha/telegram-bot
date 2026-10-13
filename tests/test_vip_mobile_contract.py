@@ -13,7 +13,7 @@ UTC = timezone.utc
 NAMES = {
     "_copy_is_mobile_executable_signal",
     "_copy_filter_mobile_recent_signals",
-    "_copy_vip_owner_identity_ok",
+    "_copy_vip_leader_identity_ok",
     "_copy_publish_vip_manual_trade",
     "_copy_broadcast_mobile_signal",
 }
@@ -41,6 +41,7 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
 
         self.ns = {
             "ADMIN_TELEGRAM_ID": 123,
+            "VIP_TEAM_LEADER_TELEGRAM_IDS": {123, 6656949901},
             "normalize_copy_telegram_user_id": lambda value: str(value or ""),
             "normalize_copy_source": lambda value: str(value or "").lower(),
             "_copy_signal_contract_kind": lambda signal: signal.get("signal_kind", "execute"),
@@ -83,11 +84,13 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
         visible = self.ns["_copy_filter_mobile_recent_signals"]
         self.assertEqual(visible(rows, True, "456"), rows)
         self.assertEqual(visible(rows, True, "123"), [])
+        self.assertEqual(visible(rows, True, "6656949901"), [])
         self.assertEqual(visible(rows, False, "456"), [])
 
     async def test_owner_manual_trade_broadcasts_without_amount_or_account(self):
         self.ns["_mobile_signal_clients"] = {
             "owner": {"telegram_user_id": "123", "token": "owner-token", "device_id": "one", "ws": "owner-ws"},
+            "second_leader": {"telegram_user_id": "6656949901", "token": "leader-token", "device_id": "three", "ws": "leader-ws"},
             "follower": {"telegram_user_id": "456", "token": "follower-token", "device_id": "two", "ws": "follower-ws"},
         }
         self.ns["_copy_signal_delivery_allowed"] = lambda enabled, signal, mobile=False: enabled
@@ -107,10 +110,41 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
         extension_signal = next(payload for ws, payload in self.sent if ws == "extension")
         self.assertNotIn("amount", extension_signal)
         self.assertNotIn("isDemo", extension_signal)
+        self.assertEqual(extension_signal["creator_user_id"], 123)
+        second_leader = await self.ns["_copy_publish_vip_manual_trade"](
+            {**event, "event_id": "mobile_second_leader"}, "", {"telegram_user_id": "6656949901"}
+        )
+        self.assertTrue(second_leader["ok"])
+        second_signal = [payload for ws, payload in self.sent if ws == "extension"][-1]
+        self.assertEqual(second_signal["creator_user_id"], 6656949901)
         denied = await self.ns["_copy_publish_vip_manual_trade"](
             event, "", {"telegram_user_id": "456"}
         )
-        self.assertEqual(denied["reason"], "owner_only")
+        self.assertEqual(denied["reason"], "leader_only")
+
+    async def test_extension_vip_delivery_excludes_both_leaders(self):
+        tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+        selected = [node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_copy_broadcast_signal"]
+        self.assertEqual(len(selected), 1)
+        clients = {
+            "owner": {"telegram_user_id": "123", "auth_mode": "license", "ws": "owner-ws"},
+            "second": {"telegram_user_id": "6656949901", "auth_mode": "license", "ws": "leader-ws"},
+            "follower": {"telegram_user_id": "456", "auth_mode": "license", "ws": "follower-ws"},
+        }
+        namespace = {
+            "_copy_clients": clients,
+            "is_copy_global_enabled": lambda: True,
+            "_copy_signal_delivery_allowed": lambda enabled, signal, mobile=False: enabled,
+            "normalize_copy_telegram_user_id": self.ns["normalize_copy_telegram_user_id"],
+            "normalize_copy_source": self.ns["normalize_copy_source"],
+            "_copy_vip_leader_identity_ok": self.ns["_copy_vip_leader_identity_ok"],
+            "_copy_send_json_safe": self.ns["_copy_send_json_safe"],
+            "now_iso": self.ns["now_iso"],
+        }
+        exec(compile(ast.Module(body=selected, type_ignores=[]), str(SOURCE), "exec"), namespace)
+        result = await namespace["_copy_broadcast_signal"]({"source": "vip_copy", "id": "vip:one"})
+        self.assertEqual(result["delivered"], 1)
+        self.assertEqual([ws for ws, _ in self.sent], ["follower-ws"])
 
 
 if __name__ == "__main__":
