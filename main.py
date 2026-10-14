@@ -1172,19 +1172,19 @@ BOT_RELEASE_VERSION = "v0.86"
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
 COPY_SERVER_VERSION = "1.49.3"
-# The published Firebase APK is build 114. Older Render environment values
+# The published Firebase APK is build 115. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
-MOBILE_APP_LATEST_BUILD = max(114, int(os.getenv("MOBILE_APP_LATEST_BUILD", "114")))
+MOBILE_APP_LATEST_BUILD = max(115, int(os.getenv("MOBILE_APP_LATEST_BUILD", "115")))
 MOBILE_APP_LATEST_VERSION = (
-    "1.0.14" if MOBILE_APP_LATEST_BUILD == 114
-    else os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.14").strip() or "1.0.14"
+    "1.0.15" if MOBILE_APP_LATEST_BUILD == 115
+    else os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.15").strip() or "1.0.15"
 )
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
 MOBILE_APP_FORCE_UPDATE = os.getenv("MOBILE_APP_FORCE_UPDATE", "false").lower() in {"1", "true", "yes", "on"}
 MOBILE_APP_RELEASE_URL = os.getenv("MOBILE_APP_RELEASE_URL", "https://trading-time-official.web.app/download").strip()
 MOBILE_APP_RELEASE_NOTES = (
-    "تحسين نسخ صفقات VIP المتقاربة وإضافة نسخ للفريق لمرسل ثانٍ مصرح له."
-    if MOBILE_APP_LATEST_BUILD == 114 else os.getenv("MOBILE_APP_RELEASE_NOTES", "").strip()
+    "إضافة تجهيز إشارات قناة VIP تلقائيًا وتقرير جلسات ونتائج نسخ VIP في قسم الإدارة."
+    if MOBILE_APP_LATEST_BUILD == 115 else os.getenv("MOBILE_APP_RELEASE_NOTES", "").strip()
 )
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
@@ -32063,20 +32063,22 @@ def create_embedded_copy_api():
             participants = db.reference("vip_copy/participants").get() or {}
             all_users = get_all_users() or {}
             for key, value in participants.items():
-                if not isinstance(value, dict) or not value.get("active"):
+                if not isinstance(value, dict):
                     continue
                 try:
                     last_seen = datetime.fromisoformat(
                         str(value.get("last_seen_at") or "").replace("Z", "+00:00")
                     )
-                    if (now_utc() - last_seen).total_seconds() > 180:
-                        continue
+                    recent = (now_utc() - last_seen).total_seconds() <= 180
                 except (TypeError, ValueError):
-                    continue
+                    recent = False
                 row = _mobile_clean_user(key, all_users.get(str(key), {}))
                 row["vip_last_seen_at"] = value.get("last_seen_at") or ""
                 row["vip_platform"] = value.get("platform") or ""
+                row["vip_active"] = bool(value.get("active") and recent)
                 rows.append(row)
+            rows.sort(key=lambda row: str(row["vip_last_seen_at"]), reverse=True)
+            rows.sort(key=lambda row: row["vip_active"], reverse=True)
         elif kind == "pending":
             data = get_all_pending_users() or {}
             for key, value in data.items(): rows.append(_mobile_clean_user(key, value))
@@ -32718,7 +32720,7 @@ def create_embedded_copy_api():
                     del _copy_client_events[:-int(COPY_SIGNAL_HISTORY_LIMIT)]
 
                     if event.get("type") == "ping":
-                        if event.get("selected_source") is not None:
+                        if telegram_user_id and event.get("selected_source") is not None:
                             active_vip = (
                                 str(event.get("selected_source") or "") == "vip_copy"
                                 and event.get("auto_copy_enabled") is True
@@ -32820,10 +32822,11 @@ def create_embedded_copy_api():
             finally:
                 _copy_clients.pop(client_id, None)
                 try:
-                    participant_ref = db.reference(f"vip_copy/participants/{telegram_user_id}")
-                    participant = participant_ref.get() or {}
-                    if participant.get("session_id") == f"extension_{client_id}":
-                        participant_ref.update({"active": False, "last_seen_at": now_iso()})
+                    if telegram_user_id:
+                        participant_ref = db.reference(f"vip_copy/participants/{telegram_user_id}")
+                        participant = participant_ref.get() or {}
+                        if participant.get("session_id") == f"extension_{client_id}":
+                            participant_ref.update({"active": False, "last_seen_at": now_iso()})
                 except Exception:
                     logger.debug("Could not mark extension VIP participant offline", exc_info=True)
 
