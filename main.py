@@ -1172,19 +1172,19 @@ BOT_RELEASE_VERSION = "v0.86"
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
 COPY_SERVER_VERSION = "1.49.3"
-# The published Firebase APK is build 115. Older Render environment values
+# The published Firebase APK is build 116. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
-MOBILE_APP_LATEST_BUILD = max(115, int(os.getenv("MOBILE_APP_LATEST_BUILD", "115")))
+MOBILE_APP_LATEST_BUILD = max(116, int(os.getenv("MOBILE_APP_LATEST_BUILD", "116")))
 MOBILE_APP_LATEST_VERSION = (
-    "1.0.15" if MOBILE_APP_LATEST_BUILD == 115
-    else os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.15").strip() or "1.0.15"
+    "1.0.16" if MOBILE_APP_LATEST_BUILD == 116
+    else os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.16").strip() or "1.0.16"
 )
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
 MOBILE_APP_FORCE_UPDATE = os.getenv("MOBILE_APP_FORCE_UPDATE", "false").lower() in {"1", "true", "yes", "on"}
 MOBILE_APP_RELEASE_URL = os.getenv("MOBILE_APP_RELEASE_URL", "https://trading-time-official.web.app/download").strip()
 MOBILE_APP_RELEASE_NOTES = (
-    "إضافة تجهيز إشارات قناة VIP تلقائيًا وتقرير جلسات ونتائج نسخ VIP في قسم الإدارة."
-    if MOBILE_APP_LATEST_BUILD == 115 else os.getenv("MOBILE_APP_RELEASE_NOTES", "").strip()
+    "إصلاح زر تجهيز قناة VIP ليقرأ الزوج المحدد من بيانات Quotex الداخلية."
+    if MOBILE_APP_LATEST_BUILD == 116 else os.getenv("MOBILE_APP_RELEASE_NOTES", "").strip()
 )
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
