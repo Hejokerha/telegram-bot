@@ -1172,19 +1172,19 @@ BOT_RELEASE_VERSION = "v0.86"
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
 COPY_SERVER_VERSION = "1.49.3"
-# The published Firebase APK is build 117. Older Render environment values
+# The published Firebase APK is build 118. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
-MOBILE_APP_LATEST_BUILD = max(117, int(os.getenv("MOBILE_APP_LATEST_BUILD", "117")))
+MOBILE_APP_LATEST_BUILD = max(118, int(os.getenv("MOBILE_APP_LATEST_BUILD", "118")))
 MOBILE_APP_LATEST_VERSION = (
-    "1.0.17" if MOBILE_APP_LATEST_BUILD == 117
-    else os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.17").strip() or "1.0.17"
+    "1.0.18" if MOBILE_APP_LATEST_BUILD == 118
+    else os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.18").strip() or "1.0.18"
 )
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
 MOBILE_APP_FORCE_UPDATE = os.getenv("MOBILE_APP_FORCE_UPDATE", "false").lower() in {"1", "true", "yes", "on"}
 MOBILE_APP_RELEASE_URL = os.getenv("MOBILE_APP_RELEASE_URL", "https://trading-time-official.web.app/download").strip()
 MOBILE_APP_RELEASE_NOTES = (
-    "إصلاح استمرار نسخ الفريق عند تبديل الزوج، ومتابعة نتائج الصفقات المتتالية في قناة VIP."
-    if MOBILE_APP_LATEST_BUILD == 117 else os.getenv("MOBILE_APP_RELEASE_NOTES", "").strip()
+    "إصلاح فحص التحديثات ليقرأ رقم النسخة المثبتة فعلياً من Android."
+    if MOBILE_APP_LATEST_BUILD == 118 else os.getenv("MOBILE_APP_RELEASE_NOTES", "").strip()
 )
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
