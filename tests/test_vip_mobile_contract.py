@@ -39,6 +39,9 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
             self.sent.append(("extension", signal))
             return {"delivered": 1, "global_enabled": True}
 
+        async def publish_channel(event, leader_id, signal):
+            return {"posted": False, "reason": "not_prepared"}
+
         self.ns = {
             "ADMIN_TELEGRAM_ID": 123,
             "VIP_TEAM_LEADER_TELEGRAM_IDS": {123, 6656949901},
@@ -59,6 +62,7 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
             "_copy_server_sanitize_signal": lambda signal: dict(signal),
             "_copy_store_signal_if_allowed": lambda *args: {"accepted": True},
             "_copy_broadcast_signal": broadcast_extension,
+            "_vip_channel_publish_entry": publish_channel,
             "_copy_send_json_safe": send_safe,
             "_mobile_signal_clients": {},
             "normalize_copy_license_token": lambda token: str(token or ""),
@@ -71,7 +75,7 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
             "datetime": datetime,
             "timedelta": timedelta,
             "UTC": UTC,
-            "logger": SimpleNamespace(info=lambda *args: None, warning=lambda *args: None),
+            "logger": SimpleNamespace(info=lambda *args: None, warning=lambda *args: None, exception=lambda *args: None),
         }
         load_functions(self.ns)
 

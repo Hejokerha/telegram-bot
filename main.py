@@ -1171,7 +1171,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.2"
+COPY_SERVER_VERSION = "1.49.3"
 # The published Firebase APK is build 114. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(114, int(os.getenv("MOBILE_APP_LATEST_BUILD", "114")))
@@ -1189,7 +1189,7 @@ MOBILE_APP_RELEASE_NOTES = (
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
 TRADING_TIME_TELEGRAM_LOOP = None
-COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.15.4").strip() or "v1.15.4"
+COPY_EXTENSION_VERSION = os.getenv("COPY_EXTENSION_VERSION", "v1.15.5").strip() or "v1.15.5"
 # No public/default secret is kept in source. If Render does not provide one,
 # derive a stable private internal secret from the already-secret Telegram token.
 _COPY_SERVER_SECRET_ENV = os.getenv("COPY_SERVER_SECRET", "").strip()
@@ -3783,6 +3783,25 @@ async def safe_send_message(bot, *, chat_id, text: str, parse_mode: str | None =
         parse_mode=parse_mode,
         reply_markup=reply_markup,
     )
+
+
+async def safe_send_sticker(bot, *, chat_id, sticker_path: str):
+    """Upload a local sticker on the Telegram polling loop."""
+    async def send():
+        try:
+            with open(sticker_path, "rb") as sticker:
+                return await bot.send_sticker(chat_id=chat_id, sticker=sticker)
+        except Exception:
+            logger.exception("Telegram sticker send failed | chat_id=%s", chat_id)
+            return None
+
+    target_loop = globals().get("TRADING_TIME_TELEGRAM_LOOP")
+    current_loop = asyncio.get_running_loop()
+    if target_loop is not None and current_loop is not target_loop:
+        if not target_loop.is_running():
+            return None
+        return await asyncio.wrap_future(asyncio.run_coroutine_threadsafe(send(), target_loop))
+    return await send()
 
 # ===== TRADING TIME COPY helpers =====
 def _copy_parse_iso(value: str | None):
@@ -30615,6 +30634,104 @@ def _copy_vip_leader_identity_ok(identity) -> bool:
         return False
 
 
+VIP_CHANNEL_CHAT_ID = -1003588701661
+VIP_CHANNEL_STICKER_DIR = os.path.join(os.path.dirname(__file__), "assets", "vip_stickers")
+
+
+def _vip_channel_pair(value: str) -> str:
+    raw = re.sub(r"(?i)(?:_otc|\s*\(?otc\)?)$", "", str(value or "").strip())
+    compact = re.sub(r"[^A-Za-z]", "", raw).upper()
+    if len(compact) != 6:
+        return ""
+    return f"{compact[:3]}/{compact[3:]}"
+
+
+def _vip_channel_pair_matches(prepared: str, traded: str) -> bool:
+    left = _vip_channel_pair(prepared).replace("/", "")
+    right = _vip_channel_pair(traded).replace("/", "")
+    return bool(left and right and (left == right or left == right[3:] + right[:3]))
+
+
+def _vip_channel_trade_ref(event_id: str):
+    key = hashlib.sha256(event_id.encode("utf-8")).hexdigest()[:40]
+    return db.reference(f"vip_channel/trades/{key}")
+
+
+async def _vip_channel_publish_entry(event: dict, leader_id: str, signal: dict) -> dict:
+    prep_ref = db.reference(f"vip_channel/prepared/{leader_id}")
+    prep = prep_ref.get() or {}
+    now = time_module.time()
+    if not isinstance(prep, dict) or float(prep.get("expires_epoch") or 0) < now:
+        return {"posted": False, "reason": "not_prepared"}
+    if not _vip_channel_pair_matches(prep.get("pair"), signal.get("platform_symbol")):
+        return {"posted": False, "reason": "different_pair"}
+    event_id = str((event or {}).get("event_id") or "")
+    trade_ref = _vip_channel_trade_ref(event_id)
+    existing = trade_ref.get() or {}
+    if existing:
+        return {"posted": existing.get("entry_posted") is True, "reason": "duplicate"}
+    app_ref = globals().get("TRADING_TIME_TELEGRAM_APP")
+    if app_ref is None:
+        return {"posted": False, "reason": "telegram_unavailable"}
+    direction = str(signal.get("direction") or "").upper()
+    sticker_name = "call.webp" if direction == "CALL" else "put.webp"
+    sent = await safe_send_sticker(
+        app_ref.bot, chat_id=VIP_CHANNEL_CHAT_ID,
+        sticker_path=os.path.join(VIP_CHANNEL_STICKER_DIR, sticker_name),
+    )
+    if sent is None:
+        return {"posted": False, "reason": "sticker_send_failed"}
+    trade_ref.set({
+        "event_id": event_id,
+        "leader_id": leader_id,
+        "signal_id": signal.get("id"),
+        "pair": prep.get("pair"),
+        "direction": direction,
+        "opened_at": now_iso(),
+        "expiry_epoch": int(signal.get("expiry_timestamp") or 0),
+        "entry_posted": True,
+        "result_posted": False,
+        "platform_request_id": str(((event or {}).get("trade") or {}).get("requestId") or ""),
+    })
+    return {"posted": True}
+
+
+def _vip_copy_record_extension_result(event: dict, client: dict) -> bool:
+    user_id = normalize_copy_telegram_user_id(client.get("telegram_user_id"))
+    client_id = str(client.get("client_id") or "")
+    signal_id = str(event.get("signal_id") or "")
+    outcome = str(event.get("outcome") or "").upper()
+    if not user_id or not client_id or not re.fullmatch(r"vip:[A-Za-z0-9_.:-]{8,80}", signal_id):
+        return False
+    if outcome not in {"PENDING", "WIN", "LOSS", "DRAW"}:
+        return False
+    pair = _vip_channel_pair(event.get("pair"))
+    if not pair:
+        return False
+    session_id = f"extension_{client_id}"
+    session_ref = db.reference(f"vip_copy/sessions/{user_id}/{session_id}")
+    if not session_ref.get():
+        session_ref.set({"started_at": client.get("connected_at") or now_iso(), "platform": "extension", "trades": {}})
+    key = hashlib.sha256(signal_id.encode("utf-8")).hexdigest()[:40]
+    ref = session_ref.child("trades").child(key)
+    previous = ref.get() or {}
+    if previous.get("outcome") in {"WIN", "LOSS", "DRAW"}:
+        return True
+    order_id = str(event.get("platform_deal_id") or "")
+    dom_match = str(event.get("dom_match_key") or "")
+    if outcome != "PENDING" and not (order_id or dom_match):
+        return False
+    ref.update({
+        "signal_id": signal_id, "pair": pair,
+        "direction": str(event.get("direction") or "").upper(),
+        "outcome": outcome,
+        "method": "platform_ws" if order_id else ("dom" if dom_match else "pending"),
+        "opened_at": previous.get("opened_at") or now_iso(),
+        "updated_at": now_iso(),
+    })
+    return True
+
+
 async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: dict) -> dict:
     """Turn one authenticated leader manual Quotex orders/open event into a VIP broadcast.
 
@@ -30721,6 +30838,11 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
         return {"ok": False, "reason": "copy_global_disabled", "signal_id": normalized.get("id")}
 
     mobile_delivery = await _copy_broadcast_mobile_signal(normalized)
+    try:
+        channel_delivery = await _vip_channel_publish_entry(event, leader_id, normalized)
+    except Exception:
+        logger.exception("VIP channel entry failed | signal_id=%s", normalized.get("id"))
+        channel_delivery = {"posted": False, "reason": "channel_error"}
     logger.info(
         "VIP Team Copy broadcast | asset=%s | direction=%s | expiry=%s | followers=%s | leader_client=%s",
         normalized.get("platform_symbol"), direction, normalized.get("expiry_timestamp"),
@@ -30731,6 +30853,7 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
         "signal_id": normalized.get("id"),
         "delivery": delivery,
         "mobile_delivery": mobile_delivery,
+        "channel_delivery": channel_delivery,
     }
 
 def _mobile_notification_visible_to_user(notification: dict, telegram_user_id: int | str | None) -> bool:
@@ -31488,6 +31611,136 @@ def create_embedded_copy_api():
             event, "", {"telegram_user_id": leader_id, "client_kind": "mobile"}
         )
 
+    @copy_api.post("/api/mobile/vip/prepare")
+    async def mobile_vip_prepare(request: Request, authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        leader_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
+        if not _copy_vip_leader_identity_ok(leader_id):
+            raise HTTPException(status_code=403, detail="leader_only")
+        if not is_vip_team_copy_enabled():
+            raise HTTPException(status_code=409, detail="vip_team_copy_disabled")
+        body = await request.json()
+        pair = _vip_channel_pair((body or {}).get("pair"))
+        if not pair:
+            raise HTTPException(status_code=400, detail="invalid_pair")
+        app_ref = _mobile_runtime_app()
+        if not await safe_send_message(app_ref.bot, chat_id=VIP_CHANNEL_CHAT_ID, text=pair.replace("/", " ")):
+            raise HTTPException(status_code=502, detail="channel_message_failed")
+        if not await safe_send_sticker(
+            app_ref.bot, chat_id=VIP_CHANNEL_CHAT_ID,
+            sticker_path=os.path.join(VIP_CHANNEL_STICKER_DIR, "minute.webp"),
+        ):
+            raise HTTPException(status_code=502, detail="channel_sticker_failed")
+        db.reference(f"vip_channel/prepared/{leader_id}").set({
+            "pair": pair, "created_at": now_iso(),
+            "expires_epoch": time_module.time() + 600,
+        })
+        return {"ok": True, "pair": pair, "duration": "1M"}
+
+    @copy_api.post("/api/mobile/vip/manual-result")
+    async def mobile_vip_manual_result(request: Request, authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        leader_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
+        if not _copy_vip_leader_identity_ok(leader_id):
+            raise HTTPException(status_code=403, detail="leader_only")
+        body = await request.json()
+        event_id = str((body or {}).get("event_id") or "")
+        result = (body or {}).get("result") or {}
+        if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,80}", event_id) or not isinstance(result, dict):
+            raise HTTPException(status_code=400, detail="invalid_result")
+        trade_ref = _vip_channel_trade_ref(event_id)
+        trade = trade_ref.get() or {}
+        if not trade or str(trade.get("leader_id")) != leader_id or not trade.get("entry_posted"):
+            raise HTTPException(status_code=404, detail="channel_trade_not_found")
+        if trade.get("result_posted"):
+            return {"ok": True, "already_posted": True}
+        outcome = str(result.get("outcome") or "").upper()
+        if outcome not in {"WIN", "LOSS", "DRAW"} or not str(result.get("method") or "").startswith("platform_ws_"):
+            raise HTTPException(status_code=400, detail="authoritative_close_required")
+        if not str(result.get("platformOrderId") or "").strip():
+            raise HTTPException(status_code=400, detail="platform_order_id_required")
+        claim_token = secrets.token_hex(8)
+        claim_time = time_module.time()
+        def claim(current):
+            current = dict(current or {})
+            if current.get("result_posted"):
+                return current
+            if (current.get("result_posting_token") and
+                claim_time - float(current.get("result_posting_epoch") or 0) < 120):
+                return current
+            current["result_posting_token"] = claim_token
+            current["result_posting_epoch"] = claim_time
+            return current
+        claimed = trade_ref.transaction(claim)
+        if claimed.get("result_posted"):
+            return {"ok": True, "already_posted": True}
+        if claimed.get("result_posting_token") != claim_token:
+            return {"ok": False, "reason": "result_post_in_progress"}
+        opened_at = datetime.fromisoformat(str(trade["opened_at"]).replace("Z", "+00:00"))
+        local_time = opened_at.astimezone(timezone(timedelta(hours=3))).strftime("%H:%M")
+        label = {"WIN": "✅ مباركة", "LOSS": "❌ خسرت", "DRAW": "↔️ تعادل"}[outcome]
+        message = f"{trade['pair'].replace('/', ' ')} • {local_time}\n{label}"
+        app_ref = _mobile_runtime_app()
+        if not await safe_send_message(app_ref.bot, chat_id=VIP_CHANNEL_CHAT_ID, text=message):
+            trade_ref.update({"result_posting_token": None, "result_posting_epoch": None})
+            raise HTTPException(status_code=502, detail="channel_result_failed")
+        trade_ref.update({
+            "result_posted": True, "outcome": outcome,
+            "platform_order_id": str(result["platformOrderId"]), "closed_at": now_iso(),
+            "result_posting_token": None, "result_posting_epoch": None,
+        })
+        return {"ok": True, "outcome": outcome}
+
+    @copy_api.post("/api/mobile/vip/participation")
+    async def mobile_vip_participation(request: Request, authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        user_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
+        body = await request.json()
+        active = (body or {}).get("active") is True
+        session_id = re.sub(r"[^A-Za-z0-9_-]", "", str((body or {}).get("session_id") or ""))[:64]
+        db.reference(f"vip_copy/participants/{user_id}").update({
+            "active": active, "session_id": session_id,
+            "platform": "android", "last_seen_at": now_iso(),
+        })
+        if active and session_id:
+            session_ref = db.reference(f"vip_copy/sessions/{user_id}/{session_id}")
+            if not session_ref.get():
+                session_ref.set({"started_at": now_iso(), "platform": "android", "trades": {}})
+        return {"ok": True}
+
+    @copy_api.post("/api/mobile/vip/follower-result")
+    async def mobile_vip_follower_result(request: Request, authorization: str | None = Header(default=None)):
+        session = _mobile_bearer_session(authorization)
+        user_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
+        body = await request.json()
+        session_id = re.sub(r"[^A-Za-z0-9_-]", "", str((body or {}).get("session_id") or ""))[:64]
+        signal_id = str((body or {}).get("signal_id") or "")
+        outcome = str((body or {}).get("outcome") or "").upper()
+        if not session_id or not re.fullmatch(r"vip:[A-Za-z0-9_.:-]{8,80}", signal_id):
+            raise HTTPException(status_code=400, detail="invalid_vip_trade")
+        if outcome not in {"PENDING", "WIN", "LOSS", "DRAW"}:
+            raise HTTPException(status_code=400, detail="invalid_outcome")
+        trade_key = hashlib.sha256(signal_id.encode("utf-8")).hexdigest()[:40]
+        ref = db.reference(f"vip_copy/sessions/{user_id}/{session_id}/trades/{trade_key}")
+        previous = ref.get() or {}
+        if previous.get("outcome") in {"WIN", "LOSS", "DRAW"}:
+            return {"ok": True, "already_final": True}
+        pair = _vip_channel_pair((body or {}).get("pair"))
+        if not pair:
+            raise HTTPException(status_code=400, detail="invalid_pair")
+        row = {
+            "signal_id": signal_id, "pair": pair,
+            "direction": str((body or {}).get("direction") or "").upper(),
+            "outcome": outcome, "updated_at": now_iso(),
+            "opened_at": previous.get("opened_at") or now_iso(),
+        }
+        if outcome != "PENDING":
+            if not str((body or {}).get("method") or "").startswith("platform_ws_") or not str((body or {}).get("platform_order_id") or ""):
+                raise HTTPException(status_code=400, detail="authoritative_close_required")
+            row["platform_order_id"] = str(body["platform_order_id"])[:100]
+        ref.update(row)
+        return {"ok": True}
+
     # ===== v1.13 Mobile Bot Features + Admin Control Plane =====
     # Flutter is only a UI/client. Signal generation and admin actions stay here,
     # reusing the exact Telegram-bot functions/state so there is one source of truth.
@@ -31806,7 +32059,25 @@ def create_embedded_copy_api():
         _mobile_require_admin(session)
         kind = str(kind or "all").lower()
         rows = []
-        if kind == "pending":
+        if kind == "vip":
+            participants = db.reference("vip_copy/participants").get() or {}
+            all_users = get_all_users() or {}
+            for key, value in participants.items():
+                if not isinstance(value, dict) or not value.get("active"):
+                    continue
+                try:
+                    last_seen = datetime.fromisoformat(
+                        str(value.get("last_seen_at") or "").replace("Z", "+00:00")
+                    )
+                    if (now_utc() - last_seen).total_seconds() > 180:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                row = _mobile_clean_user(key, all_users.get(str(key), {}))
+                row["vip_last_seen_at"] = value.get("last_seen_at") or ""
+                row["vip_platform"] = value.get("platform") or ""
+                rows.append(row)
+        elif kind == "pending":
             data = get_all_pending_users() or {}
             for key, value in data.items(): rows.append(_mobile_clean_user(key, value))
         elif kind == "active":
@@ -31822,6 +32093,34 @@ def create_embedded_copy_api():
                 merged.update(dict(value or {}))
                 rows.append(_mobile_clean_user(key, merged))
         return {"ok": True, "kind": kind, "users": rows[:200], "count": len(rows)}
+
+    @copy_api.get("/api/mobile/admin/vip-report")
+    async def mobile_admin_vip_report(
+        telegram_id: str = Query(...), authorization: str | None = Header(default=None)
+    ):
+        session = _mobile_bearer_session(authorization)
+        _mobile_require_admin(session)
+        user_id = normalize_copy_telegram_user_id(telegram_id)
+        if not user_id:
+            raise HTTPException(status_code=400, detail="invalid_telegram_id")
+        all_sessions = db.reference(f"vip_copy/sessions/{user_id}").get() or {}
+        sessions = []
+        for session_id, data in all_sessions.items():
+            if not isinstance(data, dict):
+                continue
+            trades = list((data.get("trades") or {}).values())
+            trades.sort(key=lambda row: str(row.get("opened_at") or ""), reverse=True)
+            sessions.append({
+                "session_id": session_id, "started_at": data.get("started_at") or "",
+                "platform": data.get("platform") or "",
+                "trades": trades[:100],
+                "wins": sum(row.get("outcome") == "WIN" for row in trades),
+                "losses": sum(row.get("outcome") == "LOSS" for row in trades),
+                "draws": sum(row.get("outcome") == "DRAW" for row in trades),
+                "pending": sum(row.get("outcome") == "PENDING" for row in trades),
+            })
+        sessions.sort(key=lambda row: row["started_at"], reverse=True)
+        return {"ok": True, "telegram_id": user_id, "sessions": sessions[:30]}
 
     @copy_api.get("/api/mobile/admin/user")
     async def mobile_admin_user(telegram_id: str = Query(...), authorization: str | None = Header(default=None)):
@@ -32347,6 +32646,7 @@ def create_embedded_copy_api():
 
             client_id = hashlib.sha256(f"{token}:{device_id}:{telegram_user_id}:{time_module.time()}".encode("utf-8")).hexdigest()[:16]
             _copy_clients[client_id] = {
+                "client_id": client_id,
                 "ws": websocket,
                 "license": token,
                 "device_id": device_id,
@@ -32418,6 +32718,25 @@ def create_embedded_copy_api():
                     del _copy_client_events[:-int(COPY_SIGNAL_HISTORY_LIMIT)]
 
                     if event.get("type") == "ping":
+                        if event.get("selected_source") is not None:
+                            active_vip = (
+                                str(event.get("selected_source") or "") == "vip_copy"
+                                and event.get("auto_copy_enabled") is True
+                                and event.get("extension_enabled") is not False
+                            )
+                            participant_ref = db.reference(f"vip_copy/participants/{telegram_user_id}")
+                            participant_ref.update({
+                                "active": active_vip,
+                                "session_id": f"extension_{client_id}",
+                                "platform": "extension",
+                                "last_seen_at": now_iso(),
+                            })
+                            if active_vip:
+                                report_session_ref = db.reference(f"vip_copy/sessions/{telegram_user_id}/extension_{client_id}")
+                                if not report_session_ref.get():
+                                    report_session_ref.set({
+                                        "started_at": now_iso(), "platform": "extension", "trades": {}
+                                    })
                         await _copy_send_json_safe(websocket, {
                             "type": "pong",
                             "server_time": now_iso(),
@@ -32483,6 +32802,8 @@ def create_embedded_copy_api():
                             elif event_kind == "otc_edge_trade_result" and not OTC_EDGE_INDIVIDUAL_RESULT_MESSAGES:
                                 # v0.97: accept and aggregate silently; send one session summary on stop.
                                 sent = _copy_record_otc_edge_trade_result(payload_event, _copy_clients.get(client_id) or {})
+                            elif event_kind == "vip_copy_trade_result":
+                                sent = _vip_copy_record_extension_result(payload_event, _copy_clients.get(client_id) or {})
                             else:
                                 _octopus_user_note_target_event(payload_event, _copy_clients.get(client_id) or {})
                                 sent = await _copy_send_extension_alert_to_user(payload_event, _copy_clients.get(client_id) or {})
@@ -32498,6 +32819,13 @@ def create_embedded_copy_api():
                 logger.debug("COPY WebSocket disconnected | client_id=%s", client_id)
             finally:
                 _copy_clients.pop(client_id, None)
+                try:
+                    participant_ref = db.reference(f"vip_copy/participants/{telegram_user_id}")
+                    participant = participant_ref.get() or {}
+                    if participant.get("session_id") == f"extension_{client_id}":
+                        participant_ref.update({"active": False, "last_seen_at": now_iso()})
+                except Exception:
+                    logger.debug("Could not mark extension VIP participant offline", exc_info=True)
 
         # Transitional legacy protocol for already-installed v0.87 and older builds.
         # Disable it on Render after v0.94 has reached users:
