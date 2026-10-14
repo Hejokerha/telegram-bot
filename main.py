@@ -1171,7 +1171,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.1"
+COPY_SERVER_VERSION = "1.49.2"
 # The published Firebase APK is build 114. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(114, int(os.getenv("MOBILE_APP_LATEST_BUILD", "114")))
@@ -20560,6 +20560,8 @@ THREE_CANDLE_SCAN_SECONDS = int(os.getenv("THREE_CANDLE_SCAN_SECONDS", "2"))
 THREE_CANDLE_ALERT_REMAINING_SECONDS = float(os.getenv("THREE_CANDLE_ALERT_REMAINING_SECONDS", "15"))
 THREE_CANDLE_MIN_REMAINING_SECONDS = float(os.getenv("THREE_CANDLE_MIN_REMAINING_SECONDS", "10"))
 THREE_CANDLE_RESULT_DELAY_SECONDS = int(os.getenv("THREE_CANDLE_RESULT_DELAY_SECONDS", "5"))
+# Allow late feed candles to arrive, but never let a missing candle block new signals forever.
+THREE_CANDLE_PENDING_CANDLE_GRACE_SECONDS = max(60, int(os.getenv("THREE_CANDLE_PENDING_CANDLE_GRACE_SECONDS", "180")))
 THREE_CANDLE_PAIR_LOSS_LIMIT = int(os.getenv("THREE_CANDLE_PAIR_LOSS_LIMIT", "2"))
 THREE_CANDLE_PAIR_COOLDOWN_SECONDS = int(os.getenv("THREE_CANDLE_PAIR_COOLDOWN_SECONDS", "1800"))
 THREE_CANDLE_TIE_EPSILON = float(os.getenv("THREE_CANDLE_TIE_EPSILON", str(OTC_LIVE_TIE_EPSILON)))
@@ -20622,6 +20624,8 @@ _three_candle_channel_state = {
     "today_signals": 0,
     "last_scan_at": None,
     "last_error": None,
+    "pending_timeouts": 0,
+    "last_pending_timeout": None,
     "memory_records_written": 0,
     "smart_filter_skips": 0,
     "last_smart_skip": None,
@@ -21934,6 +21938,8 @@ def build_three_candle_channel_status() -> str:
     limit = int(settings.get("daily_limit", 0) or 0)
     today_count = _three_candle_today_signal_count()
     pending = _three_candle_channel_state.get("pending_trade")
+    pending_since = int((pending or {}).get("current_bucket") or 0) if isinstance(pending, dict) else 0
+    pending_age = max(0, int(time_module.time()) - pending_since) if pending_since else 0
     # v1.03: refresh the live Three Candle universe when admin asks for channel status.
     try:
         get_three_candle_pair_map()
@@ -21946,6 +21952,8 @@ def build_three_candle_channel_status() -> str:
         f"القناة: {channel_id or 'غير مضبوطة'}\n"
         f"حد الصفقات اليومي: {'مفتوح ♾' if limit <= 0 else limit}\n"
         f"منشور اليوم: {today_count}\n"
+        f"صفقة قيد المتابعة: {'نعم' if isinstance(pending, dict) else 'لا'}{f' | {pending_age // 60}د {pending_age % 60}ث' if pending_since else ''}\n"
+        f"انتهاء انتظار شموع بهذه الجلسة: {int(_three_candle_channel_state.get('pending_timeouts', 0) or 0)} | آخر مرة: {_three_candle_channel_state.get('last_pending_timeout') or 'لا يوجد'}\n"
         f"🌐 Instruments وصلت من Quotex: {int(_three_candle_channel_state.get('universe_instruments_seen', 0) or 0)}\n"
         f"💱 أزواج عملات OTC موجودة فعلياً: {int(_three_candle_channel_state.get('universe_currency_otc', 0) or 0)}\n"
         f"✅ مؤهلة payout ≥{int(_three_candle_channel_state.get('universe_min_payout', max(THREE_CANDLE_MIN_PAYOUT, THREE_CANDLE_SMART_MIN_PAYOUT)) or max(THREE_CANDLE_MIN_PAYOUT, THREE_CANDLE_SMART_MIN_PAYOUT))}%: {int(_three_candle_channel_state.get('universe_payout_eligible', 0) or 0)}\n"
@@ -21964,7 +21972,6 @@ def build_three_candle_channel_status() -> str:
         f"سجلات الذاكرة بهذه الجلسة: {_three_candle_channel_state.get('memory_records_written', 0)}\n"
         f"ترحيل الذاكرة القديمة: {_three_candle_channel_state.get('memory_legacy_migrated', 0)} سجل\n"
         f"آخر فحص: {_three_candle_channel_state.get('last_scan_at') or 'لا يوجد'}\n"
-        f"صفقة قيد المتابعة: {'نعم' if isinstance(pending, dict) else 'لا'}\n"
         f"آخر خطأ: {_three_candle_channel_state.get('last_error') or 'لا يوجد'}"
     )[:3900]
 
@@ -22154,6 +22161,19 @@ def _three_candle_get_candle(symbol: str, bucket_ts: int) -> dict:
         return {}
 
 
+def _three_candle_pending_deadline(trade: dict) -> int:
+    """Latest safe time to wait for the entry or its possible martingale candle."""
+    entry_bucket = int(trade.get("entry_bucket") or 0)
+    if entry_bucket <= 0:
+        current_bucket = int(trade.get("current_bucket") or 0)
+        entry_bucket = current_bucket + 60 if current_bucket > 0 else 0
+    if entry_bucket <= 0:
+        return 0
+    martingale_bucket = int(trade.get("martingale_bucket") or 0)
+    last_possible_bucket = max(entry_bucket + 60, martingale_bucket)
+    return last_possible_bucket + 60 + int(THREE_CANDLE_RESULT_DELAY_SECONDS) + int(THREE_CANDLE_PENDING_CANDLE_GRACE_SECONDS)
+
+
 async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE) -> bool:
     """يعالج الصفقة الحالية إن وجدت. يرجع True إذا توجد صفقة قيد المتابعة."""
     trade = _three_candle_channel_state.get("pending_trade")
@@ -22162,6 +22182,16 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
 
     try:
         now_ts = time_module.time()
+        deadline = _three_candle_pending_deadline(trade)
+        if not deadline or now_ts >= deadline:
+            pair = str(trade.get("pair") or trade.get("symbol") or "unknown")
+            reason = f"{pair}: candle unavailable before result deadline" if deadline else f"{pair}: missing entry bucket"
+            _three_candle_channel_state["pending_trade"] = None
+            _three_candle_channel_state["pending_timeouts"] = int(_three_candle_channel_state.get("pending_timeouts", 0) or 0) + 1
+            _three_candle_channel_state["last_pending_timeout"] = f"{now_iso()} | {reason}"
+            _three_candle_channel_state["last_error"] = reason
+            logger.warning("Three-candle pending trade released without result: %s", reason)
+            return False
         channel_id = _three_candle_channel_id()
         partner_codes = list(trade.get("partner_channel_codes") or [])
         if not channel_id and not partner_codes:
