@@ -33231,7 +33231,57 @@ def _start_telegram_bot_background_once():
 @render_app.on_event("startup")
 async def _render_app_startup():
     _start_telegram_bot_background_once()
+    _start_support_bot_background_once()
     logger.warning("TRADING TIME Web Service startup complete. Copy API is listening and bot thread is starting.")
+
+
+# Support has its own token, polling application and client. It is off by default
+# and can fail independently without stopping the trading service.
+_support_bot_task = None
+_support_bot_service = None
+
+
+def _start_support_bot_background_once():
+    global _support_bot_task
+    if _support_bot_task is not None:
+        return
+    # Optional local secrets file, never committed. Hosted values take precedence.
+    from pathlib import Path
+    load_dotenv(Path(__file__).resolve().with_name(".env.support"), override=False)
+    if os.getenv("SUPPORT_BOT_ENABLED", "false").lower() not in {"1", "true", "yes", "on"}:
+        return
+
+    async def _launch_support():
+        global _support_bot_service
+        try:
+            from support_backend import build_support_snapshot
+            from support_bot import SupportConfig, SupportService
+            config = SupportConfig.from_env(ADMIN_TELEGRAM_ID)
+            store = None
+            if config.store_backend == "firebase":
+                from support_state import FirebaseSupportStore
+                store = FirebaseSupportStore(lambda: system_ref().child("support_bot"))
+                await asyncio.to_thread(store.cleanup)
+            _support_bot_service = SupportService(config, lambda uid: build_support_snapshot(globals(), uid), store=store)
+            await _support_bot_service.launch()
+        except Exception as exc:
+            # External exception strings can contain Telegram credential URLs.
+            logger.error("Independent support bot could not start (%s)", type(exc).__name__)
+            _support_bot_service = None
+
+    _support_bot_task = asyncio.create_task(_launch_support(), name="support-bot-startup")
+
+
+@render_app.on_event("shutdown")
+async def _render_support_shutdown():
+    if _support_bot_task is not None and not _support_bot_task.done():
+        _support_bot_task.cancel()
+        try:
+            await _support_bot_task
+        except asyncio.CancelledError:
+            pass
+    if _support_bot_service is not None:
+        await _support_bot_service.stop()
 
 
 if __name__ == "__main__":
