@@ -98,3 +98,20 @@ class FirebaseSupportStore:
 
     def close(self):
         pass
+
+    def onboarding_get(self, uid):
+        return self.root_ref().child("onboarding").child(str(uid)).get()
+
+    def onboarding_cas(self, uid, revision, record):
+        accepted = False
+
+        def change(current):
+            nonlocal accepted
+            accepted = (current or {}).get("revision") == revision
+            return record if accepted else current
+
+        self.root_ref().child("onboarding").child(str(uid)).transaction(change)
+        return accepted
+
+    def onboarding_links(self):
+        return self.root_ref().child("onboarding_settings").child("links").get() or []
