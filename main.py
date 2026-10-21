@@ -1171,7 +1171,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.7"
+COPY_SERVER_VERSION = "1.49.8"
 # The published Firebase APK is build 119. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(119, int(os.getenv("MOBILE_APP_LATEST_BUILD", "119")))
@@ -33391,6 +33391,33 @@ async def telegram_error_handler(update: object, context: ContextTypes.DEFAULT_T
         except Exception:
             logger.debug("Mobile bot error notification failed", exc_info=True)
 
+def _scheduler_singleflight(callback, label: str):
+    """Coalesce ticks while one scan runs; never overlap or flood APScheduler logs."""
+    active: asyncio.Task | None = None
+    started_at = 0.0
+    coalesced = 0
+    last_report_at = 0.0
+
+    async def tick(context: ContextTypes.DEFAULT_TYPE):
+        nonlocal active, started_at, coalesced, last_report_at
+        now = time_module.monotonic()
+        if active is not None and not active.done():
+            coalesced += 1
+            return
+        if coalesced and now - last_report_at >= 60.0:
+            logger.info(
+                "%s scan took %.2fs; %s scheduled ticks coalesced",
+                label, now - started_at, coalesced,
+            )
+            last_report_at = now
+        coalesced = 0
+        started_at = now
+        active = asyncio.create_task(callback(context), name=label)
+        active.add_done_callback(lambda task: _scheduler_background_task_done(task, label))
+
+    return tick
+
+
 def run_telegram_bot_only():
     global TRADING_TIME_TELEGRAM_APP, TRADING_TIME_TELEGRAM_LOOP
     if not BOT_TOKEN:
@@ -33433,7 +33460,7 @@ def run_telegram_bot_only():
     # A backend execution lock pauses PRE-ARM/execution scans while any current trade is open; Shadow learning continues.
     # Firebase enabled-state remains RAM-cached; scheduler frequency does NOT imply Firebase reads.
     job_queue.run_repeating(
-        structure_edge_job,
+        _scheduler_singleflight(structure_edge_job, "octopus_sr_retest"),
         interval=OCTOPUS_SELECTOR_SCHEDULER_SECONDS,
         first=OCTOPUS_SELECTOR_SCHEDULER_SECONDS,
         name="octopus_sr_retest",
@@ -33442,7 +33469,7 @@ def run_telegram_bot_only():
     # DS is private to the owner and has its own PRE-ARM/final-close lifecycle.
     # It never reuses or changes the Octopus execution state.
     job_queue.run_repeating(
-        ds_job,
+        _scheduler_singleflight(ds_job, "ds_sar_wave_midpoint"),
         interval=DS_SCAN_SECONDS,
         first=DS_SCAN_SECONDS,
         name="ds_sar_wave_midpoint",
@@ -33450,7 +33477,7 @@ def run_telegram_bot_only():
 
     # قناة اختبار استراتيجية 3 شموع + ذاكرة تحليل v0.59. تعمل فقط عند ضبط THREE_CANDLE_CHANNEL_ID وتفعيلها من env.
     job_queue.run_repeating(
-        three_candle_channel_job,
+        _scheduler_singleflight(three_candle_channel_job, "three_candle_channel_strategy"),
         interval=THREE_CANDLE_SCAN_SECONDS,
         first=10,
         name="three_candle_channel_strategy",
