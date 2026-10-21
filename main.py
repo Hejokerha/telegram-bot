@@ -1171,7 +1171,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.10"
+COPY_SERVER_VERSION = "1.49.11"
 # The published Firebase APK is build 120. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(120, int(os.getenv("MOBILE_APP_LATEST_BUILD", "120")))
@@ -1360,6 +1360,10 @@ COPY_TELEGRAM_LINK_TTL_SECONDS = max(120, int(os.getenv("COPY_TELEGRAM_LINK_TTL_
 COPY_TELEGRAM_LINK_NOTIFY_COOLDOWN_SECONDS = max(30, int(os.getenv("COPY_TELEGRAM_LINK_NOTIFY_COOLDOWN_SECONDS", "180")))
 COPY_TELEGRAM_DEVICE_TOUCH_SECONDS = max(60, int(os.getenv("COPY_TELEGRAM_DEVICE_TOUCH_SECONDS", "600")))
 COPY_CLIENT_AUTH_RECHECK_SECONDS = max(1, min(15, int(os.getenv("COPY_CLIENT_AUTH_RECHECK_SECONDS", "10"))))
+# The mobile account heartbeat runs every 30 seconds. Keep the two fixed VIP
+# leader identities warm across that interval so an order does not wait for a
+# Firebase device-binding read. Expiry is still capped below by the record.
+COPY_VIP_LEADER_AUTH_CACHE_SECONDS = 35
 
 
 def _copy_b64url_encode(data: bytes) -> str:
@@ -1413,7 +1417,11 @@ def _copy_mobile_auth_cache_store(session_token: str, record: dict) -> None:
     if not isinstance(row, dict):
         return
     now_ts = time_module.time()
-    valid_until = now_ts + COPY_CLIENT_AUTH_RECHECK_SECONDS
+    leader_id = normalize_copy_telegram_user_id(row.get("telegram_user_id"))
+    cache_seconds = (COPY_VIP_LEADER_AUTH_CACHE_SECONDS
+                     if leader_id in {str(uid) for uid in VIP_TEAM_LEADER_TELEGRAM_IDS}
+                     else COPY_CLIENT_AUTH_RECHECK_SECONDS)
+    valid_until = now_ts + cache_seconds
     expiry = str((record or {}).get("expires_at") or "").strip()
     if expiry and expiry.lower() != "forever":
         try:
@@ -31631,7 +31639,7 @@ def create_embedded_copy_api():
     # bearer session.  This keeps the license token out of subsequent polling
     # requests and re-validates the bound device on each mobile API call.
 
-    def _mobile_bearer_session(authorization: str | None) -> dict:
+    def _mobile_bearer_session(authorization: str | None, *, refresh_before_seconds: int = 0) -> dict:
         raw = str(authorization or "").strip()
         if not raw.lower().startswith("bearer "):
             raise HTTPException(status_code=401, detail="missing mobile session")
@@ -31666,7 +31674,7 @@ def create_embedded_copy_api():
         if not token and telegram_user_id and device_proof_key:
             cached_until = float((session_row or {}).get("mobile_auth_valid_until") or 0)
             cached_record = (session_row or {}).get("mobile_auth_record")
-            if cached_until > time_module.time() and isinstance(cached_record, dict):
+            if cached_until > time_module.time() + max(0, refresh_before_seconds) and isinstance(cached_record, dict):
                 record = dict(cached_record)
             else:
                 mobile_ok, mobile_reason, record = copy_validate_telegram_subscription_device(
@@ -31834,7 +31842,11 @@ def create_embedded_copy_api():
         # Android shell on startup/resume and periodically while signed in.
         # _mobile_bearer_session re-validates the bot subscription + mobile
         # device proof within its bounded recheck interval.
-        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
+        # Refresh the VIP leader's short device binding before it expires on a
+        # routine heartbeat, not on the latency-sensitive manual order request.
+        session = await asyncio.to_thread(
+            _mobile_bearer_session, authorization, refresh_before_seconds=15
+        )
         record = dict(session.get("license_record") or {})
         telegram_user_id = normalize_copy_telegram_user_id(
             record.get("telegram_user_id") or session.get("telegram_user_id")
@@ -31882,7 +31894,10 @@ def create_embedded_copy_api():
 
     @copy_api.post("/api/mobile/vip/manual-trade")
     async def mobile_vip_manual_trade(request: Request, authorization: str | None = Header(default=None)):
+        request_started_ms = int(time_module.time() * 1000)
+        auth_started = time_module.monotonic()
         session = await asyncio.to_thread(_mobile_bearer_session, authorization)
+        auth_ms = int((time_module.monotonic() - auth_started) * 1000)
         leader_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
         if not _copy_vip_leader_identity_ok(leader_id):
             raise HTTPException(status_code=403, detail="leader_only")
@@ -31897,6 +31912,14 @@ def create_embedded_copy_api():
             raise HTTPException(status_code=400, detail="invalid_event_id")
         if str(event.get("platform_event") or "") not in {"s_orders/open", "f_orders/open", "orders/opened", "successopenOrder", "successopen"}:
             raise HTTPException(status_code=400, detail="platform_open_confirmation_required")
+        confirmed_match = re.match(r"^mobile_(\d{13})_", event_id)
+        confirmed_at_ms = int(confirmed_match.group(1)) if confirmed_match else 0
+        logger.info(
+            "VIP mobile ingress | event_id=%s | confirm_to_handler_ms=%s | auth_ms=%s",
+            event_id,
+            request_started_ms - confirmed_at_ms if confirmed_at_ms else -1,
+            auth_ms,
+        )
         return await _copy_publish_vip_manual_trade(
             event, "", {"telegram_user_id": leader_id, "client_kind": "mobile"}
         )

@@ -46,6 +46,8 @@ class MobileAuthCacheTests(unittest.TestCase):
         self.ns = {
             "_copy_ws_sessions": self.sessions,
             "COPY_CLIENT_AUTH_RECHECK_SECONDS": 10,
+            "COPY_VIP_LEADER_AUTH_CACHE_SECONDS": 35,
+            "VIP_TEAM_LEADER_TELEGRAM_IDS": {123, 6656949901},
             "time_module": SimpleNamespace(time=lambda: self.now),
             "parse_iso": datetime.fromisoformat,
             "timezone": timezone,
@@ -78,6 +80,24 @@ class MobileAuthCacheTests(unittest.TestCase):
         with self.assertRaises(ApiError):
             self.auth("Bearer session")
         self.assertEqual(self.calls, 1)
+
+    def test_vip_leader_cache_covers_mobile_account_heartbeat(self):
+        self.sessions["session"]["telegram_user_id"] = "123"
+        self.ns["_copy_mobile_auth_cache_store"]("session", {"expires_at": "forever", "plan": "admin"})
+        def validate(*args, **kwargs):
+            self.calls += 1
+            return (True, "ok", {"expires_at": "forever", "plan": "admin"}) if self.calls == 1 else (False, "revoked", {})
+        self.ns["copy_validate_telegram_subscription_device"] = validate
+        self.now += 30
+        self.assertEqual(self.auth("Bearer session", refresh_before_seconds=15)["license_record"]["plan"], "admin")
+        self.assertEqual(self.calls, 1)
+        self.now += 14
+        self.assertEqual(self.auth("Bearer session")["license_record"]["plan"], "admin")
+        self.assertEqual(self.calls, 1)
+        self.now += 22
+        with self.assertRaises(ApiError):
+            self.auth("Bearer session")
+        self.assertEqual(self.calls, 2)
 
 
 class WebSocketDeliveryTests(unittest.IsolatedAsyncioTestCase):
