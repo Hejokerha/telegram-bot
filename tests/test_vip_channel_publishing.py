@@ -1,5 +1,6 @@
 """Offline channel tests; no Telegram post or Firebase connection is made."""
 import ast
+import asyncio
 import hashlib
 from pathlib import Path
 import re
@@ -40,7 +41,7 @@ class VipChannelPublishingTests(unittest.IsolatedAsyncioTestCase):
             return object()
 
         self.ns = {
-            "re": re, "hashlib": hashlib,
+            "re": re, "hashlib": hashlib, "asyncio": asyncio,
             "db": SimpleNamespace(reference=lambda path: Ref(self.rows, path)),
             "safe_send_sticker": send_sticker,
             "VIP_CHANNEL_CHAT_ID": -1003588701661,

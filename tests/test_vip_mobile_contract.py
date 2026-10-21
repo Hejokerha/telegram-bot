@@ -1,5 +1,6 @@
 """Offline VIP mobile routing checks; importing the live bot is intentionally avoided."""
 import ast
+import asyncio
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
@@ -56,6 +57,7 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
             "COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS": {"vip_copy": 3},
             "COPY_SIGNAL_HISTORY_LIMIT": 100,
             "COPY_SIGNAL_DEDUPE_LIMIT": 100,
+            "COPY_CLIENT_AUTH_RECHECK_SECONDS": 10,
             "_copy_signal_history": [],
             "_copy_signal_id_registry": {},
             "_copy_signal_store_lock": None,
@@ -69,9 +71,11 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
             "copy_validate_license_for_device": lambda *args, **kwargs: (True, "ok", {}),
             "copy_validate_telegram_subscription_device": lambda *args, **kwargs: (True, "ok", {}),
             "now_iso": lambda: self.now.isoformat(),
+            "time_module": SimpleNamespace(time=lambda: self.now.timestamp()),
             "_copy_signal_delivery_allowed": lambda enabled, signal, mobile=False: enabled and signal.get("source") == "vip_copy",
             "re": re,
             "secrets": secrets,
+            "asyncio": asyncio,
             "datetime": datetime,
             "timedelta": timedelta,
             "UTC": UTC,
@@ -126,6 +130,25 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(denied["reason"], "leader_only")
 
+    async def test_manual_trade_is_not_retimed_after_backend_delay(self):
+        clock = [self.now.timestamp()]
+        self.ns["time_module"] = SimpleNamespace(time=lambda: clock[0])
+
+        def delayed_settings_read():
+            clock[0] += 4
+            return True
+
+        self.ns["is_copy_global_enabled"] = delayed_settings_read
+        result = await self.ns["_copy_publish_vip_manual_trade"](
+            {"event_id": "mobile_delayed", "trade": {
+                "asset": "AUDNZD_otc", "action": "call",
+                "time": (self.now + timedelta(seconds=60)).timestamp(),
+            }},
+            "", {"telegram_user_id": "123"},
+        )
+        self.assertEqual(result["reason"], "entry_window_elapsed")
+        self.assertEqual(self.sent, [])
+
     async def test_extension_vip_delivery_excludes_both_leaders(self):
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
         selected = [node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_copy_broadcast_signal"]
@@ -137,6 +160,7 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
         }
         namespace = {
             "_copy_clients": clients,
+            "asyncio": asyncio,
             "is_copy_global_enabled": lambda: True,
             "_copy_signal_delivery_allowed": lambda enabled, signal, mobile=False: enabled,
             "normalize_copy_telegram_user_id": self.ns["normalize_copy_telegram_user_id"],

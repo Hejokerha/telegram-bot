@@ -1171,7 +1171,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.3"
+COPY_SERVER_VERSION = "1.49.4"
 # The published Firebase APK is build 119. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(119, int(os.getenv("MOBILE_APP_LATEST_BUILD", "119")))
@@ -1359,6 +1359,7 @@ COPY_TELEGRAM_SUBSCRIPTION_AUTH_ENABLED = os.getenv("COPY_TELEGRAM_SUBSCRIPTION_
 COPY_TELEGRAM_LINK_TTL_SECONDS = max(120, int(os.getenv("COPY_TELEGRAM_LINK_TTL_SECONDS", "600")))
 COPY_TELEGRAM_LINK_NOTIFY_COOLDOWN_SECONDS = max(30, int(os.getenv("COPY_TELEGRAM_LINK_NOTIFY_COOLDOWN_SECONDS", "180")))
 COPY_TELEGRAM_DEVICE_TOUCH_SECONDS = max(60, int(os.getenv("COPY_TELEGRAM_DEVICE_TOUCH_SECONDS", "600")))
+COPY_CLIENT_AUTH_RECHECK_SECONDS = max(1, min(15, int(os.getenv("COPY_CLIENT_AUTH_RECHECK_SECONDS", "10"))))
 
 
 def _copy_b64url_encode(data: bytes) -> str:
@@ -1404,6 +1405,27 @@ def _copy_session_token_verify(value: str) -> tuple[bool, str, dict | None]:
         _copy_ws_sessions.pop(session_id, None)
         return False, "session expired", None
     return True, "ok", dict(payload)
+
+
+def _copy_mobile_auth_cache_store(session_token: str, record: dict) -> None:
+    """Bound mobile entitlement reuse to a few seconds and the actual expiry."""
+    row = _copy_ws_sessions.get(session_token)
+    if not isinstance(row, dict):
+        return
+    now_ts = time_module.time()
+    valid_until = now_ts + COPY_CLIENT_AUTH_RECHECK_SECONDS
+    expiry = str((record or {}).get("expires_at") or "").strip()
+    if expiry and expiry.lower() != "forever":
+        try:
+            expires_at = parse_iso(expiry.replace("Z", "+00:00"))
+            if expires_at is not None:
+                if expires_at.tzinfo is None:
+                    expires_at = expires_at.replace(tzinfo=timezone.utc)
+                valid_until = min(valid_until, expires_at.timestamp())
+        except (TypeError, ValueError):
+            valid_until = now_ts
+    row["mobile_auth_record"] = dict(record or {})
+    row["mobile_auth_valid_until"] = valid_until
 
 
 def _copy_device_proof_valid(proof_key: str, proof: str, nonce: str, device_id: str, telegram_user_id: str) -> bool:
@@ -2586,8 +2608,9 @@ def set_copy_update_notice(message: str, admin_id: int | None = None) -> bool:
         return False
 
 
-def copy_public_settings_payload() -> dict:
-    settings = get_copy_settings()
+def copy_public_settings_payload(settings: dict | None = None) -> dict:
+    if settings is None:
+        settings = get_copy_settings()
     return {
         "global_enabled": bool(settings.get("global_enabled", False)),
         "vip_team_copy_enabled": bool(settings.get("vip_team_copy_enabled", False)),
@@ -2595,6 +2618,12 @@ def copy_public_settings_payload() -> dict:
         "update_notice": settings.get("update_notice") or "",
         "updated_at": settings.get("updated_at"),
     }
+
+
+def copy_public_settings_payload_cached() -> dict | None:
+    """Use only the in-memory settings for liveness and WebSocket heartbeats."""
+    cached = _cache_get("copy_trading:settings", COPY_SETTINGS_CACHE_TTL_SECONDS)
+    return copy_public_settings_payload(cached) if isinstance(cached, dict) else None
 
 
 # ===== TRADING TIME COPY LICENSE MANAGER =====
@@ -30565,7 +30594,7 @@ async def disconnect_all_copy_clients(code: int = 4412, reason: str = "device bi
 
 
 async def _copy_broadcast_signal(signal: dict, exclude_client_id: str | None = None) -> dict:
-    global_enabled = is_copy_global_enabled()
+    global_enabled = await asyncio.to_thread(is_copy_global_enabled)
     if not _copy_signal_delivery_allowed(global_enabled, signal, mobile=False):
         return {
             "online_clients": len(_copy_clients),
@@ -30589,10 +30618,15 @@ async def _copy_broadcast_signal(signal: dict, exclude_client_id: str | None = N
             continue
         client_user_id = normalize_copy_telegram_user_id(client.get("telegram_user_id"))
         if str((client or {}).get("auth_mode") or "") == "telegram":
-            sub_ok, _sub_reason, _sub_record = copy_bot_subscription_record(client_user_id)
-            if not sub_ok:
-                inactive.append(client_id)
-                continue
+            auth_age = time_module.time() - float(client.get("last_auth_ok_at") or 0)
+            if auth_age >= COPY_CLIENT_AUTH_RECHECK_SECONDS:
+                sub_ok, _sub_reason, _sub_record = await asyncio.to_thread(
+                    copy_bot_subscription_record, client_user_id
+                )
+                if not sub_ok:
+                    inactive.append(client_id)
+                    continue
+                client["last_auth_ok_at"] = time_module.time()
         if target_user_id and client_user_id != target_user_id:
             skipped_scope += 1
             continue
@@ -30659,7 +30693,7 @@ def _vip_channel_trade_ref(event_id: str):
 
 async def _vip_channel_publish_entry(event: dict, leader_id: str, signal: dict) -> dict:
     prep_ref = db.reference(f"vip_channel/prepared/{leader_id}")
-    prep = prep_ref.get() or {}
+    prep = await asyncio.to_thread(prep_ref.get) or {}
     now = time_module.time()
     if not isinstance(prep, dict) or float(prep.get("expires_epoch") or 0) < now:
         return {"posted": False, "reason": "not_prepared"}
@@ -30667,7 +30701,7 @@ async def _vip_channel_publish_entry(event: dict, leader_id: str, signal: dict) 
         return {"posted": False, "reason": "different_pair"}
     event_id = str((event or {}).get("event_id") or "")
     trade_ref = _vip_channel_trade_ref(event_id)
-    existing = trade_ref.get() or {}
+    existing = await asyncio.to_thread(trade_ref.get) or {}
     if existing:
         return {"posted": existing.get("entry_posted") is True, "reason": "duplicate"}
     app_ref = globals().get("TRADING_TIME_TELEGRAM_APP")
@@ -30681,7 +30715,7 @@ async def _vip_channel_publish_entry(event: dict, leader_id: str, signal: dict) 
     )
     if sent is None:
         return {"posted": False, "reason": "sticker_send_failed"}
-    trade_ref.set({
+    await asyncio.to_thread(trade_ref.set, {
         "event_id": event_id,
         "leader_id": leader_id,
         "signal_id": signal.get("id"),
@@ -30738,12 +30772,14 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
     The leader's amount/account type is deliberately NOT copied. Followers execute
     with their own extension or Android settings.
     """
+    received_at = now_utc()
+    max_delay = int(COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["vip_copy"])
     if not _copy_vip_leader_identity_ok(client):
         return {"ok": False, "reason": "leader_only"}
     leader_id = normalize_copy_telegram_user_id(client.get("telegram_user_id"))
-    if not is_copy_global_enabled():
+    if not await asyncio.to_thread(is_copy_global_enabled):
         return {"ok": False, "reason": "copy_global_disabled"}
-    if not is_vip_team_copy_enabled():
+    if not await asyncio.to_thread(is_vip_team_copy_enabled):
         return {"ok": False, "reason": "vip_team_copy_disabled"}
 
     trade = (event or {}).get("trade")
@@ -30764,8 +30800,10 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
     except (TypeError, ValueError):
         return {"ok": False, "reason": "invalid_expiry"}
 
-    now_dt = now_utc()
-    now_epoch = now_dt.timestamp()
+    now_epoch = time_module.time()
+    if now_epoch - received_at.timestamp() >= max_delay:
+        return {"ok": False, "reason": "entry_window_elapsed"}
+    now_dt = received_at
     remaining = expiry_epoch - now_epoch
     if remaining < COPY_SIGNAL_DURATION_MIN_SECONDS - 1:
         return {"ok": False, "reason": "expiry_too_close"}
@@ -30778,8 +30816,6 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
         event_id = secrets.token_hex(8)
     # Stable event identity makes retries idempotent across HTTP/WS transports.
     signal_id = f"vip:{event_id}"
-    max_delay = int(COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["vip_copy"])
-
     raw_signal = {
         "id": signal_id,
         "source": "vip_copy",
@@ -30816,7 +30852,7 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
         _copy_signal_history,
         _copy_signal_id_registry,
         normalized,
-        is_copy_global_enabled(),
+        await asyncio.to_thread(is_copy_global_enabled),
         COPY_SIGNAL_HISTORY_LIMIT,
         COPY_SIGNAL_DEDUPE_LIMIT,
         _copy_signal_store_lock,
@@ -30951,7 +30987,7 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
     The mobile stream is intentionally separate from extension device clients,
     so linking/using Android can never replace the Chrome extension binding.
     """
-    global_enabled = is_copy_global_enabled()
+    global_enabled = await asyncio.to_thread(is_copy_global_enabled)
     if not _copy_signal_delivery_allowed(global_enabled, signal, mobile=True):
         source = normalize_copy_source((signal or {}).get("source"))
         prepare_only = _copy_signal_contract_kind(signal) == "prepare" if global_enabled else False
@@ -30986,25 +31022,28 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
         if target_user_id and client_user_id != target_user_id:
             skipped_scope += 1
             continue
-        try:
-            token = normalize_copy_license_token((client or {}).get("token"))
-            device_id = str((client or {}).get("device_id") or "unknown")
-            proof = str((client or {}).get("device_proof_key") or "")
-            if not token and client_user_id and proof:
-                ok, _reason, _record = copy_validate_telegram_subscription_device(
-                    client_user_id, device_id, proof, touch=True, client_kind="mobile"
-                )
-            else:
-                ok, _reason, _record = copy_validate_license_for_device(
-                    token, device_id, telegram_user_id=client_user_id,
-                    touch=True, allow_admin_rebind=False
-                )
-            if not ok:
+        if time_module.time() - float(client.get("last_auth_ok_at") or 0) >= COPY_CLIENT_AUTH_RECHECK_SECONDS:
+            try:
+                token = normalize_copy_license_token((client or {}).get("token"))
+                device_id = str((client or {}).get("device_id") or "unknown")
+                proof = str((client or {}).get("device_proof_key") or "")
+                if not token and client_user_id and proof:
+                    ok, _reason, _record = await asyncio.to_thread(
+                        copy_validate_telegram_subscription_device,
+                        client_user_id, device_id, proof, touch=True, client_kind="mobile"
+                    )
+                else:
+                    ok, _reason, _record = await asyncio.to_thread(copy_validate_license_for_device,
+                        token, device_id, telegram_user_id=client_user_id,
+                        touch=True, allow_admin_rebind=False
+                    )
+                if not ok:
+                    inactive.append(client_id)
+                    continue
+                client["last_auth_ok_at"] = time_module.time()
+            except Exception:
                 inactive.append(client_id)
                 continue
-        except Exception:
-            inactive.append(client_id)
-            continue
         ws = (client or {}).get("ws")
         ok = await _copy_send_json_safe(ws, {
             "type": "signal",
@@ -31310,12 +31349,14 @@ def create_embedded_copy_api():
 
     @copy_api.get("/health")
     async def copy_health():
+        # Liveness must not wait for Firebase. A stalled database read used to
+        # make this endpoint (and every request sharing the event loop) hang.
         return {
             "ok": True,
             "app": "TRADING TIME COPY EMBEDDED SERVER",
             "version": COPY_SERVER_VERSION,
             "time": now_iso(),
-            "copy_settings": copy_public_settings_payload(),
+            "copy_settings": copy_public_settings_payload_cached(),
             "online_clients": len(_copy_clients),
             "bot": "telegram-bot",
         }
@@ -31330,7 +31371,10 @@ def create_embedded_copy_api():
         token = normalize_copy_license_token(body.get("token"))
         device_id = str(body.get("device_id") or "unknown")
         telegram_user_id = normalize_copy_telegram_user_id(body.get("telegram_user_id"))
-        ok, reason, record = copy_validate_license_for_device(token, device_id, telegram_user_id=telegram_user_id, touch=True, allow_admin_rebind=True)
+        ok, reason, record = await asyncio.to_thread(
+            copy_validate_license_for_device, token, device_id,
+            telegram_user_id=telegram_user_id, touch=True, allow_admin_rebind=True,
+        )
         if not ok:
             raise HTTPException(status_code=401, detail=reason)
         return {
@@ -31340,7 +31384,7 @@ def create_embedded_copy_api():
             "expires_at": (record or {}).get("expires_at"),
             "max_devices": (record or {}).get("max_devices"),
             "telegram_user_id": normalize_copy_telegram_user_id((record or {}).get("telegram_user_id") or telegram_user_id),
-            "copy_settings": copy_public_settings_payload(),
+            "copy_settings": await asyncio.to_thread(copy_public_settings_payload),
         }
 
 
@@ -31363,8 +31407,8 @@ def create_embedded_copy_api():
         # extends the server-side bearer lifetime. Active phones no longer fall
         # out after 30 minutes while polling signals. The session is still
         # bounded, device-bound, and re-validates the license below.
+        session_row = _copy_ws_sessions.get(session_token)
         try:
-            session_row = _copy_ws_sessions.get(session_token)
             if isinstance(session_row, dict):
                 session_row["expires_at"] = int(time_module.time()) + max(300, int(COPY_SESSION_TOKEN_TTL_SECONDS))
                 session_row["last_seen_at"] = int(time_module.time())
@@ -31378,14 +31422,25 @@ def create_embedded_copy_api():
 
         # v1.08: tokenless mobile sessions use the Telegram bot subscription as
         # the entitlement and a client-scoped confirmed device binding. Recheck
-        # on every mobile API request so expiry/disable on the bot immediately
-        # stops the app without waiting for the bearer session to expire.
+        # on mobile API requests so expiry/disable is observed within a short
+        # bounded interval instead of waiting for the bearer session to expire.
+        # A short validated window avoids two Firebase reads on every 3-second
+        # signal poll. It never extends beyond the subscription expiry.
         if not token and telegram_user_id and device_proof_key:
-            mobile_ok, mobile_reason, record = copy_validate_telegram_subscription_device(
-                telegram_user_id, device_id, device_proof_key, touch=True, client_kind="mobile"
-            )
-            if not mobile_ok:
-                raise HTTPException(status_code=401, detail=mobile_reason)
+            cached_until = float((session_row or {}).get("mobile_auth_valid_until") or 0)
+            cached_record = (session_row or {}).get("mobile_auth_record")
+            if cached_until > time_module.time() and isinstance(cached_record, dict):
+                record = dict(cached_record)
+            else:
+                mobile_ok, mobile_reason, record = copy_validate_telegram_subscription_device(
+                    telegram_user_id, device_id, device_proof_key, touch=True, client_kind="mobile"
+                )
+                if not mobile_ok:
+                    if isinstance(session_row, dict):
+                        session_row.pop("mobile_auth_record", None)
+                        session_row.pop("mobile_auth_valid_until", None)
+                    raise HTTPException(status_code=401, detail=mobile_reason)
+                _copy_mobile_auth_cache_store(session_token, record)
         elif token == COPY_ADMIN_LICENSE_TOKEN:
             # Legacy v0.14 mobile compatibility during rollout.
             admin_tid = str(int(ADMIN_TELEGRAM_ID))
@@ -31445,15 +31500,12 @@ def create_embedded_copy_api():
         if telegram_mobile_auth:
             if not device_proof_key:
                 raise HTTPException(status_code=400, detail="device proof is required")
-            sub_ok, sub_reason, record = copy_bot_subscription_record(telegram_user_id)
-            if not sub_ok:
-                raise HTTPException(status_code=401, detail=sub_reason)
-            device_ok, device_reason, record = copy_validate_telegram_subscription_device(
+            device_ok, device_reason, record = await asyncio.to_thread(copy_validate_telegram_subscription_device,
                 telegram_user_id, device_id, device_proof_key, touch=True, client_kind="mobile"
             )
             if not device_ok:
                 if device_reason == "telegram device confirmation required":
-                    request_id, request_data, should_notify = copy_get_or_create_telegram_link_request(
+                    request_id, request_data, should_notify = await asyncio.to_thread(copy_get_or_create_telegram_link_request,
                         telegram_user_id, device_id, device_proof_key, "android_mobile", client_kind="mobile"
                     )
                     if should_notify:
@@ -31466,6 +31518,7 @@ def create_embedded_copy_api():
                 raise HTTPException(status_code=401, detail=device_reason)
 
             session_token = _copy_session_token_issue("", device_id, telegram_user_id, device_proof_key)
+            _copy_mobile_auth_cache_store(session_token, record)
             return {
                 "ok": True,
                 "session_token": session_token,
@@ -31506,7 +31559,7 @@ def create_embedded_copy_api():
                 "mobile_session": True,
             }
         else:
-            ok, reason, record = copy_validate_license_for_device(
+            ok, reason, record = await asyncio.to_thread(copy_validate_license_for_device,
                 token,
                 device_id,
                 telegram_user_id=telegram_user_id,
@@ -31519,7 +31572,7 @@ def create_embedded_copy_api():
             # A successful HTTPS login is a completed authenticated client binding.
             # Mark the device as confirmed so normal max-device / lifecycle rules apply.
             try:
-                copy_mark_device_auth_confirmed(token, device_id)
+                await asyncio.to_thread(copy_mark_device_auth_confirmed, token, device_id)
             except Exception:
                 logger.debug("Mobile device confirmation failed", exc_info=True)
 
@@ -31543,8 +31596,8 @@ def create_embedded_copy_api():
         # v1.09 entitlement heartbeat: lightweight status endpoint used by the
         # Android shell on startup/resume and periodically while signed in.
         # _mobile_bearer_session re-validates the bot subscription + mobile
-        # device proof before this response is returned.
-        session = _mobile_bearer_session(authorization)
+        # device proof within its bounded recheck interval.
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         record = dict(session.get("license_record") or {})
         telegram_user_id = normalize_copy_telegram_user_id(
             record.get("telegram_user_id") or session.get("telegram_user_id")
@@ -31553,7 +31606,7 @@ def create_embedded_copy_api():
             "ok": True,
             "status": "active",
             "server_time": now_iso(),
-            "global_enabled": is_copy_global_enabled(),
+            "global_enabled": await asyncio.to_thread(is_copy_global_enabled),
             "notifications": _mobile_recent_notifications_for_user(telegram_user_id, limit=30),
             "account": {
                 "telegram_user_id": telegram_user_id,
@@ -31570,11 +31623,11 @@ def create_embedded_copy_api():
     async def mobile_recent_signals(response: Response, authorization: str | None = Header(default=None)):
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         telegram_user_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
         if telegram_user_id:
             _copy_mobile_recent_activity[telegram_user_id] = time_module.time()
-        global_enabled = is_copy_global_enabled()
+        global_enabled = await asyncio.to_thread(is_copy_global_enabled)
 
         source_history = list(_copy_signal_history)[-int(COPY_SIGNAL_HISTORY_LIMIT):] if global_enabled else []
         visible = _copy_filter_mobile_recent_signals(
@@ -31592,7 +31645,7 @@ def create_embedded_copy_api():
 
     @copy_api.post("/api/mobile/vip/manual-trade")
     async def mobile_vip_manual_trade(request: Request, authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         leader_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
         if not _copy_vip_leader_identity_ok(leader_id):
             raise HTTPException(status_code=403, detail="leader_only")
@@ -31613,7 +31666,7 @@ def create_embedded_copy_api():
 
     @copy_api.post("/api/mobile/vip/prepare")
     async def mobile_vip_prepare(request: Request, authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         leader_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
         if not _copy_vip_leader_identity_ok(leader_id):
             raise HTTPException(status_code=403, detail="leader_only")
@@ -31639,7 +31692,7 @@ def create_embedded_copy_api():
 
     @copy_api.post("/api/mobile/vip/manual-result")
     async def mobile_vip_manual_result(request: Request, authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         leader_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
         if not _copy_vip_leader_identity_ok(leader_id):
             raise HTTPException(status_code=403, detail="leader_only")
@@ -31693,7 +31746,7 @@ def create_embedded_copy_api():
 
     @copy_api.post("/api/mobile/vip/participation")
     async def mobile_vip_participation(request: Request, authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         user_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
         body = await request.json()
         active = (body or {}).get("active") is True
@@ -31710,7 +31763,7 @@ def create_embedded_copy_api():
 
     @copy_api.post("/api/mobile/vip/follower-result")
     async def mobile_vip_follower_result(request: Request, authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         user_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
         body = await request.json()
         session_id = re.sub(r"[^A-Za-z0-9_-]", "", str((body or {}).get("session_id") or ""))[:64]
@@ -31841,7 +31894,7 @@ def create_embedded_copy_api():
         # Used as a cross-origin image/beacon from the Firebase /download page.
         # 204 avoids response payload/cache overhead and requires no browser CORS
         # permission because the page does not read the response.
-        _mobile_app_record_download(download_id, version, build)
+        await asyncio.to_thread(_mobile_app_record_download, download_id, version, build)
         return Response(status_code=204, headers={"Cache-Control": "no-store"})
 
     @copy_api.get("/api/mobile/app/release")
@@ -31859,7 +31912,7 @@ def create_embedded_copy_api():
 
     @copy_api.get("/api/mobile/features")
     async def mobile_features(authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         tid = _mobile_session_tid(session)
         return {
             "ok": True,
@@ -31867,7 +31920,7 @@ def create_embedded_copy_api():
             "telegram_user_id": tid,
             "is_admin": tid == str(int(ADMIN_TELEGRAM_ID)),
             "can_vip_lead": _copy_vip_leader_identity_ok(tid),
-            "vip_team_copy_enabled": is_vip_team_copy_enabled() if _copy_vip_leader_identity_ok(tid) else False,
+            "vip_team_copy_enabled": await asyncio.to_thread(is_vip_team_copy_enabled) if _copy_vip_leader_identity_ok(tid) else False,
             # Owner-granted narrow permission: JavaScript injection + the same
             # internal DEMO sandbox lifecycle used by the owner. This does NOT
             # grant the mobile admin panel or any Telegram-bot admin action.
@@ -31891,7 +31944,7 @@ def create_embedded_copy_api():
 
     @copy_api.post("/api/mobile/signals/generate")
     async def mobile_generate_signal(request: Request, authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         tid = _mobile_session_tid(session)
         try:
             creator_id = int(tid)
@@ -31998,7 +32051,7 @@ def create_embedded_copy_api():
     # Backward-compatible endpoint used by older mobile builds.
     @copy_api.post("/api/mobile/signals/request")
     async def mobile_request_signal(request: Request, authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         try:
             body = await request.json()
         except Exception:
@@ -32019,93 +32072,136 @@ def create_embedded_copy_api():
 
     @copy_api.get("/api/mobile/trading-room/status")
     async def mobile_trading_room_status(authorization: str | None = Header(default=None)):
-        _mobile_bearer_session(authorization)
+        await asyncio.to_thread(_mobile_bearer_session, authorization)
         return {"ok": False, "retired": True, "message": "Trading Room retired; use Octopus."}
 
     @copy_api.post("/api/mobile/trading-room/action")
     async def mobile_trading_room_action(request: Request, authorization: str | None = Header(default=None)):
-        _mobile_bearer_session(authorization)
+        await asyncio.to_thread(_mobile_bearer_session, authorization)
         raise HTTPException(status_code=410, detail="Trading Room retired; use Octopus")
 
 
+    _mobile_admin_overview_state = {"payload": None, "updated_at": 0.0, "task": None, "generation": 0}
+
     @copy_api.get("/api/mobile/admin/overview")
     async def mobile_admin_overview(authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         _mobile_require_admin(session)
         # v1.13.1: page-open returns only the small state needed to paint the
         # dashboard. Heavy human-readable reports remain behind their explicit
         # report buttons instead of being generated on every panel open.
-        three_settings = _three_candle_get_settings()
-        public_settings = _three_candle_public_get_settings()
-        return {
-            "ok": True,
-            "stats": _mobile_bot_stats_payload(),
-            "sections": {
-                "copy": {"enabled": bool(is_copy_global_enabled()), "online_clients": len(_copy_clients)},
-                "three_candle": {"enabled": bool(_three_candle_is_enabled()), "daily_limit": int(three_settings.get("daily_limit", 0) or 0)},
-                "public_three_candle": {"enabled": bool(_three_candle_public_is_enabled()), "session_limit": int(public_settings.get("session_limit", 0) or 0)},
-                "bot": {"enabled": bool(get_bot_enabled())},
-            },
-            "menu": [
-                "pending_users", "all_users", "active_users", "user_details", "bot_stats", "export_users",
-                "copy_trading", "copy_status", "three_candle", "public_three_candle", "otc_list_check",
-                "otc_list_results", "bot_start", "bot_stop", "broadcast"
-            ],
-        }
+        async def build_overview():
+            stats, three_settings, public_settings = await asyncio.gather(
+                asyncio.to_thread(_mobile_bot_stats_payload),
+                asyncio.to_thread(_three_candle_get_settings),
+                asyncio.to_thread(_three_candle_public_get_settings),
+            )
+            public_limit = int(public_settings.get("session_limit", 0) or 0)
+            public_sent = int(public_settings.get("session_sent", 0) or 0)
+            return {
+                "ok": True,
+                "stats": stats,
+                "sections": {
+                    "copy": {"enabled": bool(stats.get("copy_enabled")), "online_clients": len(_copy_clients)},
+                    "three_candle": {"enabled": bool(three_settings.get("enabled") and _three_candle_channel_id()), "daily_limit": int(three_settings.get("daily_limit", 0) or 0)},
+                    "public_three_candle": {"enabled": bool(public_settings.get("enabled") and _three_candle_public_channel_id() and (public_limit <= 0 or public_sent < public_limit)), "session_limit": public_limit},
+                    "bot": {"enabled": bool(stats.get("bot_enabled"))},
+                },
+                "menu": [
+                    "pending_users", "all_users", "active_users", "user_details", "bot_stats", "export_users",
+                    "copy_trading", "copy_status", "three_candle", "public_three_candle", "otc_list_check",
+                    "otc_list_results", "bot_start", "bot_stop", "broadcast"
+                ],
+            }
+
+        state = _mobile_admin_overview_state
+        cached = state.get("payload")
+        age = time_module.time() - float(state.get("updated_at") or 0)
+        if isinstance(cached, dict) and age < 15:
+            return cached
+
+        generation = state["generation"]
+        async def refresh_overview():
+            try:
+                payload = await build_overview()
+                if state["generation"] == generation:
+                    state["payload"] = payload
+                    state["updated_at"] = time_module.time()
+                return payload
+            except Exception as exc:
+                logger.warning("Admin overview refresh failed (%s)", type(exc).__name__)
+                return None
+
+        task = state.get("task")
+        if task is None or task.done():
+            task = asyncio.create_task(refresh_overview(), name="mobile-admin-overview-refresh")
+            state["task"] = task
+        try:
+            result = await asyncio.wait_for(asyncio.shield(task), timeout=5.5)
+            if isinstance(result, dict):
+                return result
+        except asyncio.TimeoutError:
+            pass
+        if isinstance(cached, dict) and age < 30:
+            return {**cached, "cached_while_refreshing": True}
+        raise HTTPException(status_code=503, detail="admin overview temporarily unavailable")
 
     @copy_api.get("/api/mobile/admin/users")
     async def mobile_admin_users(kind: str = Query(default="all"), authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         _mobile_require_admin(session)
         kind = str(kind or "all").lower()
-        rows = []
-        if kind == "vip":
-            participants = db.reference("vip_copy/participants").get() or {}
-            all_users = get_all_users() or {}
-            for key, value in participants.items():
-                if not isinstance(value, dict):
-                    continue
-                try:
-                    last_seen = datetime.fromisoformat(
-                        str(value.get("last_seen_at") or "").replace("Z", "+00:00")
-                    )
-                    recent = (now_utc() - last_seen).total_seconds() <= 180
-                except (TypeError, ValueError):
-                    recent = False
-                row = _mobile_clean_user(key, all_users.get(str(key), {}))
-                row["vip_last_seen_at"] = value.get("last_seen_at") or ""
-                row["vip_platform"] = value.get("platform") or ""
-                row["vip_active"] = bool(value.get("active") and recent)
-                rows.append(row)
-            rows.sort(key=lambda row: str(row["vip_last_seen_at"]), reverse=True)
-            rows.sort(key=lambda row: row["vip_active"], reverse=True)
-        elif kind == "pending":
-            data = get_all_pending_users() or {}
-            for key, value in data.items(): rows.append(_mobile_clean_user(key, value))
-        elif kind == "active":
-            for key, value in (get_recent_active_approved_users() or []): rows.append(_mobile_clean_user(key, value))
-        else:
-            approved = get_all_approved_users() or {}
-            all_users = get_all_users() or {}
-            for key, value in approved.items():
-                try:
-                    if not is_approved(int(key)): continue
-                except Exception: continue
-                merged = dict(all_users.get(str(key), {}) or {})
-                merged.update(dict(value or {}))
-                rows.append(_mobile_clean_user(key, merged))
-        return {"ok": True, "kind": kind, "users": rows[:200], "count": len(rows)}
+        def list_users():
+            rows = []
+            if kind == "vip":
+                participants = db.reference("vip_copy/participants").get() or {}
+                all_users = get_all_users() or {}
+                for key, value in participants.items():
+                    if not isinstance(value, dict):
+                        continue
+                    try:
+                        last_seen = datetime.fromisoformat(
+                            str(value.get("last_seen_at") or "").replace("Z", "+00:00")
+                        )
+                        recent = (now_utc() - last_seen).total_seconds() <= 180
+                    except (TypeError, ValueError):
+                        recent = False
+                    row = _mobile_clean_user(key, all_users.get(str(key), {}))
+                    row["vip_last_seen_at"] = value.get("last_seen_at") or ""
+                    row["vip_platform"] = value.get("platform") or ""
+                    row["vip_active"] = bool(value.get("active") and recent)
+                    rows.append(row)
+                rows.sort(key=lambda row: str(row["vip_last_seen_at"]), reverse=True)
+                rows.sort(key=lambda row: row["vip_active"], reverse=True)
+            elif kind == "pending":
+                data = get_all_pending_users() or {}
+                for key, value in data.items(): rows.append(_mobile_clean_user(key, value))
+            elif kind == "active":
+                for key, value in (get_recent_active_approved_users() or []): rows.append(_mobile_clean_user(key, value))
+            else:
+                approved = get_all_approved_users() or {}
+                all_users = get_all_users() or {}
+                for key, value in approved.items():
+                    try:
+                        if not is_approved(int(key)): continue
+                    except Exception: continue
+                    merged = dict(all_users.get(str(key), {}) or {})
+                    merged.update(dict(value or {}))
+                    rows.append(_mobile_clean_user(key, merged))
+            return {"ok": True, "kind": kind, "users": rows[:200], "count": len(rows)}
+
+        return await asyncio.to_thread(list_users)
 
     @copy_api.get("/api/mobile/admin/vip-report")
     async def mobile_admin_vip_report(
         telegram_id: str = Query(...), authorization: str | None = Header(default=None)
     ):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         _mobile_require_admin(session)
         user_id = normalize_copy_telegram_user_id(telegram_id)
         if not user_id:
             raise HTTPException(status_code=400, detail="invalid_telegram_id")
-        all_sessions = db.reference(f"vip_copy/sessions/{user_id}").get() or {}
+        all_sessions = await asyncio.to_thread(lambda: db.reference(f"vip_copy/sessions/{user_id}").get()) or {}
         sessions = []
         for session_id, data in all_sessions.items():
             if not isinstance(data, dict):
@@ -32126,46 +32222,51 @@ def create_embedded_copy_api():
 
     @copy_api.get("/api/mobile/admin/user")
     async def mobile_admin_user(telegram_id: str = Query(...), authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         _mobile_require_admin(session)
         tid = normalize_copy_telegram_user_id(telegram_id)
         if not tid:
             raise HTTPException(status_code=400, detail="Telegram ID غير صالح")
-        all_users = get_all_users() or {}
-        approved = get_all_approved_users() or {}
-        pending = get_all_pending_users() or {}
+        all_users, approved, pending = await asyncio.gather(
+            asyncio.to_thread(get_all_users),
+            asyncio.to_thread(get_all_approved_users),
+            asyncio.to_thread(get_all_pending_users),
+        )
+        all_users, approved, pending = all_users or {}, approved or {}, pending or {}
         merged = dict(all_users.get(tid, {}) or {})
         merged.update(dict(approved.get(tid, {}) or {}))
         if not merged: merged.update(dict(pending.get(tid, {}) or {}))
         user_payload = _mobile_clean_user(tid, merged)
         try:
-            licenses = find_copy_licenses_by_telegram_id(tid, 100)
+            licenses = await asyncio.to_thread(find_copy_licenses_by_telegram_id, tid, 100)
         except Exception:
             licenses = []
-        return {"ok": True, "user": user_payload, "approved": is_approved(int(tid)), "licenses": licenses}
+        return {"ok": True, "user": user_payload, "approved": await asyncio.to_thread(is_approved, int(tid)), "licenses": licenses}
 
     @copy_api.get("/api/mobile/admin/report")
     async def mobile_admin_report(section: str = Query(...), limit: int = Query(default=20), authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         _mobile_require_admin(session)
         section = str(section or "").lower()
-        if section == "stats": text = build_bot_stats_message()
-        elif section == "copy": text = build_copy_status_message()
-        elif section == "three_status": text = build_three_candle_channel_status()
-        elif section == "three_summary": text = build_three_candle_channel_summary(None if limit <= 0 else limit)
-        elif section == "three_memory": text = build_three_candle_strategy_memory_report(None if limit <= 0 else limit)
-        elif section == "public_status": text = build_three_candle_public_status()
-        elif section == "public_summary": text = build_three_candle_public_summary(None if limit <= 0 else limit)
-        elif section == "otc_list_results":
-            saved = get_ready_otc_list_result(int(ADMIN_TELEGRAM_ID)) or {}
-            text = saved.get("result_text") or "لا توجد نتيجة جاهزة بعد."
-        elif section == "export_users": text = build_users_export_csv_bytes().decode("utf-8-sig", errors="replace")
-        else: raise HTTPException(status_code=400, detail="قسم التقرير غير معروف")
+        def build_report():
+            if section == "stats": return build_bot_stats_message()
+            if section == "copy": return build_copy_status_message()
+            if section == "three_status": return build_three_candle_channel_status()
+            if section == "three_summary": return build_three_candle_channel_summary(None if limit <= 0 else limit)
+            if section == "three_memory": return build_three_candle_strategy_memory_report(None if limit <= 0 else limit)
+            if section == "public_status": return build_three_candle_public_status()
+            if section == "public_summary": return build_three_candle_public_summary(None if limit <= 0 else limit)
+            if section == "otc_list_results":
+                saved = get_ready_otc_list_result(int(ADMIN_TELEGRAM_ID)) or {}
+                return saved.get("result_text") or "لا توجد نتيجة جاهزة بعد."
+            if section == "export_users": return build_users_export_csv_bytes().decode("utf-8-sig", errors="replace")
+            raise HTTPException(status_code=400, detail="قسم التقرير غير معروف")
+        text = await asyncio.to_thread(build_report)
         return {"ok": True, "section": section, "text": text}
 
     @copy_api.post("/api/mobile/admin/otc-list/check")
     async def mobile_admin_otc_list_check(request: Request, authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         _mobile_require_admin(session)
         app_ref = _mobile_runtime_app()
         try: body = await request.json()
@@ -32199,7 +32300,7 @@ def create_embedded_copy_api():
 
     @copy_api.post("/api/mobile/admin/action")
     async def mobile_admin_action(request: Request, authorization: str | None = Header(default=None)):
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         _mobile_require_admin(session)
         app_ref = globals().get("TRADING_TIME_TELEGRAM_APP")
         try: body = await request.json()
@@ -32208,48 +32309,54 @@ def create_embedded_copy_api():
         value = body.get("value")
         target_tid = normalize_copy_telegram_user_id(body.get("telegram_id"))
 
-        if action == "bot_start": set_bot_enabled(True); message = "تم تشغيل البوت."
-        elif action == "bot_stop": set_bot_enabled(False); message = "تم إيقاف البوت."
-        elif action == "copy_start": set_copy_global_enabled(True, int(ADMIN_TELEGRAM_ID)); message = "تم تشغيل Copy Trading."
-        elif action == "copy_stop": set_copy_global_enabled(False, int(ADMIN_TELEGRAM_ID)); message = "تم إيقاف Copy Trading."
+        if action == "bot_start": await asyncio.to_thread(set_bot_enabled, True); message = "تم تشغيل البوت."
+        elif action == "bot_stop": await asyncio.to_thread(set_bot_enabled, False); message = "تم إيقاف البوت."
+        elif action == "copy_start":
+            if not await asyncio.to_thread(set_copy_global_enabled, True, int(ADMIN_TELEGRAM_ID)):
+                raise HTTPException(status_code=503, detail="تعذر حفظ تشغيل Copy Trading")
+            message = "تم تشغيل Copy Trading."
+        elif action == "copy_stop":
+            if not await asyncio.to_thread(set_copy_global_enabled, False, int(ADMIN_TELEGRAM_ID)):
+                raise HTTPException(status_code=503, detail="تعذر حفظ إيقاف Copy Trading")
+            message = "تم إيقاف Copy Trading."
         elif action == "three_start":
-            if not _three_candle_set_enabled(True): raise HTTPException(status_code=500, detail="تعذر تشغيل قناة 3 شموع")
+            if not await asyncio.to_thread(_three_candle_set_enabled, True): raise HTTPException(status_code=500, detail="تعذر تشغيل قناة 3 شموع")
             message = "تم تشغيل نشر قناة 3 شموع."
         elif action == "three_stop":
-            if not _three_candle_set_enabled(False): raise HTTPException(status_code=500, detail="تعذر إيقاف قناة 3 شموع")
+            if not await asyncio.to_thread(_three_candle_set_enabled, False): raise HTTPException(status_code=500, detail="تعذر إيقاف قناة 3 شموع")
             message = "تم إيقاف نشر قناة 3 شموع."
         elif action == "three_limit":
             limit = safe_int(value, -1)
-            if limit < 0 or not _three_candle_set_daily_limit(limit): raise HTTPException(status_code=400, detail="حد الصفقات غير صالح")
+            if limit < 0 or not await asyncio.to_thread(_three_candle_set_daily_limit, limit): raise HTTPException(status_code=400, detail="حد الصفقات غير صالح")
             message = f"تم ضبط حد 3 شموع على {limit if limit else 'مفتوح'}."
         elif action == "three_memory_reset":
-            ok, message = _three_candle_reset_strategy_memory()
+            ok, message = await asyncio.to_thread(_three_candle_reset_strategy_memory)
             if not ok: raise HTTPException(status_code=500, detail=message)
         elif action == "public_start":
-            ok, message = _three_candle_public_set_enabled(True)
+            ok, message = await asyncio.to_thread(_three_candle_public_set_enabled, True)
             if not ok: raise HTTPException(status_code=400, detail=message)
         elif action == "public_stop":
-            ok, message = _three_candle_public_set_enabled(False)
+            ok, message = await asyncio.to_thread(_three_candle_public_set_enabled, False)
             if not ok: raise HTTPException(status_code=400, detail=message)
         elif action == "public_limit":
             limit = safe_int(value, -1)
             if limit < 0: raise HTTPException(status_code=400, detail="عدد الصفقات غير صالح")
-            ok, message = _three_candle_public_set_session_limit(limit)
+            ok, message = await asyncio.to_thread(_three_candle_public_set_session_limit, limit)
             if not ok: raise HTTPException(status_code=400, detail=message)
         elif action == "public_reset":
-            ok, message = _three_candle_public_reset_results()
+            ok, message = await asyncio.to_thread(_three_candle_public_reset_results)
             if not ok: raise HTTPException(status_code=500, detail=message)
         elif action in {"user_week", "user_month", "user_forever", "user_revoke"}:
             if not target_tid: raise HTTPException(status_code=400, detail="Telegram ID مطلوب")
             uid = int(target_tid)
             if action == "user_week":
-                set_user_expiry(uid, "week"); message = "تم تفعيل المستخدم أسبوع."; user_notice = "✅ تم تفعيل حسابك بنجاح لمدة أسبوع.\nاضغط /start للدخول إلى TRADING TIME."
+                await asyncio.to_thread(set_user_expiry, uid, "week"); message = "تم تفعيل المستخدم أسبوع."; user_notice = "✅ تم تفعيل حسابك بنجاح لمدة أسبوع.\nاضغط /start للدخول إلى TRADING TIME."
             elif action == "user_month":
-                set_user_expiry(uid, "month"); message = "تم تفعيل المستخدم شهر."; user_notice = "✅ تم تفعيل حسابك بنجاح لمدة شهر.\nاضغط /start للدخول إلى TRADING TIME."
+                await asyncio.to_thread(set_user_expiry, uid, "month"); message = "تم تفعيل المستخدم شهر."; user_notice = "✅ تم تفعيل حسابك بنجاح لمدة شهر.\nاضغط /start للدخول إلى TRADING TIME."
             elif action == "user_forever":
-                set_user_expiry(uid, "forever"); message = "تم تفعيل المستخدم دائم."; user_notice = "✅ تم تفعيل حسابك بشكل دائم.\nاضغط /start للدخول إلى TRADING TIME."
+                await asyncio.to_thread(set_user_expiry, uid, "forever"); message = "تم تفعيل المستخدم دائم."; user_notice = "✅ تم تفعيل حسابك بشكل دائم.\nاضغط /start للدخول إلى TRADING TIME."
             else:
-                block_user(uid); message = "تم إلغاء تفعيل المستخدم."; user_notice = "⛔ تم إلغاء تفعيل اشتراك TRADING TIME الخاص بك."
+                await asyncio.to_thread(block_user, uid); message = "تم إلغاء تفعيل المستخدم."; user_notice = "⛔ تم إلغاء تفعيل اشتراك TRADING TIME الخاص بك."
             if app_ref is not None:
                 try:
                     await safe_send_message(app_ref.bot, chat_id=uid, text=user_notice)
@@ -32257,11 +32364,11 @@ def create_embedded_copy_api():
                     logger.debug("Mobile admin user notification failed", exc_info=True)
         elif action == "copy_reset_telegram_device":
             if not target_tid: raise HTTPException(status_code=400, detail="Telegram ID مطلوب")
-            if not copy_reset_telegram_device(target_tid): raise HTTPException(status_code=500, detail="تعذر تصفير الجهاز")
+            if not await asyncio.to_thread(copy_reset_telegram_device, target_tid): raise HTTPException(status_code=500, detail="تعذر تصفير الجهاز")
             message = "تم تصفير جهاز Copy للمستخدم."
         elif action == "copy_update_notice":
             notice = str(value or "").strip()
-            if not set_copy_update_notice(notice, int(ADMIN_TELEGRAM_ID)):
+            if not await asyncio.to_thread(set_copy_update_notice, notice, int(ADMIN_TELEGRAM_ID)):
                 raise HTTPException(status_code=500, detail="تعذر حفظ رسالة التحديث")
             message = "تم مسح رسالة التحديث." if not notice else "تم حفظ رسالة التحديث للإضافة."
         elif action == "direct_message":
@@ -32285,7 +32392,14 @@ def create_embedded_copy_api():
             message = f"تم الإرسال: {sent}، تجاهل: {skipped}، فشل: {failed}."
         else:
             raise HTTPException(status_code=400, detail="إجراء إداري غير معروف")
-        return {"ok": True, "action": action, "message": message, "overview": _mobile_bot_stats_payload()}
+        # The Flutter caller only displays the action message and then reloads
+        # the overview. Recomputing every Firebase-backed statistic here made a
+        # successful action appear to time out on the phone.
+        previous_overview = _mobile_admin_overview_state.get("payload") or {}
+        _mobile_admin_overview_state["generation"] += 1
+        _mobile_admin_overview_state["updated_at"] = 0.0
+        _mobile_admin_overview_state["task"] = None
+        return {"ok": True, "action": action, "message": message, "overview": previous_overview.get("stats") or {}}
 
     @copy_api.post("/api/mobile/octopus/result")
     async def mobile_octopus_result(request: Request, authorization: str | None = Header(default=None)):
@@ -32295,7 +32409,7 @@ def create_embedded_copy_api():
         a result for another user.  The existing Octopus recorder performs the
         pending-signal match, canonical de-duplication and result-only channel post.
         """
-        session = _mobile_bearer_session(authorization)
+        session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         telegram_user_id = normalize_copy_telegram_user_id(session.get("telegram_user_id"))
         if not telegram_user_id:
             raise HTTPException(status_code=401, detail="invalid mobile session")
@@ -32333,7 +32447,7 @@ def create_embedded_copy_api():
         await websocket.accept()
         authorization = websocket.headers.get("authorization")
         try:
-            session = _mobile_bearer_session(authorization)
+            session = await asyncio.to_thread(_mobile_bearer_session, authorization)
         except Exception as exc:
             try:
                 await _copy_send_json_safe(websocket, {
@@ -32362,16 +32476,18 @@ def create_embedded_copy_api():
             "last_seen_at": now_iso(),
             "last_sent_at": None,
             "client_kind": "mobile",
+            "last_auth_ok_at": time_module.time(),
         }
+        global_enabled = await asyncio.to_thread(is_copy_global_enabled)
         await _copy_send_json_safe(websocket, {
             "type": "hello",
             "ok": True,
             "client_id": client_id,
             "server_time": now_iso(),
             "transport": "mobile_push_v1",
-            "global_enabled": is_copy_global_enabled(),
+            "global_enabled": global_enabled,
         })
-        if not is_copy_global_enabled():
+        if not global_enabled:
             await _copy_send_json_safe(websocket, {
                 "type": "control",
                 "action": "global_stop",
@@ -32387,12 +32503,13 @@ def create_embedded_copy_api():
                 # Re-use the HTTP bearer verifier on every client heartbeat. It
                 # refreshes the sliding mobile session and rechecks bot entitlement.
                 try:
-                    _mobile_bearer_session(f"Bearer {session_token}")
+                    await asyncio.to_thread(_mobile_bearer_session, f"Bearer {session_token}")
                 except Exception:
                     await websocket.close(code=4441, reason="mobile_subscription_inactive")
                     break
                 if client_id in _mobile_signal_clients:
                     _mobile_signal_clients[client_id]["last_seen_at"] = now_iso()
+                    _mobile_signal_clients[client_id]["last_auth_ok_at"] = time_module.time()
                 try:
                     event = json.loads(raw)
                 except Exception:
@@ -32451,7 +32568,7 @@ def create_embedded_copy_api():
 
         normalized["received_at"] = now_iso()
         normalized["origin"] = "bot"
-        global_enabled = is_copy_global_enabled()
+        global_enabled = await asyncio.to_thread(is_copy_global_enabled)
         registration = _copy_store_signal_if_allowed(
             _copy_signal_history,
             _copy_signal_id_registry,
@@ -32511,7 +32628,7 @@ def create_embedded_copy_api():
 
         normalized["received_at"] = now_iso()
         normalized["origin"] = "admin_manual"
-        global_enabled = is_copy_global_enabled()
+        global_enabled = await asyncio.to_thread(is_copy_global_enabled)
         registration = _copy_store_signal_if_allowed(
             _copy_signal_history,
             _copy_signal_id_registry,
@@ -32583,7 +32700,7 @@ def create_embedded_copy_api():
 
         async def _origin_precheck(token: str, device_id: str, telegram_user_id: str, device_proof_key: str, *, is_admin_identity: bool = False) -> tuple[bool, bool]:
             is_admin_token = normalize_copy_license_token(token) == COPY_ADMIN_LICENSE_TOKEN
-            trusted_owner = copy_is_trusted_owner_device(device_id, device_proof_key)
+            trusted_owner = await asyncio.to_thread(copy_is_trusted_owner_device, device_id, device_proof_key)
             admin_identity = bool(is_admin_token or is_admin_identity)
             allowed = is_copy_origin_allowed(
                 origin,
@@ -32621,7 +32738,7 @@ def create_embedded_copy_api():
             # the device binding considered fully established. Telegram-ID auth
             # is confirmed by the user in the bot; legacy code auth keeps the old path.
             if auth_mode != "telegram":
-                copy_mark_device_auth_confirmed(token, device_id, device_proof_key)
+                await asyncio.to_thread(copy_mark_device_auth_confirmed, token, device_id, device_proof_key)
             _copy_ws_auth_success(auth_ip)
             if legacy_auth:
                 logger.warning(
@@ -32660,6 +32777,7 @@ def create_embedded_copy_api():
                 "connected_at": now_iso(),
                 "last_seen_at": now_iso(),
                 "last_sent_at": None,
+                "last_auth_ok_at": time_module.time(),
             }
             hello = {
                 "type": "hello",
@@ -32667,7 +32785,7 @@ def create_embedded_copy_api():
                 "client_id": client_id,
                 "server_time": now_iso(),
                 "message": "TRADING TIME COPY connected",
-                "copy_settings": copy_public_settings_payload(),
+                "copy_settings": await asyncio.to_thread(copy_public_settings_payload),
                 "license": {
                     "status": "active",
                     "plan": (license_record or {}).get("plan") or (license_record or {}).get("mode"),
@@ -32693,22 +32811,27 @@ def create_embedded_copy_api():
                     raw = await websocket.receive_text()
                     if client_id in _copy_clients:
                         _copy_clients[client_id]["last_seen_at"] = now_iso()
-                    if auth_mode == "telegram":
-                        ok, reason, _record = copy_validate_telegram_subscription_device(
-                            telegram_user_id, device_id, device_proof_key, touch=True
-                        )
-                    else:
-                        ok, reason, _record = copy_validate_license_for_device(
-                            token,
-                            device_id,
-                            telegram_user_id=telegram_user_id,
-                            touch=True,
-                            allow_admin_rebind=False,
-                            device_proof_key=device_proof_key,
-                        )
-                    if not ok:
-                        await _reject_auth(reason)
-                        break
+                    client_row = _copy_clients.get(client_id) or {}
+                    if time_module.time() - float(client_row.get("last_auth_ok_at") or 0) >= COPY_CLIENT_AUTH_RECHECK_SECONDS:
+                        if auth_mode == "telegram":
+                            ok, reason, _record = await asyncio.to_thread(
+                                copy_validate_telegram_subscription_device,
+                                telegram_user_id, device_id, device_proof_key, touch=True
+                            )
+                        else:
+                            ok, reason, _record = await asyncio.to_thread(copy_validate_license_for_device,
+                                token,
+                                device_id,
+                                telegram_user_id=telegram_user_id,
+                                touch=True,
+                                allow_admin_rebind=False,
+                                device_proof_key=device_proof_key,
+                            )
+                        if not ok:
+                            await _reject_auth(reason)
+                            break
+                        if client_id in _copy_clients:
+                            _copy_clients[client_id]["last_auth_ok_at"] = time_module.time()
                     try:
                         event = json.loads(raw)
                     except Exception:
@@ -32726,23 +32849,43 @@ def create_embedded_copy_api():
                                 and event.get("auto_copy_enabled") is True
                                 and event.get("extension_enabled") is not False
                             )
-                            participant_ref = db.reference(f"vip_copy/participants/{telegram_user_id}")
-                            participant_ref.update({
-                                "active": active_vip,
-                                "session_id": f"extension_{client_id}",
-                                "platform": "extension",
-                                "last_seen_at": now_iso(),
-                            })
-                            if active_vip:
-                                report_session_ref = db.reference(f"vip_copy/sessions/{telegram_user_id}/extension_{client_id}")
-                                if not report_session_ref.get():
-                                    report_session_ref.set({
-                                        "started_at": now_iso(), "platform": "extension", "trades": {}
-                                    })
+                            client_row = _copy_clients.get(client_id) or {}
+                            presence_task = client_row.get("presence_task")
+                            last_presence = float(client_row.get("last_presence_update_at") or 0)
+                            changed = client_row.get("last_active_vip") is not active_vip
+                            if (presence_task is None or presence_task.done()) and (
+                                changed or time_module.time() - last_presence >= 30
+                            ):
+                                client_row["last_presence_update_at"] = time_module.time()
+                                client_row["last_active_vip"] = active_vip
+
+                                async def update_vip_presence(visible_active: bool):
+                                    def write_presence():
+                                        participant_ref = db.reference(f"vip_copy/participants/{telegram_user_id}")
+                                        participant_ref.update({
+                                            "active": visible_active,
+                                            "session_id": f"extension_{client_id}",
+                                            "platform": "extension",
+                                            "last_seen_at": now_iso(),
+                                        })
+                                        if visible_active:
+                                            report_session_ref = db.reference(f"vip_copy/sessions/{telegram_user_id}/extension_{client_id}")
+                                            if not report_session_ref.get():
+                                                report_session_ref.set({
+                                                    "started_at": now_iso(), "platform": "extension", "trades": {}
+                                                })
+                                    try:
+                                        await asyncio.to_thread(write_presence)
+                                    except Exception:
+                                        logger.warning("Could not refresh extension VIP presence", exc_info=True)
+
+                                client_row["presence_task"] = asyncio.create_task(
+                                    update_vip_presence(active_vip), name="extension-vip-presence"
+                                )
                         await _copy_send_json_safe(websocket, {
                             "type": "pong",
                             "server_time": now_iso(),
-                            "copy_settings": copy_public_settings_payload(),
+                            "copy_settings": copy_public_settings_payload_cached(),
                         })
                     elif event.get("type") == "vip_manual_trade":
                         vip_result = await _copy_publish_vip_manual_trade(
@@ -32805,7 +32948,7 @@ def create_embedded_copy_api():
                                 # v0.97: accept and aggregate silently; send one session summary on stop.
                                 sent = _copy_record_otc_edge_trade_result(payload_event, _copy_clients.get(client_id) or {})
                             elif event_kind == "vip_copy_trade_result":
-                                sent = _vip_copy_record_extension_result(payload_event, _copy_clients.get(client_id) or {})
+                                sent = await asyncio.to_thread(_vip_copy_record_extension_result, payload_event, _copy_clients.get(client_id) or {})
                             else:
                                 _octopus_user_note_target_event(payload_event, _copy_clients.get(client_id) or {})
                                 sent = await _copy_send_extension_alert_to_user(payload_event, _copy_clients.get(client_id) or {})
@@ -32820,13 +32963,18 @@ def create_embedded_copy_api():
             except WebSocketDisconnect:
                 logger.debug("COPY WebSocket disconnected | client_id=%s", client_id)
             finally:
-                _copy_clients.pop(client_id, None)
+                finished_client = _copy_clients.pop(client_id, None) or {}
                 try:
                     if telegram_user_id:
-                        participant_ref = db.reference(f"vip_copy/participants/{telegram_user_id}")
-                        participant = participant_ref.get() or {}
-                        if participant.get("session_id") == f"extension_{client_id}":
-                            participant_ref.update({"active": False, "last_seen_at": now_iso()})
+                        presence_task = finished_client.get("presence_task")
+                        if presence_task is not None:
+                            await presence_task
+                        def mark_vip_offline():
+                            participant_ref = db.reference(f"vip_copy/participants/{telegram_user_id}")
+                            participant = participant_ref.get() or {}
+                            if participant.get("session_id") == f"extension_{client_id}":
+                                participant_ref.update({"active": False, "last_seen_at": now_iso()})
+                        await asyncio.to_thread(mark_vip_offline)
                 except Exception:
                     logger.debug("Could not mark extension VIP participant offline", exc_info=True)
 
@@ -32843,7 +32991,7 @@ def create_embedded_copy_api():
             origin_ok, trusted_owner_device = await _origin_precheck(legacy_token, legacy_device_id, legacy_telegram_id, "")
             if not origin_ok:
                 return
-            ok, reason, license_record = copy_validate_license_for_device(
+            ok, reason, license_record = await asyncio.to_thread(copy_validate_license_for_device,
                 legacy_token,
                 legacy_device_id,
                 telegram_user_id=legacy_telegram_id,
@@ -32873,6 +33021,8 @@ def create_embedded_copy_api():
         except asyncio.TimeoutError:
             _copy_ws_auth_failure(auth_ip)
             await websocket.close(code=4408, reason="authentication timeout")
+            return
+        except WebSocketDisconnect:
             return
         except Exception:
             _copy_ws_auth_failure(auth_ip)
@@ -32914,17 +33064,12 @@ def create_embedded_copy_api():
             )
             if not origin_ok:
                 return
-            sub_ok, sub_reason, subscription = copy_bot_subscription_record(telegram_user_id)
-            if not sub_ok:
-                _copy_ws_auth_failure(auth_ip)
-                await _reject_auth(sub_reason)
-                return
-            device_ok, device_reason, subscription = copy_validate_telegram_subscription_device(
+            device_ok, device_reason, subscription = await asyncio.to_thread(copy_validate_telegram_subscription_device,
                 telegram_user_id, device_id, device_proof_key, touch=True
             )
             if not device_ok:
                 if device_reason == "telegram device confirmation required":
-                    request_id, request_data, should_notify = copy_get_or_create_telegram_link_request(
+                    request_id, request_data, should_notify = await asyncio.to_thread(copy_get_or_create_telegram_link_request,
                         telegram_user_id, device_id, device_proof_key, str(origin or "")
                     )
                     if should_notify:
@@ -32980,7 +33125,7 @@ def create_embedded_copy_api():
         if not origin_ok:
             return
 
-        ok, reason, license_record = copy_validate_license_for_device(
+        ok, reason, license_record = await asyncio.to_thread(copy_validate_license_for_device,
             token,
             device_id,
             telegram_user_id=telegram_user_id,
