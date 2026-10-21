@@ -182,6 +182,37 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
         result = await publishing
         self.assertTrue(result["channel_delivery"]["posted"])
 
+    async def test_mobile_delivery_starts_while_extension_auth_is_busy(self):
+        extension_started = asyncio.Event()
+        release_extension = asyncio.Event()
+        mobile_started = asyncio.Event()
+
+        async def slow_extension(_signal, exclude_client_id=None):
+            extension_started.set()
+            await release_extension.wait()
+            return {"delivered": 0, "global_enabled": True}
+
+        async def mobile_delivery(_signal):
+            mobile_started.set()
+            return {"delivered": 1}
+
+        self.ns["_copy_broadcast_signal"] = slow_extension
+        self.ns["_copy_broadcast_mobile_signal"] = mobile_delivery
+        event = {"event_id": "extension_slow", "trade": {
+            "asset": "AUDNZD_otc", "action": "call",
+            "time": (self.now + timedelta(seconds=60)).timestamp(),
+        }}
+        publishing = asyncio.create_task(self.ns["_copy_publish_vip_manual_trade"](
+            event, "leader", {"telegram_user_id": "123"},
+        ))
+        try:
+            await asyncio.wait_for(extension_started.wait(), 1)
+            await asyncio.wait_for(mobile_started.wait(), 1)
+            self.assertFalse(publishing.done())
+        finally:
+            release_extension.set()
+        self.assertTrue((await publishing)["ok"])
+
     async def test_slow_mobile_auth_does_not_hold_back_another_device(self):
         slow_started = threading.Event()
         release_slow = threading.Event()

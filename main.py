@@ -1171,7 +1171,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.11"
+COPY_SERVER_VERSION = "1.49.12"
 # The published Firebase APK is build 120. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(120, int(os.getenv("MOBILE_APP_LATEST_BUILD", "120")))
@@ -31063,19 +31063,8 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
             "signal_id": normalized.get("id"),
         }
 
-    delivery = await _copy_broadcast_signal(normalized, exclude_client_id=client_id)
-    extension_sent_at = time_module.time()
-    if delivery.get("global_enabled") is False:
-        with _copy_signal_store_lock:
-            _copy_signal_history[:] = [
-                row for row in _copy_signal_history
-                if str((row or {}).get("id") or "") != str(normalized.get("id") or "")
-            ]
-        return {"ok": False, "reason": "copy_global_disabled", "signal_id": normalized.get("id")}
-
-    # Channel publication starts as soon as the first follower broadcast ends.
-    # Authentication checks on other Android sockets can take seconds and must
-    # not hold the Telegram entry sticker behind them.
+    # Android followers must not queue behind extension subscription checks.
+    # Each transport performs its own global/recipient entitlement validation.
     fanout_timings = {}
 
     async def timed_fanout(name, operation):
@@ -31085,8 +31074,28 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
         finally:
             fanout_timings[name] = int((time_module.monotonic() - started) * 1000)
 
+    mobile_task = asyncio.create_task(
+        timed_fanout("mobile_ms", _copy_broadcast_mobile_signal(normalized))
+    )
+    try:
+        delivery = await _copy_broadcast_signal(normalized, exclude_client_id=client_id)
+    except BaseException:
+        mobile_task.cancel()
+        await asyncio.gather(mobile_task, return_exceptions=True)
+        raise
+    extension_sent_at = time_module.time()
+    if delivery.get("global_enabled") is False:
+        await asyncio.gather(mobile_task, return_exceptions=True)
+        with _copy_signal_store_lock:
+            _copy_signal_history[:] = [
+                row for row in _copy_signal_history
+                if str((row or {}).get("id") or "") != str(normalized.get("id") or "")
+            ]
+        return {"ok": False, "reason": "copy_global_disabled", "signal_id": normalized.get("id")}
+
+    # Channel publication remains independent of Android delivery.
     mobile_delivery, channel_delivery = await asyncio.gather(
-        timed_fanout("mobile_ms", _copy_broadcast_mobile_signal(normalized)),
+        mobile_task,
         timed_fanout("channel_ms", _vip_channel_publish_entry(event, leader_id, normalized)),
         return_exceptions=True,
     )
@@ -31112,9 +31121,14 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
     except (TypeError, ValueError):
         sent_at_ms = 0
     order_age_ms = int(pipeline_started * 1000 - sent_at_ms) if sent_at_ms > 1e12 else -1
+    try:
+        captured_at = datetime.fromisoformat(str(event.get("captured_at") or "").replace("Z", "+00:00"))
+        capture_age_ms = int((received_at - captured_at).total_seconds() * 1000)
+    except (TypeError, ValueError):
+        capture_age_ms = -1
     logger.info(
-        "VIP manual pipeline | signal_id=%s | order_age_ms=%s | settings_ms=%s | extension_ms=%s | mobile_ms=%s | channel_ms=%s | mobile_channel_ms=%s | channel_posted=%s",
-        normalized.get("id"), order_age_ms,
+        "VIP manual pipeline | signal_id=%s | order_age_ms=%s | capture_age_ms=%s | settings_ms=%s | extension_ms=%s | mobile_ms=%s | channel_ms=%s | mobile_channel_ms=%s | channel_posted=%s",
+        normalized.get("id"), order_age_ms, capture_age_ms,
         int((settings_ready_at - pipeline_started) * 1000),
         int((extension_sent_at - settings_ready_at) * 1000),
         fanout_timings.get("mobile_ms", -1),
