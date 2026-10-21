@@ -1171,7 +1171,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.9"
+COPY_SERVER_VERSION = "1.49.10"
 # The published Firebase APK is build 120. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(120, int(os.getenv("MOBILE_APP_LATEST_BUILD", "120")))
@@ -3815,7 +3815,32 @@ async def safe_send_message(bot, *, chat_id, text: str, parse_mode: str | None =
 
 
 async def safe_send_sticker(bot, *, chat_id, sticker_path: str):
-    """Upload a local sticker on the Telegram polling loop."""
+    """Upload VIP stickers independently of bot polling; use its loop elsewhere."""
+    if chat_id == VIP_CHANNEL_CHAT_ID:
+        # VIP entry stickers are latency-sensitive. The Telegram polling loop
+        # also runs scheduled bot work, so a slow scan must not queue the
+        # channel signal behind it.
+        def send_direct():
+            try:
+                with open(sticker_path, "rb") as sticker:
+                    response = requests.post(
+                        f"https://api.telegram.org/bot{bot.token}/sendSticker",
+                        data={"chat_id": chat_id},
+                        files={"sticker": (os.path.basename(sticker_path), sticker, "image/webp")},
+                        timeout=(3, 8),
+                    )
+                if response.status_code == 200:
+                    payload = response.json()
+                    if payload.get("ok"):
+                        return payload.get("result") or True
+                logger.warning("VIP sticker send rejected | status=%s", response.status_code)
+            except Exception as exc:
+                # Requests exceptions can contain the token-bearing URL.
+                logger.warning("VIP sticker send failed | error_type=%s", type(exc).__name__)
+            return None
+
+        return await asyncio.to_thread(send_direct)
+
     async def send():
         try:
             with open(sticker_path, "rb") as sticker:
@@ -30840,6 +30865,7 @@ def _vip_channel_trade_ref(event_id: str):
 
 
 async def _vip_channel_publish_entry(event: dict, leader_id: str, signal: dict) -> dict:
+    started_at = time_module.monotonic()
     prep_ref = db.reference(f"vip_channel/prepared/{leader_id}")
     event_id = str((event or {}).get("event_id") or "")
     trade_ref = _vip_channel_trade_ref(event_id)
@@ -30849,6 +30875,7 @@ async def _vip_channel_publish_entry(event: dict, leader_id: str, signal: dict) 
         asyncio.to_thread(prep_ref.get),
         asyncio.to_thread(trade_ref.get),
     )
+    prep_ms = int((time_module.monotonic() - started_at) * 1000)
     prep = prep or {}
     existing = existing or {}
     now = time_module.time()
@@ -30863,10 +30890,12 @@ async def _vip_channel_publish_entry(event: dict, leader_id: str, signal: dict) 
         return {"posted": False, "reason": "telegram_unavailable"}
     direction = str(signal.get("direction") or "").upper()
     sticker_name = "call.webp" if direction == "CALL" else "put.webp"
+    sticker_started_at = time_module.monotonic()
     sent = await safe_send_sticker(
         app_ref.bot, chat_id=VIP_CHANNEL_CHAT_ID,
         sticker_path=os.path.join(VIP_CHANNEL_STICKER_DIR, sticker_name),
     )
+    sticker_ms = int((time_module.monotonic() - sticker_started_at) * 1000)
     if sent is None:
         return {"posted": False, "reason": "sticker_send_failed"}
     await asyncio.to_thread(trade_ref.set, {
@@ -30881,6 +30910,12 @@ async def _vip_channel_publish_entry(event: dict, leader_id: str, signal: dict) 
         "result_posted": False,
         "platform_request_id": str(((event or {}).get("trade") or {}).get("requestId") or ""),
     })
+    logger.info(
+        "VIP channel timing | signal_id=%s | prep_ms=%s | sticker_ms=%s | record_ms=%s | total_ms=%s",
+        signal.get("id"), prep_ms, sticker_ms,
+        int((time_module.monotonic() - sticker_started_at) * 1000) - sticker_ms,
+        int((time_module.monotonic() - started_at) * 1000),
+    )
     return {"posted": True}
 
 
@@ -31033,9 +31068,18 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
     # Channel publication starts as soon as the first follower broadcast ends.
     # Authentication checks on other Android sockets can take seconds and must
     # not hold the Telegram entry sticker behind them.
+    fanout_timings = {}
+
+    async def timed_fanout(name, operation):
+        started = time_module.monotonic()
+        try:
+            return await operation
+        finally:
+            fanout_timings[name] = int((time_module.monotonic() - started) * 1000)
+
     mobile_delivery, channel_delivery = await asyncio.gather(
-        _copy_broadcast_mobile_signal(normalized),
-        _vip_channel_publish_entry(event, leader_id, normalized),
+        timed_fanout("mobile_ms", _copy_broadcast_mobile_signal(normalized)),
+        timed_fanout("channel_ms", _vip_channel_publish_entry(event, leader_id, normalized)),
         return_exceptions=True,
     )
     if isinstance(mobile_delivery, asyncio.CancelledError):
@@ -31061,10 +31105,12 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
         sent_at_ms = 0
     order_age_ms = int(pipeline_started * 1000 - sent_at_ms) if sent_at_ms > 1e12 else -1
     logger.info(
-        "VIP manual pipeline | signal_id=%s | order_age_ms=%s | settings_ms=%s | extension_ms=%s | mobile_channel_ms=%s | channel_posted=%s",
+        "VIP manual pipeline | signal_id=%s | order_age_ms=%s | settings_ms=%s | extension_ms=%s | mobile_ms=%s | channel_ms=%s | mobile_channel_ms=%s | channel_posted=%s",
         normalized.get("id"), order_age_ms,
         int((settings_ready_at - pipeline_started) * 1000),
         int((extension_sent_at - settings_ready_at) * 1000),
+        fanout_timings.get("mobile_ms", -1),
+        fanout_timings.get("channel_ms", -1),
         int((time_module.time() - extension_sent_at) * 1000),
         channel_delivery.get("posted"),
     )
@@ -31194,10 +31240,8 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
             "reason": reason,
         }
     target_user_id = normalize_copy_telegram_user_id((signal or {}).get("target_user_id"))
-    delivered = 0
     skipped_scope = 0
-    dead = []
-    inactive = []
+    recipients = []
     for client_id, client in list(_mobile_signal_clients.items()):
         client_user_id = normalize_copy_telegram_user_id((client or {}).get("telegram_user_id"))
         if normalize_copy_source(signal.get("source")) == "vip_copy" and _copy_vip_leader_identity_ok(client_user_id):
@@ -31206,6 +31250,9 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
         if target_user_id and client_user_id != target_user_id:
             skipped_scope += 1
             continue
+        recipients.append((client_id, client, client_user_id))
+
+    async def deliver_one(client_id, client, client_user_id):
         if time_module.time() - float(client.get("last_auth_ok_at") or 0) >= COPY_CLIENT_AUTH_RECHECK_SECONDS:
             try:
                 token = normalize_copy_license_token((client or {}).get("token"))
@@ -31222,12 +31269,10 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
                         touch=True, allow_admin_rebind=False
                     )
                 if not ok:
-                    inactive.append(client_id)
-                    continue
+                    return client_id, "inactive"
                 client["last_auth_ok_at"] = time_module.time()
             except Exception:
-                inactive.append(client_id)
-                continue
+                return client_id, "inactive"
         ws = (client or {}).get("ws")
         ok = await _copy_send_json_safe(ws, {
             "type": "signal",
@@ -31236,10 +31281,18 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
             "transport": "mobile_push_v1",
         })
         if ok:
-            delivered += 1
             client["last_sent_at"] = now_iso()
-        else:
-            dead.append(client_id)
+            return client_id, "delivered"
+        return client_id, "dead"
+
+    # One slow device verification or WebSocket must not hold back the others.
+    outcomes = await asyncio.gather(
+        *(deliver_one(client_id, client, client_user_id)
+          for client_id, client, client_user_id in recipients)
+    )
+    delivered = sum(status == "delivered" for _, status in outcomes)
+    dead = [client_id for client_id, status in outcomes if status == "dead"]
+    inactive = [client_id for client_id, status in outcomes if status == "inactive"]
     for client_id in set(dead + inactive):
         client = _mobile_signal_clients.pop(client_id, None)
         if client:

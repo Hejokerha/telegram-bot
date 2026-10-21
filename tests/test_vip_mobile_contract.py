@@ -5,6 +5,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import re
 import secrets
+import time
+import threading
 from types import SimpleNamespace
 import unittest
 
@@ -71,7 +73,7 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
             "copy_validate_license_for_device": lambda *args, **kwargs: (True, "ok", {}),
             "copy_validate_telegram_subscription_device": lambda *args, **kwargs: (True, "ok", {}),
             "now_iso": lambda: self.now.isoformat(),
-            "time_module": SimpleNamespace(time=lambda: self.now.timestamp()),
+            "time_module": SimpleNamespace(time=lambda: self.now.timestamp(), monotonic=time.monotonic),
             "_copy_signal_delivery_allowed": lambda enabled, signal, mobile=False: enabled and signal.get("source") == "vip_copy",
             "re": re,
             "secrets": secrets,
@@ -132,7 +134,7 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_manual_trade_is_not_retimed_after_backend_delay(self):
         clock = [self.now.timestamp()]
-        self.ns["time_module"] = SimpleNamespace(time=lambda: clock[0])
+        self.ns["time_module"] = SimpleNamespace(time=lambda: clock[0], monotonic=time.monotonic)
 
         def delayed_settings_read():
             clock[0] += 4
@@ -179,6 +181,36 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
             release_mobile.set()
         result = await publishing
         self.assertTrue(result["channel_delivery"]["posted"])
+
+    async def test_slow_mobile_auth_does_not_hold_back_another_device(self):
+        slow_started = threading.Event()
+        release_slow = threading.Event()
+
+        def validate(token, *_args, **_kwargs):
+            if token == "slow":
+                slow_started.set()
+                import time as real_time
+                while not release_slow.is_set():
+                    real_time.sleep(0.01)
+            return True, "ok", {}
+
+        self.ns["copy_validate_license_for_device"] = validate
+        self.ns["_mobile_signal_clients"] = {
+            "slow": {"telegram_user_id": "456", "token": "slow", "device_id": "one", "ws": "slow-ws"},
+            "fast": {"telegram_user_id": "789", "token": "fast", "device_id": "two", "ws": "fast-ws"},
+        }
+        publishing = asyncio.create_task(self.ns["_copy_broadcast_mobile_signal"]({"source": "vip_copy"}))
+        try:
+            self.assertTrue(await asyncio.to_thread(slow_started.wait, 1))
+            for _ in range(20):
+                if any(ws == "fast-ws" for ws, _ in self.sent):
+                    break
+                await asyncio.sleep(0.01)
+            self.assertTrue(any(ws == "fast-ws" for ws, _ in self.sent))
+        finally:
+            release_slow.set()
+        result = await publishing
+        self.assertEqual(result["delivered"], 2)
 
     async def test_extension_vip_delivery_excludes_both_leaders(self):
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))

@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 from pathlib import Path
 import re
+import time
 from types import SimpleNamespace
 import unittest
 
@@ -47,7 +48,8 @@ class VipChannelPublishingTests(unittest.IsolatedAsyncioTestCase):
             "VIP_CHANNEL_CHAT_ID": -1003588701661,
             "VIP_CHANNEL_STICKER_DIR": "stickers",
             "os": __import__("os"),
-            "time_module": SimpleNamespace(time=lambda: 1000),
+            "time_module": SimpleNamespace(time=lambda: 1000, monotonic=time.monotonic),
+            "logger": SimpleNamespace(info=lambda *args: None),
             "now_iso": lambda: "2026-10-14T12:00:00+00:00",
             "TRADING_TIME_TELEGRAM_APP": SimpleNamespace(bot=object()),
         }
