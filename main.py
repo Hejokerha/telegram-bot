@@ -1171,20 +1171,20 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.12"
-# The published Firebase APK is build 120. Older Render environment values
+COPY_SERVER_VERSION = "1.49.13"
+# The published Firebase APK is build 121. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
-MOBILE_APP_LATEST_BUILD = max(120, int(os.getenv("MOBILE_APP_LATEST_BUILD", "120")))
+MOBILE_APP_LATEST_BUILD = max(121, int(os.getenv("MOBILE_APP_LATEST_BUILD", "121")))
 MOBILE_APP_LATEST_VERSION = (
-    "1.0.20" if MOBILE_APP_LATEST_BUILD == 120
-    else os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.20").strip() or "1.0.20"
+    "1.0.21" if MOBILE_APP_LATEST_BUILD == 121
+    else os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.21").strip() or "1.0.21"
 )
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
 MOBILE_APP_FORCE_UPDATE = os.getenv("MOBILE_APP_FORCE_UPDATE", "false").lower() in {"1", "true", "yes", "on"}
 MOBILE_APP_RELEASE_URL = os.getenv("MOBILE_APP_RELEASE_URL", "https://trading-time-official.web.app/download").strip()
 MOBILE_APP_RELEASE_NOTES = (
-    "تقليل تأخير نسخ VIP وإشارة القناة وتحسين التقاط نتائج الصفقات وإعادة فحصها."
-    if MOBILE_APP_LATEST_BUILD == 120 else os.getenv("MOBILE_APP_RELEASE_NOTES", "").strip()
+    "تسريع دخول نسخ VIP بين الإضافة وAndroid مع قياس زمن التنفيذ بدقة."
+    if MOBILE_APP_LATEST_BUILD == 121 else os.getenv("MOBILE_APP_RELEASE_NOTES", "").strip()
 )
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
@@ -1360,6 +1360,10 @@ COPY_TELEGRAM_LINK_TTL_SECONDS = max(120, int(os.getenv("COPY_TELEGRAM_LINK_TTL_
 COPY_TELEGRAM_LINK_NOTIFY_COOLDOWN_SECONDS = max(30, int(os.getenv("COPY_TELEGRAM_LINK_NOTIFY_COOLDOWN_SECONDS", "180")))
 COPY_TELEGRAM_DEVICE_TOUCH_SECONDS = max(60, int(os.getenv("COPY_TELEGRAM_DEVICE_TOUCH_SECONDS", "600")))
 COPY_CLIENT_AUTH_RECHECK_SECONDS = max(1, min(15, int(os.getenv("COPY_CLIENT_AUTH_RECHECK_SECONDS", "10"))))
+# Android sends an authenticated ping every 20 seconds. Its WebSocket handler
+# refreshes entitlement there; normal VIP fanout can use that recent check
+# instead of blocking the order on another Firebase read.
+COPY_MOBILE_SIGNAL_AUTH_FRESH_SECONDS = 30
 # The mobile account heartbeat runs every 30 seconds. Keep the two fixed VIP
 # leader identities warm across that interval so an order does not wait for a
 # Firebase device-binding read. Expiry is still capped below by the record.
@@ -31074,8 +31078,17 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
         finally:
             fanout_timings[name] = int((time_module.monotonic() - started) * 1000)
 
+    async def dispatch_mobile():
+        result = await timed_fanout("mobile_ms", _copy_broadcast_mobile_signal(normalized))
+        logger.info(
+            "VIP mobile dispatch | signal_id=%s | delivered=%s | online=%s | elapsed_ms=%s",
+            normalized.get("id"), result.get("delivered", 0),
+            result.get("online_mobile_clients", 0), fanout_timings.get("mobile_ms", -1),
+        )
+        return result
+
     mobile_task = asyncio.create_task(
-        timed_fanout("mobile_ms", _copy_broadcast_mobile_signal(normalized))
+        dispatch_mobile()
     )
     try:
         delivery = await _copy_broadcast_signal(normalized, exclude_client_id=client_id)
@@ -31275,7 +31288,7 @@ async def _copy_broadcast_mobile_signal(signal: dict) -> dict:
         recipients.append((client_id, client, client_user_id))
 
     async def deliver_one(client_id, client, client_user_id):
-        if time_module.time() - float(client.get("last_auth_ok_at") or 0) >= COPY_CLIENT_AUTH_RECHECK_SECONDS:
+        if time_module.time() - float(client.get("last_auth_ok_at") or 0) >= COPY_MOBILE_SIGNAL_AUTH_FRESH_SECONDS:
             try:
                 token = normalize_copy_license_token((client or {}).get("token"))
                 device_id = str((client or {}).get("device_id") or "unknown")
@@ -32067,6 +32080,19 @@ def create_embedded_copy_api():
                 raise HTTPException(status_code=400, detail="authoritative_close_required")
             row["platform_order_id"] = str(body["platform_order_id"])[:100]
         await asyncio.to_thread(ref.update, row)
+        if outcome == "PENDING" and isinstance((body or {}).get("entry_trace"), dict):
+            raw_trace = body["entry_trace"]
+            trace = {}
+            for key in (
+                "drain_start_ms", "runtime_ready_ms", "account_ready_ms",
+                "prepared_ms", "durable_reserved_ms", "bridge_return_ms",
+                "receive_to_send_ms",
+            ):
+                try:
+                    trace[key] = max(0, min(600000, int(raw_trace[key])))
+                except (KeyError, TypeError, ValueError):
+                    pass
+            logger.info("VIP follower entry timing | signal_id=%s | trace=%s", signal_id, trace)
         return {"ok": True}
 
     # ===== v1.13 Mobile Bot Features + Admin Control Plane =====

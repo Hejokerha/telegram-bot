@@ -60,6 +60,7 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
             "COPY_SIGNAL_HISTORY_LIMIT": 100,
             "COPY_SIGNAL_DEDUPE_LIMIT": 100,
             "COPY_CLIENT_AUTH_RECHECK_SECONDS": 10,
+            "COPY_MOBILE_SIGNAL_AUTH_FRESH_SECONDS": 30,
             "_copy_signal_history": [],
             "_copy_signal_id_registry": {},
             "_copy_signal_store_lock": None,
@@ -242,6 +243,24 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
             release_slow.set()
         result = await publishing
         self.assertEqual(result["delivered"], 2)
+
+    async def test_recent_authenticated_mobile_ping_skips_trade_time_auth(self):
+        auth_calls = []
+
+        def validate(*_args, **_kwargs):
+            auth_calls.append(True)
+            return True, "ok", {}
+
+        self.ns["copy_validate_license_for_device"] = validate
+        self.ns["_mobile_signal_clients"] = {
+            "follower": {
+                "telegram_user_id": "456", "token": "valid", "device_id": "one",
+                "ws": "follower-ws", "last_auth_ok_at": self.now.timestamp() - 21,
+            },
+        }
+        result = await self.ns["_copy_broadcast_mobile_signal"]({"source": "vip_copy"})
+        self.assertEqual(result["delivered"], 1)
+        self.assertEqual(auth_calls, [])
 
     async def test_extension_vip_delivery_excludes_both_leaders(self):
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
