@@ -1171,20 +1171,20 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.8"
-# The published Firebase APK is build 119. Older Render environment values
+COPY_SERVER_VERSION = "1.49.9"
+# The published Firebase APK is build 120. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
-MOBILE_APP_LATEST_BUILD = max(119, int(os.getenv("MOBILE_APP_LATEST_BUILD", "119")))
+MOBILE_APP_LATEST_BUILD = max(120, int(os.getenv("MOBILE_APP_LATEST_BUILD", "120")))
 MOBILE_APP_LATEST_VERSION = (
-    "1.0.19" if MOBILE_APP_LATEST_BUILD == 119
-    else os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.19").strip() or "1.0.19"
+    "1.0.20" if MOBILE_APP_LATEST_BUILD == 120
+    else os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.20").strip() or "1.0.20"
 )
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
 MOBILE_APP_FORCE_UPDATE = os.getenv("MOBILE_APP_FORCE_UPDATE", "false").lower() in {"1", "true", "yes", "on"}
 MOBILE_APP_RELEASE_URL = os.getenv("MOBILE_APP_RELEASE_URL", "https://trading-time-official.web.app/download").strip()
 MOBILE_APP_RELEASE_NOTES = (
-    "إضافة مفتاح Quotex Local Pro في تشخيص المطور لتشغيل إضافة Quotex داخل التطبيق أو إيقافها."
-    if MOBILE_APP_LATEST_BUILD == 119 else os.getenv("MOBILE_APP_RELEASE_NOTES", "").strip()
+    "تقليل تأخير نسخ VIP وإشارة القناة وتحسين التقاط نتائج الصفقات وإعادة فحصها."
+    if MOBILE_APP_LATEST_BUILD == 120 else os.getenv("MOBILE_APP_RELEASE_NOTES", "").strip()
 )
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
@@ -30841,15 +30841,21 @@ def _vip_channel_trade_ref(event_id: str):
 
 async def _vip_channel_publish_entry(event: dict, leader_id: str, signal: dict) -> dict:
     prep_ref = db.reference(f"vip_channel/prepared/{leader_id}")
-    prep = await asyncio.to_thread(prep_ref.get) or {}
+    event_id = str((event or {}).get("event_id") or "")
+    trade_ref = _vip_channel_trade_ref(event_id)
+    # These independent Firebase reads must not add their latencies together
+    # after the followers have already received the trade.
+    prep, existing = await asyncio.gather(
+        asyncio.to_thread(prep_ref.get),
+        asyncio.to_thread(trade_ref.get),
+    )
+    prep = prep or {}
+    existing = existing or {}
     now = time_module.time()
     if not isinstance(prep, dict) or float(prep.get("expires_epoch") or 0) < now:
         return {"posted": False, "reason": "not_prepared"}
     if not _vip_channel_pair_matches(prep.get("pair"), signal.get("platform_symbol")):
         return {"posted": False, "reason": "different_pair"}
-    event_id = str((event or {}).get("event_id") or "")
-    trade_ref = _vip_channel_trade_ref(event_id)
-    existing = await asyncio.to_thread(trade_ref.get) or {}
     if existing:
         return {"posted": existing.get("entry_posted") is True, "reason": "duplicate"}
     app_ref = globals().get("TRADING_TIME_TELEGRAM_APP")
@@ -30921,6 +30927,7 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
     with their own extension or Android settings.
     """
     received_at = now_utc()
+    pipeline_started = time_module.time()
     max_delay = int(COPY_SOURCE_MAX_ENTRY_DELAY_SECONDS["vip_copy"])
     if not _copy_vip_leader_identity_ok(client):
         return {"ok": False, "reason": "leader_only"}
@@ -30929,6 +30936,7 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
         return {"ok": False, "reason": "copy_global_disabled"}
     if not await asyncio.to_thread(is_vip_team_copy_enabled):
         return {"ok": False, "reason": "vip_team_copy_disabled"}
+    settings_ready_at = time_module.time()
 
     trade = (event or {}).get("trade")
     if not isinstance(trade, dict):
@@ -31013,6 +31021,7 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
         }
 
     delivery = await _copy_broadcast_signal(normalized, exclude_client_id=client_id)
+    extension_sent_at = time_module.time()
     if delivery.get("global_enabled") is False:
         with _copy_signal_store_lock:
             _copy_signal_history[:] = [
@@ -31021,16 +31030,43 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
             ]
         return {"ok": False, "reason": "copy_global_disabled", "signal_id": normalized.get("id")}
 
-    mobile_delivery = await _copy_broadcast_mobile_signal(normalized)
-    try:
-        channel_delivery = await _vip_channel_publish_entry(event, leader_id, normalized)
-    except Exception:
-        logger.exception("VIP channel entry failed | signal_id=%s", normalized.get("id"))
+    # Channel publication starts as soon as the first follower broadcast ends.
+    # Authentication checks on other Android sockets can take seconds and must
+    # not hold the Telegram entry sticker behind them.
+    mobile_delivery, channel_delivery = await asyncio.gather(
+        _copy_broadcast_mobile_signal(normalized),
+        _vip_channel_publish_entry(event, leader_id, normalized),
+        return_exceptions=True,
+    )
+    if isinstance(mobile_delivery, asyncio.CancelledError):
+        raise mobile_delivery
+    if isinstance(channel_delivery, asyncio.CancelledError):
+        raise channel_delivery
+    if isinstance(mobile_delivery, BaseException):
+        logger.error("VIP mobile broadcast failed | signal_id=%s | error=%r", normalized.get("id"), mobile_delivery)
+        mobile_delivery = {"delivered": 0, "reason": "mobile_broadcast_error"}
+    if isinstance(channel_delivery, BaseException):
+        logger.error("VIP channel entry failed | signal_id=%s | error=%r", normalized.get("id"), channel_delivery)
         channel_delivery = {"posted": False, "reason": "channel_error"}
     logger.info(
         "VIP Team Copy broadcast | asset=%s | direction=%s | expiry=%s | followers=%s | leader_client=%s",
         normalized.get("platform_symbol"), direction, normalized.get("expiry_timestamp"),
         delivery.get("delivered", 0), client_id,
+    )
+    if not channel_delivery.get("posted"):
+        logger.warning("VIP channel entry not posted | signal_id=%s | reason=%s", normalized.get("id"), channel_delivery.get("reason"))
+    try:
+        sent_at_ms = float(trade.get("sentAtEpochMs") or 0)
+    except (TypeError, ValueError):
+        sent_at_ms = 0
+    order_age_ms = int(pipeline_started * 1000 - sent_at_ms) if sent_at_ms > 1e12 else -1
+    logger.info(
+        "VIP manual pipeline | signal_id=%s | order_age_ms=%s | settings_ms=%s | extension_ms=%s | mobile_channel_ms=%s | channel_posted=%s",
+        normalized.get("id"), order_age_ms,
+        int((settings_ready_at - pipeline_started) * 1000),
+        int((extension_sent_at - settings_ready_at) * 1000),
+        int((time_module.time() - extension_sent_at) * 1000),
+        channel_delivery.get("posted"),
     )
     return {
         "ok": True,
@@ -31832,7 +31868,7 @@ def create_embedded_copy_api():
             sticker_path=os.path.join(VIP_CHANNEL_STICKER_DIR, "minute.webp"),
         ):
             raise HTTPException(status_code=502, detail="channel_sticker_failed")
-        db.reference(f"vip_channel/prepared/{leader_id}").set({
+        await asyncio.to_thread(db.reference(f"vip_channel/prepared/{leader_id}").set, {
             "pair": pair, "created_at": now_iso(),
             "expires_epoch": time_module.time() + 600,
         })
@@ -31850,7 +31886,7 @@ def create_embedded_copy_api():
         if not re.fullmatch(r"[A-Za-z0-9_.:-]{8,80}", event_id) or not isinstance(result, dict):
             raise HTTPException(status_code=400, detail="invalid_result")
         trade_ref = _vip_channel_trade_ref(event_id)
-        trade = trade_ref.get() or {}
+        trade = await asyncio.to_thread(trade_ref.get) or {}
         if not trade or str(trade.get("leader_id")) != leader_id or not trade.get("entry_posted"):
             raise HTTPException(status_code=404, detail="channel_trade_not_found")
         if trade.get("result_posted"):
@@ -31872,7 +31908,7 @@ def create_embedded_copy_api():
             current["result_posting_token"] = claim_token
             current["result_posting_epoch"] = claim_time
             return current
-        claimed = trade_ref.transaction(claim)
+        claimed = await asyncio.to_thread(trade_ref.transaction, claim)
         if claimed.get("result_posted"):
             return {"ok": True, "already_posted": True}
         if claimed.get("result_posting_token") != claim_token:
@@ -31883,13 +31919,14 @@ def create_embedded_copy_api():
         message = f"{trade['pair'].replace('/', ' ')} • {local_time}\n{label}"
         app_ref = _mobile_runtime_app()
         if not await safe_send_message(app_ref.bot, chat_id=VIP_CHANNEL_CHAT_ID, text=message):
-            trade_ref.update({"result_posting_token": None, "result_posting_epoch": None})
+            await asyncio.to_thread(trade_ref.update, {"result_posting_token": None, "result_posting_epoch": None})
             raise HTTPException(status_code=502, detail="channel_result_failed")
-        trade_ref.update({
+        await asyncio.to_thread(trade_ref.update, {
             "result_posted": True, "outcome": outcome,
             "platform_order_id": str(result["platformOrderId"]), "closed_at": now_iso(),
             "result_posting_token": None, "result_posting_epoch": None,
         })
+        logger.info("VIP channel result posted | event_id=%s | outcome=%s", event_id, outcome)
         return {"ok": True, "outcome": outcome}
 
     @copy_api.post("/api/mobile/vip/participation")
@@ -31899,14 +31936,14 @@ def create_embedded_copy_api():
         body = await request.json()
         active = (body or {}).get("active") is True
         session_id = re.sub(r"[^A-Za-z0-9_-]", "", str((body or {}).get("session_id") or ""))[:64]
-        db.reference(f"vip_copy/participants/{user_id}").update({
+        await asyncio.to_thread(db.reference(f"vip_copy/participants/{user_id}").update, {
             "active": active, "session_id": session_id,
             "platform": "android", "last_seen_at": now_iso(),
         })
         if active and session_id:
             session_ref = db.reference(f"vip_copy/sessions/{user_id}/{session_id}")
-            if not session_ref.get():
-                session_ref.set({"started_at": now_iso(), "platform": "android", "trades": {}})
+            if not await asyncio.to_thread(session_ref.get):
+                await asyncio.to_thread(session_ref.set, {"started_at": now_iso(), "platform": "android", "trades": {}})
         return {"ok": True}
 
     @copy_api.post("/api/mobile/vip/follower-result")
@@ -31923,7 +31960,7 @@ def create_embedded_copy_api():
             raise HTTPException(status_code=400, detail="invalid_outcome")
         trade_key = hashlib.sha256(signal_id.encode("utf-8")).hexdigest()[:40]
         ref = db.reference(f"vip_copy/sessions/{user_id}/{session_id}/trades/{trade_key}")
-        previous = ref.get() or {}
+        previous = await asyncio.to_thread(ref.get) or {}
         if previous.get("outcome") in {"WIN", "LOSS", "DRAW"}:
             return {"ok": True, "already_final": True}
         pair = _vip_channel_pair((body or {}).get("pair"))
@@ -31939,7 +31976,7 @@ def create_embedded_copy_api():
             if not str((body or {}).get("method") or "").startswith("platform_ws_") or not str((body or {}).get("platform_order_id") or ""):
                 raise HTTPException(status_code=400, detail="authoritative_close_required")
             row["platform_order_id"] = str(body["platform_order_id"])[:100]
-        ref.update(row)
+        await asyncio.to_thread(ref.update, row)
         return {"ok": True}
 
     # ===== v1.13 Mobile Bot Features + Admin Control Plane =====

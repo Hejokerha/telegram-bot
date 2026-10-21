@@ -149,6 +149,37 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["reason"], "entry_window_elapsed")
         self.assertEqual(self.sent, [])
 
+    async def test_channel_post_starts_while_mobile_delivery_is_busy(self):
+        mobile_started = asyncio.Event()
+        release_mobile = asyncio.Event()
+        channel_started = asyncio.Event()
+
+        async def slow_mobile(_signal):
+            mobile_started.set()
+            await release_mobile.wait()
+            return {"delivered": 1}
+
+        async def post_channel(_event, _leader_id, _signal):
+            channel_started.set()
+            return {"posted": True}
+
+        self.ns["_copy_broadcast_mobile_signal"] = slow_mobile
+        self.ns["_vip_channel_publish_entry"] = post_channel
+        event = {"event_id": "mobile_parallel", "trade": {
+            "asset": "AUDNZD_otc", "action": "call",
+            "time": (self.now + timedelta(seconds=60)).timestamp(),
+        }}
+        publishing = asyncio.create_task(self.ns["_copy_publish_vip_manual_trade"](
+            event, "", {"telegram_user_id": "123"},
+        ))
+        try:
+            await asyncio.wait_for(mobile_started.wait(), 1)
+            await asyncio.wait_for(channel_started.wait(), 1)
+        finally:
+            release_mobile.set()
+        result = await publishing
+        self.assertTrue(result["channel_delivery"]["posted"])
+
     async def test_extension_vip_delivery_excludes_both_leaders(self):
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
         selected = [node for node in tree.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_copy_broadcast_signal"]
