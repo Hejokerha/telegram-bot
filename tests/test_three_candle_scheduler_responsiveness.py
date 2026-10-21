@@ -20,7 +20,45 @@ def load_targets(namespace):
     return namespace[node.name]
 
 
+def load_job(namespace):
+    tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
+    node = next(
+        node for node in tree.body
+        if isinstance(node, ast.AsyncFunctionDef) and node.name == "three_candle_channel_job"
+    )
+    exec(compile(ast.Module(body=[node], type_ignores=[]), str(SOURCE), "exec"), namespace)
+    return namespace[node.name]
+
+
 class ThreeCandleSchedulerResponsivenessTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_candidate_scan_does_not_block_bot_loop(self):
+        def scan():
+            time.sleep(0.15)
+            return []
+
+        async def targets():
+            return True, False, []
+
+        async def pending(_context):
+            return False
+
+        state = {}
+        namespace = {
+            "asyncio": asyncio, "ContextTypes": SimpleNamespace(DEFAULT_TYPE=object),
+            "_three_candle_scheduler_targets": targets,
+            "_three_candle_channel_state": state,
+            "_three_candle_process_pending_trade": pending,
+            "_three_candle_collect_candidates": scan,
+            "now_iso": lambda: "now", "logger": SimpleNamespace(exception=lambda *args: None),
+        }
+        job = load_job(namespace)
+        running = asyncio.create_task(job(None))
+        started = time.monotonic()
+        await asyncio.sleep(0.02)
+        self.assertLess(time.monotonic() - started, 0.10)
+        await running
+        self.assertEqual(state["last_scan_at"], "now")
+
     async def test_slow_partner_read_keeps_tick_responsive_and_cache_bounded(self):
         clock = [1000.0]
         calls = []

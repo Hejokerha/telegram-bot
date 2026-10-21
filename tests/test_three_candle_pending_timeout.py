@@ -1,5 +1,6 @@
 """Offline regression checks for a missing Quotex candle blocking the channel."""
 import ast
+import asyncio
 from pathlib import Path
 from types import SimpleNamespace
 import unittest
@@ -38,6 +39,7 @@ class ThreeCandlePendingTimeoutTests(unittest.IsolatedAsyncioTestCase):
             return True, False, []
 
         self.ns = {
+            "asyncio": asyncio,
             "ContextTypes": SimpleNamespace(DEFAULT_TYPE=object),
             "time_module": SimpleNamespace(time=lambda: self.now),
             "THREE_CANDLE_RESULT_DELAY_SECONDS": 5,

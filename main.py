@@ -1171,7 +1171,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.6"
+COPY_SERVER_VERSION = "1.49.7"
 # The published Firebase APK is build 119. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(119, int(os.getenv("MOBILE_APP_LATEST_BUILD", "119")))
@@ -4004,6 +4004,7 @@ def build_copy_trading_payload(signal: dict, source: str = "bot") -> dict:
     pair_display = _copy_display_pair({**signal, "source": source})
     raw_platform_symbol = signal.get("platform_symbol") or signal.get("symbol")
     pair_display, platform_symbol, _ = _copy_server_normalize_pair_contract({
+        "source": source,
         "pair": pair_display,
         "platform_symbol": raw_platform_symbol or pair_display,
     })
@@ -19865,6 +19866,20 @@ def _scheduler_background_task_done(task: asyncio.Task, label: str) -> None:
 
 
 _octopus_detector_task: asyncio.Task | None = None
+_octopus_restore_task: asyncio.Task | None = None
+
+
+def _octopus_snapshot_ready() -> bool:
+    """Load the startup checkpoint once without holding the half-second scan."""
+    global _octopus_restore_task
+    if _octopus_restore_task is None:
+        _octopus_restore_task = asyncio.create_task(
+            asyncio.to_thread(_octopus_restore_snapshot_once)
+        )
+        _octopus_restore_task.add_done_callback(
+            lambda task: _scheduler_background_task_done(task, "Octopus snapshot")
+        )
+    return _octopus_restore_task.done()
 
 
 async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
@@ -19874,7 +19889,8 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
     Real path remains v1.35 direct PRE-ARM commit, with owner-selectable NORMAL/REVERSE direction.
     """
     try:
-        await asyncio.to_thread(_octopus_restore_snapshot_once)
+        if not _octopus_snapshot_ready():
+            return
         now_ts = time_module.time()
         current_bucket = int(now_ts // 60) * 60
         sec = float(now_ts - current_bucket)
@@ -21018,12 +21034,13 @@ def _three_candle_public_reset_results() -> tuple[bool, str]:
 async def _three_candle_public_publish_signal(context: ContextTypes.DEFAULT_TYPE, trade: dict) -> bool:
     """Mirror a private 3-candle signal to the public channel only. Never send Copy Trading here."""
     try:
-        if not _three_candle_public_is_enabled():
-            return False
         channel_id = _three_candle_public_channel_id()
         if not channel_id:
             return False
-        settings = _three_candle_public_get_settings()
+        settings = await asyncio.to_thread(_three_candle_public_get_settings)
+        limit = int(settings.get("session_limit", 0) or 0)
+        if not settings.get("enabled") or (limit > 0 and int(settings.get("session_sent", 0) or 0) >= limit):
+            return False
         sent = await safe_send_message(context.bot, chat_id=channel_id, text=_three_candle_signal_message(trade))
         if not sent:
             _three_candle_public_state["last_error"] = "تعذر إرسال إشارة Public إلى Telegram"
@@ -21031,7 +21048,7 @@ async def _three_candle_public_publish_signal(context: ContextTypes.DEFAULT_TYPE
         trade["public_three_candle_published"] = True
         trade["public_session_started_at"] = settings.get("session_started_at")
         _three_candle_channel_state["pending_trade"] = trade
-        updated = _three_candle_public_increment_signal()
+        updated = await asyncio.to_thread(_three_candle_public_increment_signal)
         _three_candle_public_state["signals_sent"] = int(_three_candle_public_state.get("signals_sent", 0) or 0) + 1
         _three_candle_public_state["last_publish_at"] = now_iso()
         # Nth signal is still fully tracked; only future public signals are stopped.
@@ -22409,7 +22426,7 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
             result_type = "loss"
         else:
             result_type = "draw"
-        _three_candle_record_result(trade, result_type, result_text, candle=candle)
+        await asyncio.to_thread(_three_candle_record_result, trade, result_type, result_text, candle)
 
         # v1.01: Public mirror gets a result only for signals that were actually published there.
         # This runs even when Public was manually stopped or auto-stopped after reaching its quota.
@@ -22422,7 +22439,7 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
                     _three_candle_public_state["last_result_at"] = now_iso()
                 else:
                     _three_candle_public_state["last_error"] = "تعذر إرسال نتيجة Public إلى Telegram"
-            _three_candle_public_record_result(trade, result_type, result_text)
+            await asyncio.to_thread(_three_candle_public_record_result, trade, result_type, result_text)
 
         _three_candle_channel_state["pending_trade"] = None
         return False
@@ -22449,7 +22466,7 @@ async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
         if not owner_target_available and not partner_targets_available:
             return
 
-        candidates = _three_candle_collect_candidates()
+        candidates = await asyncio.to_thread(_three_candle_collect_candidates)
         if not candidates:
             return
 
@@ -30281,7 +30298,26 @@ def _copy_server_normalize_pair_contract(payload: dict) -> tuple[str, str, bool]
     pair_identity = parse(raw_pair, "pair") if raw_pair else None
     symbol_identity = parse(raw_symbol, "platform_symbol") if raw_symbol else None
     if pair_identity and symbol_identity and pair_identity != symbol_identity:
-        raise ValueError("pair and platform_symbol market identity do not match")
+        # Some live Quotex OTC instruments use a reversed internal code, e.g.
+        # displayed USD/BRL is streamed as BRLUSD_otc. Trust the live instrument
+        # name only for Three Candle, whose universe is built from that same list.
+        verified_alias = False
+        if (
+            str(payload.get("source") or "").strip().lower() == "three_candle"
+            and pair_identity[1] and symbol_identity[1]
+            and "quotex_otc_feed" in globals()
+        ):
+            with quotex_otc_feed.lock:
+                instrument = dict((quotex_otc_feed.instruments or {}).get(raw_symbol) or {})
+            verified_alias = bool(
+                instrument.get("is_otc")
+                and _three_candle_normalize_live_currency_pair(instrument.get("name"), raw_symbol)
+                == f"{pair_identity[0][:3]}/{pair_identity[0][3:]} (OTC)"
+            )
+        if not verified_alias:
+            raise ValueError("pair and platform_symbol market identity do not match")
+        base, otc = pair_identity
+        return f"{base[:3]}/{base[3:]} (OTC)", raw_symbol, otc
     base, otc = pair_identity or symbol_identity
     pair_display = f"{base[:3]}/{base[3:]}" + (" (OTC)" if otc else "")
     platform_symbol = f"{base}_otc" if otc else base

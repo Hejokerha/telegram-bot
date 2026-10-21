@@ -18,6 +18,26 @@ def load_function(name, namespace):
 
 
 class DsSchedulerMaintenanceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_octopus_startup_snapshot_does_not_hold_scan(self):
+        namespace = {"asyncio": asyncio, "_octopus_restore_task": None,
+                     "_scheduler_background_task_done": lambda task, label: task.result()}
+        calls = []
+
+        def restore():
+            calls.append(1)
+            time.sleep(0.15)
+
+        namespace["_octopus_restore_snapshot_once"] = restore
+        ready = load_function("_octopus_snapshot_ready", namespace)
+        started = time.monotonic()
+        self.assertFalse(ready())
+        await asyncio.sleep(0)
+        self.assertFalse(ready())
+        self.assertLess(time.monotonic() - started, 0.08)
+        await namespace["_octopus_restore_task"]
+        self.assertTrue(ready())
+        self.assertEqual(len(calls), 1)
+
     async def test_slow_settings_and_checkpoint_do_not_block_scans(self):
         clock = [1000.0]
         calls = {"settings": 0, "history": 0}
