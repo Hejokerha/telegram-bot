@@ -34,6 +34,9 @@ class ThreeCandlePendingTimeoutTests(unittest.IsolatedAsyncioTestCase):
             self.result_calls.append((args, kwargs))
 
         self.candles = {}
+        async def scheduler_targets():
+            return True, False, []
+
         self.ns = {
             "ContextTypes": SimpleNamespace(DEFAULT_TYPE=object),
             "time_module": SimpleNamespace(time=lambda: self.now),
@@ -52,6 +55,7 @@ class ThreeCandlePendingTimeoutTests(unittest.IsolatedAsyncioTestCase):
             "now_iso": lambda: "test-time",
             "logger": SimpleNamespace(warning=lambda *args: None, exception=lambda *args: None),
             "_three_candle_any_target_enabled": lambda: True,
+            "_three_candle_scheduler_targets": scheduler_targets,
             "_three_candle_is_enabled": lambda: True,
             "_three_candle_daily_limit_reached": lambda: False,
             "eligible_partner_channels": lambda: [],

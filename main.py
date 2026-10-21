@@ -1171,7 +1171,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.4"
+COPY_SERVER_VERSION = "1.49.5"
 # The published Firebase APK is build 119. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(119, int(os.getenv("MOBILE_APP_LATEST_BUILD", "119")))
@@ -19862,19 +19862,19 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
     Real path remains v1.35 direct PRE-ARM commit, with owner-selectable NORMAL/REVERSE direction.
     """
     try:
-        _octopus_restore_snapshot_once()
+        await asyncio.to_thread(_octopus_restore_snapshot_once)
         now_ts = time_module.time()
         current_bucket = int(now_ts // 60) * 60
         sec = float(now_ts - current_bucket)
 
         # v1.36: internal paper detector never stops. This is what makes the 2-hour
         # NORMAL-vs-REVERSE report available before real execution is turned on.
-        _octopus_mode_detector_tick(now_ts, current_bucket, sec)
+        await asyncio.to_thread(_octopus_mode_detector_tick, now_ts, current_bucket, sec)
 
         # v1.41: real execution sleeps when the global guard is OFF or when every
         # enabled user's app/extension is offline. Their ON preference is preserved,
         # and PRE-ARM resumes automatically on the next eligible window after reconnect.
-        if not _octopus_any_live_execution_enabled():
+        if not await asyncio.to_thread(_octopus_any_live_execution_enabled):
             return
 
         # A PRE-ARM is valid for exactly its target candle. If the open window was missed,
@@ -20506,10 +20506,10 @@ def build_ds_status() -> str:
 async def ds_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         _ds_expire_execution_receipt()
-        if not _ds_get_settings(False).get("enabled"):
+        if not (await asyncio.to_thread(_ds_get_settings, False)).get("enabled"):
             return
         # Warm from central live candles only, matching the other live engines.
-        history_status = _ds_prime_m1_history()
+        history_status = await asyncio.to_thread(_ds_prime_m1_history)
         if (
             not _ds_state.get("prearmed")
             and int(history_status.get("requested", 0) or 0)
@@ -21136,10 +21136,66 @@ def _three_candle_any_target_enabled() -> bool:
     return bool(_three_candle_is_enabled() or eligible_partner_channels())
 
 
-async def _three_candle_publish_to_partner_channels(context: ContextTypes.DEFAULT_TYPE, trade: dict) -> list[str]:
+_three_candle_scheduler_target_cache = {
+    "owner_enabled": False, "owner_limit_reached": False,
+    "owner_updated_at": 0.0, "owner_task": None,
+    "partners": [], "partners_updated_at": 0.0, "partners_task": None,
+}
+
+
+async def _three_candle_scheduler_targets() -> tuple[bool, bool, list[dict]]:
+    """Refresh Firebase-backed channel eligibility without stalling the bot loop."""
+    state = _three_candle_scheduler_target_cache
+    now_ts = time_module.time()
+    owner_task = state.get("owner_task")
+    if now_ts - float(state.get("owner_updated_at") or 0) >= 5 and (owner_task is None or owner_task.done()):
+        async def refresh_owner():
+            def read_owner():
+                owner_enabled = _three_candle_is_enabled()
+                owner_limit_reached = _three_candle_daily_limit_reached() if owner_enabled else False
+                return owner_enabled, owner_limit_reached
+
+            try:
+                owner_enabled, owner_limit_reached = await asyncio.to_thread(read_owner)
+                state.update({
+                    "owner_enabled": bool(owner_enabled),
+                    "owner_limit_reached": bool(owner_limit_reached),
+                    "owner_updated_at": time_module.time(),
+                })
+            except Exception as exc:
+                logger.warning("Three-candle owner target refresh failed: %s", exc)
+                state["owner_updated_at"] = time_module.time()
+
+        state["owner_task"] = asyncio.create_task(refresh_owner(), name="three-candle-owner-refresh")
+
+    partners_task = state.get("partners_task")
+    if now_ts - float(state.get("partners_updated_at") or 0) >= 5 and (partners_task is None or partners_task.done()):
+        async def refresh_partners():
+            try:
+                partners = await asyncio.to_thread(eligible_partner_channels)
+                state["partners"] = list(partners)
+                state["partners_updated_at"] = time_module.time()
+            except Exception as exc:
+                logger.warning("Three-candle partner target refresh failed: %s", exc)
+                state["partners_updated_at"] = time_module.time()
+
+        state["partners_task"] = asyncio.create_task(refresh_partners(), name="three-candle-partners-refresh")
+
+    # Do not send a new entry from an old entitlement snapshot during a DB outage.
+    owner_fresh = now_ts - float(state.get("owner_updated_at") or 0) <= 15
+    partners_fresh = now_ts - float(state.get("partners_updated_at") or 0) <= 15
+    owner_enabled = bool(state["owner_enabled"] and owner_fresh)
+    current_settings = _three_candle_channel_state.get("settings_cache")
+    if isinstance(current_settings, dict) and not current_settings.get("enabled"):
+        owner_enabled = False
+    return owner_enabled, bool(state["owner_limit_reached"]), list(state["partners"]) if partners_fresh else []
+
+
+async def _three_candle_publish_to_partner_channels(context: ContextTypes.DEFAULT_TYPE, trade: dict, targets: list[dict] | None = None) -> list[str]:
     published_codes: list[str] = []
     message = _three_candle_signal_message(trade)
-    for partner in eligible_partner_channels():
+    partner_targets = targets if targets is not None else await asyncio.to_thread(eligible_partner_channels)
+    for partner in partner_targets:
         code = str(partner.get("partner_code") or "")
         channel_id = partner.get("exploit_channel_id")
         if not code or not channel_id:
@@ -21147,7 +21203,7 @@ async def _three_candle_publish_to_partner_channels(context: ContextTypes.DEFAUL
         try:
             sent = await safe_send_message(context.bot, chat_id=channel_id, text=message)
             if sent:
-                increment_partner_trade_count(code)
+                await asyncio.to_thread(increment_partner_trade_count, code)
                 published_codes.append(code)
         except Exception as exc:
             logger.warning("Partner channel signal failed | partner=%s | error=%s", code, exc)
@@ -21158,7 +21214,7 @@ async def _three_candle_publish_result_to_partners(context: ContextTypes.DEFAULT
     # Results follow the exact channels that received the signal, even if a partner
     # pauses new entries before the result arrives.
     for code in list(trade.get("partner_channel_codes") or []):
-        partner = get_partner(str(code))
+        partner = await asyncio.to_thread(get_partner, str(code))
         channel_id = (partner or {}).get("exploit_channel_id")
         if not channel_id:
             continue
@@ -22323,7 +22379,8 @@ async def _three_candle_process_pending_trade(context: ContextTypes.DEFAULT_TYPE
 
 async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
     try:
-        if not _three_candle_any_target_enabled():
+        owner_enabled, owner_limit_reached, partner_targets = await _three_candle_scheduler_targets()
+        if not (owner_enabled or partner_targets or _three_candle_channel_state.get("pending_trade")):
             return
         _three_candle_channel_state["last_scan_at"] = now_iso()
 
@@ -22332,8 +22389,8 @@ async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
         if has_pending:
             return
 
-        owner_target_available = bool(_three_candle_is_enabled() and not _three_candle_daily_limit_reached())
-        partner_targets_available = bool(eligible_partner_channels())
+        owner_target_available = bool(owner_enabled and not owner_limit_reached)
+        partner_targets_available = bool(partner_targets)
         if not owner_target_available and not partner_targets_available:
             return
 
@@ -22356,14 +22413,14 @@ async def three_candle_channel_job(context: ContextTypes.DEFAULT_TYPE):
         owner_sent = False
         if owner_target_available and channel_id:
             owner_sent = bool(await safe_send_message(context.bot, chat_id=channel_id, text=_three_candle_signal_message(trade)))
-        partner_codes = await _three_candle_publish_to_partner_channels(context, trade)
+        partner_codes = await _three_candle_publish_to_partner_channels(context, trade, partner_targets)
         trade["owner_three_candle_published"] = owner_sent
         trade["partner_channel_codes"] = partner_codes
         _three_candle_channel_state["pending_trade"] = trade
         if owner_sent or partner_codes:
             _three_candle_channel_state["signals_sent"] = int(_three_candle_channel_state.get("signals_sent", 0) or 0) + 1
             if owner_sent:
-                _three_candle_increment_today_signal_count()
+                await asyncio.to_thread(_three_candle_increment_today_signal_count)
             _three_candle_note_published_pair(str(trade.get("pair") or ""))
             # Public channel is a Telegram-only mirror. No second Copy Trading command is generated.
             if owner_sent:
