@@ -1171,7 +1171,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.5"
+COPY_SERVER_VERSION = "1.49.6"
 # The published Firebase APK is build 119. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(119, int(os.getenv("MOBILE_APP_LATEST_BUILD", "119")))
@@ -19855,6 +19855,18 @@ async def _copy_record_structure_edge_trade_skip(payload_event: dict, client: di
         return False
 
 
+def _scheduler_background_task_done(task: asyncio.Task, label: str) -> None:
+    try:
+        task.result()
+    except asyncio.CancelledError:
+        pass
+    except Exception:
+        logger.exception("%s background task failed", label)
+
+
+_octopus_detector_task: asyncio.Task | None = None
+
+
 async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
     """v1.36 PRE-ARM COMMIT + always-on NORMAL/REVERSE market-mode detector.
 
@@ -19869,7 +19881,16 @@ async def structure_edge_job(context: ContextTypes.DEFAULT_TYPE):
 
         # v1.36: internal paper detector never stops. This is what makes the 2-hour
         # NORMAL-vs-REVERSE report available before real execution is turned on.
-        await asyncio.to_thread(_octopus_mode_detector_tick, now_ts, current_bucket, sec)
+        # Paper bookkeeping may flush to Firebase. Keep it independent of the
+        # sub-second real execution window, and never overlap two detector ticks.
+        global _octopus_detector_task
+        if _octopus_detector_task is None or _octopus_detector_task.done():
+            _octopus_detector_task = asyncio.create_task(
+                asyncio.to_thread(_octopus_mode_detector_tick, now_ts, current_bucket, sec)
+            )
+            _octopus_detector_task.add_done_callback(
+                lambda task: _scheduler_background_task_done(task, "Octopus detector")
+            )
 
         # v1.41: real execution sleeps when the global guard is OFF or when every
         # enabled user's app/extension is offline. Their ON preference is preserved,
@@ -19960,16 +19981,21 @@ def _ds_live_m1_cache_ref():
 def _ds_get_settings(force_refresh: bool = False) -> dict:
     now_ts = time_module.time()
     if force_refresh or not _ds_state.get("loaded") or now_ts - float(_ds_state.get("last_settings_at", 0) or 0) >= DS_SETTINGS_CACHE_SECONDS:
+        observed_settings_at = float(_ds_state.get("last_settings_at", 0) or 0)
         try:
             row = _ds_settings_ref().get() or {}
-            _ds_state["enabled"] = bool(row.get("enabled", DS_DEFAULT_ENABLED)) if isinstance(row, dict) else bool(DS_DEFAULT_ENABLED)
-            _ds_state["loaded"] = True
-            _ds_state["last_settings_at"] = now_ts
+            # A manual toggle can finish while this background read is pending.
+            if float(_ds_state.get("last_settings_at", 0) or 0) <= observed_settings_at:
+                _ds_state["enabled"] = bool(row.get("enabled", DS_DEFAULT_ENABLED)) if isinstance(row, dict) else bool(DS_DEFAULT_ENABLED)
+                _ds_state["loaded"] = True
+                _ds_state["last_settings_at"] = now_ts
         except Exception as exc:
             _ds_state["last_error"] = str(exc)
-            if not _ds_state.get("loaded"):
-                _ds_state["loaded"] = True
-                _ds_state["enabled"] = bool(DS_DEFAULT_ENABLED)
+            if float(_ds_state.get("last_settings_at", 0) or 0) <= observed_settings_at:
+                _ds_state["last_settings_at"] = now_ts
+                if not _ds_state.get("loaded"):
+                    _ds_state["loaded"] = True
+                    _ds_state["enabled"] = bool(DS_DEFAULT_ENABLED)
     return {"enabled": bool(_ds_state.get("enabled"))}
 
 def _ds_set_enabled(enabled: bool) -> bool:
@@ -20503,17 +20529,46 @@ def build_ds_status() -> str:
         f"آخر سبب: {_ds_state.get('last_reject_reason') or '-'}\nآخر خطأ: {_ds_state.get('last_error') or '-'}"
     )[:3900]
 
+_ds_maintenance_tasks: dict[str, asyncio.Task | None] = {"settings": None, "history": None}
+
+
+def _ds_schedule_maintenance() -> None:
+    """Refresh Firebase settings and the M1 checkpoint without delaying a scan."""
+    now_ts = time_module.time()
+    settings_task = _ds_maintenance_tasks["settings"]
+    settings_due = (
+        not _ds_state.get("loaded")
+        or now_ts - float(_ds_state.get("last_settings_at", 0) or 0) >= DS_SETTINGS_CACHE_SECONDS
+    )
+    if settings_due and (settings_task is None or settings_task.done()):
+        task = asyncio.create_task(asyncio.to_thread(_ds_get_settings, False))
+        task.add_done_callback(lambda done: _scheduler_background_task_done(done, "DS settings"))
+        _ds_maintenance_tasks["settings"] = task
+
+    if not (_ds_state.get("loaded") and _ds_state.get("enabled")):
+        return
+    history_task = _ds_maintenance_tasks["history"]
+    history_due = (
+        now_ts - float(_ds_state.get("history_last_prime_monotonic", 0) or 0)
+        >= DS_HISTORY_PRIME_SECONDS
+    )
+    if history_due and (history_task is None or history_task.done()):
+        task = asyncio.create_task(asyncio.to_thread(_ds_prime_m1_history))
+        task.add_done_callback(lambda done: _scheduler_background_task_done(done, "DS M1 maintenance"))
+        _ds_maintenance_tasks["history"] = task
+
+
 async def ds_job(context: ContextTypes.DEFAULT_TYPE):
     try:
         _ds_expire_execution_receipt()
-        if not (await asyncio.to_thread(_ds_get_settings, False)).get("enabled"):
+        _ds_schedule_maintenance()
+        if not (_ds_state.get("loaded") and _ds_state.get("enabled")):
             return
         # Warm from central live candles only, matching the other live engines.
-        history_status = await asyncio.to_thread(_ds_prime_m1_history)
         if (
             not _ds_state.get("prearmed")
-            and int(history_status.get("requested", 0) or 0)
-            and int(history_status.get("ready", 0) or 0) < int(history_status.get("requested", 0) or 0)
+            and int(_ds_state.get("history_requested", 0) or 0)
+            and int(_ds_state.get("history_ready", 0) or 0) < int(_ds_state.get("history_requested", 0) or 0)
         ):
             _ds_state["last_reject_reason"] = "DS live M1 warmup in progress"
         if not _copy_online_clients_for_user(int(ADMIN_TELEGRAM_ID)):
