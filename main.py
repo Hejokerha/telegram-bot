@@ -1171,20 +1171,20 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.13"
-# The published Firebase APK is build 121. Older Render environment values
+COPY_SERVER_VERSION = "1.49.14"
+# The published Firebase APK is build 122. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
-MOBILE_APP_LATEST_BUILD = max(121, int(os.getenv("MOBILE_APP_LATEST_BUILD", "121")))
+MOBILE_APP_LATEST_BUILD = max(122, int(os.getenv("MOBILE_APP_LATEST_BUILD", "122")))
 MOBILE_APP_LATEST_VERSION = (
-    "1.0.21" if MOBILE_APP_LATEST_BUILD == 121
-    else os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.21").strip() or "1.0.21"
+    "1.0.22" if MOBILE_APP_LATEST_BUILD == 122
+    else os.getenv("MOBILE_APP_LATEST_VERSION", "1.0.22").strip() or "1.0.22"
 )
 MOBILE_APP_MIN_SUPPORTED_BUILD = int(os.getenv("MOBILE_APP_MIN_SUPPORTED_BUILD", "100"))
 MOBILE_APP_FORCE_UPDATE = os.getenv("MOBILE_APP_FORCE_UPDATE", "false").lower() in {"1", "true", "yes", "on"}
 MOBILE_APP_RELEASE_URL = os.getenv("MOBILE_APP_RELEASE_URL", "https://trading-time-official.web.app/download").strip()
 MOBILE_APP_RELEASE_NOTES = (
-    "تسريع دخول نسخ VIP بين الإضافة وAndroid مع قياس زمن التنفيذ بدقة."
-    if MOBILE_APP_LATEST_BUILD == 121 else os.getenv("MOBILE_APP_RELEASE_NOTES", "").strip()
+    "تحسين تجهيز VIP وإرسال ملصق الدخول عند تأخر تأكيد Quotex."
+    if MOBILE_APP_LATEST_BUILD == 122 else os.getenv("MOBILE_APP_RELEASE_NOTES", "").strip()
 )
 # v1.13 mobile control plane: runtime reference to the same Telegram Application.
 TRADING_TIME_TELEGRAM_APP = None
