@@ -1171,7 +1171,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.14"
+COPY_SERVER_VERSION = "1.49.15"
 # The published Firebase APK is build 122. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(122, int(os.getenv("MOBILE_APP_LATEST_BUILD", "122")))
@@ -30988,6 +30988,24 @@ async def _copy_publish_vip_manual_trade(event: dict, client_id: str, client: di
     trade = (event or {}).get("trade")
     if not isinstance(trade, dict):
         return {"ok": False, "reason": "invalid_trade"}
+    # A delayed Quotex open confirmation is still worth matching locally, but
+    # copying its original click after the short VIP entry window would place
+    # followers at a materially different price. Both timestamps come from the
+    # same mobile clock, so this check is unaffected by server clock skew.
+    if client.get("client_kind") == "mobile":
+        confirmed_match = re.match(r"^mobile_(\d{13})_", str((event or {}).get("event_id") or ""))
+        try:
+            sent_at_ms = float(trade.get("sentAtEpochMs") or 0)
+        except (TypeError, ValueError):
+            sent_at_ms = 0
+        if confirmed_match and sent_at_ms > 1e12:
+            confirmation_lag_ms = int(int(confirmed_match.group(1)) - sent_at_ms)
+            if confirmation_lag_ms > max_delay * 1000:
+                logger.warning(
+                    "VIP manual confirmation too late | leader=%s | event_id=%s | lag_ms=%s | limit_ms=%s",
+                    leader_id, event.get("event_id"), confirmation_lag_ms, max_delay * 1000,
+                )
+                return {"ok": False, "reason": "تأخر تأكيد Quotex؛ لم تُنسخ الصفقة لتجنب دخول الفريق متأخرًا."}
     asset = str(trade.get("asset") or "").strip()
     if not asset or len(asset) > 48:
         return {"ok": False, "reason": "invalid_asset"}

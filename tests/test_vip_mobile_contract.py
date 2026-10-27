@@ -152,6 +152,23 @@ class VipMobileContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["reason"], "entry_window_elapsed")
         self.assertEqual(self.sent, [])
 
+    async def test_late_mobile_open_confirmation_cannot_enter_followers(self):
+        now_ms = int(self.now.timestamp() * 1000)
+        event = {
+            "event_id": f"mobile_{now_ms}_late",
+            "trade": {
+                "asset": "AUDNZD_otc", "action": "call",
+                "time": (self.now + timedelta(seconds=60)).timestamp(),
+                "sentAtEpochMs": now_ms - 7000,
+            },
+        }
+        result = await self.ns["_copy_publish_vip_manual_trade"](
+            event, "", {"telegram_user_id": "123", "client_kind": "mobile"},
+        )
+        self.assertFalse(result["ok"])
+        self.assertIn("تأخر تأكيد Quotex", result["reason"])
+        self.assertEqual(self.sent, [])
+
     async def test_channel_post_starts_while_mobile_delivery_is_busy(self):
         mobile_started = asyncio.Event()
         release_mobile = asyncio.Event()
