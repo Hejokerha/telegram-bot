@@ -74,6 +74,9 @@ class OctopusAutoChannelTests(unittest.IsolatedAsyncioTestCase):
             "now_iso": lambda: "2026-10-31T00:00:00+00:00",
             "OCTOPUS_AUTO_CHANNEL_RESULT_DELAY_SECONDS": 5,
             "OCTOPUS_AUTO_CHANNEL_CANDLE_GRACE_SECONDS": 180,
+            "OCTOPUS_AUTO_CHANNEL_SCAN_FIRST_SECOND": 38.0,
+            "OCTOPUS_AUTO_CHANNEL_SCAN_LAST_SECOND": 44.0,
+            "OCTOPUS_AUTO_CHANNEL_MIN_LEAD_SECONDS": 15.0,
             "logger": SimpleNamespace(info=lambda *args: None, exception=lambda *args: None),
         }
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
@@ -124,17 +127,26 @@ class OctopusAutoChannelTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(await self.ns["_octopus_auto_channel_resolve"](self.context, trade["entry_bucket"] + 241))
         self.assertIn("تعذر تأكيد النتيجة", self.sent[0][1])
 
-    async def test_channel_posts_from_detector_without_execution_client(self):
+    async def test_channel_posts_early_without_execution_client(self):
         target = int(self.now // 60) * 60 + 60
-        self.ns["_octopus_mode_detector_state"].update(
-            prearmed_candidate={"pair": "EURUSD_otc", "symbol": "EURUSD_otc", "direction": "PUT", "payout": 91},
-            prearm_target_bucket=target,
-        )
+        self.ns["_octopus_sr_prearm_watch_scan"] = lambda bucket: {
+            "ready": 22, "ranked": [{"pair": "EURUSD_otc", "symbol": "EURUSD_otc", "direction": "PUT", "payout": 91}],
+        }
         self.ns["_octopus_auto_channel_resolve"] = lambda *args: asyncio.sleep(0, result=False)
         await self.ns["octopus_auto_channel_job"](self.context)
         self.assertEqual(len(self.sent), 1)
         self.assertIn("الشمعة القادمة", self.sent[0][1])
         self.assertEqual(self.root["pending_trade"]["entry_bucket"], target)
+        self.assertGreaterEqual(self.ns["_octopus_auto_channel_state"]["last_sent_lead_seconds"], 15)
+
+    async def test_channel_skips_signal_if_early_window_is_missed(self):
+        self.now += 10  # second 50: fewer than ten seconds before entry
+        calls = []
+        self.ns["_octopus_sr_prearm_watch_scan"] = lambda bucket: calls.append(bucket)
+        self.ns["_octopus_auto_channel_resolve"] = lambda *args: asyncio.sleep(0, result=False)
+        await self.ns["octopus_auto_channel_job"](self.context)
+        self.assertEqual(calls, [])
+        self.assertEqual(self.sent, [])
 
     def test_invalid_candle_never_becomes_a_loss(self):
         grade = self.ns["_octopus_auto_channel_grade"]

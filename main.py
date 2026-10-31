@@ -1184,7 +1184,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.16"
+COPY_SERVER_VERSION = "1.49.17"
 # The published Firebase APK is build 122. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(122, int(os.getenv("MOBILE_APP_LATEST_BUILD", "122")))
@@ -5772,7 +5772,14 @@ class QuotexOTCLiveFeed:
         except Exception as e:
             logger.exception("Could not add dynamic OTC symbol: %s", e)
 
-    def request_m1_history(self, symbol: str, min_candles: int = 30) -> bool:
+    def _has_recent_closed_m1_locked(self, symbol: str, min_candles: int = 18) -> bool:
+        """Require consecutive completed M1 buckets up to the previous minute."""
+        count = max(1, int(min_candles or 1))
+        current_bucket = int(time_module.time() // 60) * 60
+        candles = self.candles.get(symbol) or {}
+        return all((current_bucket - 60 * offset) in candles for offset in range(1, count + 1))
+
+    def request_m1_history(self, symbol: str, min_candles: int = 18) -> bool:
         """Queue a standard Quotex M1-history snapshot without treating it as live data.
 
         Returns True when the central cache already contains the requested number
@@ -5785,10 +5792,10 @@ class QuotexOTCLiveFeed:
                 return False
             self.add_symbol(symbol)
             with self.lock:
-                candle_count = len(self.candles.get(symbol) or {})
-                if candle_count < max(1, int(min_candles or 1)):
+                if not self._has_recent_closed_m1_locked(symbol, min_candles):
                     self.history_hydration_requested.add(symbol)
                     return False
+                self.history_hydration_requested.discard(symbol)
                 return True
         except Exception as e:
             logger.debug("Could not queue M1 history for %s: %s", symbol, e)
@@ -5819,7 +5826,7 @@ class QuotexOTCLiveFeed:
         except Exception:
             logger.debug("Could not prune M1 history requests", exc_info=True)
 
-    def merge_extension_m1_candles(self, symbol: str, rows: list) -> int:
+    def merge_extension_m1_candles(self, symbol: str, rows: list, source: str = "extension_m1_history") -> int:
         """Merge validated M1 OHLC bars received from the owner extension.
 
         This is analysis-only data from the user's already authenticated Quotex
@@ -5852,7 +5859,7 @@ class QuotexOTCLiveFeed:
                     "open": opened, "high": max(high, opened, closed),
                     "low": min(low, opened, closed), "close": closed,
                     "open_tick_ts": float(bucket), "close_tick_ts": float(bucket + 59.999),
-                    "ticks": 0, "source": "extension_m1_history",
+                    "ticks": 0, "source": source if source in {"extension_m1_history", "octopus_checkpoint"} else "extension_m1_history",
                 }
             except Exception:
                 continue
@@ -5861,8 +5868,9 @@ class QuotexOTCLiveFeed:
         with self.lock:
             self._ensure_symbol_locked(symbol)
             self.candles.setdefault(symbol, {}).update(normalized)
-            self.extension_m1_history_received_at[symbol] = now_iso()
-            self.history_hydration_received_at[symbol] = self.extension_m1_history_received_at[symbol]
+            if source == "extension_m1_history":
+                self.extension_m1_history_received_at[symbol] = now_iso()
+            self.history_hydration_received_at[symbol] = now_iso()
             self.history_hydration_requested.discard(symbol)
         return len(normalized)
 
@@ -6573,8 +6581,9 @@ class QuotexOTCLiveFeed:
                 with self.lock:
                     pending = [
                         symbol for symbol in self.history_hydration_requested
-                        if len(self.candles.get(symbol) or {}) < 30
-                        and now_mono - float(self.history_hydration_requested_at.get(symbol, 0.0) or 0.0) >= 30.0
+                        if not self._has_recent_closed_m1_locked(symbol, 18)
+                        and now_mono - float(self.history_hydration_requested_at.get(symbol, 0.0) or 0.0)
+                        >= (120.0 if self.history_hydration_requested_at.get(symbol) else 0.0)
                     ]
                 if not pending:
                     await asyncio.sleep(0.35)
@@ -7218,6 +7227,7 @@ class QuotexOTCLiveFeed:
 
     def _rebuild_candles_from_prices_locked(self, symbol: str):
         rows = list(self.prices.get(symbol, []))
+        existing = self.candles.get(symbol) or {}
         rebuilt = {}
         for ts, price, _flag in rows:
             bucket_ts = int(float(ts) // 60) * 60
@@ -7244,6 +7254,15 @@ class QuotexOTCLiveFeed:
                     candle["close"] = price
                     candle["close_tick_ts"] = ts
                 candle["ticks"] = int(candle.get("ticks", 0)) + 1
+
+        # A tick-history reply may contain fewer observations than the full M1
+        # bars already restored from the checkpoint or Quotex OHLC history.
+        # Keep those completed bars when rebuilding the rolling tick cache.
+        current_bucket = int(time_module.time() // 60) * 60
+        for bucket, candle in existing.items():
+            if (int(bucket) < current_bucket and isinstance(candle, dict)
+                    and candle.get("source") in {"history/load", "octopus_checkpoint", "extension_m1_history"}):
+                rebuilt[int(bucket)] = dict(candle)
 
         if len(rebuilt) > 240:
             keep = sorted(rebuilt.keys())[-200:]
@@ -18483,6 +18502,17 @@ def _octopus_rank_pair(pair: str, symbol: str, payout: int, regime: dict, hour: 
     return _mi_rank_thesis(pair, symbol, payout, regime, hour, signals, intelligence or {})
 
 
+def _octopus_has_fresh_tick(tick: dict, max_age_seconds: float = 15.0) -> bool:
+    try:
+        tick_ts = float((tick or {}).get("time") or 0)
+        if tick_ts > 1e12:
+            tick_ts /= 1000.0
+        age = time_module.time() - tick_ts
+        return -3.0 <= age <= max_age_seconds
+    except (TypeError, ValueError, AttributeError):
+        return False
+
+
 def _octopus_scan_market_for_target(target_bucket: int, provisional: bool = False, execution_ranking: bool = True, update_state: bool = True) -> dict:
     pair_map = get_otc_analysis_pair_map()
     pending_rows = []
@@ -18498,7 +18528,7 @@ def _octopus_scan_market_for_target(target_bucket: int, provisional: bool = Fals
     for pair, symbol in pair_map.items():
         try:
             rows, last_tick, candles = _get_otc_rows_and_candles(symbol)
-            if not last_tick:
+            if not _octopus_has_fresh_tick(last_tick):
                 continue
             instrument = quotex_otc_feed.instrument(symbol) if "quotex_otc_feed" in globals() else {}
             payout = int(float((instrument or {}).get("payout", 0) or 0))
@@ -18506,6 +18536,8 @@ def _octopus_scan_market_for_target(target_bucket: int, provisional: bool = Fals
                 continue
             history = sorted([dict(c) for c in candles if _structure_edge_candle_bucket(c) < int(target_bucket)], key=_structure_edge_candle_bucket)
             if len(history) < OCTOPUS_SR_EXEC_MIN_CLOSED_M1:
+                continue
+            if _structure_edge_candle_bucket(history[-1]) < int(target_bucket) - 60:
                 continue
             ready += 1
             if len(history) >= 12 and not _trendline_consecutive(history[-12:]):
@@ -18613,7 +18645,7 @@ def _octopus_sr_prearm_watch_scan(target_bucket: int) -> dict:
     for pair, symbol in pair_map.items():
         try:
             rows, last_tick, candles = _get_otc_rows_and_candles(symbol)
-            if not last_tick:
+            if not _octopus_has_fresh_tick(last_tick):
                 continue
             instrument = quotex_otc_feed.instrument(symbol) if "quotex_otc_feed" in globals() else {}
             payout = int(float((instrument or {}).get("payout", 0) or 0))
@@ -18624,6 +18656,8 @@ def _octopus_sr_prearm_watch_scan(target_bucket: int) -> dict:
                 key=_structure_edge_candle_bucket,
             )
             if len(history) < OCTOPUS_SR_EXEC_MIN_CLOSED_M1:
+                continue
+            if _structure_edge_candle_bucket(history[-1]) < int(target_bucket) - 60:
                 continue
             ready += 1
             if len(history) >= 12 and not _trendline_consecutive(history[-12:]):
@@ -19007,10 +19041,97 @@ def _octopus_mode_detector_tick(now_ts: float, current_bucket: int, sec: float) 
 OCTOPUS_AUTO_CHANNEL_SETTINGS_TTL_SECONDS = 15
 OCTOPUS_AUTO_CHANNEL_RESULT_DELAY_SECONDS = 5
 OCTOPUS_AUTO_CHANNEL_CANDLE_GRACE_SECONDS = 180
+OCTOPUS_AUTO_CHANNEL_SCAN_FIRST_SECOND = 38.0
+OCTOPUS_AUTO_CHANNEL_SCAN_LAST_SECOND = 44.0
+OCTOPUS_AUTO_CHANNEL_MIN_LEAD_SECONDS = 15.0
+OCTOPUS_HISTORY_CACHE_WRITE_SECONDS = 120
+OCTOPUS_HISTORY_CACHE_MAX_AGE_SECONDS = 600
 _octopus_auto_channel_state = {
     "settings": None, "settings_at": 0.0, "pending_trade": None,
     "loaded": False, "last_signal": None, "last_result": None, "last_error": None,
+    "scan_bucket": 0, "scan_attempts": 0, "last_scan_at": 0.0,
+    "last_scan_ready": 0, "last_scan_qualified": 0, "last_sent_lead_seconds": None,
 }
+_octopus_history_state = {
+    "restore_attempted": False, "restored_bars": 0, "last_save_at": 0.0,
+    "requested": 0, "ready": 0, "last_error": None,
+}
+
+
+def _octopus_history_cache_ref():
+    return system_ref().child("octopus_market_m1_cache_v1")
+
+
+def _octopus_history_restore_cache() -> int:
+    if _octopus_history_state["restore_attempted"]:
+        return int(_octopus_history_state["restored_bars"])
+    try:
+        raw = _octopus_history_cache_ref().get() or {}
+        _octopus_history_state["restore_attempted"] = True
+        if not isinstance(raw, dict):
+            return 0
+        saved_at = float(raw.get("saved_at_epoch", 0) or 0)
+        if saved_at <= 0 or not 0 <= time_module.time() - saved_at <= OCTOPUS_HISTORY_CACHE_MAX_AGE_SECONDS:
+            return 0
+        restored = 0
+        for symbol, rows in (raw.get("symbols") or {}).items():
+            if isinstance(rows, list):
+                restored += int(quotex_otc_feed.merge_extension_m1_candles(str(symbol), rows, source="octopus_checkpoint") or 0)
+        _octopus_history_state["restored_bars"] = restored
+        logger.info("Octopus M1 checkpoint restored | bars=%s", restored)
+        return restored
+    except Exception as exc:
+        _octopus_history_state["last_error"] = str(exc)
+        logger.warning("Octopus M1 checkpoint restore failed: %s", exc)
+        return 0
+
+
+def _octopus_history_save_cache(symbols: list[str]) -> None:
+    now_ts = time_module.time()
+    if now_ts - float(_octopus_history_state["last_save_at"] or 0) < OCTOPUS_HISTORY_CACHE_WRITE_SECONDS:
+        return
+    current_bucket = int(now_ts // 60) * 60
+    payload = {}
+    with quotex_otc_feed.lock:
+        for symbol in symbols:
+            candles = quotex_otc_feed.candles.get(symbol) or {}
+            rows = []
+            for bucket, candle in sorted(candles.items())[-36:]:
+                if not current_bucket - 3600 <= int(bucket) < current_bucket or not isinstance(candle, dict):
+                    continue
+                if any(candle.get(field) is None for field in ("open", "high", "low", "close")):
+                    continue
+                rows.append({"time": int(bucket), "open": candle["open"], "high": candle["high"], "low": candle["low"], "close": candle["close"]})
+            if rows:
+                payload[symbol] = rows
+    if not payload:
+        return
+    _octopus_history_cache_ref().set({"saved_at_epoch": now_ts, "symbols": payload})
+    _octopus_history_state["last_save_at"] = now_ts
+
+
+def _octopus_history_maintenance() -> None:
+    try:
+        _octopus_history_restore_cache()
+        if not (quotex_otc_feed.connected and quotex_otc_feed.authorized):
+            return
+        pair_map = get_otc_analysis_pair_map()
+        symbols = list(dict.fromkeys(str(symbol) for symbol in pair_map.values() if symbol))
+        if not symbols:
+            return
+        ready = 0
+        for symbol in symbols:
+            if quotex_otc_feed.request_m1_history(symbol, OCTOPUS_SR_EXEC_MIN_CLOSED_M1):
+                ready += 1
+        _octopus_history_state.update(requested=len(symbols), ready=ready, last_error=None)
+        _octopus_history_save_cache(symbols)
+    except Exception as exc:
+        _octopus_history_state["last_error"] = str(exc)
+        logger.exception("Octopus M1 warmup maintenance failed: %s", exc)
+
+
+async def octopus_history_job(context: ContextTypes.DEFAULT_TYPE):
+    await asyncio.to_thread(_octopus_history_maintenance)
 
 
 def _octopus_auto_channel_ref():
@@ -19189,11 +19310,18 @@ async def octopus_auto_channel_job(context: ContextTypes.DEFAULT_TYPE):
         settings = await asyncio.to_thread(_octopus_auto_channel_settings)
         if not settings["enabled"] or not STRUCTURE_EDGE_CHANNEL_ID_RAW.strip():
             return
-        candidate = _octopus_mode_detector_state.get("prearmed_candidate")
-        target = int(_octopus_mode_detector_state.get("prearm_target_bucket") or 0)
-        if not isinstance(candidate, dict) or target <= now_ts + 1 or target > now_ts + 60:
+        current_bucket = int(now_ts // 60) * 60
+        second = now_ts - current_bucket
+        if not OCTOPUS_AUTO_CHANNEL_SCAN_FIRST_SECOND <= second <= OCTOPUS_AUTO_CHANNEL_SCAN_LAST_SECOND:
             return
         if not _octopus_snapshot_ready():
+            return
+        target = current_bucket + 60
+        if int(_octopus_auto_channel_state.get("scan_bucket") or 0) != target:
+            _octopus_auto_channel_state.update(scan_bucket=target, scan_attempts=0, last_scan_at=0.0)
+        attempts = int(_octopus_auto_channel_state.get("scan_attempts") or 0)
+        last_scan = float(_octopus_auto_channel_state.get("last_scan_at") or 0)
+        if attempts >= 2 or (last_scan and now_ts - last_scan < 3):
             return
         day_key = _octopus_auto_channel_day_key(target)
         root = _octopus_auto_channel_ref()
@@ -19201,6 +19329,15 @@ async def octopus_auto_channel_job(context: ContextTypes.DEFAULT_TYPE):
         limit = int(settings["daily_limit"])
         if limit and int((day or {}).get("signals", 0) or 0) >= limit:
             return
+        _octopus_auto_channel_state["scan_attempts"] = attempts + 1
+        _octopus_auto_channel_state["last_scan_at"] = now_ts
+        scan = await asyncio.to_thread(_octopus_sr_prearm_watch_scan, target)
+        ranked = scan.get("ranked") or []
+        _octopus_auto_channel_state["last_scan_ready"] = int(scan.get("ready", 0) or 0)
+        _octopus_auto_channel_state["last_scan_qualified"] = len(ranked)
+        if not ranked:
+            return
+        candidate = ranked[0]
         selected = _octopus_apply_execution_direction_mode(dict(candidate))
         pair, symbol = str(selected.get("pair") or ""), str(selected.get("symbol") or "")
         direction = str(selected.get("direction") or "").upper()
@@ -19215,7 +19352,7 @@ async def octopus_auto_channel_job(context: ContextTypes.DEFAULT_TYPE):
         }
         # A next-candle signal is useful only while subscribers can see it
         # before the candle opens; Firebase/Telegram latency may consume PRE-ARM.
-        if time_module.time() >= target - 1:
+        if time_module.time() >= target - OCTOPUS_AUTO_CHANNEL_MIN_LEAD_SECONDS:
             return
         sent = await safe_send_message(context.bot, chat_id=trade["channel_id"], text=_octopus_auto_channel_signal_text(trade))
         if not sent:
@@ -19223,6 +19360,7 @@ async def octopus_auto_channel_job(context: ContextTypes.DEFAULT_TYPE):
             return
         _octopus_auto_channel_state["pending_trade"] = trade
         _octopus_auto_channel_state["last_signal"] = trade
+        _octopus_auto_channel_state["last_sent_lead_seconds"] = round(max(0.0, target - time_module.time()), 2)
         _octopus_auto_channel_state["last_error"] = None
         await asyncio.to_thread(root.child("pending_trade").set, trade)
         count = int((day or {}).get("signals", 0) or 0) + 1
@@ -19244,8 +19382,11 @@ def build_octopus_auto_channel_status() -> str:
         f"القناة: {'✅ مضبوطة' if STRUCTURE_EDGE_CHANNEL_ID_RAW.strip() else '❌ غير مضبوطة'}\n"
         f"المضاعفة: {'🟢 شغالة' if settings['martingale_enabled'] else '🔴 متوقفة'}\n"
         f"حد اليوم: {settings['daily_limit'] or 'مفتوح'} | المنشور: {int((day or {}).get('signals', 0) or 0)}\n"
+        f"شموع M1 جاهزة: {int(_octopus_history_state.get('ready', 0) or 0)}/{int(_octopus_history_state.get('requested', 0) or 0)} | مستعادة من الكاش: {int(_octopus_history_state.get('restored_bars', 0) or 0)}\n"
+        f"آخر فحص مبكر: جاهزة {int(_octopus_auto_channel_state.get('last_scan_ready', 0) or 0)} | فرص مطابقة {int(_octopus_auto_channel_state.get('last_scan_qualified', 0) or 0)}\n"
+        f"مهلة آخر إشارة قبل الشمعة: {_octopus_auto_channel_state.get('last_sent_lead_seconds') or '-'} ثانية\n"
         f"إشارة تنتظر النتيجة: {pending.get('pair') or 'لا يوجد'}\n"
-        f"آخر خطأ: {_octopus_auto_channel_state.get('last_error') or 'لا يوجد'}"
+        f"آخر خطأ: {_octopus_auto_channel_state.get('last_error') or _octopus_history_state.get('last_error') or 'لا يوجد'}"
     )[:3900]
 
 
@@ -20454,9 +20595,8 @@ def _ds_prime_m1_history() -> dict:
         # Subscribe eligible pairs to the same live stream used by Octopus/Edge.
         for symbol in symbols:
             quotex_otc_feed.add_symbol(symbol)
-        # Ensure an old deployment's pending history requests cannot spam the
-        # socket after this strategy intentionally switched to live warmup.
-        quotex_otc_feed.retain_m1_history_requests([])
+        # DS uses its own live cache. Other strategies may have requested
+        # historical M1 backfill, so do not clear the shared feed queue here.
         with quotex_otc_feed.lock:
             current_bucket = int(now_ts // 60) * 60
             closed_counts = {
@@ -34007,6 +34147,12 @@ def run_telegram_bot_only():
         interval=OCTOPUS_SELECTOR_SCHEDULER_SECONDS,
         first=OCTOPUS_SELECTOR_SCHEDULER_SECONDS,
         name="octopus_auto_channel",
+    )
+    job_queue.run_repeating(
+        _scheduler_singleflight(octopus_history_job, "octopus_m1_warmup"),
+        interval=15,
+        first=2,
+        name="octopus_m1_warmup",
     )
 
     # DS is private to the owner and has its own PRE-ARM/final-close lifecycle.
