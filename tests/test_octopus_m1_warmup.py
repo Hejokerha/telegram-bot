@@ -50,6 +50,7 @@ class OctopusM1WarmupTests(unittest.TestCase):
             lock = Lock()
             candles = {"EURUSD_otc": {current - 60 * i: {} for i in range(1, 19)}}
             history_hydration_requested = set()
+            history_hydration_attempts = {}
             _has_recent_closed_m1_locked = check
 
             def add_symbol(self, symbol):
@@ -63,6 +64,10 @@ class OctopusM1WarmupTests(unittest.TestCase):
         # Plenty of older bars must not hide a gap near the current candle.
         feed.candles["EURUSD_otc"].update({current - 60 * i: {} for i in range(25, 55)})
         self.assertFalse(request(feed, "EURUSD_otc", 18))
+        # An unresponsive history endpoint must not be retried forever.
+        feed.history_hydration_attempts["EURUSD_otc"] = 2
+        self.assertFalse(request(feed, "EURUSD_otc", 18))
+        self.assertNotIn("EURUSD_otc", feed.history_hydration_requested)
 
     def test_fresh_checkpoint_restores_bars_but_old_checkpoint_is_ignored(self):
         now = 1_792_000_000.0

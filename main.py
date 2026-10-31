@@ -1184,7 +1184,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.18"
+COPY_SERVER_VERSION = "1.49.19"
 # The published Firebase APK is build 122. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(122, int(os.getenv("MOBILE_APP_LATEST_BUILD", "122")))
@@ -5737,6 +5737,7 @@ class QuotexOTCLiveFeed:
         # history only backfills ``prices`` / ``candles`` for analysis.
         self.history_hydration_requested = set()
         self.history_hydration_requested_at = {}
+        self.history_hydration_attempts = {}
         self.history_hydration_received_at = {}
         self.history_hydration_sent = 0
         self.history_payload_seen = 0
@@ -5796,7 +5797,10 @@ class QuotexOTCLiveFeed:
             self.add_symbol(symbol)
             with self.lock:
                 if not self._has_recent_closed_m1_locked(symbol, min_candles):
-                    self.history_hydration_requested.add(symbol)
+                    if self.history_hydration_attempts.get(symbol, 0) < 2:
+                        self.history_hydration_requested.add(symbol)
+                    else:
+                        self.history_hydration_requested.discard(symbol)
                     return False
                 self.history_hydration_requested.discard(symbol)
                 return True
@@ -6569,6 +6573,10 @@ class QuotexOTCLiveFeed:
         with self.lock:
             self.history_hydration_requested_at[symbol] = time_module.monotonic()
             self.history_hydration_sent += 1
+            attempts = self.history_hydration_attempts.get(symbol, 0) + 1
+            self.history_hydration_attempts[symbol] = attempts
+            if attempts >= 2:
+                self.history_hydration_requested.discard(symbol)
         logger.info("Requested Quotex M1 history/load | symbol=%s", symbol)
 
     async def _history_hydration_worker(self, ws):
@@ -6585,6 +6593,7 @@ class QuotexOTCLiveFeed:
                     pending = [
                         symbol for symbol in self.history_hydration_requested
                         if not self._has_recent_closed_m1_locked(symbol, 18)
+                        and self.history_hydration_attempts.get(symbol, 0) < 2
                         and now_mono - float(self.history_hydration_requested_at.get(symbol, 0.0) or 0.0)
                         >= (120.0 if self.history_hydration_requested_at.get(symbol) else 0.0)
                     ]
@@ -19392,6 +19401,7 @@ def build_octopus_auto_channel_status() -> str:
         with quotex_otc_feed.lock:
             queued = sum(1 for symbol in symbols if symbol in quotex_otc_feed.history_hydration_requested)
             received = sum(1 for symbol in symbols if quotex_otc_feed.history_hydration_received_at.get(symbol))
+            exhausted = sum(1 for symbol in symbols if quotex_otc_feed.history_hydration_attempts.get(symbol, 0) >= 2)
             max_recent = 0
             for symbol in symbols:
                 candles = quotex_otc_feed.candles.get(symbol) or {}
@@ -19403,7 +19413,7 @@ def build_octopus_auto_channel_status() -> str:
             seen = int(quotex_otc_feed.history_payload_seen)
             event = quotex_otc_feed.last_history_event or "-"
             shape = quotex_otc_feed.last_history_shape or "-"
-        history_details = f"طلبات التاريخ: أُرسلت {sent} | ردود {seen} | أزواج استلمت {received} | معلقة {queued}\nأطول سلسلة M1 مغلقة: {max_recent} | آخر رد: {event} ({shape})"
+        history_details = f"طلبات التاريخ: أُرسلت {sent} | ردود {seen} | أزواج لها شموع {received} | معلقة {queued} | اكتملت محاولاتها {exhausted}\nأطول سلسلة M1 مغلقة: {max_recent} | آخر رد: {event} ({shape})"
     except Exception as exc:
         history_details = f"تعذر فحص التاريخ: {type(exc).__name__}"
     return (
