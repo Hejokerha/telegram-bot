@@ -1184,7 +1184,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.17"
+COPY_SERVER_VERSION = "1.49.18"
 # The published Firebase APK is build 122. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(122, int(os.getenv("MOBILE_APP_LATEST_BUILD", "122")))
@@ -5739,6 +5739,9 @@ class QuotexOTCLiveFeed:
         self.history_hydration_requested_at = {}
         self.history_hydration_received_at = {}
         self.history_hydration_sent = 0
+        self.history_payload_seen = 0
+        self.last_history_event = None
+        self.last_history_shape = None
         # DS history is supplied by the authenticated owner extension.  Keep the
         # source separate from live quotes: an uploaded candle must never make a
         # disconnected market look executable.
@@ -6999,6 +7002,9 @@ class QuotexOTCLiveFeed:
             self._parse_instruments_payload(payload)
             return
         if event_name in {"history/list/v2", "history/load", "history/load_line"}:
+            self.history_payload_seen += 1
+            self.last_history_event = event_name
+            self.last_history_shape = ",".join(sorted(str(k) for k in payload.keys())[:8]) if isinstance(payload, dict) else type(payload).__name__
             self._parse_history_payload(payload)
             return
         if ("history" in event_name or "candle" in event_name) and isinstance(payload, dict):
@@ -7008,6 +7014,9 @@ class QuotexOTCLiveFeed:
                 "Observed Quotex history-like payload | event=%s | keys=%s",
                 event_name, ",".join(sorted(str(k) for k in payload.keys())[:12]),
             )
+            self.history_payload_seen += 1
+            self.last_history_event = event_name
+            self.last_history_shape = ",".join(sorted(str(k) for k in payload.keys())[:8])
             self._parse_history_payload(payload)
             return
         if event_name == "quotes/stream":
@@ -19376,6 +19385,27 @@ def build_octopus_auto_channel_status() -> str:
     _octopus_auto_channel_restore()
     pending = _octopus_auto_channel_state.get("pending_trade") or {}
     day = _octopus_auto_channel_ref().child("daily").child(get_utc3_day_key()).get() or {}
+    history_details = "غير متاح"
+    try:
+        symbols = list(dict.fromkeys(get_otc_analysis_pair_map().values()))
+        current_bucket = int(time_module.time() // 60) * 60
+        with quotex_otc_feed.lock:
+            queued = sum(1 for symbol in symbols if symbol in quotex_otc_feed.history_hydration_requested)
+            received = sum(1 for symbol in symbols if quotex_otc_feed.history_hydration_received_at.get(symbol))
+            max_recent = 0
+            for symbol in symbols:
+                candles = quotex_otc_feed.candles.get(symbol) or {}
+                consecutive = 0
+                while current_bucket - 60 * (consecutive + 1) in candles and consecutive < 60:
+                    consecutive += 1
+                max_recent = max(max_recent, consecutive)
+            sent = int(quotex_otc_feed.history_hydration_sent)
+            seen = int(quotex_otc_feed.history_payload_seen)
+            event = quotex_otc_feed.last_history_event or "-"
+            shape = quotex_otc_feed.last_history_shape or "-"
+        history_details = f"طلبات التاريخ: أُرسلت {sent} | ردود {seen} | أزواج استلمت {received} | معلقة {queued}\nأطول سلسلة M1 مغلقة: {max_recent} | آخر رد: {event} ({shape})"
+    except Exception as exc:
+        history_details = f"تعذر فحص التاريخ: {type(exc).__name__}"
     return (
         "📋 حالة قناة Octopus\n━━━━━━━━━━━━━━\n"
         f"النشر: {'🟢 شغال' if settings['enabled'] else '🔴 متوقف'}\n"
@@ -19383,6 +19413,8 @@ def build_octopus_auto_channel_status() -> str:
         f"المضاعفة: {'🟢 شغالة' if settings['martingale_enabled'] else '🔴 متوقفة'}\n"
         f"حد اليوم: {settings['daily_limit'] or 'مفتوح'} | المنشور: {int((day or {}).get('signals', 0) or 0)}\n"
         f"شموع M1 جاهزة: {int(_octopus_history_state.get('ready', 0) or 0)}/{int(_octopus_history_state.get('requested', 0) or 0)} | مستعادة من الكاش: {int(_octopus_history_state.get('restored_bars', 0) or 0)}\n"
+        f"{history_details}\n"
+        f"آخر حفظ للكاش: {datetime.fromtimestamp(float(_octopus_history_state.get('last_save_at') or 0), tz=UTC).astimezone(UTC_PLUS_3).strftime('%H:%M:%S') if _octopus_history_state.get('last_save_at') else '-'}\n"
         f"آخر فحص مبكر: جاهزة {int(_octopus_auto_channel_state.get('last_scan_ready', 0) or 0)} | فرص مطابقة {int(_octopus_auto_channel_state.get('last_scan_qualified', 0) or 0)}\n"
         f"مهلة آخر إشارة قبل الشمعة: {_octopus_auto_channel_state.get('last_sent_lead_seconds') or '-'} ثانية\n"
         f"إشارة تنتظر النتيجة: {pending.get('pair') or 'لا يوجد'}\n"
