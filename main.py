@@ -1184,7 +1184,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.19"
+COPY_SERVER_VERSION = "1.49.20"
 # The published Firebase APK is build 122. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(122, int(os.getenv("MOBILE_APP_LATEST_BUILD", "122")))
@@ -6565,8 +6565,10 @@ class QuotexOTCLiveFeed:
             "offset": 3600,
             "period": 60,
         }
-        # The chart-history subscription is required by this Quotex socket mode
-        # before it will answer a history/load request.
+        # Historical candles use the chart-depth stream in addition to the
+        # realtime instruments/update stream.  Keep this subscription confined
+        # to history hydration so normal price subscriptions stay lightweight.
+        await self._send_event_async(ws, "depth/follow", symbol)
         await self._send_event_async(ws, "history/subscribe_all", {"asset": symbol})
         await asyncio.sleep(0.06)
         await self._send_event_async(ws, "history/load", payload)
@@ -19062,17 +19064,18 @@ OCTOPUS_AUTO_CHANNEL_CANDLE_GRACE_SECONDS = 180
 OCTOPUS_AUTO_CHANNEL_SCAN_FIRST_SECOND = 38.0
 OCTOPUS_AUTO_CHANNEL_SCAN_LAST_SECOND = 44.0
 OCTOPUS_AUTO_CHANNEL_MIN_LEAD_SECONDS = 15.0
-OCTOPUS_HISTORY_CACHE_WRITE_SECONDS = 120
+OCTOPUS_HISTORY_CACHE_WRITE_SECONDS = 30
 OCTOPUS_HISTORY_CACHE_MAX_AGE_SECONDS = 600
 _octopus_auto_channel_state = {
     "settings": None, "settings_at": 0.0, "pending_trade": None,
     "loaded": False, "last_signal": None, "last_result": None, "last_error": None,
     "scan_bucket": 0, "scan_attempts": 0, "last_scan_at": 0.0,
-    "last_scan_ready": 0, "last_scan_qualified": 0, "last_sent_lead_seconds": None,
+    "last_scan_ready": 0, "last_scan_scanned": 0,
+    "last_scan_qualified": 0, "last_sent_lead_seconds": None,
 }
 _octopus_history_state = {
     "restore_attempted": False, "restored_bars": 0, "last_save_at": 0.0,
-    "requested": 0, "ready": 0, "last_error": None,
+    "requested": 0, "ready": 0, "recent_twelve": 0, "last_error": None,
 }
 
 
@@ -19137,11 +19140,20 @@ def _octopus_history_maintenance() -> None:
         symbols = list(dict.fromkeys(str(symbol) for symbol in pair_map.values() if symbol))
         if not symbols:
             return
-        ready = 0
+        ready = recent_twelve = 0
+        current_bucket = int(time_module.time() // 60) * 60
         for symbol in symbols:
-            if quotex_otc_feed.request_m1_history(symbol, OCTOPUS_SR_EXEC_MIN_CLOSED_M1):
+            quotex_otc_feed.request_m1_history(symbol, OCTOPUS_SR_EXEC_MIN_CLOSED_M1)
+            with quotex_otc_feed.lock:
+                candles = quotex_otc_feed.candles.get(symbol) or {}
+                closed_count = sum(1 for bucket in candles if int(bucket) < current_bucket)
+                latest_closed = current_bucket - 60 in candles
+                contiguous_twelve = all(current_bucket - 60 * offset in candles for offset in range(1, 13))
+            if closed_count >= OCTOPUS_SR_EXEC_MIN_CLOSED_M1 and latest_closed:
                 ready += 1
-        _octopus_history_state.update(requested=len(symbols), ready=ready, last_error=None)
+                if contiguous_twelve:
+                    recent_twelve += 1
+        _octopus_history_state.update(requested=len(symbols), ready=ready, recent_twelve=recent_twelve, last_error=None)
         _octopus_history_save_cache(symbols)
     except Exception as exc:
         _octopus_history_state["last_error"] = str(exc)
@@ -19352,6 +19364,7 @@ async def octopus_auto_channel_job(context: ContextTypes.DEFAULT_TYPE):
         scan = await asyncio.to_thread(_octopus_sr_prearm_watch_scan, target)
         ranked = scan.get("ranked") or []
         _octopus_auto_channel_state["last_scan_ready"] = int(scan.get("ready", 0) or 0)
+        _octopus_auto_channel_state["last_scan_scanned"] = int(scan.get("scanned", 0) or 0)
         _octopus_auto_channel_state["last_scan_qualified"] = len(ranked)
         if not ranked:
             return
@@ -19422,10 +19435,10 @@ def build_octopus_auto_channel_status() -> str:
         f"القناة: {'✅ مضبوطة' if STRUCTURE_EDGE_CHANNEL_ID_RAW.strip() else '❌ غير مضبوطة'}\n"
         f"المضاعفة: {'🟢 شغالة' if settings['martingale_enabled'] else '🔴 متوقفة'}\n"
         f"حد اليوم: {settings['daily_limit'] or 'مفتوح'} | المنشور: {int((day or {}).get('signals', 0) or 0)}\n"
-        f"شموع M1 جاهزة: {int(_octopus_history_state.get('ready', 0) or 0)}/{int(_octopus_history_state.get('requested', 0) or 0)} | مستعادة من الكاش: {int(_octopus_history_state.get('restored_bars', 0) or 0)}\n"
+        f"شموع M1 ≥{OCTOPUS_SR_EXEC_MIN_CLOSED_M1} وآخر مغلقة: {int(_octopus_history_state.get('ready', 0) or 0)}/{int(_octopus_history_state.get('requested', 0) or 0)} | آخر 12 متصلة: {int(_octopus_history_state.get('recent_twelve', 0) or 0)} | مستعادة من الكاش: {int(_octopus_history_state.get('restored_bars', 0) or 0)}\n"
         f"{history_details}\n"
         f"آخر حفظ للكاش: {datetime.fromtimestamp(float(_octopus_history_state.get('last_save_at') or 0), tz=UTC).astimezone(UTC_PLUS_3).strftime('%H:%M:%S') if _octopus_history_state.get('last_save_at') else '-'}\n"
-        f"آخر فحص مبكر: جاهزة {int(_octopus_auto_channel_state.get('last_scan_ready', 0) or 0)} | فرص مطابقة {int(_octopus_auto_channel_state.get('last_scan_qualified', 0) or 0)}\n"
+        f"آخر فحص مبكر: بيانات {int(_octopus_auto_channel_state.get('last_scan_ready', 0) or 0)} | شموع متصلة {int(_octopus_auto_channel_state.get('last_scan_scanned', 0) or 0)} | فرص مطابقة {int(_octopus_auto_channel_state.get('last_scan_qualified', 0) or 0)}\n"
         f"مهلة آخر إشارة قبل الشمعة: {_octopus_auto_channel_state.get('last_sent_lead_seconds') or '-'} ثانية\n"
         f"إشارة تنتظر النتيجة: {pending.get('pair') or 'لا يوجد'}\n"
         f"آخر خطأ: {_octopus_auto_channel_state.get('last_error') or _octopus_history_state.get('last_error') or 'لا يوجد'}"

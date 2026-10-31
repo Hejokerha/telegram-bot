@@ -1,5 +1,6 @@
 """Offline checks for Octopus historical M1 startup readiness."""
 import ast
+import asyncio
 from collections import deque
 from pathlib import Path
 from threading import Lock
@@ -21,6 +22,58 @@ def load_named(name, namespace, *, from_class=None):
 
 
 class OctopusM1WarmupTests(unittest.TestCase):
+    def test_history_request_opens_chart_stream_before_loading(self):
+        events = []
+        now = 1_792_000_000.0
+        ns = {
+            "asyncio": asyncio,
+            "time_module": SimpleNamespace(time=lambda: now, monotonic=lambda: now),
+            "logger": SimpleNamespace(info=lambda *args: None),
+        }
+        send_history = load_named("_send_m1_history_hydration", ns, from_class="QuotexOTCLiveFeed")
+
+        class Feed:
+            lock = Lock()
+            history_hydration_requested = {"EURUSD_otc"}
+            history_hydration_requested_at = {}
+            history_hydration_attempts = {}
+            history_hydration_sent = 0
+
+            async def _send_event_async(self, ws, name, payload):
+                events.append((name, payload))
+
+        feed = Feed()
+        asyncio.run(send_history(feed, object(), "EURUSD_otc"))
+        self.assertEqual([name for name, _ in events], ["depth/follow", "history/subscribe_all", "history/load"])
+        self.assertEqual(events[0][1], "EURUSD_otc")
+        self.assertEqual(feed.history_hydration_attempts["EURUSD_otc"], 1)
+
+    def test_octopus_warmup_counts_scanner_ready_bars_separately_from_continuity(self):
+        now = 1_792_000_000.0
+        current = int(now // 60) * 60
+        candles = {
+            "A_otc": {current - 60 * i: {} for i in range(1, 19)},
+            "B_otc": {current - 60 * i: {} for i in list(range(1, 14)) + list(range(25, 30))},
+            "C_otc": {current - 60 * i: {} for i in list(range(1, 7)) + list(range(10, 22))},
+        }
+        feed = SimpleNamespace(
+            lock=Lock(), connected=True, authorized=True, candles=candles,
+            request_m1_history=lambda symbol, count: False,
+        )
+        state = {"ready": 0, "recent_twelve": 0, "requested": 0, "last_error": None}
+        ns = {
+            "time_module": SimpleNamespace(time=lambda: now),
+            "quotex_otc_feed": feed,
+            "_octopus_history_state": state,
+            "_octopus_history_restore_cache": lambda: None,
+            "_octopus_history_save_cache": lambda symbols: None,
+            "get_otc_analysis_pair_map": lambda: {symbol: symbol for symbol in candles},
+            "OCTOPUS_SR_EXEC_MIN_CLOSED_M1": 18,
+        }
+        maintenance = load_named("_octopus_history_maintenance", ns)
+        maintenance()
+        self.assertEqual((state["ready"], state["recent_twelve"], state["requested"]), (3, 2, 3))
+
     def test_tick_history_rebuild_preserves_completed_checkpoint_bar(self):
         now = 1_792_000_000.0
         bucket = int(now // 60) * 60 - 60
