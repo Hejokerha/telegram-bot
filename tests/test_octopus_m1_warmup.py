@@ -2,6 +2,7 @@
 import ast
 import asyncio
 from collections import deque
+import math
 from pathlib import Path
 from threading import Lock
 from types import SimpleNamespace
@@ -60,12 +61,13 @@ class OctopusM1WarmupTests(unittest.TestCase):
             lock=Lock(), connected=True, authorized=True, candles=candles,
             request_m1_history=lambda symbol, count: False,
         )
-        state = {"ready": 0, "recent_twelve": 0, "requested": 0, "last_error": None}
+        state = {"ready": 0, "recent_twelve": 0, "requested": 0, "last_error": None,
+                 "startup_at": now - 600}
         ns = {
             "time_module": SimpleNamespace(time=lambda: now),
             "quotex_otc_feed": feed,
             "_octopus_history_state": state,
-            "_octopus_history_restore_cache": lambda: None,
+            "_octopus_history_restore_cache": lambda force=False: None,
             "_octopus_history_save_cache": lambda symbols: None,
             "get_otc_analysis_pair_map": lambda: {symbol: symbol for symbol in candles},
             "OCTOPUS_SR_EXEC_MIN_CLOSED_M1": 18,
@@ -73,6 +75,74 @@ class OctopusM1WarmupTests(unittest.TestCase):
         maintenance = load_named("_octopus_history_maintenance", ns)
         maintenance()
         self.assertEqual((state["ready"], state["recent_twelve"], state["requested"]), (3, 2, 3))
+
+    def test_overlapping_deployments_keep_both_sets_of_closed_candles(self):
+        now = 1_792_000_000.0
+        current = int(now // 60) * 60
+        old = {"saved_at_epoch": now - 30, "symbols": {
+            "EURUSD_otc": [{"time": current - 180, "open": 1, "high": 2, "low": 1, "close": 2}],
+        }}
+        incoming = {"EURUSD_otc": [
+            {"time": current - 120, "open": 2, "high": 3, "low": 2, "close": 3},
+            {"time": current, "open": 3, "high": 4, "low": 3, "close": 4},
+        ]}
+        merge = load_named("_octopus_history_merge_cache", {})
+        result = merge(old, incoming, now)
+        self.assertEqual(
+            [row["time"] for row in result["symbols"]["EURUSD_otc"]],
+            [current - 180, current - 120],
+        )
+        self.assertEqual(len(old["symbols"]["EURUSD_otc"]), 1)
+
+    def test_recent_cache_can_be_merged_again_after_startup(self):
+        now = 1_792_000_000.0
+        cache = {"saved_at_epoch": now - 10, "symbols": {"EURUSD_otc": [
+            {"time": now - 60, "open": 1, "high": 2, "low": 1, "close": 2},
+        ]}}
+        merged = []
+
+        class Ref:
+            def get(self):
+                return cache
+
+        state = {"restore_attempted": True, "restored_bars": 20,
+                 "last_sync_at": now - 31, "last_error": None}
+        ns = {
+            "time_module": SimpleNamespace(time=lambda: now),
+            "_octopus_history_state": state,
+            "_octopus_history_cache_ref": lambda: Ref(),
+            "quotex_otc_feed": SimpleNamespace(merge_extension_m1_candles=lambda symbol, rows, source: merged.append(symbol) or 1),
+            "OCTOPUS_HISTORY_CACHE_MAX_AGE_SECONDS": 600,
+            "OCTOPUS_HISTORY_CACHE_WRITE_SECONDS": 30,
+            "logger": SimpleNamespace(info=lambda *args: None, warning=lambda *args: None),
+        }
+        restore = load_named("_octopus_history_restore_cache", ns)
+        self.assertEqual(restore(force=True), 20)
+        self.assertEqual(merged, ["EURUSD_otc"])
+
+    def test_checkpoint_refresh_keeps_candles_already_built_from_live_ticks(self):
+        now = 1_792_000_000.0
+        bucket = int(now // 60) * 60 - 60
+        live = {"open": 1.0, "high": 1.4, "low": 0.9, "close": 1.3, "source": "quotes/stream"}
+        ns = {"time_module": SimpleNamespace(time=lambda: now), "math": math, "now_iso": lambda: "now"}
+        merge = load_named("merge_extension_m1_candles", ns, from_class="QuotexOTCLiveFeed")
+
+        class Feed:
+            lock = Lock()
+            candles = {"EURUSD_otc": {bucket: live}}
+            extension_m1_history_received_at = {}
+            history_hydration_received_at = {}
+            history_hydration_requested = set()
+
+            def _ensure_symbol_locked(self, symbol):
+                self.candles.setdefault(symbol, {})
+
+        feed = Feed()
+        rows = [{"time": bucket, "open": 1.0, "high": 1.2, "low": 1.0, "close": 1.1},
+                {"time": bucket - 60, "open": 0.8, "high": 1.0, "low": 0.8, "close": 1.0}]
+        merge(feed, "EURUSD_otc", rows, source="octopus_checkpoint")
+        self.assertIs(feed.candles["EURUSD_otc"][bucket], live)
+        self.assertEqual(feed.candles["EURUSD_otc"][bucket - 60]["source"], "octopus_checkpoint")
 
     def test_tick_history_rebuild_preserves_completed_checkpoint_bar(self):
         now = 1_792_000_000.0
@@ -104,6 +174,8 @@ class OctopusM1WarmupTests(unittest.TestCase):
             candles = {"EURUSD_otc": {current - 60 * i: {} for i in range(1, 19)}}
             history_hydration_requested = set()
             history_hydration_attempts = {}
+            history_hydration_sent = 0
+            history_payload_seen = 0
             _has_recent_closed_m1_locked = check
 
             def add_symbol(self, symbol):
@@ -119,6 +191,10 @@ class OctopusM1WarmupTests(unittest.TestCase):
         self.assertFalse(request(feed, "EURUSD_otc", 18))
         # An unresponsive history endpoint must not be retried forever.
         feed.history_hydration_attempts["EURUSD_otc"] = 2
+        self.assertFalse(request(feed, "EURUSD_otc", 18))
+        self.assertNotIn("EURUSD_otc", feed.history_hydration_requested)
+        feed.history_hydration_attempts.clear()
+        feed.history_hydration_sent = 16
         self.assertFalse(request(feed, "EURUSD_otc", 18))
         self.assertNotIn("EURUSD_otc", feed.history_hydration_requested)
 

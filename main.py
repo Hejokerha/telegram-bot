@@ -1184,7 +1184,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.20"
+COPY_SERVER_VERSION = "1.49.21"
 # The published Firebase APK is build 122. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(122, int(os.getenv("MOBILE_APP_LATEST_BUILD", "122")))
@@ -5797,7 +5797,8 @@ class QuotexOTCLiveFeed:
             self.add_symbol(symbol)
             with self.lock:
                 if not self._has_recent_closed_m1_locked(symbol, min_candles):
-                    if self.history_hydration_attempts.get(symbol, 0) < 2:
+                    if (self.history_hydration_attempts.get(symbol, 0) < 2
+                            and (self.history_hydration_sent < 16 or self.history_payload_seen > 0)):
                         self.history_hydration_requested.add(symbol)
                     else:
                         self.history_hydration_requested.discard(symbol)
@@ -5874,7 +5875,14 @@ class QuotexOTCLiveFeed:
             return 0
         with self.lock:
             self._ensure_symbol_locked(symbol)
-            self.candles.setdefault(symbol, {}).update(normalized)
+            target = self.candles.setdefault(symbol, {})
+            for bucket, candle in normalized.items():
+                # A checkpoint from another deployment fills missed buckets,
+                # but must not replace a candle already built from live ticks.
+                if (source == "octopus_checkpoint" and bucket in target
+                        and target[bucket].get("source") != "octopus_checkpoint"):
+                    continue
+                target[bucket] = candle
             if source == "extension_m1_history":
                 self.extension_m1_history_received_at[symbol] = now_iso()
             self.history_hydration_received_at[symbol] = now_iso()
@@ -6579,6 +6587,8 @@ class QuotexOTCLiveFeed:
             self.history_hydration_attempts[symbol] = attempts
             if attempts >= 2:
                 self.history_hydration_requested.discard(symbol)
+            if self.history_hydration_sent >= 16 and self.history_payload_seen == 0:
+                self.history_hydration_requested.clear()
         logger.info("Requested Quotex M1 history/load | symbol=%s", symbol)
 
     async def _history_hydration_worker(self, ws):
@@ -6596,6 +6606,7 @@ class QuotexOTCLiveFeed:
                         symbol for symbol in self.history_hydration_requested
                         if not self._has_recent_closed_m1_locked(symbol, 18)
                         and self.history_hydration_attempts.get(symbol, 0) < 2
+                        and (self.history_hydration_sent < 16 or self.history_payload_seen > 0)
                         and now_mono - float(self.history_hydration_requested_at.get(symbol, 0.0) or 0.0)
                         >= (120.0 if self.history_hydration_requested_at.get(symbol) else 0.0)
                     ]
@@ -19075,6 +19086,7 @@ _octopus_auto_channel_state = {
 }
 _octopus_history_state = {
     "restore_attempted": False, "restored_bars": 0, "last_save_at": 0.0,
+    "startup_at": time_module.time(), "last_sync_at": 0.0,
     "requested": 0, "ready": 0, "recent_twelve": 0, "last_error": None,
 }
 
@@ -19083,28 +19095,58 @@ def _octopus_history_cache_ref():
     return system_ref().child("octopus_market_m1_cache_v1")
 
 
-def _octopus_history_restore_cache() -> int:
-    if _octopus_history_state["restore_attempted"]:
+def _octopus_history_restore_cache(force: bool = False) -> int:
+    now_ts = time_module.time()
+    if _octopus_history_state["restore_attempted"] and not force:
+        return int(_octopus_history_state["restored_bars"])
+    if force and now_ts - float(_octopus_history_state.get("last_sync_at") or 0) < OCTOPUS_HISTORY_CACHE_WRITE_SECONDS:
         return int(_octopus_history_state["restored_bars"])
     try:
         raw = _octopus_history_cache_ref().get() or {}
         _octopus_history_state["restore_attempted"] = True
+        _octopus_history_state["last_sync_at"] = now_ts
         if not isinstance(raw, dict):
             return 0
         saved_at = float(raw.get("saved_at_epoch", 0) or 0)
-        if saved_at <= 0 or not 0 <= time_module.time() - saved_at <= OCTOPUS_HISTORY_CACHE_MAX_AGE_SECONDS:
+        if saved_at <= 0 or not 0 <= now_ts - saved_at <= OCTOPUS_HISTORY_CACHE_MAX_AGE_SECONDS:
             return 0
         restored = 0
         for symbol, rows in (raw.get("symbols") or {}).items():
             if isinstance(rows, list):
                 restored += int(quotex_otc_feed.merge_extension_m1_candles(str(symbol), rows, source="octopus_checkpoint") or 0)
-        _octopus_history_state["restored_bars"] = restored
+        if not force:
+            _octopus_history_state["restored_bars"] = restored
         logger.info("Octopus M1 checkpoint restored | bars=%s", restored)
-        return restored
+        return int(_octopus_history_state["restored_bars"])
     except Exception as exc:
         _octopus_history_state["last_error"] = str(exc)
         logger.warning("Octopus M1 checkpoint restore failed: %s", exc)
         return 0
+
+
+def _octopus_history_merge_cache(current, incoming: dict, now_ts: float) -> dict:
+    """Union closed bars from overlapping deployments without inventing prices."""
+    old = current if isinstance(current, dict) else {}
+    old_symbols = old.get("symbols") if isinstance(old.get("symbols"), dict) else {}
+    current_bucket = int(now_ts // 60) * 60
+    combined = {}
+    for symbol in set(old_symbols) | set(incoming):
+        by_bucket = {}
+        for rows in (old_symbols.get(symbol), incoming.get(symbol)):
+            if not isinstance(rows, list):
+                continue
+            for row in rows:
+                if not isinstance(row, dict):
+                    continue
+                try:
+                    bucket = int(float(row.get("time") or 0) // 60) * 60
+                except (TypeError, ValueError):
+                    continue
+                if now_ts - 3600 <= bucket < current_bucket:
+                    by_bucket[bucket] = row
+        if by_bucket:
+            combined[str(symbol)] = [by_bucket[bucket] for bucket in sorted(by_bucket)[-36:]]
+    return {"saved_at_epoch": now_ts, "symbols": combined}
 
 
 def _octopus_history_save_cache(symbols: list[str]) -> None:
@@ -19127,13 +19169,17 @@ def _octopus_history_save_cache(symbols: list[str]) -> None:
                 payload[symbol] = rows
     if not payload:
         return
-    _octopus_history_cache_ref().set({"saved_at_epoch": now_ts, "symbols": payload})
+    _octopus_history_cache_ref().transaction(
+        lambda current: _octopus_history_merge_cache(current, payload, now_ts)
+    )
     _octopus_history_state["last_save_at"] = now_ts
 
 
 def _octopus_history_maintenance() -> None:
     try:
         _octopus_history_restore_cache()
+        if time_module.time() - float(_octopus_history_state.get("startup_at") or 0) <= 300:
+            _octopus_history_restore_cache(force=True)
         if not (quotex_otc_feed.connected and quotex_otc_feed.authorized):
             return
         pair_map = get_otc_analysis_pair_map()
@@ -19424,9 +19470,12 @@ def build_octopus_auto_channel_status() -> str:
                 max_recent = max(max_recent, consecutive)
             sent = int(quotex_otc_feed.history_hydration_sent)
             seen = int(quotex_otc_feed.history_payload_seen)
+            stopped = sent >= 16 and seen == 0
             event = quotex_otc_feed.last_history_event or "-"
             shape = quotex_otc_feed.last_history_shape or "-"
         history_details = f"طلبات التاريخ: أُرسلت {sent} | ردود {seen} | أزواج لها شموع {received} | معلقة {queued} | اكتملت محاولاتها {exhausted}\nأطول سلسلة M1 مغلقة: {max_recent} | آخر رد: {event} ({shape})"
+        if stopped:
+            history_details += "\nطلبات التاريخ موقوفة مؤقتًا بعد 16 طلبًا بلا رد؛ الكاش والأسعار الحية مستمران."
     except Exception as exc:
         history_details = f"تعذر فحص التاريخ: {type(exc).__name__}"
     return (
