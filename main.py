@@ -602,6 +602,7 @@ structure_edge_admin_keyboard = ReplyKeyboardMarkup(
     [
         ["🟢 تشغيل Octopus", "🔴 إيقاف Octopus"],
         ["🌍 تشغيل تنفيذ Octopus للجميع", "🚨 إيقاف تنفيذ Octopus للجميع"],
+        ["📡 قناة Octopus"],
         ["📋 حالة Octopus", "📊 ملخص Octopus"],
         ["📊 وضع السوق ساعتين"],
         ["🟢 تنفيذ NORMAL", "🔄 تنفيذ REVERSE"],
@@ -610,6 +611,18 @@ structure_edge_admin_keyboard = ReplyKeyboardMarkup(
         ["⬅️ رجوع"],
     ],
     resize_keyboard=True
+)
+
+octopus_channel_admin_keyboard = ReplyKeyboardMarkup(
+    [
+        ["🟢 تشغيل نشر الأخطبوط", "🔴 إيقاف نشر الأخطبوط"],
+        ["🎯 حد صفقات الأخطبوط", "♾ نشر الأخطبوط مفتوح"],
+        ["🟢 تشغيل مضاعفة الأخطبوط", "🔴 إيقاف مضاعفة الأخطبوط"],
+        ["📊 ملخص قناة الأخطبوط", "📋 حالة قناة الأخطبوط"],
+        ["📜 آخر نتائج الأخطبوط", "🧹 تصفير نتائج القناة"],
+        ["⬅️ رجوع"],
+    ],
+    resize_keyboard=True,
 )
 
 # DS = Parabolic-SAR wave midpoint close-break continuation.  This menu is
@@ -1171,7 +1184,7 @@ BOT_RELEASE_VERSION = "v0.86"
 # v1.12 keeps the versioned signal contract and makes OTC Edge transport-aware:
 # a fresh authenticated Android REST poll is a valid online execution transport,
 # so OTC Edge no longer requires the Chrome extension to be connected.
-COPY_SERVER_VERSION = "1.49.15"
+COPY_SERVER_VERSION = "1.49.16"
 # The published Firebase APK is build 122. Older Render environment values
 # must not make the in-app update notice point users at an obsolete release.
 MOBILE_APP_LATEST_BUILD = max(122, int(os.getenv("MOBILE_APP_LATEST_BUILD", "122")))
@@ -18988,6 +19001,298 @@ def _octopus_mode_detector_tick(now_ts: float, current_bucket: int, sec: float) 
         logger.debug("Octopus mode detector tick failed: %s", exc)
 
 
+# The Telegram channel follows the same always-on Octopus PRE-ARM analysis as the
+# internal detector. It does not need a user's app/extension or a broker order.
+# Channel settings and the one outstanding signal survive Render restarts.
+OCTOPUS_AUTO_CHANNEL_SETTINGS_TTL_SECONDS = 15
+OCTOPUS_AUTO_CHANNEL_RESULT_DELAY_SECONDS = 5
+OCTOPUS_AUTO_CHANNEL_CANDLE_GRACE_SECONDS = 180
+_octopus_auto_channel_state = {
+    "settings": None, "settings_at": 0.0, "pending_trade": None,
+    "loaded": False, "last_signal": None, "last_result": None, "last_error": None,
+}
+
+
+def _octopus_auto_channel_ref():
+    return system_ref().child("octopus_auto_channel_v1")
+
+
+def _octopus_auto_channel_settings() -> dict:
+    now_ts = time_module.time()
+    cached = _octopus_auto_channel_state.get("settings")
+    if isinstance(cached, dict) and now_ts - float(_octopus_auto_channel_state.get("settings_at") or 0) < OCTOPUS_AUTO_CHANNEL_SETTINGS_TTL_SECONDS:
+        return dict(cached)
+    default = {"enabled": True, "daily_limit": 0, "martingale_enabled": False}
+    try:
+        data = _octopus_auto_channel_ref().child("settings").get() or {}
+        if not isinstance(data, dict):
+            data = {}
+        result = {
+            "enabled": bool(data.get("enabled", default["enabled"])),
+            "daily_limit": max(0, int(data.get("daily_limit", 0) or 0)),
+            "martingale_enabled": bool(data.get("martingale_enabled", False)),
+        }
+        _octopus_auto_channel_state.update(settings=result, settings_at=now_ts)
+        return dict(result)
+    except Exception as exc:
+        _octopus_auto_channel_state["last_error"] = str(exc)
+        logger.warning("Octopus channel settings read failed: %s", exc)
+        # Never start new channel posts when the persisted switch is unknown.
+        return dict(cached) if isinstance(cached, dict) else dict(default, enabled=False)
+
+
+def _octopus_auto_channel_set_setting(name: str, value) -> bool:
+    if name not in {"enabled", "daily_limit", "martingale_enabled"}:
+        return False
+    try:
+        normalized = max(0, int(value)) if name == "daily_limit" else bool(value)
+        _octopus_auto_channel_ref().child("settings").update({name: normalized, "updated_at": now_iso()})
+        settings = _octopus_auto_channel_settings()
+        settings[name] = normalized
+        _octopus_auto_channel_state.update(settings=settings, settings_at=time_module.time())
+        return True
+    except Exception as exc:
+        _octopus_auto_channel_state["last_error"] = str(exc)
+        logger.exception("Octopus channel setting update failed: %s", exc)
+        return False
+
+
+def _octopus_auto_channel_restore() -> bool:
+    if _octopus_auto_channel_state.get("loaded"):
+        return True
+    try:
+        pending = _octopus_auto_channel_ref().child("pending_trade").get()
+        _octopus_auto_channel_state["pending_trade"] = pending if isinstance(pending, dict) else None
+        _octopus_auto_channel_state["loaded"] = True
+        return True
+    except Exception as exc:
+        _octopus_auto_channel_state["last_error"] = str(exc)
+        logger.warning("Octopus channel pending restore failed: %s", exc)
+        return False
+
+
+def _octopus_auto_channel_day_key(entry_bucket: int) -> str:
+    return datetime.fromtimestamp(int(entry_bucket), tz=UTC).astimezone(UTC_PLUS_3).strftime("%Y-%m-%d")
+
+
+def _octopus_auto_channel_grade(direction: str, candle: dict) -> str:
+    if not isinstance(candle, dict) or candle.get("open") is None or candle.get("close") is None:
+        return "unknown"
+    try:
+        opening, closing = float(candle["open"]), float(candle["close"])
+        if not math.isfinite(opening) or not math.isfinite(closing):
+            return "unknown"
+        if abs(closing - opening) <= max(abs(opening) * 1e-10, 1e-12):
+            return "draw"
+        if direction == "CALL":
+            return "win" if closing > opening else "loss"
+        if direction == "PUT":
+            return "win" if closing < opening else "loss"
+    except (TypeError, ValueError, KeyError):
+        pass
+    return "unknown"
+
+
+def _octopus_auto_channel_signal_text(trade: dict) -> str:
+    entry = datetime.fromtimestamp(int(trade["entry_bucket"]), tz=UTC).astimezone(UTC_PLUS_3)
+    end = entry + timedelta(minutes=1)
+    direction = "🟢 CALL" if trade["direction"] == "CALL" else "🔴 PUT"
+    return (
+        "🐙 OCTOPUS SIGNAL\n━━━━━━━━━━━━━━\n"
+        f"💱 {trade['pair']}\n📌 {direction}\n"
+        f"⏳ الشمعة القادمة: {entry.strftime('%H:%M:%S')} UTC+3\n"
+        f"🏁 الانتهاء: {end.strftime('%H:%M:%S')} UTC+3\n"
+        f"💰 payout: {int(trade.get('payout', 0) or 0)}%"
+    )
+
+
+def _octopus_auto_channel_result_text(trade: dict, result: str) -> str:
+    label = {"win": "Win✅.", "loss": "Lose💔", "draw": "🟰doji", "unknown": "⚠️ تعذر تأكيد النتيجة"}.get(result, "⚠️ تعذر تأكيد النتيجة")
+    if result == "win" and int(trade.get("step", 0) or 0) == 1:
+        label = "Win✅¹"
+    return f"🐙 OCTOPUS RESULT\n━━━━━━━━━━━━━━\n💱 {trade['pair']}\n📊 {label}"
+
+
+async def _octopus_auto_channel_finish(context: ContextTypes.DEFAULT_TYPE, trade: dict, result: str) -> bool:
+    root = _octopus_auto_channel_ref()
+    result_ref = root.child("results").child(str(trade["entry_bucket"]))
+    try:
+        existing = await asyncio.to_thread(result_ref.get) or {}
+        if isinstance(existing, dict) and existing.get("posted_at"):
+            await asyncio.to_thread(root.child("pending_trade").delete)
+            _octopus_auto_channel_state["pending_trade"] = None
+            return True
+    except Exception as exc:
+        _octopus_auto_channel_state["last_error"] = str(exc)
+        logger.warning("Octopus channel result dedupe check failed: %s", exc)
+        return False
+    channel_id = trade.get("channel_id") or _structure_edge_target_chat_id()
+    sent = await safe_send_message(context.bot, chat_id=channel_id, text=_octopus_auto_channel_result_text(trade, result))
+    if not sent:
+        _octopus_auto_channel_state["last_error"] = "تعذر إرسال نتيجة Octopus إلى Telegram"
+        return False
+    record = {
+        "pair": trade["pair"], "symbol": trade["symbol"], "direction": trade["direction"],
+        "entry_bucket": int(trade["entry_bucket"]), "result": result,
+        "martingale_enabled": bool(trade.get("martingale_enabled")),
+        "martingale_step": int(trade.get("step", 0) or 0), "closed_at": now_iso(), "posted_at": now_iso(),
+    }
+    _octopus_auto_channel_state["last_result"] = record
+    _octopus_auto_channel_state["last_error"] = None
+    try:
+        await asyncio.to_thread(result_ref.set, record)
+        day_ref = root.child("daily").child(_octopus_auto_channel_day_key(trade["entry_bucket"]))
+        day = await asyncio.to_thread(day_ref.get) or {}
+        if not isinstance(day, dict):
+            day = {}
+        key = "mg_wins" if result == "win" and record["martingale_step"] else {"win": "wins", "loss": "losses", "draw": "draws"}.get(result, "unresolved")
+        await asyncio.to_thread(day_ref.update, {key: int(day.get(key, 0) or 0) + 1})
+        await asyncio.to_thread(root.child("pending_trade").delete)
+    except Exception as exc:
+        # Do not post a duplicate result merely because the statistics write failed.
+        _octopus_auto_channel_state["last_error"] = str(exc)
+        logger.exception("Octopus channel result persistence failed: %s", exc)
+    _octopus_auto_channel_state["pending_trade"] = None
+    return True
+
+
+async def _octopus_auto_channel_resolve(context: ContextTypes.DEFAULT_TYPE, now_ts: float) -> bool:
+    trade = _octopus_auto_channel_state.get("pending_trade")
+    if not isinstance(trade, dict):
+        return False
+    entry_bucket = int(trade.get("entry_bucket") or 0)
+    step = int(trade.get("step", 0) or 0)
+    bucket = entry_bucket + (60 if step else 0)
+    if now_ts < bucket + 60 + OCTOPUS_AUTO_CHANNEL_RESULT_DELAY_SECONDS:
+        return True
+    candle = _three_candle_get_candle(str(trade.get("symbol") or ""), bucket)
+    result = _octopus_auto_channel_grade(str(trade.get("direction") or ""), candle)
+    if result == "unknown" and now_ts < bucket + 60 + OCTOPUS_AUTO_CHANNEL_CANDLE_GRACE_SECONDS:
+        return True
+    if result == "loss" and step == 0 and bool(trade.get("martingale_enabled")):
+        trade = dict(trade, step=1)
+        await asyncio.to_thread(_octopus_auto_channel_ref().child("pending_trade").set, trade)
+        _octopus_auto_channel_state["pending_trade"] = trade
+        return True
+    if await _octopus_auto_channel_finish(context, trade, result):
+        return False
+    return True
+
+
+async def octopus_auto_channel_job(context: ContextTypes.DEFAULT_TYPE):
+    try:
+        if not await asyncio.to_thread(_octopus_auto_channel_restore):
+            return
+        now_ts = time_module.time()
+        if await _octopus_auto_channel_resolve(context, now_ts):
+            return
+        settings = await asyncio.to_thread(_octopus_auto_channel_settings)
+        if not settings["enabled"] or not STRUCTURE_EDGE_CHANNEL_ID_RAW.strip():
+            return
+        candidate = _octopus_mode_detector_state.get("prearmed_candidate")
+        target = int(_octopus_mode_detector_state.get("prearm_target_bucket") or 0)
+        if not isinstance(candidate, dict) or target <= now_ts + 1 or target > now_ts + 60:
+            return
+        if not _octopus_snapshot_ready():
+            return
+        day_key = _octopus_auto_channel_day_key(target)
+        root = _octopus_auto_channel_ref()
+        day = await asyncio.to_thread(lambda: root.child("daily").child(day_key).get() or {})
+        limit = int(settings["daily_limit"])
+        if limit and int((day or {}).get("signals", 0) or 0) >= limit:
+            return
+        selected = _octopus_apply_execution_direction_mode(dict(candidate))
+        pair, symbol = str(selected.get("pair") or ""), str(selected.get("symbol") or "")
+        direction = str(selected.get("direction") or "").upper()
+        if not pair or not symbol or direction not in {"CALL", "PUT"}:
+            return
+        trade = {
+            "pair": pair, "symbol": symbol, "direction": direction, "entry_bucket": target,
+            "payout": int(selected.get("payout", 0) or 0), "step": 0,
+            "martingale_enabled": bool(settings["martingale_enabled"]),
+            "channel_id": _structure_edge_target_chat_id(),
+            "created_at": now_iso(), "analysis_direction": selected.get("analysis_direction"),
+        }
+        # A next-candle signal is useful only while subscribers can see it
+        # before the candle opens; Firebase/Telegram latency may consume PRE-ARM.
+        if time_module.time() >= target - 1:
+            return
+        sent = await safe_send_message(context.bot, chat_id=trade["channel_id"], text=_octopus_auto_channel_signal_text(trade))
+        if not sent:
+            _octopus_auto_channel_state["last_error"] = "تعذر إرسال إشارة Octopus إلى Telegram"
+            return
+        _octopus_auto_channel_state["pending_trade"] = trade
+        _octopus_auto_channel_state["last_signal"] = trade
+        _octopus_auto_channel_state["last_error"] = None
+        await asyncio.to_thread(root.child("pending_trade").set, trade)
+        count = int((day or {}).get("signals", 0) or 0) + 1
+        await asyncio.to_thread(root.child("daily").child(day_key).update, {"signals": count})
+        logger.info("Octopus automatic channel signal | pair=%s | direction=%s | entry=%s | martingale=%s", pair, direction, target, trade["martingale_enabled"])
+    except Exception as exc:
+        _octopus_auto_channel_state["last_error"] = str(exc)
+        logger.exception("Octopus automatic channel job failed: %s", exc)
+
+
+def build_octopus_auto_channel_status() -> str:
+    settings = _octopus_auto_channel_settings()
+    _octopus_auto_channel_restore()
+    pending = _octopus_auto_channel_state.get("pending_trade") or {}
+    day = _octopus_auto_channel_ref().child("daily").child(get_utc3_day_key()).get() or {}
+    return (
+        "📋 حالة قناة Octopus\n━━━━━━━━━━━━━━\n"
+        f"النشر: {'🟢 شغال' if settings['enabled'] else '🔴 متوقف'}\n"
+        f"القناة: {'✅ مضبوطة' if STRUCTURE_EDGE_CHANNEL_ID_RAW.strip() else '❌ غير مضبوطة'}\n"
+        f"المضاعفة: {'🟢 شغالة' if settings['martingale_enabled'] else '🔴 متوقفة'}\n"
+        f"حد اليوم: {settings['daily_limit'] or 'مفتوح'} | المنشور: {int((day or {}).get('signals', 0) or 0)}\n"
+        f"إشارة تنتظر النتيجة: {pending.get('pair') or 'لا يوجد'}\n"
+        f"آخر خطأ: {_octopus_auto_channel_state.get('last_error') or 'لا يوجد'}"
+    )[:3900]
+
+
+def build_octopus_auto_channel_summary() -> str:
+    root = _octopus_auto_channel_ref()
+    day = root.child("daily").child(get_utc3_day_key()).get() or {}
+    result = _octopus_auto_channel_state.get("last_result") or {}
+    if not result:
+        recent = root.child("results").order_by_key().limit_to_last(1).get() or {}
+        if isinstance(recent, dict):
+            result = next(iter(recent.values()), {})
+    return (
+        "📊 ملخص قناة Octopus اليوم\n━━━━━━━━━━━━━━\n"
+        f"الإشارات: {int((day or {}).get('signals', 0) or 0)}\n"
+        f"Win✅: {int((day or {}).get('wins', 0) or 0)} | Win✅¹: {int((day or {}).get('mg_wins', 0) or 0)}\n"
+        f"Lose💔: {int((day or {}).get('losses', 0) or 0)} | Doji: {int((day or {}).get('draws', 0) or 0)}\n"
+        f"آخر نتيجة: {result.get('pair') or 'لا يوجد'} {result.get('result') or ''}"
+    )
+
+
+def build_octopus_auto_channel_recent_results() -> str:
+    rows = _octopus_auto_channel_ref().child("results").order_by_key().limit_to_last(10).get() or {}
+    if not isinstance(rows, dict) or not rows:
+        return "📜 لا توجد نتائج منشورة لقناة Octopus بعد."
+    lines = ["📜 آخر نتائج قناة Octopus", "━━━━━━━━━━━━━━"]
+    for key, row in sorted(rows.items(), reverse=True):
+        if not isinstance(row, dict):
+            continue
+        when = datetime.fromtimestamp(int(row.get("entry_bucket") or key), tz=UTC).astimezone(UTC_PLUS_3).strftime("%d/%m %H:%M")
+        label = "Win✅¹" if row.get("result") == "win" and row.get("martingale_step") else {"win": "Win✅", "loss": "Lose💔", "draw": "Doji", "unknown": "غير مؤكدة"}.get(row.get("result"), "غير مؤكدة")
+        lines.append(f"• {when} | {row.get('pair') or '-'} | {row.get('direction') or '-'} | {label}")
+    return "\n".join(lines)[:3900]
+
+
+def _octopus_auto_channel_reset_results() -> bool:
+    try:
+        root = _octopus_auto_channel_ref()
+        root.child("results").delete()
+        root.child("daily").delete()
+        _octopus_auto_channel_state["last_result"] = None
+        return True
+    except Exception as exc:
+        _octopus_auto_channel_state["last_error"] = str(exc)
+        logger.exception("Octopus channel results reset failed: %s", exc)
+        return False
+
+
 def _octopus_mode_detector_fetch(hours: float | None = None) -> list[dict]:
     lookback_hours = float(hours if hours is not None else OCTOPUS_MODE_DETECTOR_REPORT_HOURS)
     cutoff = int((time_module.time() - lookback_hours * 3600.0) // 60) * 60
@@ -19555,7 +19860,7 @@ async def _octopus_execute_prearmed_open(context: ContextTypes.DEFAULT_TYPE, now
         f"EXECUTE TEAM PRE-ARM COMMIT: {candidate.get('pair')} {candidate.get('direction')} "
         f"{candidate.get('market_setup')} Q{candidate.get('market_quality')} | users={len(published_user_ids)} | no FINAL"
     )
-    # v1.37: no signal/order Telegram posts. Octopus channel publishes RESULT ONLY after settlement.
+    # Telegram channel publishing is handled independently by octopus_auto_channel_job.
     _octopus_flush_snapshot(force=False)
     await _octopus_maybe_digest(context)
 
@@ -19849,23 +20154,8 @@ async def _copy_record_structure_edge_trade_result(payload_event: dict, client: 
 
         _octopus_execution_lock_clear(reason=f"result_{outcome}")
 
-        # RESULT-ONLY channel, de-duplicated persistently by the canonical market-signal row.
-        if is_new_canonical and TRADING_TIME_TELEGRAM_APP is not None and _octopus_channel_claim_result(market_key):
-            label = "WIN ✅" if outcome == "win" else "LOSS ❌" if outcome == "loss" else "DRAW ⚖️"
-            entry_text = _structure_edge_local_hms(record.get("executed_at") or (datetime.fromtimestamp(entry_bucket, tz=UTC).isoformat() if entry_bucket > 0 else None))
-            end_text = _structure_edge_local_hms(record.get("expires_at") or record.get("closed_at"))
-            direction_label = "🟢 صعود CALL" if str(record.get("direction") or "").upper() == "CALL" else "🔴 هبوط PUT"
-            await safe_send_message(
-                TRADING_TIME_TELEGRAM_APP.bot, chat_id=_structure_edge_target_chat_id(),
-                text=(
-                    "🐙 OCTOPUS — RESULT\n━━━━━━━━━━━━━━\n"
-                    f"💱 الزوج: {record.get('pair')}\n"
-                    f"🕒 وقت الدخول: {entry_text} UTC+3\n"
-                    f"🏁 وقت الانتهاء: {end_text} UTC+3\n"
-                    f"📌 نوع الصفقة: {direction_label}\n"
-                    f"📊 النتيجة: {label}"
-                )[:3900],
-            )
+        # Device execution results remain in canonical/user history. The channel
+        # posts only results for its own previously published next-candle signals.
         return True
     except Exception as exc:
         _structure_edge_state["last_error"] = str(exc)
@@ -29556,6 +29846,81 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update.message.reply_text("تم إلغاء الإيقاف العام.", reply_markup=structure_edge_admin_keyboard)
             return
 
+        if text == "📡 قناة Octopus":
+            await update.message.reply_text(
+                "📡 قناة Octopus — إشارات الشمعة القادمة ونتائجها تلقائيًا، حتى بدون تطبيق أو إضافة متصلة.",
+                reply_markup=octopus_channel_admin_keyboard,
+            )
+            return
+
+        if text in {"🟢 تشغيل نشر الأخطبوط", "🔴 إيقاف نشر الأخطبوط"}:
+            enabled = text.startswith("🟢")
+            ok = await asyncio.to_thread(_octopus_auto_channel_set_setting, "enabled", enabled)
+            await update.message.reply_text(
+                ("✅ تم تشغيل نشر قناة Octopus." if enabled else "⛔ تم إيقاف الإشارات الجديدة؛ نتيجة الإشارة المنشورة سابقًا ستصل عند حسمها.") if ok else "❌ تعذر حفظ إعداد النشر.",
+                reply_markup=octopus_channel_admin_keyboard,
+            )
+            return
+
+        if text == "🎯 حد صفقات الأخطبوط":
+            context.user_data["step"] = "octopus_channel_daily_limit"
+            await update.message.reply_text("أرسل حد الإشارات اليومي. أرسل 0 للنشر المفتوح.", reply_markup=octopus_channel_admin_keyboard)
+            return
+
+        if step == "octopus_channel_daily_limit":
+            context.user_data["step"] = None
+            value = safe_int(text, -1)
+            ok = value >= 0 and await asyncio.to_thread(_octopus_auto_channel_set_setting, "daily_limit", value)
+            await update.message.reply_text(
+                (f"✅ حد قناة Octopus: {value if value else 'مفتوح'}" if ok else "❌ أرسل رقمًا صحيحًا غير سالب."),
+                reply_markup=octopus_channel_admin_keyboard,
+            )
+            return
+
+        if text == "♾ نشر الأخطبوط مفتوح":
+            ok = await asyncio.to_thread(_octopus_auto_channel_set_setting, "daily_limit", 0)
+            await update.message.reply_text("✅ صار نشر Octopus مفتوحًا." if ok else "❌ تعذر حفظ الحد.", reply_markup=octopus_channel_admin_keyboard)
+            return
+
+        if text in {"🟢 تشغيل مضاعفة الأخطبوط", "🔴 إيقاف مضاعفة الأخطبوط"}:
+            enabled = text.startswith("🟢")
+            ok = await asyncio.to_thread(_octopus_auto_channel_set_setting, "martingale_enabled", enabled)
+            await update.message.reply_text(
+                ("✅ المضاعفة مفعّلة للإشارات الجديدة: عند خسارة الشمعة الأولى ننتظر نتيجة شمعة واحدة ثانية بنفس الاتجاه." if enabled else "✅ المضاعفة متوقفة للإشارات الجديدة؛ النتيجة تصدر بعد الشمعة الأولى.") if ok else "❌ تعذر حفظ إعداد المضاعفة.",
+                reply_markup=octopus_channel_admin_keyboard,
+            )
+            return
+
+        if text == "📋 حالة قناة الأخطبوط":
+            await update.message.reply_text(await asyncio.to_thread(build_octopus_auto_channel_status), reply_markup=octopus_channel_admin_keyboard)
+            return
+
+        if text == "📊 ملخص قناة الأخطبوط":
+            await update.message.reply_text(await asyncio.to_thread(build_octopus_auto_channel_summary), reply_markup=octopus_channel_admin_keyboard)
+            return
+
+        if text == "📜 آخر نتائج الأخطبوط":
+            await update.message.reply_text(await asyncio.to_thread(build_octopus_auto_channel_recent_results), reply_markup=octopus_channel_admin_keyboard)
+            return
+
+        if text == "🧹 تصفير نتائج القناة":
+            context.user_data["step"] = "octopus_channel_confirm_reset"
+            await update.message.reply_text(
+                "⚠️ سيتم حذف إحصائيات ونتائج قناة Octopus فقط. تحليل Octopus ونتائج حسابات المستخدمين لن تتأثر.\nاضغط ✅ نعم، تأكيد أو ❌ إلغاء.",
+                reply_markup=admin_confirm_keyboard,
+            )
+            return
+
+        if step == "octopus_channel_confirm_reset":
+            context.user_data["step"] = None
+            if is_admin_confirm_text(text):
+                ok = await asyncio.to_thread(_octopus_auto_channel_reset_results)
+                reply = "✅ تم تصفير نتائج قناة Octopus." if ok else "❌ تعذر تصفير النتائج."
+            else:
+                reply = "تم إلغاء التصفير."
+            await update.message.reply_text(reply, reply_markup=octopus_channel_admin_keyboard)
+            return
+
         if text == "📋 حالة Octopus":
             await update.message.reply_text(build_structure_edge_status(), reply_markup=structure_edge_admin_keyboard)
             return
@@ -33635,6 +34000,13 @@ def run_telegram_bot_only():
         interval=OCTOPUS_SELECTOR_SCHEDULER_SECONDS,
         first=OCTOPUS_SELECTOR_SCHEDULER_SECONDS,
         name="octopus_sr_retest",
+    )
+
+    job_queue.run_repeating(
+        _scheduler_singleflight(octopus_auto_channel_job, "octopus_auto_channel"),
+        interval=OCTOPUS_SELECTOR_SCHEDULER_SECONDS,
+        first=OCTOPUS_SELECTOR_SCHEDULER_SECONDS,
+        name="octopus_auto_channel",
     )
 
     # DS is private to the owner and has its own PRE-ARM/final-close lifecycle.
